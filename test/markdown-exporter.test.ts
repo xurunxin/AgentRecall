@@ -54,6 +54,12 @@ describe("MarkdownExporter", () => {
           body: "hidden secret body"
         }),
         entry({
+          id: "mem_archived",
+          status: "archived",
+          title: "Archived",
+          body: "archived body should not appear by default"
+        }),
+        entry({
           id: "mem_high",
           scope: "project",
           project_id: "repo-123",
@@ -75,6 +81,7 @@ describe("MarkdownExporter", () => {
     expect(markdown).toContain("tags: project, tests");
     expect(markdown.indexOf("mem_high")).toBeLessThan(markdown.indexOf("mem_low"));
     expect(markdown).not.toContain("hidden secret body");
+    expect(markdown).not.toContain("archived body should not appear by default");
   });
 
   it("stops before adding an entry that would exceed the context budget", () => {

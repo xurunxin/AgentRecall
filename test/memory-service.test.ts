@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -21,6 +21,14 @@ class FailingAuditStore extends SQLiteMemoryStore {
       throw new Error("audit append failed");
     }
     super.appendAudit(event);
+  }
+}
+
+class FailingStageExporter extends MarkdownExporter {
+  override stageScope(input: Parameters<MarkdownExporter["stageScope"]>[0]): ReturnType<MarkdownExporter["stageScope"]> {
+    const staged = super.stageScope(input);
+    rmSync(staged.stagingRoot, { recursive: true, force: true });
+    throw new Error("stage write failed");
   }
 }
 
@@ -966,6 +974,15 @@ describe("MemoryService", () => {
       ok: false,
       error: "invalid_scope"
     });
+    expect(memory.listMemories({ scope: "project" })).toMatchObject({
+      ok: false,
+      error: "invalid_scope"
+    });
+    expect(memory.searchMemories({ scope: "project", query: "Repo" })).toMatchObject({
+      ok: false,
+      error: "invalid_scope"
+    });
+    expect(memory.listMemories({ scope: "global" }).items.map((entry) => entry.title)).toEqual([]);
     store.close();
   });
 
@@ -1182,6 +1199,99 @@ describe("MemoryService", () => {
         })
       })
     ]);
+    store.close();
+  });
+
+  it("does not change live markdown when staged export generation fails", () => {
+    const exportRoot = join(mkdtempSync(join(tmpdir(), "lm-service-export-")), "exports");
+    const store = new SQLiteMemoryStore(join(mkdtempSync(join(tmpdir(), "lm-service-")), "memory.sqlite"));
+    const memory = new MemoryService(store, new MarkdownExporter(exportRoot));
+    const old = memory.remember({
+      scope: "global",
+      type: "preference",
+      topic: "shell",
+      title: "Old export",
+      body: "Old export body.",
+      tags: ["shell"],
+      source: { kind: "agent" },
+      importance: 4,
+      confidence: 4
+    });
+    expect(old.ok).toBe(true);
+    expect(memory.maintainMemories({ action: "rebuild_markdown_index", scope: "global" })).toMatchObject({
+      changed: 2
+    });
+    const indexPath = join(exportRoot, "global", "MEMORY.md");
+    const oldIndex = readFileSync(indexPath, "utf8");
+
+    const next = memory.remember({
+      scope: "global",
+      type: "preference",
+      topic: "new-topic",
+      title: "New export",
+      body: "New export body.",
+      tags: ["new"],
+      source: { kind: "agent" },
+      importance: 4,
+      confidence: 4
+    });
+    expect(next.ok).toBe(true);
+    const failingMemory = new MemoryService(store, new FailingStageExporter(exportRoot));
+
+    expect(() => failingMemory.maintainMemories({ action: "rebuild_markdown_index", scope: "global" })).toThrow(
+      "stage write failed"
+    );
+    expect(readFileSync(indexPath, "utf8")).toBe(oldIndex);
+    expect(readFileSync(indexPath, "utf8")).not.toContain("New export");
+    expect(existsSync(join(exportRoot, "global", "topics", "new-topic.md"))).toBe(false);
+    expect(store.listAuditEvents({ event: "markdown_exported" })).toHaveLength(1);
+    store.close();
+  });
+
+  it("rolls back live markdown when rebuild audit append fails", () => {
+    const exportRoot = join(mkdtempSync(join(tmpdir(), "lm-service-export-")), "exports");
+    const store = new FailingAuditStore(join(mkdtempSync(join(tmpdir(), "lm-service-")), "memory.sqlite"));
+    const memory = new MemoryService(store, new MarkdownExporter(exportRoot));
+    const old = memory.remember({
+      scope: "global",
+      type: "preference",
+      topic: "shell",
+      title: "Old audited export",
+      body: "Old audited export body.",
+      tags: ["shell"],
+      source: { kind: "agent" },
+      importance: 4,
+      confidence: 4
+    });
+    expect(old.ok).toBe(true);
+    expect(memory.maintainMemories({ action: "rebuild_markdown_index", scope: "global" })).toMatchObject({
+      changed: 2
+    });
+    const indexPath = join(exportRoot, "global", "MEMORY.md");
+    const oldIndex = readFileSync(indexPath, "utf8");
+
+    const next = memory.remember({
+      scope: "global",
+      type: "preference",
+      topic: "new-topic",
+      title: "New audited export",
+      body: "New audited export body.",
+      tags: ["new"],
+      source: { kind: "agent" },
+      importance: 4,
+      confidence: 4
+    });
+    expect(next.ok).toBe(true);
+
+    store.failAudit = true;
+    expect(() => memory.maintainMemories({ action: "rebuild_markdown_index", scope: "global" })).toThrow(
+      "audit append failed"
+    );
+    store.failAudit = false;
+    expect(readFileSync(indexPath, "utf8")).toBe(oldIndex);
+    expect(readFileSync(indexPath, "utf8")).not.toContain("New audited export");
+    expect(existsSync(join(exportRoot, "global", "topics", "new-topic.md"))).toBe(false);
+    expect(store.listAuditEvents({ event: "markdown_exported" })).toHaveLength(1);
     store.close();
   });
 

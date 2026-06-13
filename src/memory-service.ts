@@ -7,6 +7,8 @@ import {
   type CandidateAction
 } from "./budget-governor.js";
 import { createHash } from "node:crypto";
+import { rmSync } from "node:fs";
+import { join } from "node:path";
 import {
   DEFAULT_GLOBAL_BUDGET,
   DEFAULT_PROJECT_BUDGET,
@@ -44,6 +46,8 @@ export type RememberResult = {
 export type ListResult = {
   items: MemoryEntry[];
 };
+
+export type InvalidScopeResult = Result<never, "invalid_scope">;
 
 export type SearchMemoryItem = Pick<
   MemoryEntry,
@@ -123,6 +127,11 @@ type PrepareRememberOptions = {
 
 type SearchServiceFilters = SearchFilters & {
   include_global?: boolean;
+  project_path?: string;
+};
+
+type ListServiceFilters = EntryFilters & {
+  project_path?: string;
 };
 
 type ResolvedReadScope = {
@@ -350,26 +359,46 @@ export class MemoryService {
     return entry === undefined ? undefined : { entry, audit: this.store.getAuditEvents(id) };
   }
 
-  listMemories(filters: EntryFilters): ListResult {
+  listMemories(filters: ListServiceFilters & { scope: "project"; project_id: string }): ListResult;
+  listMemories(filters: ListServiceFilters & { scope: "project"; project_path: string }): ListResult;
+  listMemories(filters: ListServiceFilters & { scope?: "global" }): ListResult;
+  listMemories(filters: ListServiceFilters): ListResult | InvalidScopeResult;
+  listMemories(filters: ListServiceFilters): ListResult | InvalidScopeResult {
+    const resolved = this.resolveOptionalReadScope(filters);
+    if (!resolved.ok) {
+      return resolved;
+    }
+
     return {
       items: this.store.listEntries({
-        ...filters,
+        ...this.entryFiltersForRead(filters, resolved.value),
         status: filters.status ?? "active"
       })
     };
   }
 
-  searchMemories(filters: SearchServiceFilters): SearchResult {
+  searchMemories(filters: SearchServiceFilters & { scope: "project"; project_id: string }): SearchResult;
+  searchMemories(filters: SearchServiceFilters & { scope: "project"; project_path: string }): SearchResult;
+  searchMemories(filters: SearchServiceFilters & { scope?: "global" }): SearchResult;
+  searchMemories(filters: SearchServiceFilters): SearchResult | InvalidScopeResult;
+  searchMemories(filters: SearchServiceFilters): SearchResult | InvalidScopeResult {
+    const resolved = this.resolveOptionalReadScope(filters);
+    if (!resolved.ok) {
+      return resolved;
+    }
+
     const { include_global: includeGlobal, ...storeFilters } = filters;
+    const resolvedFilters = this.entryFiltersForRead(storeFilters, resolved.value);
     const limit = filters.limit ?? 10;
     const status = filters.status ?? "active";
     const projectItems = this.store.searchEntries({
-      ...storeFilters,
+      ...resolvedFilters,
+      query: filters.query,
       status,
       limit
     });
     const globalItems =
-      filters.scope === "project" && includeGlobal
+      resolved.value.scope === "project" && includeGlobal
         ? this.store.searchEntries({
             query: filters.query,
             scope: "global",
@@ -684,7 +713,7 @@ export class MemoryService {
   }
 
   private markdownExporter(): MarkdownExporter {
-    return this.exporter ?? new MarkdownExporter(".local-memory-mcp/exports");
+    return this.exporter ?? new MarkdownExporter(join(process.cwd(), ".local-memory-mcp", "exports"));
   }
 
   private resolveReadScope(input: { scope: MemoryScope; project_id?: string; project_path?: string }): Result<ResolvedReadScope, "invalid_scope"> {
@@ -699,6 +728,35 @@ export class MemoryService {
       scope: resolved.value.scope,
       ...(resolved.value.project_id !== undefined ? { project_id: resolved.value.project_id } : {})
     });
+  }
+
+  private resolveOptionalReadScope(input: {
+    scope?: MemoryScope;
+    project_id?: string;
+    project_path?: string;
+  }): Result<Partial<ResolvedReadScope>, "invalid_scope"> {
+    if (input.scope === undefined) {
+      return ok({});
+    }
+    return this.resolveReadScope(input as { scope: MemoryScope; project_id?: string; project_path?: string });
+  }
+
+  private entryFiltersForRead<T extends EntryFilters & { project_path?: string }>(
+    filters: T,
+    resolved: Partial<ResolvedReadScope>
+  ): EntryFilters {
+    const entryFilters: EntryFilters = {};
+    const scope = resolved.scope ?? filters.scope;
+    const projectId = resolved.project_id ?? filters.project_id;
+    if (scope !== undefined) entryFilters.scope = scope;
+    if (projectId !== undefined && scope !== "global") entryFilters.project_id = projectId;
+    if (filters.type !== undefined) entryFilters.type = filters.type;
+    if (filters.topic !== undefined) entryFilters.topic = filters.topic;
+    if (filters.status !== undefined) entryFilters.status = filters.status;
+    if (filters.tags !== undefined) entryFilters.tags = filters.tags;
+    if (filters.limit !== undefined) entryFilters.limit = filters.limit;
+    if (filters.offset !== undefined) entryFilters.offset = filters.offset;
+    return entryFilters;
   }
 
   private collectContextEntries(scope: ResolvedReadScope, input: ExportMemoryContextInput): MemoryEntry[] {
@@ -773,28 +831,47 @@ export class MemoryService {
   }
 
   private rebuildMarkdownIndex(scope: ResolvedReadScope): MaintainMemoriesResult {
-    return this.store.transaction(() => {
-      const paths = this.markdownExporter().exportScope({
-        scope: scope.scope,
-        ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
-        entries: this.allEntriesForScope(scope),
-        budgetStatus: this.usageForScope(scope)
-      });
-      const changed = paths.topicPaths.length + 1;
-      this.appendAudit({
-        scope: scope.scope,
-        ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
-        event: "markdown_exported",
-        actor: "agent",
-        metadata: paths
-      });
-      this.appendMaintenanceAudit(scope, "rebuild_markdown_index", changed, paths);
-      return {
-        action: "rebuild_markdown_index",
-        changed,
-        details: paths
-      };
+    const exporter = this.markdownExporter();
+    const staged = exporter.stageScope({
+      scope: scope.scope,
+      ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
+      entries: this.allEntriesForScope(scope),
+      budgetStatus: this.usageForScope(scope)
     });
+
+    const changed = staged.topicPaths.length + 1;
+    const paths = {
+      indexPath: staged.indexPath,
+      topicPaths: staged.topicPaths
+    };
+    let published: ReturnType<MarkdownExporter["publishStagedScope"]> | undefined;
+    try {
+      published = exporter.publishStagedScope(staged);
+      const result = this.store.transaction(() => {
+        this.appendAudit({
+          scope: scope.scope,
+          ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
+          event: "markdown_exported",
+          actor: "agent",
+          metadata: paths
+        });
+        this.appendMaintenanceAudit(scope, "rebuild_markdown_index", changed, paths);
+        return {
+          action: "rebuild_markdown_index" as const,
+          changed,
+          details: paths
+        };
+      });
+      published.complete();
+      return result;
+    } catch (error) {
+      if (published === undefined) {
+        rmSync(staged.stagingRoot, { recursive: true, force: true });
+      } else {
+        published.rollback();
+      }
+      throw error;
+    }
   }
 
   private expireDueMemories(scope: ResolvedReadScope): MaintainMemoriesResult {
@@ -802,21 +879,26 @@ export class MemoryService {
     const expired = this.activeEntriesForScope(scope)
       .filter((entry) => isDue(entry.expires_at, now))
       .sort((a, b) => compareText(a.expires_at ?? "", b.expires_at ?? "") || compareText(a.id, b.id));
-    const details = {
-      expired: expired.map((entry) => ({
-        memory_id: entry.id,
-        expires_at: entry.expires_at ?? ""
-      }))
-    };
 
     return this.store.transaction(() => {
+      const forgotten: Array<{ memory_id: string; expires_at: string }> = [];
+      const failed: Array<{ memory_id: string; error: string }> = [];
       for (const entry of expired) {
-        this.forgetMemory(entry.id, "expired by maintain_memories");
+        const result = this.forgetMemory(entry.id, "expired by maintain_memories");
+        if (result.ok) {
+          forgotten.push({
+            memory_id: entry.id,
+            expires_at: entry.expires_at ?? ""
+          });
+        } else {
+          failed.push({ memory_id: entry.id, error: result.error });
+        }
       }
-      this.appendMaintenanceAudit(scope, "expire_due", expired.length, details);
+      const details = failed.length === 0 ? { expired: forgotten } : { expired: forgotten, failed };
+      this.appendMaintenanceAudit(scope, "expire_due", forgotten.length, details);
       return {
         action: "expire_due",
-        changed: expired.length,
+        changed: forgotten.length,
         details
       };
     });
@@ -826,21 +908,26 @@ export class MemoryService {
     const lowValue = this.activeEntriesForScope(scope)
       .filter((entry) => entry.importance <= 2 && entry.confidence <= 2 && entry.access_count === 0 && entry.source.kind !== "user")
       .sort(compareLowValueCandidates);
-    const details = {
-      archived: lowValue.map((entry) => ({
-        memory_id: entry.id,
-        reason: "low importance, low confidence, never accessed"
-      }))
-    };
 
     return this.store.transaction(() => {
+      const archived: Array<{ memory_id: string; reason: string }> = [];
+      const failed: Array<{ memory_id: string; error: string }> = [];
       for (const entry of lowValue) {
-        this.updateMemory(entry.id, { status: "archived" });
+        const result = this.updateMemory(entry.id, { status: "archived" });
+        if (result.ok) {
+          archived.push({
+            memory_id: entry.id,
+            reason: "low importance, low confidence, never accessed"
+          });
+        } else {
+          failed.push({ memory_id: entry.id, error: result.error });
+        }
       }
-      this.appendMaintenanceAudit(scope, "archive_low_value", lowValue.length, details);
+      const details = failed.length === 0 ? { archived } : { archived, failed };
+      this.appendMaintenanceAudit(scope, "archive_low_value", archived.length, details);
       return {
         action: "archive_low_value",
-        changed: lowValue.length,
+        changed: archived.length,
         details
       };
     });

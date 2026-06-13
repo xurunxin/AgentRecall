@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import type { MemoryEntry, MemoryScope } from "./domain.js";
 import type { BudgetUsage } from "./sqlite-store.js";
 
@@ -20,6 +20,17 @@ export type ExportScopeInput = {
 export type ExportScopeResult = {
   indexPath: string;
   topicPaths: string[];
+};
+
+export type StagedScopeExport = ExportScopeResult & {
+  stagingRoot: string;
+  stagingScopeDir: string;
+  scopeDir: string;
+};
+
+export type PublishedScopeExport = ExportScopeResult & {
+  complete(): void;
+  rollback(): void;
 };
 
 const AUTHORITY_NOTICE = "Generated from SQLite. SQLite is authoritative; manual edits may be overwritten.";
@@ -159,17 +170,6 @@ function entryDetail(entry: MemoryEntry): string {
   ].join("\n");
 }
 
-function cleanupGeneratedTopicFiles(topicsDir: string): void {
-  if (!existsSync(topicsDir)) {
-    return;
-  }
-  for (const file of readdirSync(topicsDir, { withFileTypes: true })) {
-    if (file.isFile() && file.name.endsWith(".md")) {
-      unlinkSync(join(topicsDir, file.name));
-    }
-  }
-}
-
 function boundedJoin(blocks: string[], budgetChars: number): string {
   const budget = Math.max(0, Math.floor(budgetChars));
   let output = "";
@@ -185,12 +185,23 @@ function boundedJoin(blocks: string[], budgetChars: number): string {
   return output;
 }
 
+function uniquePath(parent: string, prefix: string): string {
+  let index = 0;
+  while (true) {
+    const candidate = join(parent, `${prefix}-${process.pid}-${Date.now()}-${index}`);
+    if (!existsSync(candidate)) {
+      return candidate;
+    }
+    index += 1;
+  }
+}
+
 export class MarkdownExporter {
   constructor(private readonly exportRoot: string) {}
 
   buildContextPack(input: ContextPackInput): string {
     const title = input.title.trim().length > 0 ? input.title.trim() : "Local Memory Context";
-    const entries = [...input.entries].filter((entry) => entry.status !== "forgotten").sort(compareEntries);
+    const entries = [...input.entries].filter((entry) => entry.status === "active").sort(compareEntries);
     const blocks = [
       [`# ${title}`, "", `> ${AUTHORITY_NOTICE}`, "", "## Memories", ""].join("\n"),
       ...entries.map((entry) => `${entryDetail(entry)}\n`)
@@ -200,11 +211,111 @@ export class MarkdownExporter {
   }
 
   exportScope(input: ExportScopeInput): ExportScopeResult {
+    const staged = this.stageScope(input);
+    let published: PublishedScopeExport | undefined;
+    try {
+      published = this.publishStagedScope(staged);
+      published.complete();
+      return {
+        indexPath: staged.indexPath,
+        topicPaths: staged.topicPaths
+      };
+    } catch (error) {
+      if (published === undefined) {
+        rmSync(staged.stagingRoot, { recursive: true, force: true });
+      } else {
+        published.rollback();
+      }
+      throw error;
+    }
+  }
+
+  stageScope(input: ExportScopeInput): StagedScopeExport {
+    const stagingParent = join(this.exportRoot, ".staging");
+    mkdirSync(stagingParent, { recursive: true });
+    const stagingRoot = mkdtempSync(join(stagingParent, "export-"));
+    try {
+      const staged = this.writeScope(input, stagingRoot);
+      const finalScopeDir = this.scopeDir(input, this.exportRoot);
+      return {
+        indexPath: join(finalScopeDir, "MEMORY.md"),
+        topicPaths: staged.topicPaths.map((path) => join(finalScopeDir, "topics", basename(path))),
+        stagingRoot,
+        stagingScopeDir: this.scopeDir(input, stagingRoot),
+        scopeDir: finalScopeDir
+      };
+    } catch (error) {
+      rmSync(stagingRoot, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  publishStagedScope(staged: StagedScopeExport): PublishedScopeExport {
+    const parent = dirname(staged.scopeDir);
+    mkdirSync(parent, { recursive: true });
+    const backupDir = uniquePath(parent, `.backup-${basename(staged.scopeDir)}`);
+    const hadLiveExport = existsSync(staged.scopeDir);
+    let active = true;
+
+    if (hadLiveExport) {
+      renameSync(staged.scopeDir, backupDir);
+    }
+
+    try {
+      renameSync(staged.stagingScopeDir, staged.scopeDir);
+    } catch (error) {
+      if (hadLiveExport) {
+        renameSync(backupDir, staged.scopeDir);
+      }
+      rmSync(staged.stagingRoot, { recursive: true, force: true });
+      active = false;
+      throw error;
+    }
+
+    const complete = (): void => {
+      if (!active) return;
+      try {
+        rmSync(staged.stagingRoot, { recursive: true, force: true });
+      } catch {
+        // Cleanup is best-effort after the live export has been replaced.
+      }
+      try {
+        if (hadLiveExport) {
+          rmSync(backupDir, { recursive: true, force: true });
+        }
+      } catch {
+        // Leaving a backup is safer than reporting a failed successful export.
+      }
+      active = false;
+    };
+
+    const rollback = (): void => {
+      if (!active) return;
+      rmSync(staged.scopeDir, { recursive: true, force: true });
+      if (hadLiveExport && existsSync(backupDir)) {
+        renameSync(backupDir, staged.scopeDir);
+      }
+      rmSync(staged.stagingRoot, { recursive: true, force: true });
+      active = false;
+    };
+
+    return {
+      indexPath: staged.indexPath,
+      topicPaths: staged.topicPaths,
+      complete,
+      rollback
+    };
+  }
+
+  private scopeDir(input: Pick<ExportScopeInput, "scope" | "project_id">, root: string): string {
+    return input.scope === "global" ? join(root, "global") : join(root, "projects", input.project_id ?? "unknown-project");
+  }
+
+  private writeScope(input: ExportScopeInput, root: string): ExportScopeResult {
     const scopeDir =
-      input.scope === "global" ? join(this.exportRoot, "global") : join(this.exportRoot, "projects", input.project_id ?? "unknown-project");
+      input.scope === "global" ? join(root, "global") : join(root, "projects", input.project_id ?? "unknown-project");
     const topicsDir = join(scopeDir, "topics");
     mkdirSync(topicsDir, { recursive: true });
-    cleanupGeneratedTopicFiles(topicsDir);
 
     const activeEntries = [...input.entries].filter((entry) => entry.status === "active").sort(compareEntriesForTopic);
     const topics = [...new Set(activeEntries.map((entry) => entry.topic))].sort(compareText);
