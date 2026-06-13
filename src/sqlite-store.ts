@@ -150,10 +150,7 @@ function decodeAudit(row: Row): MemoryAuditEvent {
 }
 
 function ftsQuery(query: string): string {
-  return query
-    .split(/\s+/)
-    .map((token) => token.replace(/[^\p{L}\p{N}_-]/gu, ""))
-    .filter(Boolean)
+  return (query.match(/[\p{L}\p{N}_]+/gu) ?? [])
     .map((token) => `"${token.replaceAll("\"", "\"\"")}"`)
     .join(" OR ");
 }
@@ -528,15 +525,15 @@ export class SQLiteMemoryStore {
       `
       )
       .all(...params);
-    const topic_chars: Record<string, number> = {};
+    const topicChars = new Map<string, number>();
     for (const row of topicRows) {
-      topic_chars[stringCell(row, "topic")] = numberCell(row, "chars");
+      topicChars.set(stringCell(row, "topic"), numberCell(row, "chars"));
     }
 
     return {
       active_entries: summary === undefined ? 0 : numberCell(summary, "active_entries"),
       active_chars: summary === undefined ? 0 : numberCell(summary, "active_chars"),
-      topic_chars,
+      topic_chars: Object.fromEntries(topicChars) as Record<string, number>,
       index_chars: summary === undefined ? 0 : numberCell(summary, "index_chars")
     };
   }

@@ -142,6 +142,31 @@ describe("SQLiteMemoryStore", () => {
     store.close();
   });
 
+  it("treats punctuation in FTS queries as token separators", () => {
+    const store = new SQLiteMemoryStore(join(mkdtempSync(join(tmpdir(), "lm-store-")), "memory.sqlite"));
+    store.insertEntry(makeEntry());
+    expect(store.searchEntries({ query: "postgres/failures", scope: "project", project_id: "repo-123", limit: 5 }).map((entry) => entry.id)).toEqual([
+      "mem_test_001"
+    ]);
+    store.close();
+  });
+
+  it("reports topic budget usage for prototype-shaped topic names", () => {
+    const store = new SQLiteMemoryStore(join(mkdtempSync(join(tmpdir(), "lm-store-")), "memory.sqlite"));
+    store.insertEntry(
+      makeEntry({
+        topic: "__proto__",
+        char_count: 77,
+        token_estimate: 20
+      })
+    );
+
+    const usage = store.getBudgetUsage({ scope: "project", project_id: "repo-123" });
+    expect(Object.prototype.hasOwnProperty.call(usage.topic_chars, "__proto__")).toBe(true);
+    expect(usage.topic_chars["__proto__"]).toBe(77);
+    store.close();
+  });
+
   it("reports exact active budget usage across all entries and excludes inactive statuses", () => {
     const store = new SQLiteMemoryStore(":memory:");
     let expectedIndexChars = 0;
