@@ -32,6 +32,23 @@ export type BudgetUsage = {
   index_chars: number;
 };
 
+type EntryPatchField =
+  | "topic"
+  | "title"
+  | "body"
+  | "tags"
+  | "importance"
+  | "confidence"
+  | "status"
+  | "expires_at"
+  | "review_after"
+  | "supersedes"
+  | "superseded_by"
+  | "token_estimate"
+  | "char_count";
+
+export type EntryPatch = Partial<Pick<MemoryEntry, EntryPatchField>> & Pick<MemoryEntry, "updated_at">;
+
 type Row = Record<string, SQLOutputValue>;
 
 function encodeJson(value: unknown): string {
@@ -151,15 +168,31 @@ function normalizeOffset(offset: number | undefined): number {
   return Number.isInteger(offset) && offset > 0 ? offset : 0;
 }
 
-function definedPatch<T extends object>(patch: Partial<T>): Partial<T> {
-  const result: Record<string, unknown> = {};
-  for (const key of Object.keys(patch) as Array<keyof T>) {
+const ENTRY_PATCH_FIELDS = [
+  "topic",
+  "title",
+  "body",
+  "tags",
+  "importance",
+  "confidence",
+  "status",
+  "expires_at",
+  "review_after",
+  "supersedes",
+  "superseded_by",
+  "token_estimate",
+  "char_count"
+] as const satisfies readonly EntryPatchField[];
+
+function sanitizeEntryPatch(patch: EntryPatch): EntryPatch {
+  const result: Record<string, unknown> = { updated_at: patch.updated_at };
+  for (const key of ENTRY_PATCH_FIELDS) {
     const value = patch[key];
     if (value !== undefined) {
-      result[String(key)] = value;
+      result[key] = value;
     }
   }
-  return result as Partial<T>;
+  return result as EntryPatch;
 }
 
 function buildEntryWhere(filters: EntryFilters, alias: string): { where: string; params: SQLInputValue[] } {
@@ -194,6 +227,19 @@ function buildEntryWhere(filters: EntryFilters, alias: string): { where: string;
 
   return {
     where: clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`,
+    params
+  };
+}
+
+function buildBudgetWhere(filters: { scope: MemoryScope; project_id?: string }): { where: string; params: SQLInputValue[] } {
+  const clauses = ["status = 'active'", "scope = ?"];
+  const params: SQLInputValue[] = [filters.scope];
+  if (filters.project_id !== undefined) {
+    clauses.push("project_id = ?");
+    params.push(filters.project_id);
+  }
+  return {
+    where: `WHERE ${clauses.join(" AND ")}`,
     params
   };
 }
@@ -377,11 +423,11 @@ export class SQLiteMemoryStore {
     return rows.map(decodeEntry);
   }
 
-  updateEntry(id: string, patch: Partial<MemoryEntry> & { updated_at: string }): void {
+  updateEntry(id: string, patch: EntryPatch): void {
     const current = this.readEntry(id);
     if (current === undefined) return;
 
-    const next: MemoryEntry = { ...current, ...definedPatch<MemoryEntry>(patch) };
+    const next: MemoryEntry = { ...current, ...sanitizeEntryPatch(patch), id: current.id };
     this.transaction(() => {
       this.db
         .prepare(
@@ -446,27 +492,52 @@ export class SQLiteMemoryStore {
   }
 
   getBudgetUsage(filters: { scope: MemoryScope; project_id?: string }): BudgetUsage {
-    const entries = this.listEntries({
-      scope: filters.scope,
-      ...(filters.project_id !== undefined ? { project_id: filters.project_id } : {}),
-      status: "active",
-      limit: 10_000
-    });
+    const { where, params } = buildBudgetWhere(filters);
+    const summary = this.db
+      .prepare(
+        `
+        SELECT
+          COUNT(*) AS active_entries,
+          COALESCE(SUM(char_count), 0) AS active_chars,
+          COALESCE(SUM(
+            length(title) +
+            length(topic) +
+            (
+              SELECT
+                CASE
+                  WHEN COUNT(*) = 0 THEN 0
+                  ELSE COALESCE(SUM(length(CAST(value AS TEXT))), 0) + COUNT(*) - 1
+                END
+              FROM json_each(memory_entries.tags_json)
+            ) +
+            16
+          ), 0) AS index_chars
+        FROM memory_entries
+        ${where}
+      `
+      )
+      .get(...params);
+    const topicRows = this.db
+      .prepare(
+        `
+        SELECT topic, COALESCE(SUM(char_count), 0) AS chars
+        FROM memory_entries
+        ${where}
+        GROUP BY topic
+        ORDER BY topic ASC
+      `
+      )
+      .all(...params);
     const topic_chars: Record<string, number> = {};
-    let active_chars = 0;
-    let index_chars = 0;
-
-    for (const entry of entries) {
-      active_chars += entry.char_count;
-      topic_chars[entry.topic] = (topic_chars[entry.topic] ?? 0) + entry.char_count;
-      index_chars += entry.title.length + entry.topic.length + entry.tags.join(" ").length + 16;
+    for (const row of topicRows) {
+      topic_chars[stringCell(row, "topic")] = numberCell(row, "chars");
     }
 
     return {
-      active_entries: entries.length,
-      active_chars,
+      active_entries: summary === undefined ? 0 : numberCell(summary, "active_entries"),
+      active_chars: summary === undefined ? 0 : numberCell(summary, "active_chars"),
       topic_chars,
-      index_chars
+      index_chars: summary === undefined ? 0 : numberCell(summary, "index_chars")
     };
   }
 

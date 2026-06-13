@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_PROJECT_BUDGET, type MemoryEntry } from "../src/domain.js";
-import { SQLiteMemoryStore } from "../src/sqlite-store.js";
+import { SQLiteMemoryStore, type EntryPatch } from "../src/sqlite-store.js";
 
 function makeEntry(overrides: Partial<MemoryEntry> = {}): MemoryEntry {
   return {
@@ -91,4 +91,100 @@ describe("SQLiteMemoryStore", () => {
     });
     store.close();
   });
+
+  it("ignores attempted id changes during update and keeps FTS tied to the stored entry id", () => {
+    const store = new SQLiteMemoryStore(join(mkdtempSync(join(tmpdir(), "lm-store-")), "memory.sqlite"));
+    store.insertEntry(makeEntry());
+    store.updateEntry("mem_test_001", {
+      id: "mem_bad",
+      title: "Updated SQLite title",
+      body: "Updated body with sqlite only",
+      tags: ["sqlite"],
+      updated_at: "2026-06-13T00:02:00.000Z",
+      char_count: 31,
+      token_estimate: 8
+    } as unknown as EntryPatch);
+
+    expect(store.getEntry("mem_test_001")).toMatchObject({
+      id: "mem_test_001",
+      title: "Updated SQLite title"
+    });
+    expect(store.getEntry("mem_bad")).toBeUndefined();
+    expect(store.searchEntries({ query: "postgres", scope: "project", project_id: "repo-123", limit: 5 })).toEqual([]);
+    expect(store.searchEntries({ query: "sqlite", scope: "project", project_id: "repo-123", limit: 5 }).map((entry) => entry.id)).toEqual([
+      "mem_test_001"
+    ]);
+    store.close();
+  });
+
+  it("removes old FTS terms when an entry is updated", () => {
+    const store = new SQLiteMemoryStore(join(mkdtempSync(join(tmpdir(), "lm-store-")), "memory.sqlite"));
+    store.insertEntry(makeEntry());
+    store.updateEntry("mem_test_001", {
+      body: "Updated body with sqlite only",
+      tags: ["sqlite"],
+      updated_at: "2026-06-13T00:03:00.000Z",
+      char_count: 29,
+      token_estimate: 8
+    });
+
+    expect(store.searchEntries({ query: "postgres", scope: "project", project_id: "repo-123", limit: 5 })).toEqual([]);
+    expect(store.searchEntries({ query: "sqlite", scope: "project", project_id: "repo-123", limit: 5 }).map((entry) => entry.id)).toEqual([
+      "mem_test_001"
+    ]);
+    store.close();
+  });
+
+  it("returns no search results for punctuation-only FTS queries", () => {
+    const store = new SQLiteMemoryStore(join(mkdtempSync(join(tmpdir(), "lm-store-")), "memory.sqlite"));
+    store.insertEntry(makeEntry());
+    expect(store.searchEntries({ query: "!!! ??? ...", scope: "project", project_id: "repo-123", limit: 5 })).toEqual([]);
+    store.close();
+  });
+
+  it("reports exact active budget usage across all entries and excludes inactive statuses", () => {
+    const store = new SQLiteMemoryStore(":memory:");
+    let expectedIndexChars = 0;
+    for (let index = 0; index < 10_001; index += 1) {
+      const topic = index % 2 === 0 ? "alpha" : "beta";
+      const title = `Active ${index}`;
+      expectedIndexChars += title.length + topic.length + 16;
+      store.insertEntry(
+        makeEntry({
+          id: `mem_active_${String(index).padStart(5, "0")}`,
+          topic,
+          title,
+          body: `Active exact budget row ${index}`,
+          tags: [],
+          char_count: 1,
+          token_estimate: 1
+        })
+      );
+    }
+    for (const status of ["archived", "superseded", "forgotten"] as const) {
+      store.insertEntry(
+        makeEntry({
+          id: `mem_${status}`,
+          status,
+          topic: "alpha",
+          title: `Inactive ${status}`,
+          body: `Inactive ${status} entry`,
+          tags: [],
+          char_count: 999,
+          token_estimate: 250
+        })
+      );
+    }
+
+    expect(store.getBudgetUsage({ scope: "project", project_id: "repo-123" })).toEqual({
+      active_entries: 10_001,
+      active_chars: 10_001,
+      topic_chars: {
+        alpha: 5001,
+        beta: 5000
+      },
+      index_chars: expectedIndexChars
+    });
+    store.close();
+  }, 30_000);
 });
