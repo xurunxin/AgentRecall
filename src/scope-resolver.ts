@@ -21,6 +21,11 @@ function sanitizeProjectId(value: string): string {
   return value.trim().replace(/[^A-Za-z0-9_.-]/g, "-").replace(/-+/g, "-").slice(0, 96);
 }
 
+function normalizeProjectId(value: string): string | undefined {
+  const sanitized = sanitizeProjectId(value);
+  return /[A-Za-z0-9]/.test(sanitized) ? sanitized : undefined;
+}
+
 function canonicalizePath(projectPath: string): string {
   const absolute = resolve(projectPath);
   return existsSync(absolute) ? realpathSync.native(absolute) : absolute;
@@ -41,18 +46,26 @@ export function resolveMemoryScope(input: ScopeInput): Result<ResolvedScope, "in
   }
   if (input.project_path) {
     const project_path = canonicalizePath(input.project_path);
+    const project_id = input.project_id === undefined ? deriveProjectId(project_path) : normalizeProjectId(input.project_id);
+    if (project_id === undefined) {
+      return err("invalid_scope", "project_id must contain letters or numbers");
+    }
     return ok({
       scope: "project",
-      project_id: input.project_id ? sanitizeProjectId(input.project_id) : deriveProjectId(project_path),
+      project_id,
       project_path,
       display_name: basename(project_path)
     });
   }
-  if (input.project_id) {
+  if (input.project_id !== undefined) {
+    const project_id = normalizeProjectId(input.project_id);
+    if (project_id === undefined) {
+      return err("invalid_scope", "project_id must contain letters or numbers");
+    }
     return ok({
       scope: "project",
-      project_id: sanitizeProjectId(input.project_id),
-      display_name: sanitizeProjectId(input.project_id)
+      project_id,
+      display_name: project_id
     });
   }
   return err("invalid_scope", "project scope requires project_id or project_path");

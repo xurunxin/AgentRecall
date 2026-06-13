@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { resolveMemoryScope } from "../src/scope-resolver.js";
 
@@ -36,6 +36,63 @@ describe("resolveMemoryScope", () => {
         scope: "project",
         project_id: "metronx-core"
       }
+    });
+  });
+
+  it("normalizes dirty but valid explicit project IDs", () => {
+    const result = resolveMemoryScope({ scope: "project", project_id: "MetronX Core!" });
+    expect(result).toMatchObject({
+      ok: true,
+      value: {
+        scope: "project",
+        project_id: "MetronX-Core-"
+      }
+    });
+  });
+
+  it("resolves missing project paths as absolute paths and derives IDs", () => {
+    const root = mkdtempSync(join(tmpdir(), "local-memory-mcp-"));
+    const project = join(root, "missing-repo");
+    const result = resolveMemoryScope({ scope: "project", project_path: project });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.project_path).toBe(resolve(project));
+      expect(result.value.project_id).toMatch(/^missing-repo-[a-f0-9]{12}$/);
+    }
+  });
+
+  it("rejects whitespace-only project_id without a path", () => {
+    expect(resolveMemoryScope({ scope: "project", project_id: "   " })).toMatchObject({
+      ok: false,
+      error: "invalid_scope"
+    });
+  });
+
+  it("rejects whitespace-only project_id even when a path is provided", () => {
+    const root = mkdtempSync(join(tmpdir(), "local-memory-mcp-"));
+    const project = join(root, "repo");
+    mkdirSync(project);
+    expect(resolveMemoryScope({ scope: "project", project_id: "   ", project_path: project })).toMatchObject({
+      ok: false,
+      error: "invalid_scope"
+    });
+  });
+
+  it("rejects reserved dot segment project IDs", () => {
+    expect(resolveMemoryScope({ scope: "project", project_id: "." })).toMatchObject({
+      ok: false,
+      error: "invalid_scope"
+    });
+    expect(resolveMemoryScope({ scope: "project", project_id: ".." })).toMatchObject({
+      ok: false,
+      error: "invalid_scope"
+    });
+  });
+
+  it("rejects project IDs that normalize to punctuation only", () => {
+    expect(resolveMemoryScope({ scope: "project", project_id: "---" })).toMatchObject({
+      ok: false,
+      error: "invalid_scope"
     });
   });
 
