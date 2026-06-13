@@ -3,6 +3,8 @@ import { existsSync, realpathSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { err, ok, type MemoryBudget, type MemoryScope, type Result } from "./domain.js";
 
+const WINDOWS_RESERVED_BASENAMES = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
+
 export type ScopeInput = {
   scope: MemoryScope | string;
   project_id?: string;
@@ -21,9 +23,18 @@ function sanitizeProjectId(value: string): string {
   return value.trim().replace(/[^A-Za-z0-9_.-]/g, "-").replace(/-+/g, "-").slice(0, 96);
 }
 
+function isWindowsUnsafeProjectId(value: string): boolean {
+  return value.endsWith(".") || WINDOWS_RESERVED_BASENAMES.test(value.split(".")[0] ?? "");
+}
+
 function normalizeProjectId(value: string): string | undefined {
   const sanitized = sanitizeProjectId(value);
-  return /[A-Za-z0-9]/.test(sanitized) ? sanitized : undefined;
+  return /[A-Za-z0-9]/.test(sanitized) && !isWindowsUnsafeProjectId(sanitized) ? sanitized : undefined;
+}
+
+function sanitizeDerivedProjectName(value: string): string {
+  const sanitized = sanitizeProjectId(value).replace(/\.+$/g, "");
+  return /[A-Za-z0-9]/.test(sanitized) && !isWindowsUnsafeProjectId(sanitized) ? sanitized : "project";
 }
 
 function canonicalizePath(projectPath: string): string {
@@ -33,7 +44,7 @@ function canonicalizePath(projectPath: string): string {
 
 function deriveProjectId(canonicalPath: string): string {
   const hash = createHash("sha256").update(canonicalPath).digest("hex").slice(0, 12);
-  const name = sanitizeProjectId(basename(canonicalPath) || "project");
+  const name = sanitizeDerivedProjectName(basename(canonicalPath) || "project");
   return `${name}-${hash}`;
 }
 

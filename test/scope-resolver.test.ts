@@ -96,6 +96,16 @@ describe("resolveMemoryScope", () => {
     });
   });
 
+  it.each(["CON", "nul", "COM1", "LPT9", "repo."])(
+    "rejects Windows-unsafe explicit project ID %s",
+    (project_id) => {
+      expect(resolveMemoryScope({ scope: "project", project_id })).toMatchObject({
+        ok: false,
+        error: "invalid_scope"
+      });
+    }
+  );
+
   it("rejects project scope without identity", () => {
     expect(resolveMemoryScope({ scope: "project" })).toMatchObject({
       ok: false,
