@@ -1,4 +1,4 @@
-import { evaluateBudget, rankCleanupCandidates, type BudgetWarning, type CandidateAction } from "./budget-governor.js";
+import { evaluateBudget, rankCleanupCandidates, type BudgetAccepted, type BudgetWarning, type CandidateAction } from "./budget-governor.js";
 import {
   DEFAULT_GLOBAL_BUDGET,
   DEFAULT_PROJECT_BUDGET,
@@ -56,8 +56,13 @@ export type MemoryBudgetResult = {
 
 type RememberError = "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded";
 type UpdateError = "not_found" | "invalid_state" | "invalid_schema" | "secret_detected";
-type SupersedeError = RememberError | "not_found";
+type SupersedeError = RememberError | "not_found" | "invalid_state";
 type ForgetError = "not_found";
+
+type PreparedRemember = {
+  entry: MemoryEntry;
+  budget: BudgetAccepted;
+};
 
 type SearchServiceFilters = SearchFilters & {
   include_global?: boolean;
@@ -99,15 +104,23 @@ export class MemoryService {
   }
 
   remember(input: RememberInput): Result<RememberResult, RememberError> {
+    const prepared = this.prepareRemember(input, true);
+    if (!prepared.ok) {
+      return prepared;
+    }
+    return this.store.transaction(() => ok(this.commitPreparedRemember(prepared.value)));
+  }
+
+  private prepareRemember(input: RememberInput, auditRejections: boolean): Result<PreparedRemember, RememberError> {
     const validated = validateRememberInput(input);
     if (!validated.ok) {
-      this.auditRejected(input, validated.error, validated.details);
+      if (auditRejections) this.auditRejected(input, validated.error, validated.details);
       return validated;
     }
 
     const resolved = resolveMemoryScope(validated.value);
     if (!resolved.ok) {
-      this.auditRejected(input, resolved.error, resolved.details);
+      if (auditRejections) this.auditRejected(input, resolved.error, resolved.details);
       return resolved;
     }
 
@@ -115,7 +128,7 @@ export class MemoryService {
     if (resolved.value.scope === "project") {
       const projectId = resolved.value.project_id;
       if (projectId === undefined) {
-        this.auditRejected(input, "invalid_scope", undefined);
+        if (auditRejections) this.auditRejected(input, "invalid_scope", undefined);
         return err("invalid_scope", "project scope requires project_id or project_path");
       }
       projectScope = this.ensureProjectScope(
@@ -144,10 +157,15 @@ export class MemoryService {
     });
     const budgetResult = evaluateBudget({ budget, usage, candidate: entry, existingEntries, now });
     if (!budgetResult.ok) {
-      this.auditRejected(input, "capacity_exceeded", budgetResult.details);
+      if (auditRejections) this.auditRejected(input, "capacity_exceeded", budgetResult.details);
       return budgetResult;
     }
 
+    return ok({ entry, budget: budgetResult.value });
+  }
+
+  private commitPreparedRemember(prepared: PreparedRemember): RememberResult {
+    const { entry, budget } = prepared;
     this.store.insertEntry(entry);
     this.appendAudit({
       memory_id: entry.id,
@@ -161,12 +179,12 @@ export class MemoryService {
       }
     });
 
-    return ok({
+    return {
       memory_id: entry.id,
       status: entry.status,
-      budget_after: budgetResult.value.budget_after,
-      warnings: budgetResult.value.warnings
-    });
+      budget_after: budget.budget_after,
+      warnings: budget.warnings
+    };
   }
 
   getMemory(id: string): { entry: MemoryEntry; audit: MemoryAuditEvent[] } | undefined {
@@ -260,18 +278,20 @@ export class MemoryService {
       patch.token_estimate = size.token_estimate;
     }
 
-    this.store.updateEntry(id, patch);
-    this.appendAudit({
-      memory_id: id,
-      scope: current.scope,
-      ...(current.project_id !== undefined ? { project_id: current.project_id } : {}),
-      event: "updated",
-      actor: "agent",
-      metadata: {
-        fields: Object.keys(validated.value).sort()
-      }
+    return this.store.transaction(() => {
+      this.store.updateEntry(id, patch);
+      this.appendAudit({
+        memory_id: id,
+        scope: current.scope,
+        ...(current.project_id !== undefined ? { project_id: current.project_id } : {}),
+        event: "updated",
+        actor: "agent",
+        metadata: {
+          fields: Object.keys(validated.value).sort()
+        }
+      });
+      return ok({ memory_id: id });
     });
-    return ok({ memory_id: id });
   }
 
   supersedeMemory(input: {
@@ -280,35 +300,61 @@ export class MemoryService {
     reason: string;
   }): Result<{ memory_id: string }, SupersedeError> {
     const oldIds = [...new Set(input.old_memory_ids)];
-    const created = this.remember({ ...input.replacement, supersedes: oldIds });
-    if (!created.ok) {
-      return created;
+    if (oldIds.length === 0 || oldIds.some((id) => id.trim().length === 0)) {
+      return err("invalid_schema", "supersede requires at least one old memory id");
     }
 
+    const oldEntries: MemoryEntry[] = [];
     for (const oldId of oldIds) {
       const old = this.store.peekEntry(oldId);
-      if (old === undefined || (old.status !== "active" && old.status !== "archived")) {
-        continue;
+      if (old === undefined) {
+        return err("not_found", "memory not found", { memory_id: oldId });
       }
-      this.store.updateEntry(oldId, {
-        status: "superseded",
-        superseded_by: created.value.memory_id,
-        updated_at: nowIso()
-      });
-      this.appendAudit({
-        memory_id: oldId,
-        scope: old.scope,
-        ...(old.project_id !== undefined ? { project_id: old.project_id } : {}),
-        event: "superseded",
-        actor: "agent",
-        reason: input.reason,
-        metadata: {
-          superseded_by: created.value.memory_id
-        }
-      });
+      if (old.status !== "active" && old.status !== "archived") {
+        return err("invalid_state", "only active or archived memories can be superseded", {
+          memory_id: oldId,
+          status: old.status
+        });
+      }
+      oldEntries.push(old);
     }
 
-    return ok({ memory_id: created.value.memory_id });
+    const prepared = this.prepareRemember({ ...input.replacement, supersedes: oldIds }, true);
+    if (!prepared.ok) {
+      return prepared;
+    }
+    for (const old of oldEntries) {
+      if (!this.matchesReplacementScope(old, prepared.value.entry)) {
+        return err("invalid_scope", "superseded memories must match replacement scope and project_id", {
+          memory_id: old.id,
+          replacement_scope: prepared.value.entry.scope,
+          replacement_project_id: prepared.value.entry.project_id ?? null
+        });
+      }
+    }
+
+    return this.store.transaction(() => {
+      const created = this.commitPreparedRemember(prepared.value);
+      for (const old of oldEntries) {
+        this.store.updateEntry(old.id, {
+          status: "superseded",
+          superseded_by: created.memory_id,
+          updated_at: nowIso()
+        });
+        this.appendAudit({
+          memory_id: old.id,
+          scope: old.scope,
+          ...(old.project_id !== undefined ? { project_id: old.project_id } : {}),
+          event: "superseded",
+          actor: "agent",
+          reason: input.reason,
+          metadata: {
+            superseded_by: created.memory_id
+          }
+        });
+      }
+      return ok({ memory_id: created.memory_id });
+    });
   }
 
   forgetMemory(id: string, reason: string): Result<{ memory_id: string; released_chars: number }, ForgetError> {
@@ -318,29 +364,37 @@ export class MemoryService {
     }
 
     const released_chars = current.status === "active" ? current.char_count : 0;
-    this.store.updateEntry(id, {
-      status: "forgotten",
-      body: "",
-      tags: [],
-      char_count: 0,
-      token_estimate: 0,
-      updated_at: nowIso()
+    return this.store.transaction(() => {
+      this.store.updateEntry(id, {
+        status: "forgotten",
+        body: "",
+        tags: [],
+        char_count: 0,
+        token_estimate: 0,
+        updated_at: nowIso()
+      });
+      this.appendAudit({
+        memory_id: id,
+        scope: current.scope,
+        ...(current.project_id !== undefined ? { project_id: current.project_id } : {}),
+        event: "forgotten",
+        actor: "agent",
+        reason,
+        metadata: {
+          released_chars
+        }
+      });
+      return ok({ memory_id: id, released_chars });
     });
-    this.appendAudit({
-      memory_id: id,
-      scope: current.scope,
-      ...(current.project_id !== undefined ? { project_id: current.project_id } : {}),
-      event: "forgotten",
-      actor: "agent",
-      reason,
-      metadata: {
-        released_chars
-      }
-    });
-    return ok({ memory_id: id, released_chars });
   }
 
-  getMemoryBudget(input: { scope: MemoryScope; project_id?: string }): MemoryBudgetResult {
+  getMemoryBudget(input: { scope: "global" }): MemoryBudgetResult;
+  getMemoryBudget(input: { scope: "project"; project_id: string }): MemoryBudgetResult;
+  getMemoryBudget(input: { scope: MemoryScope; project_id?: string }): MemoryBudgetResult | Result<never, "invalid_scope">;
+  getMemoryBudget(input: { scope: MemoryScope; project_id?: string }): MemoryBudgetResult | Result<never, "invalid_scope"> {
+    if (input.scope === "project" && input.project_id === undefined) {
+      return err("invalid_scope", "project budget requires project_id");
+    }
     const budget =
       input.scope === "global" ? DEFAULT_GLOBAL_BUDGET : this.store.getProjectScope(input.project_id ?? "")?.budget ?? DEFAULT_PROJECT_BUDGET;
     const usage = this.store.getBudgetUsage(input);
@@ -355,6 +409,16 @@ export class MemoryService {
       usage,
       cleanup_candidates: rankCleanupCandidates(activeEntries, nowIso())
     };
+  }
+
+  private matchesReplacementScope(old: MemoryEntry, replacement: MemoryEntry): boolean {
+    if (old.scope !== replacement.scope) {
+      return false;
+    }
+    if (old.scope === "project") {
+      return old.project_id === replacement.project_id;
+    }
+    return replacement.project_id === undefined;
   }
 
   private ensureProjectScope(project_id: string, project_path: string, display_name: string): ProjectScope {

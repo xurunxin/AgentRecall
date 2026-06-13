@@ -280,6 +280,7 @@ function buildAuditWhere(filters: AuditFilters): { where: string; params: SQLInp
 
 export class SQLiteMemoryStore {
   private readonly db: DatabaseSync;
+  private transactionDepth = 0;
 
   constructor(dbPath: string) {
     mkdirSync(dirname(dbPath), { recursive: true });
@@ -289,6 +290,25 @@ export class SQLiteMemoryStore {
 
   close(): void {
     this.db.close();
+  }
+
+  transaction<T>(work: () => T): T {
+    if (this.transactionDepth > 0) {
+      return work();
+    }
+
+    this.db.exec("BEGIN IMMEDIATE");
+    this.transactionDepth = 1;
+    try {
+      const result = work();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    } finally {
+      this.transactionDepth = 0;
+    }
   }
 
   private migrate(): void {
@@ -629,14 +649,4 @@ export class SQLiteMemoryStore {
       .run(entry.id, entry.scope, entry.project_id ?? "", entry.topic, entry.title, entry.body, entry.tags.join(" "));
   }
 
-  private transaction(work: () => void): void {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      work();
-      this.db.exec("COMMIT");
-    } catch (error) {
-      this.db.exec("ROLLBACK");
-      throw error;
-    }
-  }
 }

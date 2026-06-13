@@ -2,13 +2,24 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { DEFAULT_PROJECT_BUDGET } from "../src/domain.js";
+import { DEFAULT_PROJECT_BUDGET, type MemoryAuditEvent } from "../src/domain.js";
 import { MemoryService } from "../src/memory-service.js";
 import { SQLiteMemoryStore } from "../src/sqlite-store.js";
 
 function service() {
   const store = new SQLiteMemoryStore(join(mkdtempSync(join(tmpdir(), "lm-service-")), "memory.sqlite"));
   return { store, memory: new MemoryService(store) };
+}
+
+class FailingAuditStore extends SQLiteMemoryStore {
+  failAudit = false;
+
+  override appendAudit(event: MemoryAuditEvent): void {
+    if (this.failAudit) {
+      throw new Error("audit append failed");
+    }
+    super.appendAudit(event);
+  }
 }
 
 describe("MemoryService", () => {
@@ -105,6 +116,159 @@ describe("MemoryService", () => {
     expect(forgotten?.entry.status).toBe("forgotten");
     expect(forgotten?.entry.body).toBe("");
     expect(forgotten?.audit.length).toBeGreaterThanOrEqual(3);
+    store.close();
+  });
+
+  it("rejects supersede with empty old ids without creating a replacement", () => {
+    const { store, memory } = service();
+    const rejected = memory.supersedeMemory({
+      old_memory_ids: [],
+      replacement: {
+        scope: "global",
+        type: "lesson",
+        topic: "supersede",
+        title: "replacement-empty-old-ids",
+        body: "This replacement must not be created.",
+        tags: [],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3
+      },
+      reason: "missing old id"
+    });
+
+    expect(rejected).toMatchObject({ ok: false, error: "invalid_schema" });
+    expect(memory.searchMemories({ scope: "global", query: "replacement-empty-old-ids" }).items).toEqual([]);
+    store.close();
+  });
+
+  it("rejects supersede with missing old id without creating a replacement", () => {
+    const { store, memory } = service();
+    const rejected = memory.supersedeMemory({
+      old_memory_ids: ["mem_missing"],
+      replacement: {
+        scope: "global",
+        type: "lesson",
+        topic: "supersede",
+        title: "replacement-missing-old-id",
+        body: "This replacement must not be created.",
+        tags: [],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3
+      },
+      reason: "missing old id"
+    });
+
+    expect(rejected).toMatchObject({ ok: false, error: "not_found" });
+    expect(memory.searchMemories({ scope: "global", query: "replacement-missing-old-id" }).items).toEqual([]);
+    store.close();
+  });
+
+  it("rejects supersede with forgotten old entry without creating a replacement", () => {
+    const { store, memory } = service();
+    const old = memory.remember({
+      scope: "global",
+      type: "lesson",
+      topic: "supersede",
+      title: "Forgotten old entry",
+      body: "Old body",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    });
+    expect(old.ok).toBe(true);
+    if (!old.ok) throw new Error("expected old memory");
+    expect(memory.forgetMemory(old.value.memory_id, "test forgotten old").ok).toBe(true);
+
+    const rejected = memory.supersedeMemory({
+      old_memory_ids: [old.value.memory_id],
+      replacement: {
+        scope: "global",
+        type: "lesson",
+        topic: "supersede",
+        title: "replacement-forgotten-old-entry",
+        body: "This replacement must not be created.",
+        tags: [],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3
+      },
+      reason: "forgotten old entry"
+    });
+
+    expect(rejected).toMatchObject({ ok: false, error: "invalid_state" });
+    expect(memory.searchMemories({ scope: "global", query: "replacement-forgotten-old-entry" }).items).toEqual([]);
+    store.close();
+  });
+
+  it("rejects supersede across scopes and projects without creating a replacement", () => {
+    const { store, memory } = service();
+    const globalOld = memory.remember({
+      scope: "global",
+      type: "lesson",
+      topic: "supersede",
+      title: "Global old entry",
+      body: "Old body",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    });
+    const projectOld = memory.remember({
+      scope: "project",
+      project_id: "repo-a",
+      type: "lesson",
+      topic: "supersede",
+      title: "Project old entry",
+      body: "Old body",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    });
+    expect(globalOld.ok).toBe(true);
+    expect(projectOld.ok).toBe(true);
+    if (!globalOld.ok || !projectOld.ok) throw new Error("expected old memories");
+
+    const crossScope = memory.supersedeMemory({
+      old_memory_ids: [globalOld.value.memory_id],
+      replacement: {
+        scope: "project",
+        project_id: "repo-a",
+        type: "lesson",
+        topic: "supersede",
+        title: "replacement-cross-scope",
+        body: "This replacement must not be created.",
+        tags: [],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3
+      },
+      reason: "cross scope"
+    });
+    const crossProject = memory.supersedeMemory({
+      old_memory_ids: [projectOld.value.memory_id],
+      replacement: {
+        scope: "project",
+        project_id: "repo-b",
+        type: "lesson",
+        topic: "supersede",
+        title: "replacement-cross-project",
+        body: "This replacement must not be created.",
+        tags: [],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3
+      },
+      reason: "cross project"
+    });
+
+    expect(crossScope).toMatchObject({ ok: false, error: "invalid_scope" });
+    expect(crossProject).toMatchObject({ ok: false, error: "invalid_scope" });
+    expect(memory.searchMemories({ scope: "project", project_id: "repo-a", query: "replacement-cross-scope" }).items).toEqual([]);
+    expect(memory.searchMemories({ scope: "project", project_id: "repo-b", query: "replacement-cross-project" }).items).toEqual([]);
     store.close();
   });
 
@@ -272,6 +436,32 @@ describe("MemoryService", () => {
     store.close();
   });
 
+  it("rolls back entry updates when audit append fails", () => {
+    const store = new FailingAuditStore(join(mkdtempSync(join(tmpdir(), "lm-service-")), "memory.sqlite"));
+    const memory = new MemoryService(store);
+    const first = memory.remember({
+      scope: "global",
+      type: "lesson",
+      topic: "transactions",
+      title: "Original title",
+      body: "Original body",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error("expected memory");
+
+    store.failAudit = true;
+    expect(() => memory.updateMemory(first.value.memory_id, { title: "Updated title" })).toThrow("audit append failed");
+    expect(store.peekEntry(first.value.memory_id)).toMatchObject({
+      title: "Original title",
+      body: "Original body"
+    });
+    store.close();
+  });
+
   it("reports budget usage and cleanup candidates", () => {
     const { store, memory } = service();
     memory.configureProjectBudget("repo-123", { max_active_entries: 1, max_total_chars: 1000, max_topic_chars: 1000, max_index_chars: 1000 }, "G:\\Projects\\Repo", "Repo");
@@ -296,6 +486,40 @@ describe("MemoryService", () => {
         memory_id: expect.any(String)
       })
     ]);
+    store.close();
+  });
+
+  it("rejects project budget reads without project_id instead of aggregating projects", () => {
+    const { store, memory } = service();
+    expect(memory.remember({
+      scope: "project",
+      project_id: "repo-a",
+      type: "lesson",
+      topic: "budget",
+      title: "Repo A",
+      body: "Repo A body",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    }).ok).toBe(true);
+    expect(memory.remember({
+      scope: "project",
+      project_id: "repo-b",
+      type: "lesson",
+      topic: "budget",
+      title: "Repo B",
+      body: "Repo B body",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    }).ok).toBe(true);
+
+    expect(memory.getMemoryBudget({ scope: "project" })).toMatchObject({
+      ok: false,
+      error: "invalid_scope"
+    });
     store.close();
   });
 });

@@ -72,6 +72,20 @@ describe("SQLiteMemoryStore", () => {
     store.close();
   });
 
+  it("returns transaction values and rolls back nested entry writes", () => {
+    const store = new SQLiteMemoryStore(join(mkdtempSync(join(tmpdir(), "lm-store-")), "memory.sqlite"));
+
+    expect(store.transaction(() => "committed")).toBe("committed");
+    expect(() =>
+      store.transaction(() => {
+        store.insertEntry(makeEntry());
+        throw new Error("rollback");
+      })
+    ).toThrow("rollback");
+    expect(store.peekEntry("mem_test_001")).toBeUndefined();
+    store.close();
+  });
+
   it("updates entries, appends audit events, and reports budget usage", () => {
     const store = new SQLiteMemoryStore(join(mkdtempSync(join(tmpdir(), "lm-store-")), "memory.sqlite"));
     store.insertEntry(makeEntry());
