@@ -36,12 +36,37 @@ describe("evaluateBudget", () => {
     expect(result.ok).toBe(true);
   });
 
-  it("rejects writes exceeding active entry count and returns actions", () => {
+  it("rejects writes exceeding active entry count and suggests archiving non-expired entries", () => {
     const result = evaluateBudget({
       budget: { max_active_entries: 1, max_total_chars: 100, max_topic_chars: 80, max_index_chars: 200 },
       usage: { active_entries: 1, active_chars: 20, topic_chars: { tests: 20 }, index_chars: 20 },
       candidate: entry("mem_new"),
       existingEntries: [entry("mem_old", { importance: 1, confidence: 1 })]
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      error: "capacity_exceeded"
+    });
+    if (!result.ok) {
+      expect(result.details?.candidate_actions).toEqual([
+        expect.objectContaining({ action: "archive", memory_id: "mem_old" })
+      ]);
+    }
+  });
+
+  it("suggests forgetting expired entries when capacity is exceeded", () => {
+    const result = evaluateBudget({
+      budget: { max_active_entries: 1, max_total_chars: 100, max_topic_chars: 80, max_index_chars: 200 },
+      usage: { active_entries: 1, active_chars: 20, topic_chars: { tests: 20 }, index_chars: 20 },
+      candidate: entry("mem_new"),
+      existingEntries: [
+        entry("mem_old", {
+          importance: 1,
+          confidence: 1,
+          expires_at: "2026-01-01T00:00:00.000Z"
+        })
+      ],
+      now: "2026-06-13T00:00:00.000Z"
     });
     expect(result).toMatchObject({
       ok: false,
@@ -92,5 +117,6 @@ describe("rankCleanupCandidates", () => {
       "2026-06-13T00:00:00.000Z"
     );
     expect(ranked[0]?.memory_id).toBe("remove");
+    expect(ranked[0]?.action).toBe("forget_memory");
   });
 });

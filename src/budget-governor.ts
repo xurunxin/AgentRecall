@@ -41,7 +41,6 @@ function cloneTopicChars(topicChars: BudgetUsage["topic_chars"]): BudgetUsage["t
 
 function cleanupAction(entry: MemoryEntry, now: string): CandidateAction["action"] {
   if (entry.expires_at && entry.expires_at <= now) return "forget_memory";
-  if (entry.importance <= 1 && entry.confidence <= 1 && entry.access_count === 0) return "forget_memory";
   return "archive";
 }
 
