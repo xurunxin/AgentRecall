@@ -71,6 +71,12 @@ type PreparedRemember = {
   budget: BudgetAccepted;
 };
 
+type ResolvedRemember = {
+  entry: MemoryEntry;
+  project_path?: string;
+  display_name?: string;
+};
+
 type PrepareRememberOptions = {
   excludedActiveMemoryIds?: ReadonlySet<string>;
 };
@@ -127,6 +133,35 @@ export class MemoryService {
     auditRejections: boolean,
     options: PrepareRememberOptions = {}
   ): Result<PreparedRemember, RememberError> {
+    const resolved = this.resolveRememberInput(input, auditRejections);
+    if (!resolved.ok) {
+      return resolved;
+    }
+
+    let budget = DEFAULT_GLOBAL_BUDGET;
+    if (resolved.value.entry.scope === "project") {
+      const projectId = resolved.value.entry.project_id;
+      if (projectId === undefined) {
+        if (auditRejections) this.auditRejected(input, "invalid_scope", undefined);
+        return err("invalid_scope", "project scope requires project_id or project_path");
+      }
+      budget = this.ensureProjectScope(
+        projectId,
+        resolved.value.project_path ?? "",
+        resolved.value.display_name ?? projectId
+      ).budget;
+    }
+
+    const budgetResult = this.evaluateEntryBudget(resolved.value.entry, budget, options);
+    if (!budgetResult.ok) {
+      if (auditRejections) this.auditRejected(input, "capacity_exceeded", budgetResult.details);
+      return budgetResult;
+    }
+
+    return ok({ entry: resolved.value.entry, budget: budgetResult.value });
+  }
+
+  private resolveRememberInput(input: RememberInput, auditRejections: boolean): Result<ResolvedRemember, RememberError> {
     const validated = validateRememberInput(input);
     if (!validated.ok) {
       if (auditRejections) this.auditRejected(input, validated.error, validated.details);
@@ -139,18 +174,11 @@ export class MemoryService {
       return resolved;
     }
 
-    let projectScope: ProjectScope | undefined;
     if (resolved.value.scope === "project") {
-      const projectId = resolved.value.project_id;
-      if (projectId === undefined) {
+      if (resolved.value.project_id === undefined) {
         if (auditRejections) this.auditRejected(input, "invalid_scope", undefined);
         return err("invalid_scope", "project scope requires project_id or project_path");
       }
-      projectScope = this.ensureProjectScope(
-        projectId,
-        resolved.value.project_path ?? "",
-        resolved.value.display_name ?? projectId
-      );
     }
 
     const now = nowIso();
@@ -159,18 +187,10 @@ export class MemoryService {
       ...(resolved.value.project_path !== undefined ? { project_path: resolved.value.project_path } : {})
     });
 
-    const budget = entry.scope === "global" ? DEFAULT_GLOBAL_BUDGET : projectScope?.budget ?? DEFAULT_PROJECT_BUDGET;
-    const existingEntries = this.activeEntriesFor(entry).filter(
-      (existing) => !options.excludedActiveMemoryIds?.has(existing.id)
-    );
-    const usage = this.usageFromActiveEntries(existingEntries);
-    const budgetResult = evaluateBudget({ budget, usage, candidate: entry, existingEntries, now });
-    if (!budgetResult.ok) {
-      if (auditRejections) this.auditRejected(input, "capacity_exceeded", budgetResult.details);
-      return budgetResult;
-    }
-
-    return ok({ entry, budget: budgetResult.value });
+    const result: ResolvedRemember = { entry };
+    if (resolved.value.project_path !== undefined) result.project_path = resolved.value.project_path;
+    if (resolved.value.display_name !== undefined) result.display_name = resolved.value.display_name;
+    return ok(result);
   }
 
   private commitPreparedRemember(prepared: PreparedRemember): RememberResult {
@@ -255,6 +275,10 @@ export class MemoryService {
       return err("not_found", "memory not found");
     }
     if (current.status !== "active" && current.status !== "archived") {
+      this.auditRejectedForEntry(current, "invalid_state", {
+        memory_id: id,
+        status: current.status
+      });
       return err("invalid_state", "only active or archived memories can be updated", {
         status: current.status
       });
@@ -329,16 +353,32 @@ export class MemoryService {
   }): Result<{ memory_id: string }, SupersedeError> {
     const oldIds = [...new Set(input.old_memory_ids)];
     if (oldIds.length === 0 || oldIds.some((id) => id.trim().length === 0)) {
+      this.auditRejected(input.replacement, "invalid_schema", {
+        old_memory_ids_count: oldIds.length
+      });
       return err("invalid_schema", "supersede requires at least one old memory id");
     }
+
+    const resolvedReplacement = this.resolveRememberInput({ ...input.replacement, supersedes: oldIds }, true);
+    if (!resolvedReplacement.ok) {
+      return resolvedReplacement;
+    }
+    const replacement = resolvedReplacement.value.entry;
 
     const oldEntries: MemoryEntry[] = [];
     for (const oldId of oldIds) {
       const old = this.store.peekEntry(oldId);
       if (old === undefined) {
+        this.auditRejectedForScope(replacement.scope, replacement.project_id, "not_found", {
+          memory_id: oldId
+        });
         return err("not_found", "memory not found", { memory_id: oldId });
       }
       if (old.status !== "active" && old.status !== "archived") {
+        this.auditRejectedForEntry(old, "invalid_state", {
+          memory_id: oldId,
+          status: old.status
+        });
         return err("invalid_state", "only active or archived memories can be superseded", {
           memory_id: oldId,
           status: old.status
@@ -347,25 +387,45 @@ export class MemoryService {
       oldEntries.push(old);
     }
 
-    const excludedActiveMemoryIds = new Set(oldEntries.filter((old) => old.status === "active").map((old) => old.id));
-    const prepared = this.prepareRemember({ ...input.replacement, supersedes: oldIds }, true, {
-      excludedActiveMemoryIds
-    });
-    if (!prepared.ok) {
-      return prepared;
-    }
     for (const old of oldEntries) {
-      if (!this.matchesReplacementScope(old, prepared.value.entry)) {
+      if (!this.matchesReplacementScope(old, replacement)) {
+        this.auditRejectedForEntry(old, "invalid_scope", {
+          memory_id: old.id,
+          replacement_scope: replacement.scope,
+          replacement_project_id: replacement.project_id ?? null
+        });
         return err("invalid_scope", "superseded memories must match replacement scope and project_id", {
           memory_id: old.id,
-          replacement_scope: prepared.value.entry.scope,
-          replacement_project_id: prepared.value.entry.project_id ?? null
+          replacement_scope: replacement.scope,
+          replacement_project_id: replacement.project_id ?? null
         });
       }
     }
 
+    let budget = DEFAULT_GLOBAL_BUDGET;
+    if (replacement.scope === "project") {
+      const projectId = replacement.project_id;
+      if (projectId === undefined) {
+        this.auditRejectedForScope(replacement.scope, replacement.project_id, "invalid_scope", undefined);
+        return err("invalid_scope", "project scope requires project_id or project_path");
+      }
+      budget = this.ensureProjectScope(
+        projectId,
+        resolvedReplacement.value.project_path ?? "",
+        resolvedReplacement.value.display_name ?? projectId
+      ).budget;
+    }
+
+    const excludedActiveMemoryIds = new Set(oldEntries.filter((old) => old.status === "active").map((old) => old.id));
+    const budgetResult = this.evaluateEntryBudget(replacement, budget, { excludedActiveMemoryIds });
+    if (!budgetResult.ok) {
+      this.auditRejectedForScope(replacement.scope, replacement.project_id, "capacity_exceeded", budgetResult.details);
+      return budgetResult;
+    }
+    const prepared: PreparedRemember = { entry: replacement, budget: budgetResult.value };
+
     return this.store.transaction(() => {
-      const created = this.commitPreparedRemember(prepared.value);
+      const created = this.commitPreparedRemember(prepared);
       for (const old of oldEntries) {
         this.store.updateEntry(old.id, {
           status: "superseded",
@@ -450,6 +510,18 @@ export class MemoryService {
       return old.project_id === replacement.project_id;
     }
     return replacement.project_id === undefined;
+  }
+
+  private evaluateEntryBudget(
+    entry: MemoryEntry,
+    budget: MemoryBudget,
+    options: PrepareRememberOptions = {}
+  ): Result<BudgetAccepted, "capacity_exceeded"> {
+    const existingEntries = this.activeEntriesFor(entry).filter(
+      (existing) => !options.excludedActiveMemoryIds?.has(existing.id)
+    );
+    const usage = this.usageFromActiveEntries(existingEntries);
+    return evaluateBudget({ budget, usage, candidate: entry, existingEntries, now: entry.updated_at });
   }
 
   private budgetFor(entry: MemoryEntry): MemoryBudget {
@@ -539,10 +611,6 @@ export class MemoryService {
   }
 
   private auditRejected(input: unknown, error: string, details: Record<string, unknown> | undefined): void {
-    const metadata: Record<string, unknown> = { error };
-    if (details !== undefined) {
-      metadata.details = details;
-    }
     const project_id = safeProjectIdFromInput(input);
     this.appendAudit({
       scope: safeScopeFromInput(input),
@@ -550,15 +618,11 @@ export class MemoryService {
       event: "write_rejected",
       actor: "system",
       reason: error,
-      metadata
+      metadata: this.rejectionMetadata(error, details)
     });
   }
 
   private auditRejectedForEntry(entry: MemoryEntry, error: string, details: Record<string, unknown> | undefined): void {
-    const metadata: Record<string, unknown> = { error };
-    if (details !== undefined) {
-      metadata.details = details;
-    }
     this.appendAudit({
       memory_id: entry.id,
       scope: entry.scope,
@@ -566,7 +630,27 @@ export class MemoryService {
       event: "write_rejected",
       actor: "system",
       reason: error,
-      metadata
+      metadata: this.rejectionMetadata(error, details)
     });
+  }
+
+  private auditRejectedForScope(
+    scope: MemoryScope,
+    project_id: string | undefined,
+    error: string,
+    details: Record<string, unknown> | undefined
+  ): void {
+    this.appendAudit({
+      scope,
+      ...(project_id !== undefined ? { project_id } : {}),
+      event: "write_rejected",
+      actor: "system",
+      reason: error,
+      metadata: this.rejectionMetadata(error, details)
+    });
+  }
+
+  private rejectionMetadata(error: string, details: Record<string, unknown> | undefined): Record<string, unknown> {
+    return details === undefined ? { error } : { error, ...details };
   }
 }

@@ -139,6 +139,17 @@ describe("MemoryService", () => {
 
     expect(rejected).toMatchObject({ ok: false, error: "invalid_schema" });
     expect(memory.searchMemories({ scope: "global", query: "replacement-empty-old-ids" }).items).toEqual([]);
+    expect(store.listAuditEvents({ event: "write_rejected" })).toEqual([
+      expect.objectContaining({
+        event: "write_rejected",
+        scope: "global",
+        reason: "invalid_schema",
+        metadata: expect.objectContaining({
+          error: "invalid_schema",
+          old_memory_ids_count: 0
+        })
+      })
+    ]);
     store.close();
   });
 
@@ -162,6 +173,17 @@ describe("MemoryService", () => {
 
     expect(rejected).toMatchObject({ ok: false, error: "not_found" });
     expect(memory.searchMemories({ scope: "global", query: "replacement-missing-old-id" }).items).toEqual([]);
+    expect(store.listAuditEvents({ event: "write_rejected" })).toEqual([
+      expect.objectContaining({
+        event: "write_rejected",
+        scope: "global",
+        reason: "not_found",
+        metadata: expect.objectContaining({
+          error: "not_found",
+          memory_id: "mem_missing"
+        })
+      })
+    ]);
     store.close();
   });
 
@@ -200,6 +222,18 @@ describe("MemoryService", () => {
 
     expect(rejected).toMatchObject({ ok: false, error: "invalid_state" });
     expect(memory.searchMemories({ scope: "global", query: "replacement-forgotten-old-entry" }).items).toEqual([]);
+    expect(store.listAuditEvents({ memory_id: old.value.memory_id, event: "write_rejected" })).toEqual([
+      expect.objectContaining({
+        event: "write_rejected",
+        scope: "global",
+        reason: "invalid_state",
+        metadata: expect.objectContaining({
+          error: "invalid_state",
+          memory_id: old.value.memory_id,
+          status: "forgotten"
+        })
+      })
+    ]);
     store.close();
   });
 
@@ -255,6 +289,18 @@ describe("MemoryService", () => {
     expect(memory.listMemories({ scope: "global" }).items.map((entry) => entry.title)).not.toContain(
       "replacement-superseded-old-entry"
     );
+    expect(store.listAuditEvents({ memory_id: old.value.memory_id, event: "write_rejected" })).toEqual([
+      expect.objectContaining({
+        event: "write_rejected",
+        scope: "global",
+        reason: "invalid_state",
+        metadata: expect.objectContaining({
+          error: "invalid_state",
+          memory_id: old.value.memory_id,
+          status: "superseded"
+        })
+      })
+    ]);
     store.close();
   });
 
@@ -324,6 +370,158 @@ describe("MemoryService", () => {
     expect(crossProject).toMatchObject({ ok: false, error: "invalid_scope" });
     expect(memory.searchMemories({ scope: "project", project_id: "repo-a", query: "replacement-cross-scope" }).items).toEqual([]);
     expect(memory.searchMemories({ scope: "project", project_id: "repo-b", query: "replacement-cross-project" }).items).toEqual([]);
+    expect(store.listAuditEvents({ event: "write_rejected" })).toEqual([
+      expect.objectContaining({
+        memory_id: globalOld.value.memory_id,
+        scope: "global",
+        reason: "invalid_scope",
+        metadata: expect.objectContaining({
+          error: "invalid_scope",
+          memory_id: globalOld.value.memory_id,
+          replacement_scope: "project",
+          replacement_project_id: "repo-a"
+        })
+      }),
+      expect.objectContaining({
+        memory_id: projectOld.value.memory_id,
+        scope: "project",
+        project_id: "repo-a",
+        reason: "invalid_scope",
+        metadata: expect.objectContaining({
+          error: "invalid_scope",
+          memory_id: projectOld.value.memory_id,
+          replacement_scope: "project",
+          replacement_project_id: "repo-b"
+        })
+      })
+    ]);
+    store.close();
+  });
+
+  it("rejects cross-scope supersede without creating replacement project scope", () => {
+    const { store, memory } = service();
+    const old = memory.remember({
+      scope: "global",
+      type: "lesson",
+      topic: "supersede",
+      title: "Global old for side effect test",
+      body: "Old body",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    });
+    expect(old.ok).toBe(true);
+    if (!old.ok) throw new Error("expected old memory");
+
+    const rejected = memory.supersedeMemory({
+      old_memory_ids: [old.value.memory_id],
+      replacement: {
+        scope: "project",
+        project_id: "repo-created-by-preflight",
+        type: "lesson",
+        topic: "supersede",
+        title: "replacement-should-not-create-scope",
+        body: "This replacement must not create project scope.",
+        tags: [],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3
+      },
+      reason: "cross scope"
+    });
+
+    expect(rejected).toMatchObject({ ok: false, error: "invalid_scope" });
+    expect(store.getProjectScope("repo-created-by-preflight")).toBeUndefined();
+    expect(memory.searchMemories({ scope: "project", project_id: "repo-created-by-preflight", query: "replacement-should-not-create-scope" }).items).toEqual([]);
+    expect(store.listAuditEvents({ event: "write_rejected" })).toEqual([
+      expect.objectContaining({
+        memory_id: old.value.memory_id,
+        scope: "global",
+        reason: "invalid_scope",
+        metadata: expect.objectContaining({
+          error: "invalid_scope",
+          memory_id: old.value.memory_id,
+          replacement_scope: "project",
+          replacement_project_id: "repo-created-by-preflight"
+        })
+      })
+    ]);
+    store.close();
+  });
+
+  it("rejects cross-project supersede before replacement budget checks", () => {
+    const { store, memory } = service();
+    memory.configureProjectBudget(
+      "repo-b",
+      { max_active_entries: 1, max_total_chars: 1000, max_topic_chars: 1000, max_index_chars: 1000 },
+      "G:\\Projects\\RepoB",
+      "RepoB"
+    );
+    const old = memory.remember({
+      scope: "project",
+      project_id: "repo-a",
+      type: "lesson",
+      topic: "supersede",
+      title: "Repo A old memory",
+      body: "Old body",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    });
+    const existing = memory.remember({
+      scope: "project",
+      project_id: "repo-b",
+      type: "lesson",
+      topic: "supersede",
+      title: "Repo B fills budget",
+      body: "Existing body",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    });
+    expect(old.ok).toBe(true);
+    expect(existing.ok).toBe(true);
+    if (!old.ok) throw new Error("expected old memory");
+
+    const rejected = memory.supersedeMemory({
+      old_memory_ids: [old.value.memory_id],
+      replacement: {
+        scope: "project",
+        project_id: "repo-b",
+        type: "lesson",
+        topic: "supersede",
+        title: "replacement-full-budget-cross-project",
+        body: "This replacement would overflow repo-b if budget ran first.",
+        tags: [],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3
+      },
+      reason: "cross project"
+    });
+
+    expect(rejected).toMatchObject({ ok: false, error: "invalid_scope" });
+    expect(memory.listMemories({ scope: "project", project_id: "repo-b" }).items.map((entry) => entry.title)).not.toContain(
+      "replacement-full-budget-cross-project"
+    );
+    expect(store.listAuditEvents({ event: "write_rejected" }).map((event) => event.reason)).toEqual(["invalid_scope"]);
+    expect(store.listAuditEvents({ event: "write_rejected" })[0]).toEqual(
+      expect.objectContaining({
+        memory_id: old.value.memory_id,
+        scope: "project",
+        project_id: "repo-a",
+        reason: "invalid_scope",
+        metadata: expect.objectContaining({
+          error: "invalid_scope",
+          memory_id: old.value.memory_id,
+          replacement_scope: "project",
+          replacement_project_id: "repo-b"
+        })
+      })
+    );
     store.close();
   });
 
@@ -455,6 +653,16 @@ describe("MemoryService", () => {
       status: "superseded",
       superseded_by: replacement.value.memory_id
     });
+    expect(store.listAuditEvents({ memory_id: old.value.memory_id, event: "write_rejected" })).toEqual([
+      expect.objectContaining({
+        scope: "global",
+        reason: "invalid_state",
+        metadata: expect.objectContaining({
+          error: "invalid_state",
+          status: "superseded"
+        })
+      })
+    ]);
     store.close();
   });
 
