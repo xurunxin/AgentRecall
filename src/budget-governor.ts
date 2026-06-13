@@ -22,7 +22,7 @@ export type BudgetAccepted = {
 export type BudgetInput = {
   budget: MemoryBudget;
   usage: BudgetUsage;
-  candidate: Pick<MemoryEntry, "topic" | "title" | "body" | "tags" | "char_count">;
+  candidate: Pick<MemoryEntry, "topic" | "title" | "body" | "tags" | "status" | "char_count">;
   existingEntries?: MemoryEntry[];
   now?: string;
 };
@@ -39,20 +39,33 @@ function cloneTopicChars(topicChars: BudgetUsage["topic_chars"]): BudgetUsage["t
   return result;
 }
 
+function parseTimestamp(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : undefined;
+}
+
+function isExpired(expiresAt: string | undefined, now: string): boolean {
+  const expiresAtTimestamp = parseTimestamp(expiresAt);
+  const nowTimestamp = parseTimestamp(now);
+  return expiresAtTimestamp !== undefined && nowTimestamp !== undefined && expiresAtTimestamp <= nowTimestamp;
+}
+
 function cleanupAction(entry: MemoryEntry, now: string): CleanupActionName {
-  if (entry.expires_at && entry.expires_at <= now) return "forget_memory";
-  return "archive";
+  return isExpired(entry.expires_at, now) ? "forget_memory" : "archive";
 }
 
-function cleanupDate(entry: MemoryEntry): string | undefined {
-  return [entry.review_after, entry.expires_at].filter((date): date is string => date !== undefined).sort()[0];
+function cleanupDate(entry: MemoryEntry): number | undefined {
+  return [parseTimestamp(entry.review_after), parseTimestamp(entry.expires_at)]
+    .filter((date): date is number => date !== undefined)
+    .sort((a, b) => a - b)[0];
 }
 
-function compareOptionalIso(a: string | undefined, b: string | undefined): number {
+function compareOptionalNumber(a: number | undefined, b: number | undefined): number {
   if (a === undefined && b === undefined) return 0;
   if (a === undefined) return 1;
   if (b === undefined) return -1;
-  return a.localeCompare(b);
+  return a - b;
 }
 
 function codePointCount(text: string): number {
@@ -78,8 +91,8 @@ export function rankCleanupCandidates(entries: MemoryEntry[], now: string): Cand
       let score = 0;
       score += 6 - entry.importance;
       score += 6 - entry.confidence;
-      if (entry.expires_at && entry.expires_at <= now) score += 5;
-      if (entry.review_after && entry.review_after <= now) score += 2;
+      if (isExpired(entry.expires_at, now)) score += 5;
+      if (isExpired(entry.review_after, now)) score += 2;
       if (entry.access_count === 0) score += 2;
       return { entry, score, cleanup_date: cleanupDate(entry) };
     })
@@ -87,7 +100,7 @@ export function rankCleanupCandidates(entries: MemoryEntry[], now: string): Cand
       const scoreOrder = b.score - a.score;
       if (scoreOrder !== 0) return scoreOrder;
 
-      const cleanupDateOrder = compareOptionalIso(a.cleanup_date, b.cleanup_date);
+      const cleanupDateOrder = compareOptionalNumber(a.cleanup_date, b.cleanup_date);
       if (cleanupDateOrder !== 0) return cleanupDateOrder;
 
       const updatedAtOrder = a.entry.updated_at.localeCompare(b.entry.updated_at);
@@ -109,21 +122,30 @@ export function rankCleanupCandidates(entries: MemoryEntry[], now: string): Cand
 export function evaluateBudget(input: BudgetInput): Result<BudgetAccepted, "capacity_exceeded"> {
   const existingEntries = input.existingEntries ?? [];
   const warnings: BudgetWarning[] = existingEntries
-    .filter((entry) => sameText(entry.title, input.candidate.title) || sameText(entry.body, input.candidate.body))
+    .filter(
+      (entry) =>
+        entry.status === "active" &&
+        (sameText(entry.title, input.candidate.title) || sameText(entry.body, input.candidate.body))
+    )
     .map((entry) => ({
       code: "duplicate_candidate",
       memory_id: entry.id,
       reason: "existing active memory has the same title or body"
     }));
 
+  const countsAgainstActiveBudget = input.candidate.status === "active";
   const topicChars = cloneTopicChars(input.usage.topic_chars);
-  topicChars[input.candidate.topic] = (topicChars[input.candidate.topic] ?? 0) + input.candidate.char_count;
+  if (countsAgainstActiveBudget) {
+    topicChars[input.candidate.topic] = (topicChars[input.candidate.topic] ?? 0) + input.candidate.char_count;
+  }
 
   const budget_after: BudgetUsage = {
-    active_entries: input.usage.active_entries + 1,
-    active_chars: input.usage.active_chars + input.candidate.char_count,
+    active_entries: input.usage.active_entries + (countsAgainstActiveBudget ? 1 : 0),
+    active_chars: input.usage.active_chars + (countsAgainstActiveBudget ? input.candidate.char_count : 0),
     topic_chars: topicChars,
-    index_chars: input.usage.index_chars + estimateIndexChars(input.candidate.title, input.candidate.topic, input.candidate.tags)
+    index_chars:
+      input.usage.index_chars +
+      (countsAgainstActiveBudget ? estimateIndexChars(input.candidate.title, input.candidate.topic, input.candidate.tags) : 0)
   };
 
   const exceeds =

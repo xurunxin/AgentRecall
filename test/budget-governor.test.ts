@@ -52,6 +52,24 @@ describe("evaluateBudget", () => {
     }
   });
 
+  it("does not charge archived candidate writes against active budgets", () => {
+    const usage = { active_entries: 1, active_chars: 20, topic_chars: { tests: 20 }, index_chars: 33 };
+    const result = evaluateBudget({
+      budget: { max_active_entries: 1, max_total_chars: 20, max_topic_chars: 20, max_index_chars: 33 },
+      usage,
+      candidate: entry("mem_archived_new", {
+        status: "archived",
+        title: "Large archived memory",
+        tags: ["big-tag"],
+        char_count: 500
+      })
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.budget_after).toMatchObject(usage);
+    }
+  });
+
   it("rejects writes exceeding total character budget", () => {
     const result = evaluateBudget({
       budget: { max_active_entries: 3, max_total_chars: 20, max_topic_chars: 80, max_index_chars: 200 },
@@ -161,6 +179,19 @@ describe("evaluateBudget", () => {
     }
   });
 
+  it("ignores inactive existing entries when checking duplicate warnings", () => {
+    const result = evaluateBudget({
+      budget: { max_active_entries: 10, max_total_chars: 1000, max_topic_chars: 500, max_index_chars: 500 },
+      usage: { active_entries: 1, active_chars: 20, topic_chars: { tests: 20 }, index_chars: 20 },
+      candidate: entry("mem_new", { title: "Same", body: "Same body" }),
+      existingEntries: [entry("mem_old", { status: "archived", title: "Same", body: "Same body" })]
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.warnings).toEqual([]);
+    }
+  });
+
   it("includes duplicate warnings when budget rejects write", () => {
     const result = evaluateBudget({
       budget: { max_active_entries: 1, max_total_chars: 1000, max_topic_chars: 500, max_index_chars: 500 },
@@ -203,6 +234,40 @@ describe("rankCleanupCandidates", () => {
     );
     expect(ranked[0]?.memory_id).toBe("remove");
     expect(ranked[0]?.action).toBe("forget_memory");
+  });
+
+  it("uses parsed instants instead of lexical order for offset expiry checks", () => {
+    const expired = rankCleanupCandidates(
+      [
+        entry("mem_expired_offset", {
+          expires_at: "2026-06-13T01:00:00+02:00",
+          importance: 1,
+          confidence: 1
+        })
+      ],
+      "2026-06-13T00:30:00.000Z"
+    );
+    expect(expired[0]).toMatchObject({ action: "forget_memory", memory_id: "mem_expired_offset" });
+
+    const future = rankCleanupCandidates(
+      [
+        entry("mem_future_offset", {
+          expires_at: "2026-06-12T23:30:00-02:00",
+          importance: 1,
+          confidence: 1
+        })
+      ],
+      "2026-06-13T00:00:00.000Z"
+    );
+    expect(future[0]).toMatchObject({ action: "archive", memory_id: "mem_future_offset" });
+  });
+
+  it("treats invalid expires_at values as non-expired", () => {
+    const ranked = rankCleanupCandidates(
+      [entry("mem_invalid_expiry", { expires_at: "1000-not-a-date", importance: 1, confidence: 1 })],
+      "2026-06-13T00:00:00.000Z"
+    );
+    expect(ranked[0]).toMatchObject({ action: "archive", memory_id: "mem_invalid_expiry" });
   });
 
   it("orders same-score cleanup candidates by id regardless of input order", () => {
