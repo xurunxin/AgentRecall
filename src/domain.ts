@@ -46,6 +46,7 @@ export type MemorySource = {
   ref?: string;
 };
 
+/** Normalized persisted memory shape; optional write input fields are normalized before storage. */
 export type MemoryEntry = {
   id: string;
   scope: MemoryScope;

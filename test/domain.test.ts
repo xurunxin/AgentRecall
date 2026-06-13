@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_GLOBAL_BUDGET,
   DEFAULT_PROJECT_BUDGET,
+  computeEntrySize,
+  createAuditId,
   createMemoryId,
   estimateTokens,
   isMemoryStatus,
@@ -31,13 +33,26 @@ describe("domain helpers", () => {
     expect(isMemoryStatus("deleted")).toBe(false);
   });
 
-  it("creates sortable timestamps and stable memory id shape", () => {
-    expect(nowIso()).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  it("creates sortable UTC timestamps and stable id shapes", () => {
+    const earlier = nowIso(new Date("2026-01-01T00:00:00.000Z"));
+    const later = nowIso(new Date("2026-01-01T00:00:00.001Z"));
+
+    expect(nowIso()).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    expect(earlier).toBe("2026-01-01T00:00:00.000Z");
+    expect(earlier < later).toBe(true);
     expect(createMemoryId()).toMatch(/^mem_[a-f0-9]{24}$/);
+    expect(createAuditId()).toMatch(/^aud_[a-f0-9]{24}$/);
   });
 
   it("estimates token count from character count without external models", () => {
     expect(estimateTokens("abcd")).toBe(1);
     expect(estimateTokens("a".repeat(401))).toBe(101);
+  });
+
+  it("computes stored entry size from title, body, and tags", () => {
+    expect(computeEntrySize("Title", "Body text", ["one", "two"])).toEqual({
+      char_count: 21,
+      token_estimate: 6
+    });
   });
 });
