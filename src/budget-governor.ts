@@ -22,7 +22,7 @@ export type BudgetAccepted = {
 export type BudgetInput = {
   budget: MemoryBudget;
   usage: BudgetUsage;
-  candidate: Pick<MemoryEntry, "topic" | "title" | "body" | "char_count">;
+  candidate: Pick<MemoryEntry, "topic" | "title" | "body" | "tags" | "char_count">;
   existingEntries?: MemoryEntry[];
   now?: string;
 };
@@ -44,6 +44,21 @@ function cleanupAction(entry: MemoryEntry, now: string): CandidateAction["action
   return "archive";
 }
 
+function cleanupDate(entry: MemoryEntry): string | undefined {
+  return [entry.review_after, entry.expires_at].filter((date): date is string => date !== undefined).sort()[0];
+}
+
+function compareOptionalIso(a: string | undefined, b: string | undefined): number {
+  if (a === undefined && b === undefined) return 0;
+  if (a === undefined) return 1;
+  if (b === undefined) return -1;
+  return a.localeCompare(b);
+}
+
+function candidateIndexChars(candidate: BudgetInput["candidate"]): number {
+  return candidate.title.length + candidate.topic.length + candidate.tags.join(" ").length + 16;
+}
+
 export function rankCleanupCandidates(entries: MemoryEntry[], now: string): CandidateAction[] {
   return entries
     .map((entry) => {
@@ -55,9 +70,20 @@ export function rankCleanupCandidates(entries: MemoryEntry[], now: string): Cand
       if (entry.access_count === 0) score += 2;
       if (entry.source.kind === "user") score -= 3;
       if (entry.importance >= 5) score -= 5;
-      return { entry, score };
+      return { entry, score, cleanup_date: cleanupDate(entry) };
     })
-    .sort((a, b) => b.score - a.score)
+    .sort((a, b) => {
+      const scoreOrder = b.score - a.score;
+      if (scoreOrder !== 0) return scoreOrder;
+
+      const cleanupDateOrder = compareOptionalIso(a.cleanup_date, b.cleanup_date);
+      if (cleanupDateOrder !== 0) return cleanupDateOrder;
+
+      const updatedAtOrder = a.entry.updated_at.localeCompare(b.entry.updated_at);
+      if (updatedAtOrder !== 0) return updatedAtOrder;
+
+      return a.entry.id.localeCompare(b.entry.id);
+    })
     .slice(0, 5)
     .map(({ entry }) => {
       const action = cleanupAction(entry, now);
@@ -86,7 +112,7 @@ export function evaluateBudget(input: BudgetInput): Result<BudgetAccepted, "capa
     active_entries: input.usage.active_entries + 1,
     active_chars: input.usage.active_chars + input.candidate.char_count,
     topic_chars: topicChars,
-    index_chars: input.usage.index_chars + input.candidate.title.length + input.candidate.topic.length + 16
+    index_chars: input.usage.index_chars + candidateIndexChars(input.candidate)
   };
 
   const exceeds =

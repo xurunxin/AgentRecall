@@ -36,6 +36,61 @@ describe("evaluateBudget", () => {
     expect(result.ok).toBe(true);
   });
 
+  it("allows writes exactly at budget maximums", () => {
+    const result = evaluateBudget({
+      budget: { max_active_entries: 1, max_total_chars: 20, max_topic_chars: 20, max_index_chars: 33 },
+      usage: { active_entries: 0, active_chars: 0, topic_chars: { tests: 0 }, index_chars: 0 },
+      candidate: entry("mem_new", { title: "Exact", tags: ["alpha", "b"], char_count: 20 })
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.budget_after).toMatchObject({
+        active_entries: 1,
+        active_chars: 20,
+        index_chars: 33
+      });
+    }
+  });
+
+  it("rejects writes exceeding total character budget", () => {
+    const result = evaluateBudget({
+      budget: { max_active_entries: 3, max_total_chars: 20, max_topic_chars: 80, max_index_chars: 200 },
+      usage: { active_entries: 0, active_chars: 0, topic_chars: { tests: 0 }, index_chars: 0 },
+      candidate: entry("mem_new", { char_count: 21 })
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      error: "capacity_exceeded"
+    });
+  });
+
+  it("rejects writes exceeding topic character budget", () => {
+    const result = evaluateBudget({
+      budget: { max_active_entries: 3, max_total_chars: 100, max_topic_chars: 20, max_index_chars: 200 },
+      usage: { active_entries: 0, active_chars: 19, topic_chars: { tests: 19 }, index_chars: 0 },
+      candidate: entry("mem_new", { char_count: 2 })
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      error: "capacity_exceeded"
+    });
+  });
+
+  it("rejects writes when tags push index budget over max", () => {
+    const result = evaluateBudget({
+      budget: { max_active_entries: 3, max_total_chars: 100, max_topic_chars: 80, max_index_chars: 32 },
+      usage: { active_entries: 0, active_chars: 0, topic_chars: { tests: 0 }, index_chars: 0 },
+      candidate: entry("mem_new", { title: "Exact", tags: ["alpha", "b"], char_count: 20 })
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      error: "capacity_exceeded"
+    });
+    if (!result.ok) {
+      expect(result.details?.budget_after).toMatchObject({ index_chars: 33 });
+    }
+  });
+
   it("rejects writes exceeding active entry count and suggests archiving non-expired entries", () => {
     const result = evaluateBudget({
       budget: { max_active_entries: 1, max_total_chars: 100, max_topic_chars: 80, max_index_chars: 200 },
@@ -118,5 +173,25 @@ describe("rankCleanupCandidates", () => {
     );
     expect(ranked[0]?.memory_id).toBe("remove");
     expect(ranked[0]?.action).toBe("forget_memory");
+  });
+
+  it("orders same-score cleanup candidates by id regardless of input order", () => {
+    const entries = [
+      entry("mem_c", { updated_at: "2026-06-12T00:00:00.000Z" }),
+      entry("mem_a", { updated_at: "2026-06-12T00:00:00.000Z" }),
+      entry("mem_b", { updated_at: "2026-06-12T00:00:00.000Z" })
+    ];
+    const reversed = [...entries].reverse();
+
+    expect(rankCleanupCandidates(entries, "2026-06-13T00:00:00.000Z").map((action) => action.memory_id)).toEqual([
+      "mem_a",
+      "mem_b",
+      "mem_c"
+    ]);
+    expect(rankCleanupCandidates(reversed, "2026-06-13T00:00:00.000Z").map((action) => action.memory_id)).toEqual([
+      "mem_a",
+      "mem_b",
+      "mem_c"
+    ]);
   });
 });
