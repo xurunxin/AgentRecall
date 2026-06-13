@@ -8,14 +8,14 @@ function closeService(service: ReturnType<typeof createService>): void {
   (service as unknown as { store?: { close: () => void } }).store?.close();
 }
 
-describe("local memory mcp e2e", () => {
-  it("resolves data home from LOCAL_MEMORY_MCP_HOME and home-relative paths", () => {
+describe("AgentRecall e2e", () => {
+  it("resolves data home from AGENT_RECALL_HOME and home-relative paths", () => {
     const configuredHome = mkdtempSync(join(tmpdir(), "lm-e2e-home-"));
 
-    expect(resolveDataHome({ LOCAL_MEMORY_MCP_HOME: configuredHome })).toBe(resolve(configuredHome));
-    expect(resolveDataHome({ LOCAL_MEMORY_MCP_HOME: "~/lm-e2e-home" })).toBe(resolve(join(homedir(), "lm-e2e-home")));
-    expect(resolveDataHome({ LOCAL_MEMORY_MCP_HOME: "~\\lm-e2e-home" })).toBe(resolve(join(homedir(), "lm-e2e-home")));
-    expect(resolveDataHome({ LOCAL_MEMORY_MCP_HOME: "   " })).toBe(resolve(join(homedir(), ".local-memory-mcp")));
+    expect(resolveDataHome({ AGENT_RECALL_HOME: configuredHome })).toBe(resolve(configuredHome));
+    expect(resolveDataHome({ AGENT_RECALL_HOME: "~/lm-e2e-home" })).toBe(resolve(join(homedir(), "lm-e2e-home")));
+    expect(resolveDataHome({ AGENT_RECALL_HOME: "~\\lm-e2e-home" })).toBe(resolve(join(homedir(), "lm-e2e-home")));
+    expect(resolveDataHome({ AGENT_RECALL_HOME: "   " })).toBe(resolve(join(homedir(), ".agent-recall")));
   });
 
   it("creates a service that remembers global memory and exports it as context", () => {

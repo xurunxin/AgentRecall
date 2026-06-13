@@ -9,7 +9,7 @@ import { SQLiteMemoryStore } from "./sqlite-store.js";
 import { registerMemoryTools } from "./tools/register-tools.js";
 
 export function serverName(): string {
-  return "local-memory-mcp";
+  return "agent-recall";
 }
 
 function expandHome(path: string): string {
@@ -23,8 +23,8 @@ function expandHome(path: string): string {
 }
 
 export function resolveDataHome(env: NodeJS.ProcessEnv = process.env): string {
-  const configured = env.LOCAL_MEMORY_MCP_HOME?.trim();
-  return resolve(expandHome(configured === undefined || configured.length === 0 ? "~/.local-memory-mcp" : configured));
+  const configured = env.AGENT_RECALL_HOME?.trim() || env.LOCAL_MEMORY_MCP_HOME?.trim();
+  return resolve(expandHome(configured === undefined || configured.length === 0 ? "~/.agent-recall" : configured));
 }
 
 export function createService(dataHome = resolveDataHome()): MemoryService {

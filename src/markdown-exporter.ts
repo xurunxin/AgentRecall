@@ -200,7 +200,7 @@ export class MarkdownExporter {
   constructor(private readonly exportRoot: string) {}
 
   buildContextPack(input: ContextPackInput): string {
-    const title = input.title.trim().length > 0 ? input.title.trim() : "Local Memory Context";
+    const title = input.title.trim().length > 0 ? input.title.trim() : "AgentRecall Context";
     const entries = [...input.entries].filter((entry) => entry.status === "active").sort(compareEntries);
     const blocks = [
       [`# ${title}`, "", `> ${AUTHORITY_NOTICE}`, "", "## Memories", ""].join("\n"),
@@ -328,7 +328,7 @@ export class MarkdownExporter {
       .slice(0, 10);
     const scope = input.scope === "project" ? `project/${input.project_id ?? "unknown-project"}` : "global";
     const index = [
-      "# Local Memory MCP Export",
+      "# AgentRecall Export",
       "",
       `> ${AUTHORITY_NOTICE}`,
       "",

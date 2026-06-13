@@ -665,7 +665,7 @@ export class MemoryService {
     const resolved = this.resolveReadScope(input);
     if (!resolved.ok) {
       return exporter.buildContextPack({
-        title: "Local Memory Context",
+        title: "AgentRecall Context",
         budget_chars: input.budget_chars,
         entries: []
       });
@@ -673,7 +673,7 @@ export class MemoryService {
 
     const entries = this.collectContextEntries(resolved.value, input);
     return exporter.buildContextPack({
-      title: "Local Memory Context",
+      title: "AgentRecall Context",
       budget_chars: input.budget_chars,
       entries
     });
@@ -713,7 +713,7 @@ export class MemoryService {
   }
 
   private markdownExporter(): MarkdownExporter {
-    return this.exporter ?? new MarkdownExporter(join(process.cwd(), ".local-memory-mcp", "exports"));
+    return this.exporter ?? new MarkdownExporter(join(process.cwd(), ".agent-recall", "exports"));
   }
 
   private resolveReadScope(input: { scope: MemoryScope; project_id?: string; project_path?: string }): Result<ResolvedReadScope, "invalid_scope"> {

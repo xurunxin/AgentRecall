@@ -1,6 +1,6 @@
-# local-memory-mcp
+# AgentRecall
 
-`local-memory-mcp` is a local-first MCP server for coding-agent memory. It gives MCP-compatible clients a governed tool surface for storing, searching, maintaining, and exporting global or project-scoped memories.
+AgentRecall is a local-first MCP server for coding-agent memory. It gives MCP-compatible clients a governed tool surface for storing, searching, maintaining, and exporting global or project-scoped memories.
 
 SQLite is the source of truth. Markdown files are deterministic exports for review and handoff, not the live database. The server runs over stdio and does not require a hosted database, embedding service, or network model call.
 
@@ -37,16 +37,16 @@ node dist/index.js
 By default, runtime data lives under:
 
 ```text
-~/.local-memory-mcp/
+~/.agent-recall/
 ```
 
-Set `LOCAL_MEMORY_MCP_HOME` to use a different directory:
+Set `AGENT_RECALL_HOME` to use a different directory:
 
 ```bash
-LOCAL_MEMORY_MCP_HOME=/path/to/local-memory npm start
+AGENT_RECALL_HOME=/path/to/agent-recall npm start
 ```
 
-The server trims empty values and falls back to `~/.local-memory-mcp`. Home-relative values beginning with `~/` or `~\` are expanded against the current user's home directory. Other values are resolved to an absolute path. In JSON client configs on Windows, escape backslashes, for example `G:\\Memory\\local-memory-mcp`.
+The legacy `LOCAL_MEMORY_MCP_HOME` variable is also honored when `AGENT_RECALL_HOME` is not set. The server trims empty values and falls back to `~/.agent-recall`. Home-relative values beginning with `~/` or `~\` are expanded against the current user's home directory. Other values are resolved to an absolute path. In JSON client configs on Windows, escape backslashes, for example `G:\\Memory\\AgentRecall`.
 
 ## MCP Client Config
 
@@ -55,11 +55,11 @@ Most MCP clients support a JSON server entry. Use the built file after `npm run 
 ```json
 {
   "mcpServers": {
-    "local-memory": {
+    "agent-recall": {
       "command": "node",
-      "args": ["G:\\Projects\\MetronX\\local-memory-mcp\\dist\\index.js"],
+      "args": ["G:\\Projects\\MetronX\\AgentRecall\\dist\\index.js"],
       "env": {
-        "LOCAL_MEMORY_MCP_HOME": "G:\\Memory\\local-memory-mcp"
+        "AGENT_RECALL_HOME": "G:\\Memory\\AgentRecall"
       }
     }
   }
@@ -71,12 +71,12 @@ If your client supports `cwd`, you can launch through npm:
 ```json
 {
   "mcpServers": {
-    "local-memory": {
+    "agent-recall": {
       "command": "npm",
       "args": ["start"],
-      "cwd": "G:\\Projects\\MetronX\\local-memory-mcp",
+      "cwd": "G:\\Projects\\MetronX\\AgentRecall",
       "env": {
-        "LOCAL_MEMORY_MCP_HOME": "G:\\Memory\\local-memory-mcp"
+        "AGENT_RECALL_HOME": "G:\\Memory\\AgentRecall"
       }
     }
   }
@@ -123,13 +123,13 @@ If your client supports `cwd`, you can launch through npm:
 The authoritative SQLite database is stored at:
 
 ```text
-<LOCAL_MEMORY_MCP_HOME>/memory.sqlite
+<AGENT_RECALL_HOME>/memory.sqlite
 ```
 
 Generated markdown exports are stored at:
 
 ```text
-<LOCAL_MEMORY_MCP_HOME>/exports/
+<AGENT_RECALL_HOME>/exports/
 ```
 
 Markdown exports are for inspection and handoff. Manual edits under `exports/` may be overwritten by `maintain_memories` with `action: "rebuild_markdown_index"`.

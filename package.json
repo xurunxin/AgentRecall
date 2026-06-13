@@ -1,11 +1,11 @@
 {
-  "name": "local-memory-mcp",
+  "name": "agent-recall",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "Local-first MCP memory server for coding agents.",
   "bin": {
-    "local-memory-mcp": "./dist/index.js"
+    "agent-recall": "./dist/index.js"
   },
   "engines": {
     "node": ">=24.0.0"

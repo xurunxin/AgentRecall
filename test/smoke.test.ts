@@ -13,7 +13,7 @@ function closeService(service: MemoryService): void {
 
 describe("project scaffold", () => {
   it("exports the server name", () => {
-    expect(serverName()).toBe("local-memory-mcp");
+    expect(serverName()).toBe("agent-recall");
   });
 
   it("imports the MCP server SDK entry points", () => {
@@ -22,11 +22,14 @@ describe("project scaffold", () => {
   });
 
   it("resolves the data home from defaults, env, and home-relative paths", () => {
-    expect(resolveDataHome({})).toBe(resolve(join(homedir(), ".local-memory-mcp")));
-    expect(resolveDataHome({ LOCAL_MEMORY_MCP_HOME: "G:\\Projects\\MetronX\\memory-home" })).toBe(
+    expect(resolveDataHome({})).toBe(resolve(join(homedir(), ".agent-recall")));
+    expect(resolveDataHome({ AGENT_RECALL_HOME: "G:\\Projects\\MetronX\\memory-home" })).toBe(
       resolve("G:\\Projects\\MetronX\\memory-home")
     );
-    expect(resolveDataHome({ LOCAL_MEMORY_MCP_HOME: "~/memory-home" })).toBe(resolve(join(homedir(), "memory-home")));
+    expect(resolveDataHome({ AGENT_RECALL_HOME: "~/memory-home" })).toBe(resolve(join(homedir(), "memory-home")));
+    expect(resolveDataHome({ LOCAL_MEMORY_MCP_HOME: "~/legacy-memory-home" })).toBe(
+      resolve(join(homedir(), "legacy-memory-home"))
+    );
   });
 
   it("creates a service that can remember and export context", () => {

@@ -26,7 +26,7 @@ function fakeService(overrides: Record<string, unknown> = {}) {
     forgetMemory: vi.fn(() => ({ ok: true, value: { memory_id: "mem_1", released_chars: 12 } })),
     getMemoryBudget: vi.fn(() => ({ usage: { active_entries: 0 }, cleanup_candidates: [] })),
     maintainMemories: vi.fn(() => ({ action: "find_duplicates", changed: 0, details: { groups: [] } })),
-    exportMemoryContext: vi.fn(() => "# Local Memory Context\n"),
+    exportMemoryContext: vi.fn(() => "# AgentRecall Context\n"),
     ...overrides
   };
 }
@@ -211,13 +211,13 @@ describe("createMemoryToolHandlers", () => {
 
   it("returns raw markdown for export context", async () => {
     const service = fakeService({
-      exportMemoryContext: vi.fn(() => "# Local Memory Context\n\n## Memories\n")
+      exportMemoryContext: vi.fn(() => "# AgentRecall Context\n\n## Memories\n")
     });
     const handlers = createMemoryToolHandlers(service);
 
     const result = await handlers.export_memory_context({ scope: "global", budget_chars: 1000 });
 
-    expect(textOf(result)).toBe("# Local Memory Context\n\n## Memories\n");
+    expect(textOf(result)).toBe("# AgentRecall Context\n\n## Memories\n");
   });
 
   it("wraps service error results as JSON text", async () => {
