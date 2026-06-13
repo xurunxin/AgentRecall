@@ -1,0 +1,523 @@
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
+import type {
+  MemoryAuditEvent,
+  MemoryEntry,
+  MemoryScope,
+  MemoryStatus,
+  MemoryType,
+  ProjectScope
+} from "./domain.js";
+
+export type EntryFilters = {
+  scope?: MemoryScope;
+  project_id?: string;
+  type?: MemoryType | string;
+  topic?: string;
+  status?: MemoryStatus | string;
+  tags?: string[];
+  limit?: number;
+  offset?: number;
+};
+
+export type SearchFilters = EntryFilters & {
+  query: string;
+};
+
+export type BudgetUsage = {
+  active_entries: number;
+  active_chars: number;
+  topic_chars: Record<string, number>;
+  index_chars: number;
+};
+
+type Row = Record<string, SQLOutputValue>;
+
+function encodeJson(value: unknown): string {
+  return JSON.stringify(value);
+}
+
+function decodeJson<T>(value: string): T {
+  return JSON.parse(value) as T;
+}
+
+function stringCell(row: Row, column: string): string {
+  const value = row[column];
+  return value === undefined || value === null ? "" : String(value);
+}
+
+function optionalStringCell(row: Row, column: string): string | undefined {
+  const value = row[column];
+  return value === undefined || value === null ? undefined : String(value);
+}
+
+function numberCell(row: Row, column: string): number {
+  const value = row[column];
+  return typeof value === "number" || typeof value === "bigint" ? Number(value) : Number(String(value));
+}
+
+function decodeEntry(row: Row): MemoryEntry {
+  const entry: MemoryEntry = {
+    id: stringCell(row, "id"),
+    scope: stringCell(row, "scope") as MemoryScope,
+    type: stringCell(row, "type") as MemoryEntry["type"],
+    topic: stringCell(row, "topic"),
+    title: stringCell(row, "title"),
+    body: stringCell(row, "body"),
+    tags: decodeJson<string[]>(stringCell(row, "tags_json")),
+    source: decodeJson<MemoryEntry["source"]>(stringCell(row, "source_json")),
+    importance: numberCell(row, "importance") as MemoryEntry["importance"],
+    confidence: numberCell(row, "confidence") as MemoryEntry["confidence"],
+    status: stringCell(row, "status") as MemoryEntry["status"],
+    created_at: stringCell(row, "created_at"),
+    updated_at: stringCell(row, "updated_at"),
+    access_count: numberCell(row, "access_count"),
+    supersedes: decodeJson<string[]>(stringCell(row, "supersedes_json")),
+    token_estimate: numberCell(row, "token_estimate"),
+    char_count: numberCell(row, "char_count")
+  };
+
+  const projectId = optionalStringCell(row, "project_id");
+  if (projectId !== undefined) entry.project_id = projectId;
+
+  const projectPath = optionalStringCell(row, "project_path");
+  if (projectPath !== undefined) entry.project_path = projectPath;
+
+  const lastAccessedAt = optionalStringCell(row, "last_accessed_at");
+  if (lastAccessedAt !== undefined) entry.last_accessed_at = lastAccessedAt;
+
+  const expiresAt = optionalStringCell(row, "expires_at");
+  if (expiresAt !== undefined) entry.expires_at = expiresAt;
+
+  const reviewAfter = optionalStringCell(row, "review_after");
+  if (reviewAfter !== undefined) entry.review_after = reviewAfter;
+
+  const supersededBy = optionalStringCell(row, "superseded_by");
+  if (supersededBy !== undefined) entry.superseded_by = supersededBy;
+
+  return entry;
+}
+
+function decodeProject(row: Row): ProjectScope {
+  return {
+    project_id: stringCell(row, "project_id"),
+    canonical_path: stringCell(row, "canonical_path"),
+    display_name: stringCell(row, "display_name"),
+    created_at: stringCell(row, "created_at"),
+    updated_at: stringCell(row, "updated_at"),
+    budget: decodeJson<ProjectScope["budget"]>(stringCell(row, "budget_json"))
+  };
+}
+
+function decodeAudit(row: Row): MemoryAuditEvent {
+  const event: MemoryAuditEvent = {
+    id: stringCell(row, "id"),
+    scope: stringCell(row, "scope") as MemoryScope,
+    event: stringCell(row, "event") as MemoryAuditEvent["event"],
+    actor: stringCell(row, "actor") as MemoryAuditEvent["actor"],
+    metadata: decodeJson<Record<string, unknown>>(stringCell(row, "metadata_json")),
+    created_at: stringCell(row, "created_at")
+  };
+
+  const memoryId = optionalStringCell(row, "memory_id");
+  if (memoryId !== undefined) event.memory_id = memoryId;
+
+  const projectId = optionalStringCell(row, "project_id");
+  if (projectId !== undefined) event.project_id = projectId;
+
+  const reason = optionalStringCell(row, "reason");
+  if (reason !== undefined) event.reason = reason;
+
+  return event;
+}
+
+function ftsQuery(query: string): string {
+  return query
+    .split(/\s+/)
+    .map((token) => token.replace(/[^\p{L}\p{N}_-]/gu, ""))
+    .filter(Boolean)
+    .map((token) => `"${token.replaceAll("\"", "\"\"")}"`)
+    .join(" OR ");
+}
+
+function normalizeLimit(limit: number | undefined, fallback: number): number {
+  if (limit === undefined) return fallback;
+  return Number.isInteger(limit) && limit > 0 ? limit : fallback;
+}
+
+function normalizeOffset(offset: number | undefined): number {
+  if (offset === undefined) return 0;
+  return Number.isInteger(offset) && offset > 0 ? offset : 0;
+}
+
+function definedPatch<T extends object>(patch: Partial<T>): Partial<T> {
+  const result: Record<string, unknown> = {};
+  for (const key of Object.keys(patch) as Array<keyof T>) {
+    const value = patch[key];
+    if (value !== undefined) {
+      result[String(key)] = value;
+    }
+  }
+  return result as Partial<T>;
+}
+
+function buildEntryWhere(filters: EntryFilters, alias: string): { where: string; params: SQLInputValue[] } {
+  const clauses: string[] = [];
+  const params: SQLInputValue[] = [];
+  const column = (name: string) => `${alias}.${name}`;
+
+  if (filters.scope !== undefined) {
+    clauses.push(`${column("scope")} = ?`);
+    params.push(filters.scope);
+  }
+  if (filters.project_id !== undefined) {
+    clauses.push(`${column("project_id")} = ?`);
+    params.push(filters.project_id);
+  }
+  if (filters.type !== undefined) {
+    clauses.push(`${column("type")} = ?`);
+    params.push(filters.type);
+  }
+  if (filters.topic !== undefined) {
+    clauses.push(`${column("topic")} = ?`);
+    params.push(filters.topic);
+  }
+  if (filters.status !== undefined) {
+    clauses.push(`${column("status")} = ?`);
+    params.push(filters.status);
+  }
+  for (const tag of filters.tags ?? []) {
+    clauses.push(`EXISTS (SELECT 1 FROM json_each(${column("tags_json")}) WHERE value = ?)`);
+    params.push(tag);
+  }
+
+  return {
+    where: clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`,
+    params
+  };
+}
+
+export class SQLiteMemoryStore {
+  private readonly db: DatabaseSync;
+
+  constructor(dbPath: string) {
+    mkdirSync(dirname(dbPath), { recursive: true });
+    this.db = new DatabaseSync(dbPath, { enableForeignKeyConstraints: true, timeout: 5000 });
+    this.migrate();
+  }
+
+  close(): void {
+    this.db.close();
+  }
+
+  private migrate(): void {
+    this.db.exec(`
+      PRAGMA foreign_keys = ON;
+
+      CREATE TABLE IF NOT EXISTS project_scopes (
+        project_id TEXT PRIMARY KEY,
+        canonical_path TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        budget_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS memory_entries (
+        id TEXT PRIMARY KEY,
+        scope TEXT NOT NULL CHECK (scope IN ('global', 'project')),
+        project_id TEXT,
+        project_path TEXT,
+        type TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        tags_json TEXT NOT NULL,
+        source_json TEXT NOT NULL,
+        importance INTEGER NOT NULL,
+        confidence INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('active', 'archived', 'superseded', 'forgotten')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_accessed_at TEXT,
+        access_count INTEGER NOT NULL,
+        expires_at TEXT,
+        review_after TEXT,
+        supersedes_json TEXT NOT NULL,
+        superseded_by TEXT,
+        token_estimate INTEGER NOT NULL,
+        char_count INTEGER NOT NULL
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS memory_entries_scope_project_idx
+        ON memory_entries(scope, project_id, status, updated_at);
+      CREATE INDEX IF NOT EXISTS memory_entries_topic_idx
+        ON memory_entries(topic);
+      CREATE INDEX IF NOT EXISTS memory_entries_type_idx
+        ON memory_entries(type);
+
+      CREATE TABLE IF NOT EXISTS audit_events (
+        id TEXT PRIMARY KEY,
+        memory_id TEXT,
+        scope TEXT NOT NULL CHECK (scope IN ('global', 'project')),
+        project_id TEXT,
+        event TEXT NOT NULL,
+        reason TEXT,
+        actor TEXT NOT NULL CHECK (actor IN ('agent', 'user', 'system')),
+        metadata_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS audit_events_memory_created_idx
+        ON audit_events(memory_id, created_at);
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+        id UNINDEXED,
+        scope UNINDEXED,
+        project_id UNINDEXED,
+        topic,
+        title,
+        body,
+        tags
+      );
+    `);
+  }
+
+  upsertProjectScope(scope: ProjectScope): void {
+    this.db
+      .prepare(
+        `
+        INSERT INTO project_scopes (project_id, canonical_path, display_name, budget_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(project_id) DO UPDATE SET
+          canonical_path = excluded.canonical_path,
+          display_name = excluded.display_name,
+          budget_json = excluded.budget_json,
+          updated_at = excluded.updated_at
+      `
+      )
+      .run(
+        scope.project_id,
+        scope.canonical_path,
+        scope.display_name,
+        encodeJson(scope.budget),
+        scope.created_at,
+        scope.updated_at
+      );
+  }
+
+  getProjectScope(projectId: string): ProjectScope | undefined {
+    const row = this.db.prepare("SELECT * FROM project_scopes WHERE project_id = ?").get(projectId);
+    return row === undefined ? undefined : decodeProject(row);
+  }
+
+  insertEntry(entry: MemoryEntry): void {
+    this.transaction(() => {
+      this.db
+        .prepare(
+          `
+          INSERT INTO memory_entries (
+            id, scope, project_id, project_path, type, topic, title, body, tags_json, source_json,
+            importance, confidence, status, created_at, updated_at, last_accessed_at, access_count,
+            expires_at, review_after, supersedes_json, superseded_by, token_estimate, char_count
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `
+        )
+        .run(...this.entryParams(entry));
+      this.upsertFts(entry);
+    });
+  }
+
+  getEntry(id: string): MemoryEntry | undefined {
+    const entry = this.readEntry(id);
+    if (entry === undefined) return undefined;
+
+    const lastAccessedAt = new Date().toISOString();
+    this.db
+      .prepare("UPDATE memory_entries SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?")
+      .run(lastAccessedAt, id);
+    return {
+      ...entry,
+      access_count: entry.access_count + 1,
+      last_accessed_at: lastAccessedAt
+    };
+  }
+
+  listEntries(filters: EntryFilters): MemoryEntry[] {
+    const { where, params } = buildEntryWhere(filters, "memory_entries");
+    const limit = normalizeLimit(filters.limit, 100);
+    const offset = normalizeOffset(filters.offset);
+    const rows = this.db
+      .prepare(`SELECT * FROM memory_entries ${where} ORDER BY updated_at DESC LIMIT ? OFFSET ?`)
+      .all(...params, limit, offset);
+    return rows.map(decodeEntry);
+  }
+
+  searchEntries(filters: SearchFilters): MemoryEntry[] {
+    const query = ftsQuery(filters.query);
+    if (query.length === 0) return [];
+
+    const { where, params } = buildEntryWhere(filters, "m");
+    const clauses = ["memory_fts MATCH ?", ...(where.length === 0 ? [] : [where.slice("WHERE ".length)])];
+    const limit = normalizeLimit(filters.limit, 10);
+    const offset = normalizeOffset(filters.offset);
+    const rows = this.db
+      .prepare(
+        `
+        SELECT m.*
+        FROM memory_fts
+        JOIN memory_entries m ON m.id = memory_fts.id
+        WHERE ${clauses.join(" AND ")}
+        ORDER BY rank
+        LIMIT ? OFFSET ?
+      `
+      )
+      .all(query, ...params, limit, offset);
+    return rows.map(decodeEntry);
+  }
+
+  updateEntry(id: string, patch: Partial<MemoryEntry> & { updated_at: string }): void {
+    const current = this.readEntry(id);
+    if (current === undefined) return;
+
+    const next: MemoryEntry = { ...current, ...definedPatch<MemoryEntry>(patch) };
+    this.transaction(() => {
+      this.db
+        .prepare(
+          `
+          UPDATE memory_entries SET
+            scope = ?,
+            project_id = ?,
+            project_path = ?,
+            type = ?,
+            topic = ?,
+            title = ?,
+            body = ?,
+            tags_json = ?,
+            source_json = ?,
+            importance = ?,
+            confidence = ?,
+            status = ?,
+            created_at = ?,
+            updated_at = ?,
+            last_accessed_at = ?,
+            access_count = ?,
+            expires_at = ?,
+            review_after = ?,
+            supersedes_json = ?,
+            superseded_by = ?,
+            token_estimate = ?,
+            char_count = ?
+          WHERE id = ?
+        `
+        )
+        .run(...this.entryParams(next).slice(1), id);
+      this.upsertFts(next);
+    });
+  }
+
+  appendAudit(event: MemoryAuditEvent): void {
+    this.db
+      .prepare(
+        `
+        INSERT INTO audit_events (id, memory_id, scope, project_id, event, reason, actor, metadata_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `
+      )
+      .run(
+        event.id,
+        event.memory_id ?? null,
+        event.scope,
+        event.project_id ?? null,
+        event.event,
+        event.reason ?? null,
+        event.actor,
+        encodeJson(event.metadata),
+        event.created_at
+      );
+  }
+
+  getAuditEvents(memoryId: string): MemoryAuditEvent[] {
+    return this.db
+      .prepare("SELECT * FROM audit_events WHERE memory_id = ? ORDER BY created_at ASC")
+      .all(memoryId)
+      .map(decodeAudit);
+  }
+
+  getBudgetUsage(filters: { scope: MemoryScope; project_id?: string }): BudgetUsage {
+    const entries = this.listEntries({
+      scope: filters.scope,
+      ...(filters.project_id !== undefined ? { project_id: filters.project_id } : {}),
+      status: "active",
+      limit: 10_000
+    });
+    const topic_chars: Record<string, number> = {};
+    let active_chars = 0;
+    let index_chars = 0;
+
+    for (const entry of entries) {
+      active_chars += entry.char_count;
+      topic_chars[entry.topic] = (topic_chars[entry.topic] ?? 0) + entry.char_count;
+      index_chars += entry.title.length + entry.topic.length + entry.tags.join(" ").length + 16;
+    }
+
+    return {
+      active_entries: entries.length,
+      active_chars,
+      topic_chars,
+      index_chars
+    };
+  }
+
+  private readEntry(id: string): MemoryEntry | undefined {
+    const row = this.db.prepare("SELECT * FROM memory_entries WHERE id = ?").get(id);
+    return row === undefined ? undefined : decodeEntry(row);
+  }
+
+  private entryParams(entry: MemoryEntry): SQLInputValue[] {
+    return [
+      entry.id,
+      entry.scope,
+      entry.project_id ?? null,
+      entry.project_path ?? null,
+      entry.type,
+      entry.topic,
+      entry.title,
+      entry.body,
+      encodeJson(entry.tags),
+      encodeJson(entry.source),
+      entry.importance,
+      entry.confidence,
+      entry.status,
+      entry.created_at,
+      entry.updated_at,
+      entry.last_accessed_at ?? null,
+      entry.access_count,
+      entry.expires_at ?? null,
+      entry.review_after ?? null,
+      encodeJson(entry.supersedes),
+      entry.superseded_by ?? null,
+      entry.token_estimate,
+      entry.char_count
+    ];
+  }
+
+  private upsertFts(entry: MemoryEntry): void {
+    this.db.prepare("DELETE FROM memory_fts WHERE id = ?").run(entry.id);
+    this.db
+      .prepare("INSERT INTO memory_fts (id, scope, project_id, topic, title, body, tags) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(entry.id, entry.scope, entry.project_id ?? "", entry.topic, entry.title, entry.body, entry.tags.join(" "));
+  }
+
+  private transaction(work: () => void): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      work();
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+}
