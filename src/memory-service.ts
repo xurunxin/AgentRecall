@@ -1,4 +1,11 @@
-import { evaluateBudget, rankCleanupCandidates, type BudgetAccepted, type BudgetWarning, type CandidateAction } from "./budget-governor.js";
+import {
+  estimateIndexChars,
+  evaluateBudget,
+  rankCleanupCandidates,
+  type BudgetAccepted,
+  type BudgetWarning,
+  type CandidateAction
+} from "./budget-governor.js";
 import {
   DEFAULT_GLOBAL_BUDGET,
   DEFAULT_PROJECT_BUDGET,
@@ -55,13 +62,17 @@ export type MemoryBudgetResult = {
 };
 
 type RememberError = "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded";
-type UpdateError = "not_found" | "invalid_state" | "invalid_schema" | "secret_detected";
+type UpdateError = "not_found" | "invalid_state" | "invalid_schema" | "secret_detected" | "capacity_exceeded";
 type SupersedeError = RememberError | "not_found" | "invalid_state";
 type ForgetError = "not_found";
 
 type PreparedRemember = {
   entry: MemoryEntry;
   budget: BudgetAccepted;
+};
+
+type PrepareRememberOptions = {
+  excludedActiveMemoryIds?: ReadonlySet<string>;
 };
 
 type SearchServiceFilters = SearchFilters & {
@@ -111,7 +122,11 @@ export class MemoryService {
     return this.store.transaction(() => ok(this.commitPreparedRemember(prepared.value)));
   }
 
-  private prepareRemember(input: RememberInput, auditRejections: boolean): Result<PreparedRemember, RememberError> {
+  private prepareRemember(
+    input: RememberInput,
+    auditRejections: boolean,
+    options: PrepareRememberOptions = {}
+  ): Result<PreparedRemember, RememberError> {
     const validated = validateRememberInput(input);
     if (!validated.ok) {
       if (auditRejections) this.auditRejected(input, validated.error, validated.details);
@@ -145,16 +160,10 @@ export class MemoryService {
     });
 
     const budget = entry.scope === "global" ? DEFAULT_GLOBAL_BUDGET : projectScope?.budget ?? DEFAULT_PROJECT_BUDGET;
-    const usage = this.store.getBudgetUsage({
-      scope: entry.scope,
-      ...(entry.project_id !== undefined ? { project_id: entry.project_id } : {})
-    });
-    const existingEntries = this.store.listEntries({
-      scope: entry.scope,
-      ...(entry.project_id !== undefined ? { project_id: entry.project_id } : {}),
-      status: "active",
-      limit: 10_000
-    });
+    const existingEntries = this.activeEntriesFor(entry).filter(
+      (existing) => !options.excludedActiveMemoryIds?.has(existing.id)
+    );
+    const usage = this.usageFromActiveEntries(existingEntries);
     const budgetResult = evaluateBudget({ budget, usage, candidate: entry, existingEntries, now });
     if (!budgetResult.ok) {
       if (auditRejections) this.auditRejected(input, "capacity_exceeded", budgetResult.details);
@@ -245,8 +254,10 @@ export class MemoryService {
     if (current === undefined) {
       return err("not_found", "memory not found");
     }
-    if (current.status === "forgotten") {
-      return err("invalid_state", "forgotten memories cannot be updated");
+    if (current.status !== "active" && current.status !== "archived") {
+      return err("invalid_state", "only active or archived memories can be updated", {
+        status: current.status
+      });
     }
 
     const validated = validateUpdateInput(input);
@@ -278,13 +289,30 @@ export class MemoryService {
       patch.token_estimate = size.token_estimate;
     }
 
+    const next: MemoryEntry = { ...current, ...patch, id: current.id };
+    const existingEntries = this.activeEntriesFor(next).filter((entry) => entry.id !== id);
+    const budget = this.budgetFor(next);
+    const budgetResult = evaluateBudget({
+      budget,
+      usage: this.usageFromActiveEntries(existingEntries),
+      candidate: next,
+      existingEntries,
+      now: patch.updated_at
+    });
+    if (!budgetResult.ok) {
+      this.auditRejectedForEntry(current, "capacity_exceeded", budgetResult.details);
+      return err("capacity_exceeded", budgetResult.message, budgetResult.details);
+    }
+
+    const event = current.status === "active" && patch.status === "archived" ? "archived" : "updated";
+
     return this.store.transaction(() => {
       this.store.updateEntry(id, patch);
       this.appendAudit({
         memory_id: id,
         scope: current.scope,
         ...(current.project_id !== undefined ? { project_id: current.project_id } : {}),
-        event: "updated",
+        event,
         actor: "agent",
         metadata: {
           fields: Object.keys(validated.value).sort()
@@ -319,7 +347,10 @@ export class MemoryService {
       oldEntries.push(old);
     }
 
-    const prepared = this.prepareRemember({ ...input.replacement, supersedes: oldIds }, true);
+    const excludedActiveMemoryIds = new Set(oldEntries.filter((old) => old.status === "active").map((old) => old.id));
+    const prepared = this.prepareRemember({ ...input.replacement, supersedes: oldIds }, true, {
+      excludedActiveMemoryIds
+    });
     if (!prepared.ok) {
       return prepared;
     }
@@ -419,6 +450,41 @@ export class MemoryService {
       return old.project_id === replacement.project_id;
     }
     return replacement.project_id === undefined;
+  }
+
+  private budgetFor(entry: MemoryEntry): MemoryBudget {
+    if (entry.scope === "global") {
+      return DEFAULT_GLOBAL_BUDGET;
+    }
+    return this.store.getProjectScope(entry.project_id ?? "")?.budget ?? DEFAULT_PROJECT_BUDGET;
+  }
+
+  private activeEntriesFor(entry: Pick<MemoryEntry, "scope" | "project_id">): MemoryEntry[] {
+    return this.store.listEntries({
+      scope: entry.scope,
+      ...(entry.project_id !== undefined ? { project_id: entry.project_id } : {}),
+      status: "active",
+      limit: 10_000
+    });
+  }
+
+  private usageFromActiveEntries(entries: MemoryEntry[]): BudgetUsage {
+    const topic_chars: Record<string, number> = {};
+    let active_chars = 0;
+    let index_chars = 0;
+
+    for (const entry of entries) {
+      active_chars += entry.char_count;
+      topic_chars[entry.topic] = (topic_chars[entry.topic] ?? 0) + entry.char_count;
+      index_chars += estimateIndexChars(entry.title, entry.topic, entry.tags);
+    }
+
+    return {
+      active_entries: entries.length,
+      active_chars,
+      topic_chars,
+      index_chars
+    };
   }
 
   private ensureProjectScope(project_id: string, project_path: string, display_name: string): ProjectScope {

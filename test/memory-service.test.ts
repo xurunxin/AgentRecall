@@ -203,6 +203,61 @@ describe("MemoryService", () => {
     store.close();
   });
 
+  it("rejects supersede with superseded old entry without creating a replacement", () => {
+    const { store, memory } = service();
+    const old = memory.remember({
+      scope: "global",
+      type: "lesson",
+      topic: "supersede",
+      title: "Superseded old entry",
+      body: "Old body",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    });
+    expect(old.ok).toBe(true);
+    if (!old.ok) throw new Error("expected old memory");
+    const firstReplacement = memory.supersedeMemory({
+      old_memory_ids: [old.value.memory_id],
+      replacement: {
+        scope: "global",
+        type: "lesson",
+        topic: "supersede",
+        title: "First replacement",
+        body: "First replacement body",
+        tags: [],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3
+      },
+      reason: "first replacement"
+    });
+    expect(firstReplacement.ok).toBe(true);
+
+    const rejected = memory.supersedeMemory({
+      old_memory_ids: [old.value.memory_id],
+      replacement: {
+        scope: "global",
+        type: "lesson",
+        topic: "supersede",
+        title: "replacement-superseded-old-entry",
+        body: "This replacement must not be created.",
+        tags: [],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3
+      },
+      reason: "superseded old entry"
+    });
+
+    expect(rejected).toMatchObject({ ok: false, error: "invalid_state" });
+    expect(memory.listMemories({ scope: "global" }).items.map((entry) => entry.title)).not.toContain(
+      "replacement-superseded-old-entry"
+    );
+    store.close();
+  });
+
   it("rejects supersede across scopes and projects without creating a replacement", () => {
     const { store, memory } = service();
     const globalOld = memory.remember({
@@ -355,6 +410,187 @@ describe("MemoryService", () => {
     expect(memory.updateMemory(first.value.memory_id, { title: "Use rtk wrapper" }).ok).toBe(true);
     expect(memory.forgetMemory(first.value.memory_id, "test cleanup").ok).toBe(true);
     expect(store.peekEntry(first.value.memory_id)?.access_count).toBe(0);
+    store.close();
+  });
+
+  it("rejects updates to superseded entries without modifying replacement linkage", () => {
+    const { store, memory } = service();
+    const old = memory.remember({
+      scope: "global",
+      type: "lesson",
+      topic: "updates",
+      title: "Original superseded title",
+      body: "Original superseded body",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    });
+    expect(old.ok).toBe(true);
+    if (!old.ok) throw new Error("expected old memory");
+    const replacement = memory.supersedeMemory({
+      old_memory_ids: [old.value.memory_id],
+      replacement: {
+        scope: "global",
+        type: "lesson",
+        topic: "updates",
+        title: "Replacement title",
+        body: "Replacement body",
+        tags: [],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3
+      },
+      reason: "replace old"
+    });
+    expect(replacement.ok).toBe(true);
+    if (!replacement.ok) throw new Error("expected replacement");
+
+    const rejected = memory.updateMemory(old.value.memory_id, { title: "Reactivated title", status: "active" });
+
+    expect(rejected).toMatchObject({ ok: false, error: "invalid_state" });
+    expect(store.peekEntry(old.value.memory_id)).toMatchObject({
+      title: "Original superseded title",
+      body: "Original superseded body",
+      status: "superseded",
+      superseded_by: replacement.value.memory_id
+    });
+    store.close();
+  });
+
+  it("rejects active update expansion that would exceed budget", () => {
+    const { store, memory } = service();
+    memory.configureProjectBudget(
+      "repo-123",
+      { max_active_entries: 5, max_total_chars: 20, max_topic_chars: 1000, max_index_chars: 1000 },
+      "G:\\Projects\\Repo",
+      "Repo"
+    );
+    const first = memory.remember({
+      scope: "project",
+      project_id: "repo-123",
+      type: "lesson",
+      topic: "updates",
+      title: "Tiny",
+      body: "Small",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error("expected memory");
+
+    const rejected = memory.updateMemory(first.value.memory_id, { body: "This body is far too large for the budget" });
+
+    expect(rejected).toMatchObject({ ok: false, error: "capacity_exceeded" });
+    expect(store.peekEntry(first.value.memory_id)).toMatchObject({
+      title: "Tiny",
+      body: "Small",
+      status: "active"
+    });
+    expect(store.listAuditEvents({ memory_id: first.value.memory_id, event: "write_rejected" })).toEqual([
+      expect.objectContaining({
+        reason: "capacity_exceeded",
+        metadata: expect.objectContaining({ error: "capacity_exceeded" })
+      })
+    ]);
+    store.close();
+  });
+
+  it("rejects archived to active update that would exceed active entry budget", () => {
+    const { store, memory } = service();
+    memory.configureProjectBudget(
+      "repo-123",
+      { max_active_entries: 1, max_total_chars: 1000, max_topic_chars: 1000, max_index_chars: 1000 },
+      "G:\\Projects\\Repo",
+      "Repo"
+    );
+    const active = memory.remember({
+      scope: "project",
+      project_id: "repo-123",
+      type: "lesson",
+      topic: "updates",
+      title: "Active memory",
+      body: "Active body",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    });
+    const archived = memory.remember({
+      scope: "project",
+      project_id: "repo-123",
+      type: "lesson",
+      topic: "updates",
+      title: "Archived memory",
+      body: "Archived body",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3,
+      status: "archived"
+    });
+    expect(active.ok).toBe(true);
+    expect(archived.ok).toBe(true);
+    if (!archived.ok) throw new Error("expected archived memory");
+
+    const rejected = memory.updateMemory(archived.value.memory_id, { status: "active" });
+
+    expect(rejected).toMatchObject({ ok: false, error: "capacity_exceeded" });
+    expect(store.peekEntry(archived.value.memory_id)).toMatchObject({
+      title: "Archived memory",
+      status: "archived"
+    });
+    store.close();
+  });
+
+  it("accepts full-budget one-for-one supersede replacements", () => {
+    const { store, memory } = service();
+    memory.configureProjectBudget(
+      "repo-123",
+      { max_active_entries: 1, max_total_chars: 1000, max_topic_chars: 1000, max_index_chars: 1000 },
+      "G:\\Projects\\Repo",
+      "Repo"
+    );
+    const old = memory.remember({
+      scope: "project",
+      project_id: "repo-123",
+      type: "lesson",
+      topic: "supersede",
+      title: "Old active memory",
+      body: "Old active body",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    });
+    expect(old.ok).toBe(true);
+    if (!old.ok) throw new Error("expected old memory");
+
+    const replacement = memory.supersedeMemory({
+      old_memory_ids: [old.value.memory_id],
+      replacement: {
+        scope: "project",
+        project_id: "repo-123",
+        type: "lesson",
+        topic: "supersede",
+        title: "Replacement active memory",
+        body: "Replacement active body",
+        tags: [],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3
+      },
+      reason: "one for one"
+    });
+
+    expect(replacement.ok).toBe(true);
+    if (!replacement.ok) throw new Error("expected replacement");
+    expect(store.peekEntry(old.value.memory_id)?.status).toBe("superseded");
+    expect(memory.listMemories({ scope: "project", project_id: "repo-123" }).items.map((entry) => entry.id)).toEqual([
+      replacement.value.memory_id
+    ]);
     store.close();
   });
 
