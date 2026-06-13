@@ -7,12 +7,12 @@ export type BudgetWarning = {
   reason: string;
 };
 
-export type CandidateAction = {
-  action: "forget_memory" | "supersede_memory" | "archive";
-  memory_id?: string;
-  memory_ids?: string[];
-  reason: string;
-};
+export type CandidateAction =
+  | { action: "forget_memory"; memory_id: string; reason: string }
+  | { action: "archive"; memory_id: string; reason: string }
+  | { action: "supersede_memory"; memory_ids: string[]; reason: string };
+
+type CleanupActionName = "forget_memory" | "archive";
 
 export type BudgetAccepted = {
   warnings: BudgetWarning[];
@@ -39,7 +39,7 @@ function cloneTopicChars(topicChars: BudgetUsage["topic_chars"]): BudgetUsage["t
   return result;
 }
 
-function cleanupAction(entry: MemoryEntry, now: string): CandidateAction["action"] {
+function cleanupAction(entry: MemoryEntry, now: string): CleanupActionName {
   if (entry.expires_at && entry.expires_at <= now) return "forget_memory";
   return "archive";
 }
@@ -55,17 +55,25 @@ function compareOptionalIso(a: string | undefined, b: string | undefined): numbe
   return a.localeCompare(b);
 }
 
-function candidateIndexChars(candidate: BudgetInput["candidate"]): number {
-  return candidate.title.length + candidate.topic.length + candidate.tags.join(" ").length + 16;
+function codePointCount(text: string): number {
+  return Array.from(text).length;
+}
+
+export function estimateIndexChars(title: string, topic: string, tags: string[]): number {
+  return codePointCount(title) + codePointCount(topic) + codePointCount(tags.join(" ")) + 16;
 }
 
 function isProtectedCleanupEntry(entry: MemoryEntry): boolean {
   return entry.source.kind === "user" || entry.importance >= 5;
 }
 
+function isCleanupCandidateEntry(entry: MemoryEntry): boolean {
+  return entry.status === "active" && !isProtectedCleanupEntry(entry);
+}
+
 export function rankCleanupCandidates(entries: MemoryEntry[], now: string): CandidateAction[] {
   return entries
-    .filter((entry) => !isProtectedCleanupEntry(entry))
+    .filter(isCleanupCandidateEntry)
     .map((entry) => {
       let score = 0;
       score += 6 - entry.importance;
@@ -115,7 +123,7 @@ export function evaluateBudget(input: BudgetInput): Result<BudgetAccepted, "capa
     active_entries: input.usage.active_entries + 1,
     active_chars: input.usage.active_chars + input.candidate.char_count,
     topic_chars: topicChars,
-    index_chars: input.usage.index_chars + candidateIndexChars(input.candidate)
+    index_chars: input.usage.index_chars + estimateIndexChars(input.candidate.title, input.candidate.topic, input.candidate.tags)
   };
 
   const exceeds =
@@ -133,6 +141,7 @@ export function evaluateBudget(input: BudgetInput): Result<BudgetAccepted, "capa
     budget: input.budget,
     usage: input.usage,
     budget_after,
+    warnings,
     candidate_actions: rankCleanupCandidates(existingEntries, input.now ?? new Date().toISOString())
   });
 }

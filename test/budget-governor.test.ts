@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { MemoryEntry } from "../src/domain.js";
-import { evaluateBudget, rankCleanupCandidates } from "../src/budget-governor.js";
+import { estimateIndexChars, evaluateBudget, rankCleanupCandidates } from "../src/budget-governor.js";
 
 function entry(id: string, overrides: Partial<MemoryEntry> = {}): MemoryEntry {
   return {
@@ -91,6 +91,20 @@ describe("evaluateBudget", () => {
     }
   });
 
+  it("counts emoji title and tags by code point for index budget", () => {
+    expect(estimateIndexChars("🧠", "tests", ["tag🚀"])).toBe(26);
+
+    const result = evaluateBudget({
+      budget: { max_active_entries: 1, max_total_chars: 20, max_topic_chars: 20, max_index_chars: 26 },
+      usage: { active_entries: 0, active_chars: 0, topic_chars: { tests: 0 }, index_chars: 0 },
+      candidate: entry("mem_emoji", { title: "🧠", tags: ["tag🚀"], char_count: 20 })
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.budget_after.index_chars).toBe(26);
+    }
+  });
+
   it("rejects writes exceeding active entry count and suggests archiving non-expired entries", () => {
     const result = evaluateBudget({
       budget: { max_active_entries: 1, max_total_chars: 100, max_topic_chars: 80, max_index_chars: 200 },
@@ -144,6 +158,22 @@ describe("evaluateBudget", () => {
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.value.warnings).toContainEqual(expect.objectContaining({ code: "duplicate_candidate" }));
+    }
+  });
+
+  it("includes duplicate warnings when budget rejects write", () => {
+    const result = evaluateBudget({
+      budget: { max_active_entries: 1, max_total_chars: 1000, max_topic_chars: 500, max_index_chars: 500 },
+      usage: { active_entries: 1, active_chars: 20, topic_chars: { tests: 20 }, index_chars: 20 },
+      candidate: entry("mem_new", { title: "Same", body: "Same body" }),
+      existingEntries: [entry("mem_old", { title: "Same", body: "Same body" })]
+    });
+    expect(result).toMatchObject({
+      ok: false,
+      error: "capacity_exceeded"
+    });
+    if (!result.ok) {
+      expect(result.details?.warnings).toContainEqual(expect.objectContaining({ code: "duplicate_candidate" }));
     }
   });
 
@@ -221,6 +251,22 @@ describe("rankCleanupCandidates", () => {
             expires_at: "2026-01-01T00:00:00.000Z"
           })
         ],
+        "2026-06-13T00:00:00.000Z"
+      )
+    ).toEqual([]);
+  });
+
+  it("omits inactive entries from cleanup candidates even when expired", () => {
+    expect(
+      rankCleanupCandidates(
+        (["archived", "superseded", "forgotten"] as const).map((status) =>
+          entry(`mem_${status}`, {
+            status,
+            importance: 1,
+            confidence: 1,
+            expires_at: "2026-01-01T00:00:00.000Z"
+          })
+        ),
         "2026-06-13T00:00:00.000Z"
       )
     ).toEqual([]);
