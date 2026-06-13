@@ -194,4 +194,35 @@ describe("rankCleanupCandidates", () => {
       "mem_c"
     ]);
   });
+
+  it("omits user-originated entries from cleanup candidates even when alone", () => {
+    expect(
+      rankCleanupCandidates(
+        [
+          entry("mem_user", {
+            source: { kind: "user" },
+            importance: 1,
+            confidence: 1,
+            expires_at: "2026-01-01T00:00:00.000Z"
+          })
+        ],
+        "2026-06-13T00:00:00.000Z"
+      )
+    ).toEqual([]);
+  });
+
+  it("omits importance-5 entries from cleanup candidates even when alone", () => {
+    expect(
+      rankCleanupCandidates(
+        [
+          entry("mem_critical", {
+            importance: 5,
+            confidence: 1,
+            expires_at: "2026-01-01T00:00:00.000Z"
+          })
+        ],
+        "2026-06-13T00:00:00.000Z"
+      )
+    ).toEqual([]);
+  });
 });

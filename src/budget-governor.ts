@@ -59,8 +59,13 @@ function candidateIndexChars(candidate: BudgetInput["candidate"]): number {
   return candidate.title.length + candidate.topic.length + candidate.tags.join(" ").length + 16;
 }
 
+function isProtectedCleanupEntry(entry: MemoryEntry): boolean {
+  return entry.source.kind === "user" || entry.importance >= 5;
+}
+
 export function rankCleanupCandidates(entries: MemoryEntry[], now: string): CandidateAction[] {
   return entries
+    .filter((entry) => !isProtectedCleanupEntry(entry))
     .map((entry) => {
       let score = 0;
       score += 6 - entry.importance;
@@ -68,8 +73,6 @@ export function rankCleanupCandidates(entries: MemoryEntry[], now: string): Cand
       if (entry.expires_at && entry.expires_at <= now) score += 5;
       if (entry.review_after && entry.review_after <= now) score += 2;
       if (entry.access_count === 0) score += 2;
-      if (entry.source.kind === "user") score -= 3;
-      if (entry.importance >= 5) score -= 5;
       return { entry, score, cleanup_date: cleanupDate(entry) };
     })
     .sort((a, b) => {
