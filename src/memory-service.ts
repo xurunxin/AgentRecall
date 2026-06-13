@@ -233,6 +233,7 @@ export class MemoryService {
 
     const validated = validateUpdateInput(input);
     if (!validated.ok) {
+      this.auditRejectedForEntry(current, validated.error, validated.details);
       return validated;
     }
 
@@ -416,6 +417,22 @@ export class MemoryService {
     this.appendAudit({
       scope: safeScopeFromInput(input),
       ...(project_id !== undefined ? { project_id } : {}),
+      event: "write_rejected",
+      actor: "system",
+      reason: error,
+      metadata
+    });
+  }
+
+  private auditRejectedForEntry(entry: MemoryEntry, error: string, details: Record<string, unknown> | undefined): void {
+    const metadata: Record<string, unknown> = { error };
+    if (details !== undefined) {
+      metadata.details = details;
+    }
+    this.appendAudit({
+      memory_id: entry.id,
+      scope: entry.scope,
+      ...(entry.project_id !== undefined ? { project_id: entry.project_id } : {}),
       event: "write_rejected",
       actor: "system",
       reason: error,

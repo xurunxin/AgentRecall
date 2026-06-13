@@ -194,6 +194,84 @@ describe("MemoryService", () => {
     store.close();
   });
 
+  it("audits rejected invalid update status without modifying memory", () => {
+    const { store, memory } = service();
+    const first = memory.remember({
+      scope: "project",
+      project_id: "repo-123",
+      type: "lesson",
+      topic: "updates",
+      title: "Original title",
+      body: "Original body",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error("expected memory");
+
+    const rejected = memory.updateMemory(
+      first.value.memory_id,
+      { status: "forgotten" } as unknown as Parameters<MemoryService["updateMemory"]>[1]
+    );
+
+    expect(rejected).toMatchObject({ ok: false, error: "invalid_schema" });
+    expect(store.peekEntry(first.value.memory_id)).toMatchObject({
+      title: "Original title",
+      body: "Original body",
+      status: "active"
+    });
+    expect(store.listAuditEvents({ memory_id: first.value.memory_id, event: "write_rejected" })).toEqual([
+      expect.objectContaining({
+        memory_id: first.value.memory_id,
+        scope: "project",
+        project_id: "repo-123",
+        reason: "invalid_schema",
+        metadata: expect.objectContaining({ error: "invalid_schema" })
+      })
+    ]);
+    store.close();
+  });
+
+  it("audits rejected secret updates without storing secret text or modifying memory", () => {
+    const { store, memory } = service();
+    const first = memory.remember({
+      scope: "global",
+      type: "debugging",
+      topic: "updates",
+      title: "Safe title",
+      body: "Safe body",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    });
+    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error("expected memory");
+
+    const rejected = memory.updateMemory(first.value.memory_id, {
+      body: "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz1234567890"
+    });
+
+    expect(rejected).toMatchObject({ ok: false, error: "secret_detected" });
+    expect(store.peekEntry(first.value.memory_id)).toMatchObject({
+      title: "Safe title",
+      body: "Safe body"
+    });
+    const rejectionAudit = store.listAuditEvents({ memory_id: first.value.memory_id, event: "write_rejected" });
+    expect(JSON.stringify(rejectionAudit)).not.toContain("abcdefghijklmnopqrstuvwxyz1234567890");
+    expect(rejectionAudit).toEqual([
+      expect.objectContaining({
+        memory_id: first.value.memory_id,
+        scope: "global",
+        reason: "secret_detected",
+        metadata: expect.objectContaining({ error: "secret_detected" })
+      })
+    ]);
+    store.close();
+  });
+
   it("reports budget usage and cleanup candidates", () => {
     const { store, memory } = service();
     memory.configureProjectBudget("repo-123", { max_active_entries: 1, max_total_chars: 1000, max_topic_chars: 1000, max_index_chars: 1000 }, "G:\\Projects\\Repo", "Repo");
