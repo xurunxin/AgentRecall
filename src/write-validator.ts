@@ -59,18 +59,15 @@ export type ValidatedRememberInput = {
 export type UpdateInput = Partial<
   Pick<
     ValidatedRememberInput,
-    | "type"
     | "topic"
     | "title"
     | "body"
     | "tags"
-    | "source"
     | "importance"
     | "confidence"
     | "status"
     | "expires_at"
     | "review_after"
-    | "supersedes"
   >
 >;
 
@@ -78,18 +75,15 @@ export type ValidatedUpdateInput = UpdateInput;
 
 const WRITABLE_STATUSES = ["active", "archived"] as const;
 const MUTABLE_UPDATE_FIELDS = new Set([
-  "type",
   "topic",
   "title",
   "body",
   "tags",
-  "source",
   "importance",
   "confidence",
   "status",
   "expires_at",
-  "review_after",
-  "supersedes"
+  "review_after"
 ]);
 
 export function validateRememberInput(input: unknown): Result<ValidatedRememberInput, ValidationError> {
@@ -178,10 +172,6 @@ export function validateUpdateInput(input: unknown): Result<ValidatedUpdateInput
   const value: ValidatedUpdateInput = {};
   const secretInputs: { title?: string; body?: string; tags?: string[] } = {};
 
-  if ("type" in input) {
-    const type = parseMemoryType(input.type, issues);
-    if (type !== undefined) value.type = type;
-  }
   if ("topic" in input) {
     const topic = parseRequiredString(input, "topic", issues);
     if (topic !== undefined) value.topic = topic;
@@ -207,10 +197,6 @@ export function validateUpdateInput(input: unknown): Result<ValidatedUpdateInput
       secretInputs.tags = tags;
     }
   }
-  if ("source" in input) {
-    const source = parseSource(input.source, issues);
-    if (source !== undefined) value.source = source;
-  }
   if ("importance" in input) {
     const importance = parseRating(input.importance, "importance", issues);
     if (importance !== undefined) value.importance = importance;
@@ -231,11 +217,6 @@ export function validateUpdateInput(input: unknown): Result<ValidatedUpdateInput
     const reviewAfter = parseOptionalNonEmptyString(input, "review_after", issues);
     if (reviewAfter !== undefined) value.review_after = reviewAfter;
   }
-  if ("supersedes" in input) {
-    const supersedes = parseStringList(input.supersedes, "supersedes", issues, undefined);
-    if (supersedes !== undefined) value.supersedes = supersedes;
-  }
-
   if (issues.length > 0) {
     return invalidSchema(issues);
   }

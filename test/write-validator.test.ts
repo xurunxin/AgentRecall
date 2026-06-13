@@ -89,4 +89,19 @@ describe("update validation", () => {
       error: "invalid_schema"
     });
   });
+
+  it("rejects immutable fields", () => {
+    expect(validateUpdateInput({ type: "debugging" })).toMatchObject({
+      ok: false,
+      error: "invalid_schema"
+    });
+    expect(validateUpdateInput({ source: { kind: "agent" } })).toMatchObject({
+      ok: false,
+      error: "invalid_schema"
+    });
+    expect(validateUpdateInput({ supersedes: ["mem_123"] })).toMatchObject({
+      ok: false,
+      error: "invalid_schema"
+    });
+  });
 });
