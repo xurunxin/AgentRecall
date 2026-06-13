@@ -112,7 +112,14 @@ function serviceInput<T>(value: unknown): T {
 }
 
 function memoryIdFromInput(input: { id?: string | undefined; memory_id?: string | undefined }): string {
-  return input.memory_id ?? input.id ?? "";
+  if (input.memory_id !== undefined && input.id !== undefined && input.memory_id !== input.id) {
+    throw new Error("memory_id and id must match when both are provided");
+  }
+  const memoryId = input.memory_id ?? input.id;
+  if (memoryId === undefined) {
+    throw new Error("memory_id or id is required");
+  }
+  return memoryId;
 }
 
 function patchFromUpdateInput(input: {
@@ -187,9 +194,10 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
     search_memories: jsonHandler("search_memories", memoryToolSchemas.search_memories, (input) =>
       service.searchMemories(serviceInput<Parameters<MemoryService["searchMemories"]>[0]>(input))
     ),
-    get_memory: jsonHandler("get_memory", memoryToolSchemas.get_memory, (input) =>
-      service.getMemory(memoryIdFromInput(input)) ?? asNotFoundMemoryResult(memoryIdFromInput(input))
-    ),
+    get_memory: jsonHandler("get_memory", memoryToolSchemas.get_memory, (input) => {
+      const memoryId = memoryIdFromInput(input);
+      return service.getMemory(memoryId) ?? asNotFoundMemoryResult(memoryId);
+    }),
     list_memories: jsonHandler("list_memories", memoryToolSchemas.list_memories, (input) =>
       service.listMemories(serviceInput<Parameters<MemoryService["listMemories"]>[0]>(input))
     ),

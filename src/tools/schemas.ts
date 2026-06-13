@@ -63,6 +63,28 @@ function requireProjectId(input: { scope?: string | undefined; project_id?: stri
   });
 }
 
+function requireConsistentMemoryId(
+  input: { id?: string | undefined; memory_id?: string | undefined },
+  context: z.RefinementCtx
+): void {
+  if (input.memory_id === undefined && input.id === undefined) {
+    context.addIssue({
+      code: "custom",
+      path: ["memory_id"],
+      message: "memory_id or id is required"
+    });
+    return;
+  }
+
+  if (input.memory_id !== undefined && input.id !== undefined && input.memory_id !== input.id) {
+    context.addIssue({
+      code: "custom",
+      path: ["memory_id"],
+      message: "memory_id and id must match when both are provided"
+    });
+  }
+}
+
 export const rememberToolSchema = z
   .object({
     scope: scopeSchema,
@@ -112,14 +134,7 @@ export const getMemoryToolSchema = z
     memory_id: nonEmptyString.optional()
   })
   .strict()
-  .superRefine((input, context) => {
-    if (input.memory_id !== undefined || input.id !== undefined) return;
-    context.addIssue({
-      code: "custom",
-      path: ["memory_id"],
-      message: "memory_id or id is required"
-    });
-  });
+  .superRefine(requireConsistentMemoryId);
 
 export const listMemoriesToolSchema = z
   .object({
@@ -152,13 +167,7 @@ export const updateMemoryToolSchema = z
   })
   .strict()
   .superRefine((input, context) => {
-    if (input.memory_id === undefined && input.id === undefined) {
-      context.addIssue({
-        code: "custom",
-        path: ["memory_id"],
-        message: "memory_id or id is required"
-      });
-    }
+    requireConsistentMemoryId(input, context);
 
     const topLevelFields = updateFieldNames.filter((field) => input[field] !== undefined);
     if (input.patch !== undefined && topLevelFields.length > 0) {
@@ -195,14 +204,7 @@ export const forgetMemoryToolSchema = z
     reason: nonEmptyString
   })
   .strict()
-  .superRefine((input, context) => {
-    if (input.memory_id !== undefined || input.id !== undefined) return;
-    context.addIssue({
-      code: "custom",
-      path: ["memory_id"],
-      message: "memory_id or id is required"
-    });
-  });
+  .superRefine(requireConsistentMemoryId);
 
 export const getMemoryBudgetToolSchema = z
   .object({

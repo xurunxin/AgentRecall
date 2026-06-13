@@ -160,6 +160,27 @@ describe("memory tool schemas", () => {
       }
     });
   });
+
+  it("allows matching id aliases and rejects conflicting id aliases", () => {
+    expect(memoryToolSchemas.get_memory.parse({ id: "mem_1", memory_id: "mem_1" })).toEqual({
+      id: "mem_1",
+      memory_id: "mem_1"
+    });
+    expect(memoryToolSchemas.update_memory.parse({ id: "mem_1", memory_id: "mem_1", title: "Updated" })).toMatchObject({
+      id: "mem_1",
+      memory_id: "mem_1",
+      title: "Updated"
+    });
+    expect(memoryToolSchemas.forget_memory.parse({ id: "mem_1", memory_id: "mem_1", reason: "obsolete" })).toEqual({
+      id: "mem_1",
+      memory_id: "mem_1",
+      reason: "obsolete"
+    });
+
+    expect(() => memoryToolSchemas.get_memory.parse({ id: "mem_1", memory_id: "mem_2" })).toThrow();
+    expect(() => memoryToolSchemas.update_memory.parse({ id: "mem_1", memory_id: "mem_2", title: "Updated" })).toThrow();
+    expect(() => memoryToolSchemas.forget_memory.parse({ id: "mem_1", memory_id: "mem_2", reason: "obsolete" })).toThrow();
+  });
 });
 
 describe("createMemoryToolHandlers", () => {
@@ -243,6 +264,28 @@ describe("createMemoryToolHandlers", () => {
       error: "tool_error",
       message: "maintenance failed"
     });
+  });
+
+  it("rejects conflicting id aliases before dispatch", async () => {
+    const service = fakeService();
+    const handlers = createMemoryToolHandlers(service);
+
+    expect(jsonOf(await handlers.get_memory({ id: "mem_1", memory_id: "mem_2" }))).toMatchObject({
+      ok: false,
+      error: "invalid_schema"
+    });
+    expect(jsonOf(await handlers.update_memory({ id: "mem_1", memory_id: "mem_2", title: "Updated" }))).toMatchObject({
+      ok: false,
+      error: "invalid_schema"
+    });
+    expect(jsonOf(await handlers.forget_memory({ id: "mem_1", memory_id: "mem_2", reason: "obsolete" }))).toMatchObject({
+      ok: false,
+      error: "invalid_schema"
+    });
+
+    expect(service.getMemory).not.toHaveBeenCalled();
+    expect(service.updateMemory).not.toHaveBeenCalled();
+    expect(service.forgetMemory).not.toHaveBeenCalled();
   });
 
   it("dispatches tools to updated service methods", async () => {
