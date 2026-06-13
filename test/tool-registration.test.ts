@@ -1,5 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { describe, expect, it, vi } from "vitest";
 import { createMemoryToolHandlers, registerMemoryTools } from "../src/tools/register-tools.js";
 import { memoryToolSchemas } from "../src/tools/schemas.js";
 
@@ -81,6 +81,85 @@ describe("memory tool schemas", () => {
       })
     ).toThrow();
   });
+
+  it("rejects project-scoped reads and maintenance without required project identity", () => {
+    expect(() => memoryToolSchemas.search_memories.parse({ scope: "project", query: "sqlite" })).toThrow();
+    expect(() => memoryToolSchemas.list_memories.parse({ scope: "project" })).toThrow();
+    expect(() => memoryToolSchemas.maintain_memories.parse({ action: "find_duplicates", scope: "project" })).toThrow();
+    expect(() =>
+      memoryToolSchemas.export_memory_context.parse({
+        scope: "project",
+        budget_chars: 1000
+      })
+    ).toThrow();
+  });
+
+  it("requires project_id for project memory budget reads", () => {
+    expect(() => memoryToolSchemas.get_memory_budget.parse({ scope: "project" })).toThrow();
+    expect(memoryToolSchemas.get_memory_budget.parse({ scope: "project", project_id: "repo-a" })).toEqual({
+      scope: "project",
+      project_id: "repo-a"
+    });
+  });
+
+  it("rejects unknown fields in top-level and nested objects", () => {
+    expect(() =>
+      memoryToolSchemas.remember.parse({
+        scope: "global",
+        type: "lesson",
+        topic: "tools",
+        title: "Unknown root",
+        body: "Unknown root fields should be rejected.",
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 4,
+        unexpected: true
+      })
+    ).toThrow();
+
+    expect(() =>
+      memoryToolSchemas.remember.parse({
+        scope: "global",
+        type: "lesson",
+        topic: "tools",
+        title: "Unknown source",
+        body: "Unknown nested fields should be rejected.",
+        source: { kind: "agent", unexpected: true },
+        importance: 3,
+        confidence: 4
+      })
+    ).toThrow();
+
+    expect(() =>
+      memoryToolSchemas.update_memory.parse({
+        memory_id: "mem_1",
+        patch: {
+          title: "Updated",
+          unexpected: true
+        }
+      })
+    ).toThrow();
+  });
+
+  it("requires update_memory to include at least one update field", () => {
+    expect(() => memoryToolSchemas.update_memory.parse({ memory_id: "mem_1" })).toThrow();
+    expect(() => memoryToolSchemas.update_memory.parse({ memory_id: "mem_1", patch: {} })).toThrow();
+    expect(() => memoryToolSchemas.update_memory.parse({ memory_id: "mem_1", typo_field: "Updated" })).toThrow();
+    expect(() =>
+      memoryToolSchemas.update_memory.parse({ memory_id: "mem_1", patch: { title: "Patch" }, title: "Top level" })
+    ).toThrow();
+
+    expect(memoryToolSchemas.update_memory.parse({ memory_id: "mem_1", title: "Updated" })).toMatchObject({
+      memory_id: "mem_1",
+      title: "Updated"
+    });
+    expect(memoryToolSchemas.update_memory.parse({ memory_id: "mem_1", patch: { title: "Updated" } })).toMatchObject({
+      memory_id: "mem_1",
+      patch: {
+        title: "Updated"
+      }
+    });
+  });
 });
 
 describe("createMemoryToolHandlers", () => {
@@ -126,7 +205,7 @@ describe("createMemoryToolHandlers", () => {
     });
     const handlers = createMemoryToolHandlers(service);
 
-    const result = await handlers.search_memories({ scope: "project", query: "sqlite" });
+    const result = await handlers.search_memories({ scope: "project", project_id: "repo-a", query: "sqlite" });
 
     expect(jsonOf(result)).toEqual({
       ok: false,
@@ -135,7 +214,7 @@ describe("createMemoryToolHandlers", () => {
     });
   });
 
-  it("wraps zod parse errors as JSON text", async () => {
+  it("wraps direct handler zod parse errors as JSON text", async () => {
     const service = fakeService();
     const handlers = createMemoryToolHandlers(service);
 
@@ -147,6 +226,23 @@ describe("createMemoryToolHandlers", () => {
       message: "Input does not match the remember tool schema."
     });
     expect(service.remember).not.toHaveBeenCalled();
+  });
+
+  it("wraps thrown service errors as JSON text", async () => {
+    const service = fakeService({
+      maintainMemories: vi.fn(() => {
+        throw new Error("maintenance failed");
+      })
+    });
+    const handlers = createMemoryToolHandlers(service);
+
+    const result = await handlers.maintain_memories({ action: "find_duplicates", scope: "global" });
+
+    expect(jsonOf(result)).toEqual({
+      ok: false,
+      error: "tool_error",
+      message: "maintenance failed"
+    });
   });
 
   it("dispatches tools to updated service methods", async () => {

@@ -220,6 +220,8 @@ export function registerMemoryTools(server: MemoryToolServer, service: MemorySer
   const handlers = createMemoryToolHandlers(service);
 
   for (const name of memoryToolNames) {
+    // Registered MCP calls are pre-validated by the SDK from inputSchema;
+    // handlers also parse defensively for direct unit usage and service errors.
     server.registerTool(
       name,
       {
