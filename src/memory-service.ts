@@ -6,6 +6,7 @@ import {
   type BudgetWarning,
   type CandidateAction
 } from "./budget-governor.js";
+import { createHash } from "node:crypto";
 import {
   DEFAULT_GLOBAL_BUDGET,
   DEFAULT_PROJECT_BUDGET,
@@ -22,6 +23,7 @@ import {
   type ProjectScope,
   type Result
 } from "./domain.js";
+import { MarkdownExporter } from "./markdown-exporter.js";
 import { resolveMemoryScope } from "./scope-resolver.js";
 import type { BudgetUsage, EntryFilters, SearchFilters, SQLiteMemoryStore } from "./sqlite-store.js";
 import {
@@ -61,6 +63,44 @@ export type MemoryBudgetResult = {
   cleanup_candidates: CandidateAction[];
 };
 
+export type ExportMemoryContextInput = {
+  scope: MemoryScope;
+  project_id?: string;
+  project_path?: string;
+  query?: string;
+  include_global?: boolean;
+  budget_chars: number;
+  types?: string[];
+  topics?: string[];
+};
+
+export type MaintenanceAction =
+  | "archive_low_value"
+  | "expire_due"
+  | "rebuild_markdown_index"
+  | "vacuum_fts"
+  | "find_duplicates";
+
+export type DuplicateGroup = {
+  reason: "same_title_and_body" | "same_title" | "same_body";
+  fingerprint: string;
+  memory_ids: string[];
+  titles: string[];
+};
+
+export type MaintainMemoriesInput = {
+  action: MaintenanceAction;
+  scope: MemoryScope;
+  project_id?: string;
+  project_path?: string;
+};
+
+export type MaintainMemoriesResult = {
+  action: MaintenanceAction;
+  changed: number;
+  details: unknown;
+};
+
 type RememberError = "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded";
 type UpdateError = "not_found" | "invalid_state" | "invalid_schema" | "secret_detected" | "capacity_exceeded";
 type SupersedeError = RememberError | "not_found" | "invalid_state";
@@ -85,6 +125,16 @@ type SearchServiceFilters = SearchFilters & {
   include_global?: boolean;
 };
 
+type ResolvedReadScope = {
+  scope: MemoryScope;
+  project_id?: string;
+};
+
+type ContextScore = {
+  entry: MemoryEntry;
+  query_score: number;
+};
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -97,8 +147,87 @@ function safeProjectIdFromInput(input: unknown): string | undefined {
   return isRecord(input) && typeof input.project_id === "string" ? input.project_id : undefined;
 }
 
+function compareText(a: string, b: string): number {
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
+}
+
+function parseTimestamp(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : undefined;
+}
+
+function isDue(timestamp: string | undefined, now: string): boolean {
+  const dueAt = parseTimestamp(timestamp);
+  const current = parseTimestamp(now);
+  return dueAt !== undefined && current !== undefined && dueAt <= current;
+}
+
+function normalizeDuplicateText(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function duplicateFingerprint(reason: DuplicateGroup["reason"], key: string): string {
+  return createHash("sha256").update(`${reason}\n${key}`).digest("hex").slice(0, 12);
+}
+
+function queryTokens(query: string | undefined): string[] {
+  if (query === undefined) return [];
+  return [...new Set((query.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? []).filter((token) => token.length > 0))].sort();
+}
+
+function contextQueryScore(entry: MemoryEntry, tokens: string[]): number {
+  if (tokens.length === 0) return 0;
+  const title = entry.title.toLowerCase();
+  const topic = entry.topic.toLowerCase();
+  const tags = entry.tags.join(" ").toLowerCase();
+  const body = entry.body.toLowerCase();
+  let score = 0;
+  for (const token of tokens) {
+    if (title.includes(token)) score += 8;
+    if (topic.includes(token)) score += 4;
+    if (tags.includes(token)) score += 3;
+    if (body.includes(token)) score += 1;
+  }
+  return score;
+}
+
+function compareContextScores(a: ContextScore, b: ContextScore): number {
+  const queryOrder = b.query_score - a.query_score;
+  if (queryOrder !== 0) return queryOrder;
+
+  const importanceOrder = b.entry.importance - a.entry.importance;
+  if (importanceOrder !== 0) return importanceOrder;
+
+  const confidenceOrder = b.entry.confidence - a.entry.confidence;
+  if (confidenceOrder !== 0) return confidenceOrder;
+
+  const updatedOrder = compareText(b.entry.updated_at, a.entry.updated_at);
+  if (updatedOrder !== 0) return updatedOrder;
+
+  return compareText(a.entry.id, b.entry.id);
+}
+
+function compareLowValueCandidates(a: MemoryEntry, b: MemoryEntry): number {
+  const importanceOrder = a.importance - b.importance;
+  if (importanceOrder !== 0) return importanceOrder;
+
+  const confidenceOrder = a.confidence - b.confidence;
+  if (confidenceOrder !== 0) return confidenceOrder;
+
+  const updatedOrder = compareText(a.updated_at, b.updated_at);
+  if (updatedOrder !== 0) return updatedOrder;
+
+  return compareText(a.id, b.id);
+}
+
 export class MemoryService {
-  constructor(private readonly store: SQLiteMemoryStore) {}
+  constructor(
+    private readonly store: SQLiteMemoryStore,
+    private readonly exporter?: MarkdownExporter
+  ) {}
 
   configureProjectBudget(
     project_id: string,
@@ -500,6 +629,315 @@ export class MemoryService {
       usage,
       cleanup_candidates: rankCleanupCandidates(activeEntries, nowIso())
     };
+  }
+
+  exportMemoryContext(input: ExportMemoryContextInput): string {
+    const exporter = this.markdownExporter();
+    const resolved = this.resolveReadScope(input);
+    if (!resolved.ok) {
+      return exporter.buildContextPack({
+        title: "Local Memory Context",
+        budget_chars: input.budget_chars,
+        entries: []
+      });
+    }
+
+    const entries = this.collectContextEntries(resolved.value, input);
+    return exporter.buildContextPack({
+      title: "Local Memory Context",
+      budget_chars: input.budget_chars,
+      entries
+    });
+  }
+
+  maintainMemories(input: MaintainMemoriesInput): MaintainMemoriesResult {
+    const resolved = this.resolveReadScope(input);
+    if (!resolved.ok) {
+      return {
+        action: input.action,
+        changed: 0,
+        details: {
+          error: "invalid_scope",
+          message: resolved.message
+        }
+      };
+    }
+
+    switch (input.action) {
+      case "find_duplicates":
+        return {
+          action: input.action,
+          changed: 0,
+          details: {
+            groups: this.findDuplicateGroups(this.activeEntriesForScope(resolved.value))
+          }
+        };
+      case "rebuild_markdown_index":
+        return this.rebuildMarkdownIndex(resolved.value);
+      case "expire_due":
+        return this.expireDueMemories(resolved.value);
+      case "archive_low_value":
+        return this.archiveLowValueMemories(resolved.value);
+      case "vacuum_fts":
+        return this.vacuumFts(resolved.value);
+    }
+  }
+
+  private markdownExporter(): MarkdownExporter {
+    return this.exporter ?? new MarkdownExporter(".local-memory-mcp/exports");
+  }
+
+  private resolveReadScope(input: { scope: MemoryScope; project_id?: string; project_path?: string }): Result<ResolvedReadScope, "invalid_scope"> {
+    const resolved = resolveMemoryScope(input);
+    if (!resolved.ok) {
+      return resolved;
+    }
+    if (resolved.value.scope === "project" && resolved.value.project_id === undefined) {
+      return err("invalid_scope", "project scope requires project_id or project_path");
+    }
+    return ok({
+      scope: resolved.value.scope,
+      ...(resolved.value.project_id !== undefined ? { project_id: resolved.value.project_id } : {})
+    });
+  }
+
+  private collectContextEntries(scope: ResolvedReadScope, input: ExportMemoryContextInput): MemoryEntry[] {
+    const scopes: ResolvedReadScope[] = [
+      ...(scope.scope === "project" && input.include_global ? [{ scope: "global" as const }] : []),
+      scope
+    ];
+    const byId = new Map<string, MemoryEntry>();
+    for (const readScope of scopes) {
+      for (const entry of this.contextEntriesForScope(readScope, input.query)) {
+        if (this.matchesContextFilters(entry, input)) {
+          byId.set(entry.id, entry);
+        }
+      }
+    }
+
+    const tokens = queryTokens(input.query);
+    return [...byId.values()]
+      .map((entry) => ({ entry, query_score: contextQueryScore(entry, tokens) }))
+      .sort(compareContextScores)
+      .map(({ entry }) => entry);
+  }
+
+  private contextEntriesForScope(scope: ResolvedReadScope, query: string | undefined): MemoryEntry[] {
+    const baseFilters = {
+      scope: scope.scope,
+      ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
+      status: "active" as const,
+      limit: 10_000
+    };
+    if (query !== undefined && query.trim().length > 0) {
+      return this.store.searchEntries({
+        ...baseFilters,
+        query
+      });
+    }
+    return this.store.listEntries(baseFilters);
+  }
+
+  private matchesContextFilters(entry: MemoryEntry, input: ExportMemoryContextInput): boolean {
+    if (input.types !== undefined && input.types.length > 0 && !input.types.includes(entry.type)) {
+      return false;
+    }
+    if (input.topics !== undefined && input.topics.length > 0 && !input.topics.includes(entry.topic)) {
+      return false;
+    }
+    return entry.status === "active";
+  }
+
+  private activeEntriesForScope(scope: ResolvedReadScope): MemoryEntry[] {
+    return this.store.listEntries({
+      scope: scope.scope,
+      ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
+      status: "active",
+      limit: 10_000
+    });
+  }
+
+  private allEntriesForScope(scope: ResolvedReadScope): MemoryEntry[] {
+    return this.store.listEntries({
+      scope: scope.scope,
+      ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
+      limit: 10_000
+    });
+  }
+
+  private usageForScope(scope: ResolvedReadScope): BudgetUsage {
+    return this.store.getBudgetUsage({
+      scope: scope.scope,
+      ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {})
+    });
+  }
+
+  private rebuildMarkdownIndex(scope: ResolvedReadScope): MaintainMemoriesResult {
+    return this.store.transaction(() => {
+      const paths = this.markdownExporter().exportScope({
+        scope: scope.scope,
+        ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
+        entries: this.allEntriesForScope(scope),
+        budgetStatus: this.usageForScope(scope)
+      });
+      const changed = paths.topicPaths.length + 1;
+      this.appendAudit({
+        scope: scope.scope,
+        ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
+        event: "markdown_exported",
+        actor: "agent",
+        metadata: paths
+      });
+      this.appendMaintenanceAudit(scope, "rebuild_markdown_index", changed, paths);
+      return {
+        action: "rebuild_markdown_index",
+        changed,
+        details: paths
+      };
+    });
+  }
+
+  private expireDueMemories(scope: ResolvedReadScope): MaintainMemoriesResult {
+    const now = nowIso();
+    const expired = this.activeEntriesForScope(scope)
+      .filter((entry) => isDue(entry.expires_at, now))
+      .sort((a, b) => compareText(a.expires_at ?? "", b.expires_at ?? "") || compareText(a.id, b.id));
+    const details = {
+      expired: expired.map((entry) => ({
+        memory_id: entry.id,
+        expires_at: entry.expires_at ?? ""
+      }))
+    };
+
+    return this.store.transaction(() => {
+      for (const entry of expired) {
+        this.forgetMemory(entry.id, "expired by maintain_memories");
+      }
+      this.appendMaintenanceAudit(scope, "expire_due", expired.length, details);
+      return {
+        action: "expire_due",
+        changed: expired.length,
+        details
+      };
+    });
+  }
+
+  private archiveLowValueMemories(scope: ResolvedReadScope): MaintainMemoriesResult {
+    const lowValue = this.activeEntriesForScope(scope)
+      .filter((entry) => entry.importance <= 2 && entry.confidence <= 2 && entry.access_count === 0 && entry.source.kind !== "user")
+      .sort(compareLowValueCandidates);
+    const details = {
+      archived: lowValue.map((entry) => ({
+        memory_id: entry.id,
+        reason: "low importance, low confidence, never accessed"
+      }))
+    };
+
+    return this.store.transaction(() => {
+      for (const entry of lowValue) {
+        this.updateMemory(entry.id, { status: "archived" });
+      }
+      this.appendMaintenanceAudit(scope, "archive_low_value", lowValue.length, details);
+      return {
+        action: "archive_low_value",
+        changed: lowValue.length,
+        details
+      };
+    });
+  }
+
+  private vacuumFts(scope: ResolvedReadScope): MaintainMemoriesResult {
+    const vacuum = (this.store as SQLiteMemoryStore & { vacuumFts?: () => void }).vacuumFts;
+    if (typeof vacuum === "function") {
+      vacuum.call(this.store);
+      const details = { status: "vacuumed" };
+      this.appendMaintenanceAudit(scope, "vacuum_fts", 1, details);
+      return {
+        action: "vacuum_fts",
+        changed: 1,
+        details
+      };
+    }
+
+    const details = {
+      status: "noop",
+      reason: "SQLiteMemoryStore does not expose FTS vacuum support"
+    };
+    this.appendMaintenanceAudit(scope, "vacuum_fts", 0, details);
+    return {
+      action: "vacuum_fts",
+      changed: 0,
+      details
+    };
+  }
+
+  private findDuplicateGroups(entries: MemoryEntry[]): DuplicateGroup[] {
+    const sortedEntries = [...entries].sort((a, b) => compareText(a.id, b.id));
+    const groups: DuplicateGroup[] = [
+      ...this.duplicateGroupsFor(sortedEntries, "same_title_and_body", (entry) => `${normalizeDuplicateText(entry.title)}\n${normalizeDuplicateText(entry.body)}`),
+      ...this.duplicateGroupsFor(sortedEntries, "same_title", (entry) => normalizeDuplicateText(entry.title)),
+      ...this.duplicateGroupsFor(sortedEntries, "same_body", (entry) => normalizeDuplicateText(entry.body))
+    ];
+    const reasonRank: Record<DuplicateGroup["reason"], number> = {
+      same_title_and_body: 0,
+      same_title: 1,
+      same_body: 2
+    };
+    return groups.sort((a, b) => {
+      const reasonOrder = reasonRank[a.reason] - reasonRank[b.reason];
+      if (reasonOrder !== 0) return reasonOrder;
+
+      const firstIdOrder = compareText(a.memory_ids[0] ?? "", b.memory_ids[0] ?? "");
+      if (firstIdOrder !== 0) return firstIdOrder;
+
+      return compareText(a.fingerprint, b.fingerprint);
+    });
+  }
+
+  private duplicateGroupsFor(
+    entries: MemoryEntry[],
+    reason: DuplicateGroup["reason"],
+    keyForEntry: (entry: MemoryEntry) => string
+  ): DuplicateGroup[] {
+    const buckets = new Map<string, MemoryEntry[]>();
+    for (const entry of entries) {
+      const key = keyForEntry(entry);
+      if (key.length === 0) continue;
+      buckets.set(key, [...(buckets.get(key) ?? []), entry]);
+    }
+
+    return [...buckets.entries()]
+      .filter(([, group]) => group.length > 1)
+      .map(([key, group]) => {
+        const memory_ids = group.map((entry) => entry.id).sort(compareText);
+        const titles = [...new Set(group.map((entry) => entry.title.trim()).filter((title) => title.length > 0))].sort(compareText);
+        return {
+          reason,
+          fingerprint: duplicateFingerprint(reason, key),
+          memory_ids,
+          titles
+        };
+      });
+  }
+
+  private appendMaintenanceAudit(
+    scope: ResolvedReadScope,
+    action: Exclude<MaintenanceAction, "find_duplicates">,
+    changed: number,
+    details: unknown
+  ): void {
+    this.appendAudit({
+      scope: scope.scope,
+      ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
+      event: "maintenance_run",
+      actor: "agent",
+      reason: action,
+      metadata: {
+        action,
+        changed,
+        details
+      }
+    });
   }
 
   private matchesReplacementScope(old: MemoryEntry, replacement: MemoryEntry): boolean {

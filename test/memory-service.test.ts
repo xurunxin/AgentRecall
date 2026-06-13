@@ -1,14 +1,16 @@
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { DEFAULT_PROJECT_BUDGET, type MemoryAuditEvent } from "../src/domain.js";
+import { MarkdownExporter } from "../src/markdown-exporter.js";
 import { MemoryService } from "../src/memory-service.js";
 import { SQLiteMemoryStore } from "../src/sqlite-store.js";
 
-function service() {
+function service(exportRoot?: string) {
   const store = new SQLiteMemoryStore(join(mkdtempSync(join(tmpdir(), "lm-service-")), "memory.sqlite"));
-  return { store, memory: new MemoryService(store) };
+  const exporter = exportRoot === undefined ? undefined : new MarkdownExporter(exportRoot);
+  return { store, memory: new MemoryService(store, exporter) };
 }
 
 class FailingAuditStore extends SQLiteMemoryStore {
@@ -964,6 +966,351 @@ describe("MemoryService", () => {
       ok: false,
       error: "invalid_scope"
     });
+    store.close();
+  });
+
+  it("exports project context without global leakage or access-count pollution", () => {
+    const { store, memory } = service();
+    const global = memory.remember({
+      scope: "global",
+      type: "preference",
+      topic: "shell",
+      title: "Global rtk preference",
+      body: "Use rtk for shell commands in every repository.",
+      tags: ["rtk"],
+      source: { kind: "user" },
+      importance: 5,
+      confidence: 5
+    });
+    const project = memory.remember({
+      scope: "project",
+      project_id: "repo-a",
+      type: "debugging",
+      topic: "shell",
+      title: "Repo A rtk wrapper",
+      body: "Repo A commands should keep the rtk wrapper.",
+      tags: ["rtk"],
+      source: { kind: "agent" },
+      importance: 4,
+      confidence: 5
+    });
+    const otherProject = memory.remember({
+      scope: "project",
+      project_id: "repo-b",
+      type: "debugging",
+      topic: "shell",
+      title: "Repo B rtk wrapper",
+      body: "Repo B context must not leak into Repo A exports.",
+      tags: ["rtk"],
+      source: { kind: "agent" },
+      importance: 4,
+      confidence: 5
+    });
+    const forgotten = memory.remember({
+      scope: "project",
+      project_id: "repo-a",
+      type: "lesson",
+      topic: "shell",
+      title: "Forgotten rtk note",
+      body: "forgotten body must never appear",
+      tags: ["rtk"],
+      source: { kind: "agent" },
+      importance: 5,
+      confidence: 5
+    });
+    expect(global.ok).toBe(true);
+    expect(project.ok).toBe(true);
+    expect(otherProject.ok).toBe(true);
+    expect(forgotten.ok).toBe(true);
+    if (!global.ok || !project.ok || !forgotten.ok) throw new Error("expected memories");
+    expect(memory.forgetMemory(forgotten.value.memory_id, "test forget").ok).toBe(true);
+
+    const projectOnly = memory.exportMemoryContext({
+      scope: "project",
+      project_id: "repo-a",
+      query: "rtk",
+      budget_chars: 2000
+    });
+    const withGlobal = memory.exportMemoryContext({
+      scope: "project",
+      project_id: "repo-a",
+      query: "rtk",
+      include_global: true,
+      budget_chars: 2000
+    });
+
+    expect(projectOnly).toContain("Repo A rtk wrapper");
+    expect(projectOnly).not.toContain("Global rtk preference");
+    expect(projectOnly).not.toContain("Repo B rtk wrapper");
+    expect(projectOnly).not.toContain("forgotten body must never appear");
+    expect(withGlobal).toContain("Repo A rtk wrapper");
+    expect(withGlobal).toContain("Global rtk preference");
+    expect(store.peekEntry(project.value.memory_id)?.access_count).toBe(0);
+    expect(store.peekEntry(global.value.memory_id)?.access_count).toBe(0);
+    store.close();
+  });
+
+  it("prefers high-importance high-confidence context and applies type and topic filters", () => {
+    const { store, memory } = service();
+    const low = memory.remember({
+      scope: "global",
+      type: "lesson",
+      topic: "shell",
+      title: "Low rtk note",
+      body: "Low priority rtk context.",
+      tags: ["rtk"],
+      source: { kind: "agent" },
+      importance: 1,
+      confidence: 1
+    });
+    const high = memory.remember({
+      scope: "global",
+      type: "preference",
+      topic: "shell",
+      title: "High rtk note",
+      body: "High priority rtk context.",
+      tags: ["rtk"],
+      source: { kind: "user" },
+      importance: 5,
+      confidence: 5
+    });
+    expect(low.ok).toBe(true);
+    expect(high.ok).toBe(true);
+
+    const all = memory.exportMemoryContext({ scope: "global", query: "rtk", budget_chars: 2000 });
+    const filtered = memory.exportMemoryContext({
+      scope: "global",
+      query: "rtk",
+      budget_chars: 2000,
+      types: ["preference"],
+      topics: ["shell"]
+    });
+
+    expect(all.indexOf("High rtk note")).toBeLessThan(all.indexOf("Low rtk note"));
+    expect(filtered).toContain("High rtk note");
+    expect(filtered).not.toContain("Low rtk note");
+    store.close();
+  });
+
+  it("finds deterministic duplicate groups without mutating memories", () => {
+    const { store, memory } = service();
+    const first = memory.remember({
+      scope: "global",
+      type: "lesson",
+      topic: "duplicates",
+      title: "Same title",
+      body: "Same body",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    });
+    const second = memory.remember({
+      scope: "global",
+      type: "lesson",
+      topic: "duplicates",
+      title: " same   title ",
+      body: " same body ",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    });
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (!first.ok || !second.ok) throw new Error("expected duplicate memories");
+    const duplicateIds = [first.value.memory_id, second.value.memory_id].sort();
+
+    const result = memory.maintainMemories({ action: "find_duplicates", scope: "global" });
+
+    expect(result).toMatchObject({ action: "find_duplicates", changed: 0 });
+    expect(result.details).toEqual({
+      groups: [
+        expect.objectContaining({
+          reason: "same_title_and_body",
+          memory_ids: duplicateIds
+        }),
+        expect.objectContaining({
+          reason: "same_title",
+          memory_ids: duplicateIds
+        }),
+        expect.objectContaining({
+          reason: "same_body",
+          memory_ids: duplicateIds
+        })
+      ]
+    });
+    expect(store.peekEntry(first.value.memory_id)?.status).toBe("active");
+    expect(store.listAuditEvents({ event: "maintenance_run" })).toEqual([]);
+    store.close();
+  });
+
+  it("rebuilds markdown index and audits the export", () => {
+    const exportRoot = join(mkdtempSync(join(tmpdir(), "lm-service-export-")), "exports");
+    const { store, memory } = service(exportRoot);
+    const remembered = memory.remember({
+      scope: "global",
+      type: "preference",
+      topic: "shell",
+      title: "Use rtk",
+      body: "Prefix shell commands with rtk.",
+      tags: ["shell"],
+      source: { kind: "user" },
+      importance: 5,
+      confidence: 5
+    });
+    expect(remembered.ok).toBe(true);
+
+    const result = memory.maintainMemories({ action: "rebuild_markdown_index", scope: "global" });
+
+    expect(result).toMatchObject({ action: "rebuild_markdown_index", changed: 2 });
+    expect(result.details).toEqual(
+      expect.objectContaining({
+        indexPath: join(exportRoot, "global", "MEMORY.md"),
+        topicPaths: [join(exportRoot, "global", "topics", "shell.md")]
+      })
+    );
+    expect(existsSync(join(exportRoot, "global", "MEMORY.md"))).toBe(true);
+    expect(readFileSync(join(exportRoot, "global", "MEMORY.md"), "utf8")).toContain("SQLite is authoritative");
+    expect(readFileSync(join(exportRoot, "global", "topics", "shell.md"), "utf8")).toContain("mem_");
+    expect(store.listAuditEvents({ event: "markdown_exported" })).toEqual([
+      expect.objectContaining({
+        scope: "global",
+        event: "markdown_exported",
+        metadata: expect.objectContaining({
+          indexPath: join(exportRoot, "global", "MEMORY.md")
+        })
+      })
+    ]);
+    store.close();
+  });
+
+  it("expires due active memories by forgetting bodies and recording maintenance", () => {
+    const { store, memory } = service();
+    const expired = memory.remember({
+      scope: "global",
+      type: "lesson",
+      topic: "expiry",
+      title: "Expired memory",
+      body: "expired body should be removed",
+      tags: ["old"],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3,
+      expires_at: "2000-01-01T00:00:00.000Z"
+    });
+    const future = memory.remember({
+      scope: "global",
+      type: "lesson",
+      topic: "expiry",
+      title: "Future memory",
+      body: "future body should remain",
+      tags: ["new"],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3,
+      expires_at: "2999-01-01T00:00:00.000Z"
+    });
+    expect(expired.ok).toBe(true);
+    expect(future.ok).toBe(true);
+    if (!expired.ok || !future.ok) throw new Error("expected expiry memories");
+
+    const result = memory.maintainMemories({ action: "expire_due", scope: "global" });
+
+    expect(result).toMatchObject({
+      action: "expire_due",
+      changed: 1,
+      details: { expired: [{ memory_id: expired.value.memory_id, expires_at: "2000-01-01T00:00:00.000Z" }] }
+    });
+    expect(store.peekEntry(expired.value.memory_id)).toMatchObject({
+      status: "forgotten",
+      body: "",
+      tags: []
+    });
+    expect(store.peekEntry(future.value.memory_id)).toMatchObject({
+      status: "active",
+      body: "future body should remain"
+    });
+    expect(store.listAuditEvents({ event: "maintenance_run" })).toEqual([
+      expect.objectContaining({
+        scope: "global",
+        reason: "expire_due",
+        metadata: expect.objectContaining({ changed: 1 })
+      })
+    ]);
+    store.close();
+  });
+
+  it("archives low-value active memories and leaves protected entries active", () => {
+    const { store, memory } = service();
+    const low = memory.remember({
+      scope: "project",
+      project_id: "repo-a",
+      type: "lesson",
+      topic: "cleanup",
+      title: "Low value cleanup note",
+      body: "Low confidence and unaccessed.",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 1,
+      confidence: 1
+    });
+    const protectedEntry = memory.remember({
+      scope: "project",
+      project_id: "repo-a",
+      type: "lesson",
+      topic: "cleanup",
+      title: "User cleanup note",
+      body: "User-authored memories should not be archived as low value.",
+      tags: [],
+      source: { kind: "user" },
+      importance: 1,
+      confidence: 1
+    });
+    expect(low.ok).toBe(true);
+    expect(protectedEntry.ok).toBe(true);
+    if (!low.ok || !protectedEntry.ok) throw new Error("expected cleanup memories");
+
+    const result = memory.maintainMemories({ action: "archive_low_value", scope: "project", project_id: "repo-a" });
+
+    expect(result).toMatchObject({
+      action: "archive_low_value",
+      changed: 1,
+      details: { archived: [{ memory_id: low.value.memory_id, reason: "low importance, low confidence, never accessed" }] }
+    });
+    expect(store.peekEntry(low.value.memory_id)?.status).toBe("archived");
+    expect(store.peekEntry(protectedEntry.value.memory_id)?.status).toBe("active");
+    expect(store.listAuditEvents({ event: "maintenance_run" })).toEqual([
+      expect.objectContaining({
+        scope: "project",
+        project_id: "repo-a",
+        reason: "archive_low_value",
+        metadata: expect.objectContaining({ changed: 1 })
+      })
+    ]);
+    store.close();
+  });
+
+  it("reports vacuum_fts as a clear no-op when the store has no vacuum support", () => {
+    const { store, memory } = service();
+
+    const result = memory.maintainMemories({ action: "vacuum_fts", scope: "global" });
+
+    expect(result).toEqual({
+      action: "vacuum_fts",
+      changed: 0,
+      details: {
+        status: "noop",
+        reason: "SQLiteMemoryStore does not expose FTS vacuum support"
+      }
+    });
+    expect(store.listAuditEvents({ event: "maintenance_run" })).toEqual([
+      expect.objectContaining({
+        scope: "global",
+        reason: "vacuum_fts",
+        metadata: expect.objectContaining({ changed: 0 })
+      })
+    ]);
     store.close();
   });
 });
