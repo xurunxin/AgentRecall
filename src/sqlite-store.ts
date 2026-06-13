@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
 import type {
+  AuditEventName,
   MemoryAuditEvent,
   MemoryEntry,
   MemoryScope,
@@ -23,6 +24,15 @@ export type EntryFilters = {
 
 export type SearchFilters = EntryFilters & {
   query: string;
+};
+
+export type AuditFilters = {
+  memory_id?: string;
+  scope?: MemoryScope;
+  project_id?: string;
+  event?: AuditEventName | string;
+  limit?: number;
+  offset?: number;
 };
 
 export type BudgetUsage = {
@@ -241,6 +251,33 @@ function buildBudgetWhere(filters: { scope: MemoryScope; project_id?: string }):
   };
 }
 
+function buildAuditWhere(filters: AuditFilters): { where: string; params: SQLInputValue[] } {
+  const clauses: string[] = [];
+  const params: SQLInputValue[] = [];
+
+  if (filters.memory_id !== undefined) {
+    clauses.push("memory_id = ?");
+    params.push(filters.memory_id);
+  }
+  if (filters.scope !== undefined) {
+    clauses.push("scope = ?");
+    params.push(filters.scope);
+  }
+  if (filters.project_id !== undefined) {
+    clauses.push("project_id = ?");
+    params.push(filters.project_id);
+  }
+  if (filters.event !== undefined) {
+    clauses.push("event = ?");
+    params.push(filters.event);
+  }
+
+  return {
+    where: clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`,
+    params
+  };
+}
+
 export class SQLiteMemoryStore {
   private readonly db: DatabaseSync;
 
@@ -387,6 +424,10 @@ export class SQLiteMemoryStore {
     };
   }
 
+  peekEntry(id: string): MemoryEntry | undefined {
+    return this.readEntry(id);
+  }
+
   listEntries(filters: EntryFilters): MemoryEntry[] {
     const { where, params } = buildEntryWhere(filters, "memory_entries");
     const limit = normalizeLimit(filters.limit, 100);
@@ -485,6 +526,16 @@ export class SQLiteMemoryStore {
     return this.db
       .prepare("SELECT * FROM audit_events WHERE memory_id = ? ORDER BY created_at ASC")
       .all(memoryId)
+      .map(decodeAudit);
+  }
+
+  listAuditEvents(filters: AuditFilters = {}): MemoryAuditEvent[] {
+    const { where, params } = buildAuditWhere(filters);
+    const limit = normalizeLimit(filters.limit, 100);
+    const offset = normalizeOffset(filters.offset);
+    return this.db
+      .prepare(`SELECT * FROM audit_events ${where} ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?`)
+      .all(...params, limit, offset)
       .map(decodeAudit);
   }
 

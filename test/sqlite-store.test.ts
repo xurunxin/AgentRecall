@@ -62,6 +62,16 @@ describe("SQLiteMemoryStore", () => {
     store.close();
   });
 
+  it("peeks entries without recording access", () => {
+    const store = new SQLiteMemoryStore(join(mkdtempSync(join(tmpdir(), "lm-store-")), "memory.sqlite"));
+    store.insertEntry(makeEntry());
+
+    expect(store.peekEntry("mem_test_001")?.access_count).toBe(0);
+    expect(store.peekEntry("mem_test_001")?.access_count).toBe(0);
+    expect(store.getEntry("mem_test_001")?.access_count).toBe(1);
+    store.close();
+  });
+
   it("updates entries, appends audit events, and reports budget usage", () => {
     const store = new SQLiteMemoryStore(join(mkdtempSync(join(tmpdir(), "lm-store-")), "memory.sqlite"));
     store.insertEntry(makeEntry());
@@ -85,6 +95,7 @@ describe("SQLiteMemoryStore", () => {
     });
     expect(store.getEntry("mem_test_001")).toMatchObject({ title: "Updated title" });
     expect(store.getAuditEvents("mem_test_001")).toHaveLength(1);
+    expect(store.listAuditEvents({ event: "updated" })).toHaveLength(1);
     expect(store.getBudgetUsage({ scope: "project", project_id: "repo-123" })).toMatchObject({
       active_entries: 1,
       active_chars: 42
