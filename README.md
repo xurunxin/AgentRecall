@@ -46,7 +46,7 @@ Set `AGENT_RECALL_HOME` to use a different directory:
 AGENT_RECALL_HOME=/path/to/agent-recall npm start
 ```
 
-The legacy `LOCAL_MEMORY_MCP_HOME` variable is also honored when `AGENT_RECALL_HOME` is not set. The server trims empty values and falls back to `~/.agent-recall`. Home-relative values beginning with `~/` or `~\` are expanded against the current user's home directory. Other values are resolved to an absolute path. In JSON client configs on Windows, escape backslashes, for example `G:\\Memory\\AgentRecall`.
+The legacy `LOCAL_MEMORY_MCP_HOME` variable is also honored when `AGENT_RECALL_HOME` is not set. The server trims empty values and falls back to `~/.agent-recall`. Home-relative values beginning with `~/` or `~\` are expanded against the current user's home directory. Other values are resolved to an absolute path. In JSON client configs on Windows, escape backslashes, for example `C:\\path\\to\\agent-recall-data`.
 
 ## MCP Client Config
 
@@ -57,9 +57,9 @@ Most MCP clients support a JSON server entry. Use the built file after `npm run 
   "mcpServers": {
     "agent-recall": {
       "command": "node",
-      "args": ["G:\\Projects\\MetronX\\AgentRecall\\dist\\index.js"],
+      "args": ["/path/to/agent-recall/dist/index.js"],
       "env": {
-        "AGENT_RECALL_HOME": "G:\\Memory\\AgentRecall"
+        "AGENT_RECALL_HOME": "/path/to/agent-recall-data"
       }
     }
   }
@@ -74,9 +74,9 @@ If your client supports `cwd`, you can launch through npm:
     "agent-recall": {
       "command": "npm",
       "args": ["start"],
-      "cwd": "G:\\Projects\\MetronX\\AgentRecall",
+      "cwd": "/path/to/agent-recall",
       "env": {
-        "AGENT_RECALL_HOME": "G:\\Memory\\AgentRecall"
+        "AGENT_RECALL_HOME": "/path/to/agent-recall-data"
       }
     }
   }
@@ -87,6 +87,7 @@ If your client supports `cwd`, you can launch through npm:
 
 | Tool | Description |
 | --- | --- |
+| `recall_context` | Task-start memory recall entry point. Call this near the beginning of a coding task to retrieve relevant global or project context. |
 | `remember` | Store one validated local memory entry. |
 | `search_memories` | Search memories by full-text query and optional metadata filters. |
 | `get_memory` | Read one memory entry and its audit history by memory id. |
@@ -109,6 +110,7 @@ If your client supports `cwd`, you can launch through npm:
 
 ## Memory Hygiene
 
+- At task start, prefer `recall_context` with the current task query and, when available, the current project path.
 - Keep each memory atomic: one preference, decision, constraint, lesson, or debugging fact per entry.
 - Search before writing to avoid duplicate or near-duplicate memories.
 - Use project scope for repository-specific facts, paths, commands, and debugging lessons.
@@ -136,14 +138,10 @@ Markdown exports are for inspection and handoff. Manual edits under `exports/` m
 
 ## Verification
 
-In this repository's local environment, shell commands are normally run through `rtk`:
-
 ```bash
-rtk npm test -- test/e2e.test.ts
-rtk npm test
-rtk npm run typecheck
-rtk npm run build
-rtk git diff --check
+npm test -- test/e2e.test.ts
+npm test
+npm run typecheck
+npm run build
+git diff --check
 ```
-
-Without the local wrapper, run the same npm and git commands without the `rtk` prefix.

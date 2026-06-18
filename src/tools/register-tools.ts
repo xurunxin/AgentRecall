@@ -8,6 +8,7 @@ export type MemoryToolHandler = (input: unknown) => Promise<CallToolResult>;
 export type MemoryToolHandlers = Record<MemoryToolName, MemoryToolHandler>;
 
 const memoryToolNames = [
+  "recall_context",
   "remember",
   "search_memories",
   "get_memory",
@@ -21,8 +22,11 @@ const memoryToolNames = [
 ] as const satisfies readonly MemoryToolName[];
 
 const memoryToolDescriptions: Record<MemoryToolName, string> = {
-  remember: "Store a validated local memory entry.",
-  search_memories: "Search local memories by full-text query and optional filters.",
+  recall_context:
+    "Call this near the start of a task to retrieve relevant AgentRecall memory for the current repo or user before planning or editing.",
+  remember:
+    "Store one atomic, durable memory after learning a reusable user preference, project fact, decision, procedure, debugging lesson, or constraint.",
+  search_memories: "Search local memories by full-text query and optional filters before writing or when you need a specific past fact.",
   get_memory: "Read a memory entry and its audit history by memory id.",
   list_memories: "List local memories with optional scope and metadata filters.",
   update_memory: "Update mutable fields on an active or archived memory.",
@@ -188,6 +192,9 @@ function textHandler<T>(
 
 export function createMemoryToolHandlers(service: MemoryService): MemoryToolHandlers {
   return {
+    recall_context: textHandler("recall_context", memoryToolSchemas.recall_context, (input) =>
+      service.exportMemoryContext(serviceInput<Parameters<MemoryService["exportMemoryContext"]>[0]>(input))
+    ),
     remember: jsonHandler("remember", memoryToolSchemas.remember, (input) =>
       service.remember(serviceInput<Parameters<MemoryService["remember"]>[0]>(input))
     ),

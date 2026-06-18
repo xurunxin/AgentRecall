@@ -238,6 +238,20 @@ export const exportMemoryContextToolSchema = z
   .strict()
   .superRefine(requireProjectIdentity);
 
+export const recallContextToolSchema = z
+  .object({
+    query: nonEmptyString.optional(),
+    scope: scopeSchema.default("global"),
+    project_id: nonEmptyString.optional(),
+    project_path: nonEmptyString.optional(),
+    include_global: z.boolean().default(true),
+    budget_chars: z.number().int().min(100).max(50_000).default(8000),
+    types: z.array(typeSchema).default([]),
+    topics: stringListSchema
+  })
+  .strict()
+  .superRefine(requireProjectIdentity);
+
 export const rememberSchema = rememberToolSchema;
 export const searchSchema = searchMemoriesToolSchema;
 export const getMemorySchema = getMemoryToolSchema;
@@ -248,8 +262,10 @@ export const forgetSchema = forgetMemoryToolSchema;
 export const budgetSchema = getMemoryBudgetToolSchema;
 export const maintainSchema = maintainMemoriesToolSchema;
 export const exportContextSchema = exportMemoryContextToolSchema;
+export const recallContextSchema = recallContextToolSchema;
 
 export const memoryToolSchemas = {
+  recall_context: recallContextToolSchema,
   remember: rememberToolSchema,
   search_memories: searchMemoriesToolSchema,
   get_memory: getMemoryToolSchema,

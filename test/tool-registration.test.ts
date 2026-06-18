@@ -67,6 +67,19 @@ describe("memory tool schemas", () => {
     });
   });
 
+  it("defaults recall context for low-friction task-start retrieval", () => {
+    const parsed = memoryToolSchemas.recall_context.parse({ query: "startup failure" });
+
+    expect(parsed).toEqual({
+      query: "startup failure",
+      scope: "global",
+      include_global: true,
+      budget_chars: 8000,
+      types: [],
+      topics: []
+    });
+  });
+
   it("rejects project remembers without a project identity", () => {
     expect(() =>
       memoryToolSchemas.remember.parse({
@@ -220,6 +233,30 @@ describe("createMemoryToolHandlers", () => {
     expect(textOf(result)).toBe("# AgentRecall Context\n\n## Memories\n");
   });
 
+  it("recalls context through a task-start friendly tool", async () => {
+    const service = fakeService({
+      exportMemoryContext: vi.fn(() => "# AgentRecall Context\n\n## Memories\n")
+    });
+    const handlers = createMemoryToolHandlers(service);
+
+    const result = await handlers.recall_context({
+      query: "tool registration",
+      scope: "project",
+      project_path: "G:\\Projects\\Repo"
+    });
+
+    expect(service.exportMemoryContext).toHaveBeenCalledWith({
+      query: "tool registration",
+      scope: "project",
+      project_path: "G:\\Projects\\Repo",
+      include_global: true,
+      budget_chars: 8000,
+      types: [],
+      topics: []
+    });
+    expect(textOf(result)).toContain("# AgentRecall Context");
+  });
+
   it("wraps service error results as JSON text", async () => {
     const service = fakeService({
       searchMemories: vi.fn(() => ({ ok: false, error: "invalid_scope", message: "project scope requires project_id or project_path" }))
@@ -337,6 +374,7 @@ describe("registerMemoryTools", () => {
     registerMemoryTools(server, fakeService());
 
     expect(registered.map((tool) => tool.name)).toEqual([
+      "recall_context",
       "remember",
       "search_memories",
       "get_memory",
@@ -348,6 +386,7 @@ describe("registerMemoryTools", () => {
       "maintain_memories",
       "export_memory_context"
     ]);
+    expect(registered[0]?.config.description).toContain("Call this near the start of a task");
     for (const tool of registered) {
       expect(tool.config.description).toEqual(expect.any(String));
       expect(tool.config.inputSchema).toBe(memoryToolSchemas[tool.name as keyof typeof memoryToolSchemas]);
