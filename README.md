@@ -116,17 +116,25 @@ machine-readable output and `--no-color` to disable ANSI colors.
 
 ## Per-Client Env Setup
 
-`AGENT_RECALL_ACTOR` controls which agent name shows up in the audit log.
-Set it in the MCP server's `env` block in your client's JSON config. Without
-it, audit rows are written as `agent:unknown` (or the legacy `agent` value
-until the v1→v2 migration is run).
+`AGENT_RECALL_ACTOR` controls which agent name shows up in the audit log
+and in the `last_accessed_by` map. Set it in the MCP server's `env` block
+in your client's JSON config. Without it, audit rows are written as
+`agent:unknown` (or the legacy `agent` value until the v1→v2 migration
+is run), and per-agent access hints on `get_memory` calls are not
+recorded.
 
 Recommended names: `claude-code`, `cursor`, `codex`, `aider`, `cline`,
 `continue`, `windsurf`, `roo-cline`, `copilot`.
 
+The `last_accessed_by` column lands with the **v2 → v3 migration** in
+Stage 2; existing v2 databases need `agent-recall migrate --yes` to
+opt in. `remember` calls that hit a duplicate-candidate also need an
+explicit `confirm_write: true` from the caller to proceed — the agent
+should not silently overwrite.
+
 ## Doctor
 
-`agent-recall doctor` runs nine health checks and exits with:
+`agent-recall doctor` runs ten health checks and exits with:
 
 - `0` — all OK
 - `1` — warnings present, no failures
@@ -159,6 +167,7 @@ maintenance actions (`rebuild_markdown_index`, `expire_due`,
 | `forget_memory` | Forget a memory by clearing its body and marking it forgotten. |
 | `get_memory_budget` | Report budget usage and cleanup candidates for a scope. |
 | `maintain_memories` | Run local maintenance actions such as export rebuilds, expiry, cleanup, FTS vacuum, or duplicate detection. |
+| `merge_memories` | Merge two or more active memories into a single replacement. Requires `confirm_write` semantics; relaxes budget to allow post-merge cap. |
 | `export_memory_context` | Export selected memories as a bounded markdown context pack. |
 
 ## Tool And Schema Notes
@@ -200,9 +209,13 @@ Markdown exports are for inspection and handoff. Manual edits under `exports/` m
 
 ## Changelog
 
-Stage-level changes are tracked in [`CHANGELOG.md`](./CHANGELOG.md). Stage 1
-delivered CLI, doctor, backup, structured `actor`, schema migration, and
-rewritten tool descriptions; see the [Stage 1 closure report](./docs/superpowers/plans/2026-07-19-stage-one-closure.md) for plan-vs-actual details.
+Stage-level changes are tracked in [`CHANGELOG.md`](./CHANGELOG.md).
+Stage 2 delivered `merge_memories`, `confirm_write`, the
+`last_accessed_by` column (with v2 → v3 migration), and a tenth doctor
+check; see the [Stage 2 closure report](./docs/superpowers/plans/2026-07-19-stage-two-closure.md).
+Stage 1 delivered CLI, doctor, backup, structured `actor`, schema
+migration, and rewritten tool descriptions; see the
+[Stage 1 closure report](./docs/superpowers/plans/2026-07-19-stage-one-closure.md).
 
 ## Verification
 
