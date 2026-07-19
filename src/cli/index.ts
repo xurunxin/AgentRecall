@@ -6,6 +6,14 @@
 
 import { resolveDataHome } from "../index.js";
 import { SQLiteMemoryStore } from "../sqlite-store.js";
+import { auditCommand } from "./commands/audit.js";
+import { backupCommand } from "./commands/backup.js";
+import { doctorCommand } from "./commands/doctor.js";
+import { exportCommand } from "./commands/export.js";
+import { listCommand } from "./commands/list.js";
+import { migrateCommand } from "./commands/migrate.js";
+import { searchCommand } from "./commands/search.js";
+import { showCommand } from "./commands/show.js";
 import { parseArgs, type ParsedArgs } from "./arg-parser.js";
 
 export type CliContext = {
@@ -42,7 +50,15 @@ Global flags:
 type CommandHandler = (ctx: CliContext) => CliResult | Promise<CliResult>;
 
 const dispatch: Record<string, CommandHandler> = {
-  help: () => ({ exitCode: 0, stdout: HELP_TEXT, stderr: "" })
+  help: () => ({ exitCode: 0, stdout: HELP_TEXT, stderr: "" }),
+  list: listCommand,
+  show: showCommand,
+  search: searchCommand,
+  audit: auditCommand,
+  doctor: doctorCommand,
+  export: exportCommand,
+  backup: backupCommand,
+  migrate: migrateCommand
 };
 
 export async function runCli(
