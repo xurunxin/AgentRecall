@@ -574,18 +574,37 @@ export class SQLiteMemoryStore {
     });
   }
 
-  getEntry(id: string): MemoryEntry | undefined {
+  getEntry(id: string, accessedBy?: string): MemoryEntry | undefined {
     const entry = this.readEntry(id);
     if (entry === undefined) return undefined;
 
     const lastAccessedAt = new Date().toISOString();
-    this.db
-      .prepare("UPDATE memory_entries SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?")
-      .run(lastAccessedAt, id);
+
+    // Update the per-agent access map. `decodeEntry` already parsed the
+    // JSON column into a `Record<string, string>` (or left it undefined
+    // for rows that have never been read with an actor). We extend that
+    // map; a missing or undefined map is treated as empty.
+    let nextMap: Record<string, string> | undefined;
+    if (accessedBy !== undefined) {
+      const existing = entry.last_accessed_by ?? {};
+      nextMap = { ...existing, [accessedBy]: lastAccessedAt };
+    }
+
+    if (nextMap !== undefined) {
+      this.db
+        .prepare("UPDATE memory_entries SET access_count = access_count + 1, last_accessed_at = ?, last_accessed_by = ? WHERE id = ?")
+        .run(lastAccessedAt, JSON.stringify(nextMap), id);
+    } else {
+      this.db
+        .prepare("UPDATE memory_entries SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?")
+        .run(lastAccessedAt, id);
+    }
+
     return {
       ...entry,
       access_count: entry.access_count + 1,
-      last_accessed_at: lastAccessedAt
+      last_accessed_at: lastAccessedAt,
+      ...(nextMap !== undefined ? { last_accessed_by: nextMap } : {})
     };
   }
 

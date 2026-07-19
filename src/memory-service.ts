@@ -387,8 +387,11 @@ export class MemoryService {
     };
   }
 
-  getMemory(id: string): { entry: MemoryEntry; audit: MemoryAuditEvent[] } | undefined {
-    const entry = this.store.getEntry(id);
+  getMemory(
+    id: string,
+    accessedBy?: string
+  ): { entry: MemoryEntry; audit: MemoryAuditEvent[] } | undefined {
+    const entry = this.store.getEntry(id, accessedBy);
     return entry === undefined ? undefined : { entry, audit: this.store.getAuditEvents(id) };
   }
 

@@ -30,7 +30,7 @@ describe("runDoctor", () => {
     const report = runDoctor(ctx);
     expect(report.exit_code).toBe(0);
     expect(report.summary.fail).toBe(0);
-    expect(report.results.length).toBe(9);
+    expect(report.results.length).toBe(10);
     store.close();
   });
 
