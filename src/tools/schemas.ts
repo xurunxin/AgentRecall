@@ -198,6 +198,15 @@ export const supersedeMemoryToolSchema = z
   })
   .strict();
 
+export const mergeMemoriesToolSchema = z
+  .object({
+    old_memory_ids: z.array(nonEmptyString).min(2),
+    replacement: rememberToolSchema,
+    reason: nonEmptyString,
+    strategy: z.enum(["keep_first", "keep_newest"]).default("keep_first")
+  })
+  .strict();
+
 export const forgetMemoryToolSchema = z
   .object({
     id: nonEmptyString.optional(),
@@ -273,6 +282,7 @@ export const memoryToolSchemas = {
   list_memories: listMemoriesToolSchema,
   update_memory: updateMemoryToolSchema,
   supersede_memory: supersedeMemoryToolSchema,
+  merge_memories: mergeMemoriesToolSchema,
   forget_memory: forgetMemoryToolSchema,
   get_memory_budget: getMemoryBudgetToolSchema,
   maintain_memories: maintainMemoriesToolSchema,
