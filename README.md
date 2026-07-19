@@ -57,7 +57,7 @@ Most MCP clients support a JSON server entry. Use the built file after `npm run 
   "mcpServers": {
     "agent-recall-mcp": {
       "command": "node",
-      "args": ["/path/to/agent-recall/dist/index.js"],
+      "args": ["/path/to/agent-recall/dist/src/index.js"],
       "env": {
         "AGENT_RECALL_HOME": "/path/to/agent-recall-data",
         "AGENT_RECALL_ACTOR": "claude-code"
@@ -67,7 +67,7 @@ Most MCP clients support a JSON server entry. Use the built file after `npm run 
 }
 ```
 
-> **Note:** As of stage 1, the `bin` field in `package.json` publishes the CLI as `agent-recall`. MCP server entry is exposed as `agent-recall-mcp` (or via the explicit path `node /path/to/agent-recall/dist/index.js`). Existing configs that invoke the bare `agent-recall` command will start a CLI process instead and fail to connect — update them to use `agent-recall-mcp` or the explicit path. The MCP server prints a one-time deprecation notice to stderr unless `AGENT_RECALL_SUPPRESS_MCP_DEPRECATION=1` is set.
+> **Note:** As of stage 1, the `bin` field in `package.json` publishes the CLI as `agent-recall`. MCP server entry is exposed as `agent-recall-mcp` (or via the explicit path `node /path/to/agent-recall/dist/src/index.js`). Existing configs that invoke the bare `agent-recall` command will start a CLI process instead and fail to connect — update them to use `agent-recall-mcp` or the explicit path. The MCP server prints a one-time deprecation notice to stderr unless `AGENT_RECALL_SUPPRESS_MCP_DEPRECATION=1` is set.
 
 If your client supports `cwd`, you can launch through npm:
 

@@ -38,7 +38,7 @@ export async function main(): Promise<void> {
   if (process.env.AGENT_RECALL_SUPPRESS_MCP_DEPRECATION !== "1") {
     console.error(
       "[agent-recall] Note: the `agent-recall` binary is now the CLI. " +
-        "MCP server entry is `dist/index.js` (also published as `agent-recall-mcp`). " +
+        "MCP server entry is `dist/src/index.js` (also published as `agent-recall-mcp`). " +
         "Set AGENT_RECALL_SUPPRESS_MCP_DEPRECATION=1 to silence this message."
     );
   }
