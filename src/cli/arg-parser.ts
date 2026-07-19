@@ -26,15 +26,18 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
   }
   const args = [...argv];
   let command = "help";
-  if (args.length > 0 && !args[0].startsWith("-")) {
-    command = args.shift()!;
+  if (args.length > 0) {
+    const first = args[0]!;
+    if (!first.startsWith("-")) {
+      command = args.shift()!;
+    }
   }
   const positional: string[] = [];
   const flags: Record<string, string | boolean> = {};
   let afterDoubleDash = false;
 
   for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i];
+    const arg = args[i]!;
     if (afterDoubleDash) {
       positional.push(arg);
       continue;
