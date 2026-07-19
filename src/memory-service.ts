@@ -107,7 +107,7 @@ export type MaintainMemoriesResult = {
   details: unknown;
 };
 
-type RememberError = "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded";
+type RememberError = "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate";
 type UpdateError = "not_found" | "invalid_state" | "invalid_schema" | "secret_detected" | "capacity_exceeded";
 type SupersedeError = RememberError | "not_found" | "invalid_state";
 type ForgetError = "not_found";
@@ -278,6 +278,23 @@ export class MemoryService {
     const prepared = this.prepareRemember(input, true);
     if (!prepared.ok) {
       return prepared;
+    }
+    // Forced-confirm flow: if a duplicate candidate is detected, the
+    // caller must opt in by passing `confirm_write: true` to proceed.
+    if (input.confirm_write !== true) {
+      const matchingIds = prepared.value.budget.warnings
+        .filter((w) => w.code === "duplicate_candidate")
+        .map((w) => w.memory_id);
+      if (matchingIds.length > 0) {
+        // No store writes have happened yet; prepareRemember is read-only.
+        // We audit the rejection so the agent can see what happened.
+        this.auditRejected(input, "duplicate_candidate", { matching_ids: matchingIds });
+        return err(
+          "duplicate_candidate",
+          "existing active memory has the same title or body; pass confirm_write: true to proceed",
+          { matching_ids: matchingIds }
+        );
+      }
     }
     return this.store.transaction(() => ok(this.commitPreparedRemember(prepared.value)));
   }

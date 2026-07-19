@@ -100,6 +100,7 @@ export const rememberToolSchema = z
     confidence: ratingSchema,
     status: writableStatusSchema.default("active"),
     expires_at: nonEmptyString.optional(),
+    confirm_write: z.boolean().optional(),
     review_after: nonEmptyString.optional(),
     supersedes: stringListSchema
   })
