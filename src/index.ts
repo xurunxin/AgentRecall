@@ -31,10 +31,17 @@ export function resolveDataHome(env: NodeJS.ProcessEnv = process.env): string {
 export function createService(dataHome = resolveDataHome()): MemoryService {
   const store = new SQLiteMemoryStore(join(dataHome, "memory.sqlite"));
   const exporter = new MarkdownExporter(join(dataHome, "exports"));
-  return new MemoryService(store, exporter);
+  return new MemoryService(store, exporter, undefined, dataHome);
 }
 
 export async function main(): Promise<void> {
+  if (process.env.AGENT_RECALL_SUPPRESS_MCP_DEPRECATION !== "1") {
+    console.error(
+      "[agent-recall] Note: the `agent-recall` binary is now the CLI. " +
+        "MCP server entry is `dist/src/index.js` (also published as `agent-recall-mcp`). " +
+        "Set AGENT_RECALL_SUPPRESS_MCP_DEPRECATION=1 to silence this message."
+    );
+  }
   const service = createService();
   const server = new McpServer({
     name: serverName(),

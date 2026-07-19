@@ -90,7 +90,8 @@ export type AuditEventName =
   | "forgotten"
   | "write_rejected"
   | "maintenance_run"
-  | "markdown_exported";
+  | "markdown_exported"
+  | "backup_created";
 
 export type MemoryAuditEvent = {
   id: string;

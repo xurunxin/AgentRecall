@@ -55,33 +55,95 @@ Most MCP clients support a JSON server entry. Use the built file after `npm run 
 ```json
 {
   "mcpServers": {
-    "agent-recall": {
+    "agent-recall-mcp": {
       "command": "node",
-      "args": ["/path/to/agent-recall/dist/index.js"],
+      "args": ["/path/to/agent-recall/dist/src/index.js"],
       "env": {
-        "AGENT_RECALL_HOME": "/path/to/agent-recall-data"
+        "AGENT_RECALL_HOME": "/path/to/agent-recall-data",
+        "AGENT_RECALL_ACTOR": "claude-code"
       }
     }
   }
 }
 ```
+
+> **Note:** As of stage 1, the `bin` field in `package.json` publishes the CLI as `agent-recall`. MCP server entry is exposed as `agent-recall-mcp` (or via the explicit path `node /path/to/agent-recall/dist/src/index.js`). Existing configs that invoke the bare `agent-recall` command will start a CLI process instead and fail to connect — update them to use `agent-recall-mcp` or the explicit path. The MCP server prints a one-time deprecation notice to stderr unless `AGENT_RECALL_SUPPRESS_MCP_DEPRECATION=1` is set.
 
 If your client supports `cwd`, you can launch through npm:
 
 ```json
 {
   "mcpServers": {
-    "agent-recall": {
+    "agent-recall-mcp": {
       "command": "npm",
       "args": ["start"],
       "cwd": "/path/to/agent-recall",
       "env": {
-        "AGENT_RECALL_HOME": "/path/to/agent-recall-data"
+        "AGENT_RECALL_HOME": "/path/to/agent-recall-data",
+        "AGENT_RECALL_ACTOR": "claude-code"
       }
     }
   }
 }
 ```
+
+## CLI
+
+A standalone terminal interface is available alongside the MCP server. Use it
+for one-off inspection, health checks, manual backups, and schema migration.
+
+```bash
+# via npm script (no build required)
+npm run cli -- doctor
+npm run cli -- list --limit 10
+npm run cli -- search "postgres" --limit 5
+npm run cli -- show <memory_id>
+npm run cli -- audit <memory_id>
+npm run cli -- backup
+npm run cli -- migrate --yes
+```
+
+After `npm run build`, the same commands are available via the `agent-recall`
+binary:
+
+```bash
+node dist/bin/agent-recall.js doctor
+```
+
+The CLI respects the same `AGENT_RECALL_HOME` / `LOCAL_MEMORY_MCP_HOME`
+environment variables as the MCP server. All commands accept `--json` for
+machine-readable output and `--no-color` to disable ANSI colors.
+
+## Per-Client Env Setup
+
+`AGENT_RECALL_ACTOR` controls which agent name shows up in the audit log.
+Set it in the MCP server's `env` block in your client's JSON config. Without
+it, audit rows are written as `agent:unknown` (or the legacy `agent` value
+until the v1→v2 migration is run).
+
+Recommended names: `claude-code`, `cursor`, `codex`, `aider`, `cline`,
+`continue`, `windsurf`, `roo-cline`, `copilot`.
+
+## Doctor
+
+`agent-recall doctor` runs nine health checks and exits with:
+
+- `0` — all OK
+- `1` — warnings present, no failures
+- `2` — at least one failure (data integrity, missing data home, etc.)
+
+Use it as a periodic self-check or before/after risky operations like
+schema upgrades or hand-edits to the SQLite file. `--json` is supported for
+scripting.
+
+## Backup
+
+Backups are written to `<AGENT_RECALL_HOME>/backups/memory-<timestamp>.sqlite`
+via SQLite's `VACUUM INTO` command. The 14 most recent backups are kept; older
+ones are pruned automatically. Backups run automatically after successful
+maintenance actions (`rebuild_markdown_index`, `expire_due`,
+`archive_low_value`). Use `agent-recall backup` to trigger one manually, or
+`--keep N` to override the retention count.
 
 ## Tools
 
@@ -135,6 +197,12 @@ Generated markdown exports are stored at:
 ```
 
 Markdown exports are for inspection and handoff. Manual edits under `exports/` may be overwritten by `maintain_memories` with `action: "rebuild_markdown_index"`.
+
+## Changelog
+
+Stage-level changes are tracked in [`CHANGELOG.md`](./CHANGELOG.md). Stage 1
+delivered CLI, doctor, backup, structured `actor`, schema migration, and
+rewritten tool descriptions; see the [Stage 1 closure report](./docs/superpowers/plans/2026-07-19-stage-one-closure.md) for plan-vs-actual details.
 
 ## Verification
 

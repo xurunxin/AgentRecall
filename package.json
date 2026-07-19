@@ -5,7 +5,8 @@
   "type": "module",
   "description": "Local-first MCP memory server for coding agents.",
   "bin": {
-    "agent-recall": "./dist/index.js"
+    "agent-recall": "./dist/bin/agent-recall.js",
+    "agent-recall-mcp": "./dist/src/index.js"
   },
   "engines": {
     "node": ">=24.0.0"
@@ -13,7 +14,9 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts",
-    "start": "node dist/index.js",
+    "start": "node dist/src/index.js",
+    "cli": "tsx bin/agent-recall.ts",
+    "cli:doctor": "tsx bin/agent-recall.ts doctor",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json --noEmit"
