@@ -299,6 +299,15 @@ export class SQLiteMemoryStore {
     this.db.close();
   }
 
+  /**
+   * Returns the underlying database handle. Intended ONLY for backup
+   * (VACUUM INTO). Do not call arbitrary statements; doing so bypasses
+   * the store's row-decoding and audit/FTS bookkeeping.
+   */
+  backupHandle(): DatabaseSync {
+    return this.db;
+  }
+
   transaction<T>(work: () => T): T {
     if (this.transactionDepth > 0) {
       return work();

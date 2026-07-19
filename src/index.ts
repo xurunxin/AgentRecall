@@ -31,7 +31,7 @@ export function resolveDataHome(env: NodeJS.ProcessEnv = process.env): string {
 export function createService(dataHome = resolveDataHome()): MemoryService {
   const store = new SQLiteMemoryStore(join(dataHome, "memory.sqlite"));
   const exporter = new MarkdownExporter(join(dataHome, "exports"));
-  return new MemoryService(store, exporter);
+  return new MemoryService(store, exporter, undefined, dataHome);
 }
 
 export async function main(): Promise<void> {

@@ -28,6 +28,7 @@ import {
 import { MarkdownExporter } from "./markdown-exporter.js";
 import { resolveActor } from "./actor.js";
 import { resolveMemoryScope } from "./scope-resolver.js";
+import { runBackup } from "./backup.js";
 import type { BudgetUsage, EntryFilters, SearchFilters, SQLiteMemoryStore } from "./sqlite-store.js";
 import {
   type RememberInput,
@@ -245,7 +246,12 @@ export class MemoryService {
      * migration) widens the constraint, after which the call sites
      * start writing structured values like `agent:claude-code`.
      */
-    private readonly defaultActor: string = "agent"
+    private readonly defaultActor: string = "agent",
+    /**
+     * Data home directory, used as the destination for `backups/`.
+     * If unset, automatic backup is disabled.
+     */
+    private readonly dataHome?: string
   ) {}
 
   configureProjectBudget(
@@ -647,6 +653,40 @@ export class MemoryService {
     });
   }
 
+  backup(): { path: string; size: number; duration_ms: number } | { error: string } {
+    if (this.dataHome === undefined) {
+      return { error: "data_home_unknown" };
+    }
+    const backupDir = join(this.dataHome, "backups");
+    try {
+      const result = runBackup(this.store.backupHandle(), { backupDir });
+      this.appendAudit({
+        scope: "global",
+        event: "backup_created",
+        actor: "system:backup",
+        reason: "backup_created",
+        metadata: {
+          path: result.path,
+          size: result.size,
+          duration_ms: result.durationMs,
+          kept: result.kept,
+          pruned: result.pruned
+        }
+      });
+      return { path: result.path, size: result.size, duration_ms: result.durationMs };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.appendAudit({
+        scope: "global",
+        event: "maintenance_run",
+        actor: "system:backup",
+        reason: "backup_failed",
+        metadata: { action: "backup_failed", error: message }
+      });
+      return { error: message };
+    }
+  }
+
   getMemoryBudget(input: { scope: "global" }): MemoryBudgetResult;
   getMemoryBudget(input: { scope: "project"; project_id: string }): MemoryBudgetResult;
   getMemoryBudget(input: { scope: MemoryScope; project_id?: string }): MemoryBudgetResult | Result<never, "invalid_scope">;
@@ -720,6 +760,16 @@ export class MemoryService {
       case "vacuum_fts":
         return this.vacuumFts(resolved.value);
     }
+  }
+
+  /**
+   * Run a backup after a maintenance action that mutated state. No-op if
+   * the changed count is zero or if dataHome is unset. Backup errors are
+   * swallowed (they're already audited inside `backup()`).
+   */
+  private maybeBackup(changed: number): void {
+    if (changed <= 0 || this.dataHome === undefined) return;
+    this.backup();
   }
 
   private markdownExporter(): MarkdownExporter {
@@ -873,6 +923,7 @@ export class MemoryService {
         };
       });
       published.complete();
+      this.maybeBackup(changed);
       return result;
     } catch (error) {
       if (published === undefined) {
@@ -906,6 +957,7 @@ export class MemoryService {
       }
       const details = failed.length === 0 ? { expired: forgotten } : { expired: forgotten, failed };
       this.appendMaintenanceAudit(scope, "expire_due", forgotten.length, details);
+      this.maybeBackup(forgotten.length);
       return {
         action: "expire_due",
         changed: forgotten.length,
@@ -935,6 +987,7 @@ export class MemoryService {
       }
       const details = failed.length === 0 ? { archived } : { archived, failed };
       this.appendMaintenanceAudit(scope, "archive_low_value", archived.length, details);
+      this.maybeBackup(archived.length);
       return {
         action: "archive_low_value",
         changed: archived.length,
