@@ -26,6 +26,13 @@ export type SearchFilters = EntryFilters & {
   query: string;
 };
 
+/**
+ * Current authoritative schema version. Stage 1 introduces explicit
+ * `PRAGMA user_version` tracking. v2 loosens the `audit_events.actor`
+ * CHECK constraint to allow structured values like `agent:claude-code`.
+ */
+export const CURRENT_SCHEMA_VERSION = 2;
+
 export type AuditFilters = {
   memory_id?: string;
   scope?: MemoryScope;
@@ -381,6 +388,103 @@ export class SQLiteMemoryStore {
         body,
         tags
       );
+    `);
+    this.migrateForward();
+  }
+
+  private readUserVersion(): number {
+    const row = this.db.prepare("PRAGMA user_version").get();
+    if (row === undefined) return 0;
+    const value = (row as Record<string, unknown>).user_version;
+    return typeof value === "number" ? value : 0;
+  }
+
+  getUserVersion(): number {
+    return this.readUserVersion();
+  }
+
+  setUserVersion(version: number): void {
+    // Exposed for the CLI migrate command. Runs outside a transaction.
+    this.db.exec(`PRAGMA user_version = ${version}`);
+  }
+
+  runMigrations(): { from: number; to: number } {
+    const before = this.readUserVersion();
+    this.migrateForward();
+    const after = this.readUserVersion();
+    return { from: before, to: after };
+  }
+
+  private migrateForward(): void {
+    const current = this.readUserVersion();
+    if (current >= CURRENT_SCHEMA_VERSION) {
+      return;
+    }
+    for (let version = current + 1; version <= CURRENT_SCHEMA_VERSION; version += 1) {
+      this.migrateToVersion(version);
+    }
+  }
+
+  private migrateToVersion(version: number): void {
+    if (version === 1) {
+      // v1 is the base schema. The CREATE TABLE IF NOT EXISTS DDL above
+      // is already the v1 shape; this step just records the version
+      // marker so a future v1->v2 migration has a stable starting point.
+      this.setUserVersion(1);
+      return;
+    }
+    if (version === 2) {
+      this.migrate_v1_to_v2();
+      return;
+    }
+    throw new Error(`No migration registered for schema version ${version}`);
+  }
+
+  private migrate_v1_to_v2(): void {
+    // Loosen the audit_events.actor CHECK constraint to accept structured
+    // values like "agent:claude-code". The v1 constraint allowed only
+    // "agent" / "user" / "system". SQLite does not support `ALTER TABLE ...
+    // DROP CONSTRAINT` and node:sqlite blocks `PRAGMA writable_schema`, so
+    // we rebuild the table: create _v2 without the CHECK, copy rows over,
+    // drop the old table, rename.
+    const row = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'audit_events'")
+      .get() as { sql: string } | undefined;
+    if (row === undefined) {
+      this.db.exec("PRAGMA user_version = 2");
+      return;
+    }
+    if (!/CHECK \(actor IN \('agent', 'user', 'system'\)\)/.test(row.sql)) {
+      // Already migrated (no CHECK to replace)
+      this.db.exec("PRAGMA user_version = 2");
+      return;
+    }
+    this.db.exec(`
+      CREATE TABLE audit_events_v2 (
+        id TEXT PRIMARY KEY,
+        memory_id TEXT,
+        scope TEXT NOT NULL CHECK (scope IN ('global', 'project')),
+        project_id TEXT,
+        event TEXT NOT NULL,
+        reason TEXT,
+        actor TEXT NOT NULL,
+        metadata_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      ) STRICT;
+
+      INSERT INTO audit_events_v2
+        (id, memory_id, scope, project_id, event, reason, actor, metadata_json, created_at)
+        SELECT id, memory_id, scope, project_id, event, reason, actor, metadata_json, created_at
+        FROM audit_events;
+
+      DROP TABLE audit_events;
+
+      ALTER TABLE audit_events_v2 RENAME TO audit_events;
+
+      CREATE INDEX IF NOT EXISTS audit_events_memory_created_idx
+        ON audit_events(memory_id, created_at);
+
+      PRAGMA user_version = 2;
     `);
   }
 
