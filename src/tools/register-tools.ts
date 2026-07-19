@@ -2,12 +2,13 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z, type ZodType } from "zod";
 import type { MemoryService } from "../memory-service.js";
+import { memoryToolDescriptions } from "./descriptions.js";
 import { memoryToolSchemas, type MemoryToolName } from "./schemas.js";
 
 export type MemoryToolHandler = (input: unknown) => Promise<CallToolResult>;
 export type MemoryToolHandlers = Record<MemoryToolName, MemoryToolHandler>;
 
-const memoryToolNames = [
+export const memoryToolNames = [
   "recall_context",
   "remember",
   "search_memories",
@@ -20,22 +21,6 @@ const memoryToolNames = [
   "maintain_memories",
   "export_memory_context"
 ] as const satisfies readonly MemoryToolName[];
-
-const memoryToolDescriptions: Record<MemoryToolName, string> = {
-  recall_context:
-    "Call this near the start of a task to retrieve relevant AgentRecall memory for the current repo or user before planning or editing.",
-  remember:
-    "Store one atomic, durable memory after learning a reusable user preference, project fact, decision, procedure, debugging lesson, or constraint.",
-  search_memories: "Search local memories by full-text query and optional filters before writing or when you need a specific past fact.",
-  get_memory: "Read a memory entry and its audit history by memory id.",
-  list_memories: "List local memories with optional scope and metadata filters.",
-  update_memory: "Update mutable fields on an active or archived memory.",
-  supersede_memory: "Create a replacement memory and mark older memories as superseded.",
-  forget_memory: "Forget a memory by clearing its body and marking it forgotten.",
-  get_memory_budget: "Report budget usage and cleanup candidates for a scope.",
-  maintain_memories: "Run local memory maintenance actions.",
-  export_memory_context: "Export selected memories as a markdown context pack."
-};
 
 const updateFieldNames = [
   "topic",

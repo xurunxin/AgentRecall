@@ -386,7 +386,7 @@ describe("registerMemoryTools", () => {
       "maintain_memories",
       "export_memory_context"
     ]);
-    expect(registered[0]?.config.description).toContain("Call this near the start of a task");
+    expect(registered[0]?.config.description).toContain("[TRIGGER] Call near the start of a coding task");
     for (const tool of registered) {
       expect(tool.config.description).toEqual(expect.any(String));
       expect(tool.config.inputSchema).toBe(memoryToolSchemas[tool.name as keyof typeof memoryToolSchemas]);
