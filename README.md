@@ -198,6 +198,12 @@ Generated markdown exports are stored at:
 
 Markdown exports are for inspection and handoff. Manual edits under `exports/` may be overwritten by `maintain_memories` with `action: "rebuild_markdown_index"`.
 
+## Changelog
+
+Stage-level changes are tracked in [`CHANGELOG.md`](./CHANGELOG.md). Stage 1
+delivered CLI, doctor, backup, structured `actor`, schema migration, and
+rewritten tool descriptions; see the [Stage 1 closure report](./docs/superpowers/plans/2026-07-19-stage-one-closure.md) for plan-vs-actual details.
+
 ## Verification
 
 ```bash
