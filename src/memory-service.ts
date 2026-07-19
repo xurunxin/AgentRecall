@@ -26,6 +26,7 @@ import {
   type Result
 } from "./domain.js";
 import { MarkdownExporter } from "./markdown-exporter.js";
+import { resolveActor } from "./actor.js";
 import { resolveMemoryScope } from "./scope-resolver.js";
 import type { BudgetUsage, EntryFilters, SearchFilters, SQLiteMemoryStore } from "./sqlite-store.js";
 import {
@@ -235,7 +236,16 @@ function compareLowValueCandidates(a: MemoryEntry, b: MemoryEntry): number {
 export class MemoryService {
   constructor(
     private readonly store: SQLiteMemoryStore,
-    private readonly exporter?: MarkdownExporter
+    private readonly exporter?: MarkdownExporter,
+    /**
+     * Default actor identifier for audit events. Resolved per-write through
+     * `resolveActor`, so an explicit override on each call still wins.
+     * Stage 1 only relaxes the TS type here; the underlying SQLite CHECK
+     * constraint is still `(agent, user, system)`. Stage 2 (v1->v2
+     * migration) widens the constraint, after which the call sites
+     * start writing structured values like `agent:claude-code`.
+     */
+    private readonly defaultActor: string = "agent"
   ) {}
 
   configureProjectBudget(
@@ -1120,12 +1130,12 @@ export class MemoryService {
     };
   }
 
-  private appendAudit(input: Omit<MemoryAuditEvent, "id" | "created_at">): void {
+  private appendAudit(input: Omit<MemoryAuditEvent, "id" | "created_at" | "actor"> & { actor?: string }): void {
     const event: MemoryAuditEvent = {
       id: createAuditId(),
       scope: input.scope,
       event: input.event,
-      actor: input.actor,
+      actor: resolveActor(input.actor ?? this.defaultActor) as MemoryAuditEvent["actor"],
       metadata: input.metadata,
       created_at: nowIso()
     };
