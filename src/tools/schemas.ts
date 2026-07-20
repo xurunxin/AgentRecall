@@ -122,7 +122,12 @@ const entryFilterFields = {
   // comparison is correct for the format.
   since: z.string().datetime({ offset: true }).optional(),
   until: z.string().datetime({ offset: true }).optional(),
-  last_accessed_since: z.string().datetime({ offset: true }).optional()
+  last_accessed_since: z.string().datetime({ offset: true }).optional(),
+  // Stage 7: updated_at filters (parallel to the Stage 6 pair on
+  // created_at). Useful for "what memories have I touched in the
+  // last week?" queries.
+  updated_since: z.string().datetime({ offset: true }).optional(),
+  updated_until: z.string().datetime({ offset: true }).optional()
 };
 
 export const searchMemoriesToolSchema = z

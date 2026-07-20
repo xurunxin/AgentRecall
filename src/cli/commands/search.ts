@@ -14,6 +14,7 @@ export function searchCommand(ctx: CliContext): CliResult {
   const actor = flagString(ctx.args, "actor");
   const since = flagString(ctx.args, "since");
   const lastAccessedSince = flagString(ctx.args, "last-accessed-since");
+  const updatedSince = flagString(ctx.args, "updated-since");
   const limit = Number.parseInt(flagString(ctx.args, "limit") ?? "10", 10);
 
   const filters: SearchFilters = { query, scope, status: "active", limit };
@@ -21,6 +22,7 @@ export function searchCommand(ctx: CliContext): CliResult {
   if (actor !== undefined) filters.actor = actor;
   if (since !== undefined) filters.since = since;
   if (lastAccessedSince !== undefined) filters.last_accessed_since = lastAccessedSince;
+  if (updatedSince !== undefined) filters.updated_since = updatedSince;
 
   const items = ctx.store.searchEntries(filters);
   const json = flagBool(ctx.args, "json");

@@ -13,6 +13,8 @@ export function listCommand(ctx: CliContext): CliResult {
   const since = flagString(ctx.args, "since");
   const until = flagString(ctx.args, "until");
   const lastAccessedSince = flagString(ctx.args, "last-accessed-since");
+  const updatedSince = flagString(ctx.args, "updated-since");
+  const updatedUntil = flagString(ctx.args, "updated-until");
 
   const filters: Record<string, unknown> = { scope, status, limit, offset };
   if (projectId !== undefined) filters.project_id = projectId;
@@ -20,6 +22,8 @@ export function listCommand(ctx: CliContext): CliResult {
   if (since !== undefined) filters.since = since;
   if (until !== undefined) filters.until = until;
   if (lastAccessedSince !== undefined) filters.last_accessed_since = lastAccessedSince;
+  if (updatedSince !== undefined) filters.updated_since = updatedSince;
+  if (updatedUntil !== undefined) filters.updated_until = updatedUntil;
 
   const items = ctx.store.listEntries(filters);
   const json = flagBool(ctx.args, "json");

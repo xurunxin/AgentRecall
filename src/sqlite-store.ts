@@ -42,6 +42,18 @@ export type EntryFilters = {
    * design — "never touched" is not "touched since X".
    */
   last_accessed_since?: string;
+  /**
+   * Stage 7: ISO 8601 lower bound on `updated_at`. Strings are
+   * compared lexicographically, which is correct for ISO 8601.
+   * Distinct from `since` (which filters `created_at`) — useful
+   * for "what memories have I touched in the last week?" queries.
+   */
+  updated_since?: string;
+  /**
+   * Stage 7: ISO 8601 upper bound on `updated_at`. Parallel to
+   * `until` (which filters `created_at`).
+   */
+  updated_until?: string;
 };
 
 export type SearchFilters = EntryFilters & {
@@ -294,6 +306,14 @@ function buildEntryWhere(filters: EntryFilters, alias: string): { where: string;
     // Exclude never-read memories by the IS NOT NULL guard.
     clauses.push(`${column("last_accessed_at")} IS NOT NULL AND ${column("last_accessed_at")} >= ?`);
     params.push(filters.last_accessed_since);
+  }
+  if (filters.updated_since !== undefined) {
+    clauses.push(`${column("updated_at")} >= ?`);
+    params.push(filters.updated_since);
+  }
+  if (filters.updated_until !== undefined) {
+    clauses.push(`${column("updated_at")} <= ?`);
+    params.push(filters.updated_until);
   }
 
   return {

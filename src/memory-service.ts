@@ -1022,6 +1022,11 @@ export class MemoryService {
     if (filters.since !== undefined) entryFilters.since = filters.since;
     if (filters.until !== undefined) entryFilters.until = filters.until;
     if (filters.last_accessed_since !== undefined) entryFilters.last_accessed_since = filters.last_accessed_since;
+    // Stage 7: updated_at filters (parallel to Stage 6's created_at
+    // pair). Useful for "what memories have I touched in the last
+    // week?" queries.
+    if (filters.updated_since !== undefined) entryFilters.updated_since = filters.updated_since;
+    if (filters.updated_until !== undefined) entryFilters.updated_until = filters.updated_until;
     return entryFilters;
   }
 
