@@ -31,6 +31,10 @@ import {
   type ProjectScope,
   type Result
 } from "../domain.js";
+
+// Re-export so the sub-services can import the global budget
+// default from this module without reaching into domain.ts.
+export { DEFAULT_GLOBAL_BUDGET };
 import type { BudgetUsage, SQLiteMemoryStore } from "../sqlite-store.js";
 import type { ValidatedRememberInput } from "../write-validator.js";
 
@@ -448,6 +452,47 @@ export function ensureProjectScope(
 ): ProjectScope {
   const existing = store.getProjectScope(project_id);
   return existing ?? configureFn(project_id, DEFAULT_PROJECT_BUDGET, project_path, display_name);
+}
+
+/**
+ * Read-side scope helpers. Both the read and maintenance
+ * sub-services use these; the maintenance code needs to
+ * walk all active entries in a scope to find candidates
+ * for archive / expire / dedup, and the read code needs
+ * the same to build context packs.
+ */
+
+export function activeEntriesForScope(
+  store: SQLiteMemoryStore,
+  scope: { scope: MemoryScope; project_id?: string | undefined }
+): MemoryEntry[] {
+  return store.listEntries({
+    scope: scope.scope,
+    ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
+    status: "active",
+    limit: 10_000
+  });
+}
+
+export function allEntriesForScope(
+  store: SQLiteMemoryStore,
+  scope: { scope: MemoryScope; project_id?: string | undefined }
+): MemoryEntry[] {
+  return store.listEntries({
+    scope: scope.scope,
+    ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
+    limit: 10_000
+  });
+}
+
+export function usageForScope(
+  store: SQLiteMemoryStore,
+  scope: { scope: MemoryScope; project_id?: string | undefined }
+): BudgetUsage {
+  return store.getBudgetUsage({
+    scope: scope.scope,
+    ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {})
+  });
 }
 
 /**
