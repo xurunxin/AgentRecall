@@ -913,12 +913,14 @@ export class MemoryService {
     }
 
     const collected = this.collectContextEntries(resolved.value, input);
-    // Stage 5: annotate each entry with its trust_boost so the
+    // Stage 5: annotate each entry with its trust_boost (so the
     // exporter can break importance ties in favor of the calling
-    // agent's own (or recently-touched) memories.
+    // agent's own or recently-touched memories) and the writer
+    // actor (so the markdown output can show who wrote it).
     const entries = collected.map((entry) => ({
       ...entry,
-      trust_boost: computeTrustBoost(entry, this.defaultActor, (e) => this.actorForEntry(e))
+      trust_boost: computeTrustBoost(entry, this.defaultActor, (e) => this.actorForEntry(e)),
+      writer: this.actorForEntry(entry)
     }));
     return exporter.buildContextPack({
       title: "AgentRecall Context",

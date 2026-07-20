@@ -161,6 +161,10 @@ describe("exportMemoryContext trust_boost ranking (stage 5)", () => {
       throw new Error(`memories not in output. id1=${r1.value.memory_id} id2=${r2.value.memory_id} len=${result.length}\nresult:\n${result}`);
     }
     expect(idx1).toBeLessThan(idx2);
+
+    // Each entry's title is annotated with [writer: <actor>].
+    expect(result).toContain("[writer: agent:claude-code]");
+    expect(result).toContain("[writer: agent:other]");
   });
 
   it("ranks a recently-touched foreign memory above an untouched foreign memory", () => {

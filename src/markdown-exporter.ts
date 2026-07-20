@@ -7,7 +7,7 @@ import type { BudgetUsage } from "./sqlite-store.js";
 export type ContextPackInput = {
   title: string;
   budget_chars: number;
-  entries: Array<MemoryEntry & { trust_boost?: number }>;
+  entries: Array<MemoryEntry & { trust_boost?: number; writer?: string }>;
 };
 
 export type ExportScopeInput = {
@@ -158,9 +158,10 @@ function entrySummary(entry: MemoryEntry): string {
   ].join("\n");
 }
 
-function entryDetail(entry: MemoryEntry): string {
+function entryDetail(entry: MemoryEntry & { writer?: string }): string {
+  const writerAnnotation = entry.writer !== undefined ? ` [writer: ${entry.writer}]` : "";
   return [
-    `## ${entry.title}`,
+    `## ${entry.title}${writerAnnotation}`,
     "",
     `- memory_id: ${entry.id}`,
     `- scope: ${scopeLabel(entry)}`,
