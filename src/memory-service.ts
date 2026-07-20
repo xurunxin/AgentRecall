@@ -107,7 +107,7 @@ export type MaintainMemoriesResult = {
   details: unknown;
 };
 
-type RememberError = "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded";
+type RememberError = "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate";
 type UpdateError = "not_found" | "invalid_state" | "invalid_schema" | "secret_detected" | "capacity_exceeded";
 type SupersedeError = RememberError | "not_found" | "invalid_state";
 type ForgetError = "not_found";
@@ -279,6 +279,23 @@ export class MemoryService {
     if (!prepared.ok) {
       return prepared;
     }
+    // Forced-confirm flow: if a duplicate candidate is detected, the
+    // caller must opt in by passing `confirm_write: true` to proceed.
+    if (input.confirm_write !== true) {
+      const matchingIds = prepared.value.budget.warnings
+        .filter((w) => w.code === "duplicate_candidate")
+        .map((w) => w.memory_id);
+      if (matchingIds.length > 0) {
+        // No store writes have happened yet; prepareRemember is read-only.
+        // We audit the rejection so the agent can see what happened.
+        this.auditRejected(input, "duplicate_candidate", { matching_ids: matchingIds });
+        return err(
+          "duplicate_candidate",
+          "existing active memory has the same title or body; pass confirm_write: true to proceed",
+          { matching_ids: matchingIds }
+        );
+      }
+    }
     return this.store.transaction(() => ok(this.commitPreparedRemember(prepared.value)));
   }
 
@@ -370,8 +387,11 @@ export class MemoryService {
     };
   }
 
-  getMemory(id: string): { entry: MemoryEntry; audit: MemoryAuditEvent[] } | undefined {
-    const entry = this.store.getEntry(id);
+  getMemory(
+    id: string,
+    accessedBy?: string
+  ): { entry: MemoryEntry; audit: MemoryAuditEvent[] } | undefined {
+    const entry = this.store.getEntry(id, accessedBy);
     return entry === undefined ? undefined : { entry, audit: this.store.getAuditEvents(id) };
   }
 
@@ -619,6 +639,137 @@ export class MemoryService {
         });
       }
       return ok({ memory_id: created.memory_id });
+    });
+  }
+
+  /**
+   * Stage 2: collapse N near-duplicate memories into one, marking the old
+   * entries as superseded. Differs from `supersedeMemory` in that the
+   * caller is explicitly merging multiple source entries (≥ 2), and the
+   * budget check excludes the old ids from the active count so the merge
+   * passes the budget even when the pre-merge state is at the cap.
+   */
+  mergeMemories(input: {
+    old_memory_ids: string[];
+    replacement: RememberInput;
+    reason: string;
+    strategy?: "keep_first" | "keep_newest";
+  }): Result<{ memory_id: string; merged_from: string[] }, SupersedeError> {
+    const oldIds = [...new Set(input.old_memory_ids)];
+    if (oldIds.length < 2 || oldIds.some((id) => id.trim().length === 0)) {
+      this.auditRejected(input.replacement, "invalid_schema", {
+        old_memory_ids_count: oldIds.length
+      });
+      return err("invalid_schema", "merge_memories requires at least two old memory ids");
+    }
+
+    const resolvedReplacement = this.resolveRememberInput(
+      { ...input.replacement, supersedes: oldIds },
+      true
+    );
+    if (!resolvedReplacement.ok) {
+      return resolvedReplacement;
+    }
+    const replacement = resolvedReplacement.value.entry;
+
+    const oldEntries: MemoryEntry[] = [];
+    for (const oldId of oldIds) {
+      const old = this.store.peekEntry(oldId);
+      if (old === undefined) {
+        this.auditRejectedForScope(replacement.scope, replacement.project_id, "not_found", {
+          memory_id: oldId
+        });
+        return err("not_found", "memory not found", { memory_id: oldId });
+      }
+      if (old.status !== "active" && old.status !== "archived") {
+        this.auditRejectedForEntry(old, "invalid_state", {
+          memory_id: oldId,
+          status: old.status
+        });
+        return err("invalid_state", "only active or archived memories can be merged", {
+          memory_id: oldId,
+          status: old.status
+        });
+      }
+      oldEntries.push(old);
+    }
+
+    for (const old of oldEntries) {
+      if (!this.matchesReplacementScope(old, replacement)) {
+        this.auditRejectedForEntry(old, "invalid_scope", {
+          memory_id: old.id,
+          replacement_scope: replacement.scope,
+          replacement_project_id: replacement.project_id ?? null
+        });
+        return err("invalid_scope", "merged memories must match replacement scope and project_id", {
+          memory_id: old.id,
+          replacement_scope: replacement.scope,
+          replacement_project_id: replacement.project_id ?? null
+        });
+      }
+    }
+
+    let budget = DEFAULT_GLOBAL_BUDGET;
+    if (replacement.scope === "project") {
+      const projectId = replacement.project_id;
+      if (projectId === undefined) {
+        this.auditRejectedForScope(replacement.scope, replacement.project_id, "invalid_scope", undefined);
+        return err("invalid_scope", "project scope requires project_id or project_path");
+      }
+      budget = this.ensureProjectScope(
+        projectId,
+        resolvedReplacement.value.project_path ?? "",
+        resolvedReplacement.value.display_name ?? projectId
+      ).budget;
+    }
+
+    // Budget relaxation: exclude the old ids from the active count so a
+    // merge at the budget cap still succeeds.
+    const excludedActiveMemoryIds = new Set(
+      oldEntries.filter((old) => old.status === "active").map((old) => old.id)
+    );
+    const budgetResult = this.evaluateEntryBudget(replacement, budget, { excludedActiveMemoryIds });
+    if (!budgetResult.ok) {
+      this.auditRejectedForScope(
+        replacement.scope,
+        replacement.project_id,
+        "capacity_exceeded",
+        budgetResult.details
+      );
+      return budgetResult;
+    }
+    const prepared: PreparedRemember = { entry: replacement, budget: budgetResult.value };
+
+    const canonicalId = input.strategy === "keep_newest"
+      ? oldEntries.reduce((acc, e) => (acc === undefined || e.created_at > acc.created_at ? e : acc)).id
+      : oldEntries.reduce((acc, e) => (acc === undefined || e.created_at < acc.created_at ? e : acc)).id;
+
+    return this.store.transaction(() => {
+      const created = this.commitPreparedRemember(prepared);
+      for (const old of oldEntries) {
+        this.store.updateEntry(old.id, {
+          status: "superseded",
+          superseded_by: created.memory_id,
+          updated_at: nowIso()
+        });
+        this.appendAudit({
+          memory_id: old.id,
+          scope: old.scope,
+          ...(old.project_id !== undefined ? { project_id: old.project_id } : {}),
+          event: "superseded",
+          actor: "agent",
+          reason: input.reason,
+          metadata: {
+            superseded_by: created.memory_id,
+            canonical: old.id === canonicalId,
+            merged_count: oldEntries.length
+          }
+        });
+      }
+      return ok({
+        memory_id: created.memory_id,
+        merged_from: oldEntries.map((e) => e.id).sort()
+      });
     });
   }
 

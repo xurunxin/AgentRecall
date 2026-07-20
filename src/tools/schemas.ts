@@ -100,6 +100,7 @@ export const rememberToolSchema = z
     confidence: ratingSchema,
     status: writableStatusSchema.default("active"),
     expires_at: nonEmptyString.optional(),
+    confirm_write: z.boolean().optional(),
     review_after: nonEmptyString.optional(),
     supersedes: stringListSchema
   })
@@ -197,6 +198,15 @@ export const supersedeMemoryToolSchema = z
   })
   .strict();
 
+export const mergeMemoriesToolSchema = z
+  .object({
+    old_memory_ids: z.array(nonEmptyString).min(2),
+    replacement: rememberToolSchema,
+    reason: nonEmptyString,
+    strategy: z.enum(["keep_first", "keep_newest"]).default("keep_first")
+  })
+  .strict();
+
 export const forgetMemoryToolSchema = z
   .object({
     id: nonEmptyString.optional(),
@@ -272,6 +282,7 @@ export const memoryToolSchemas = {
   list_memories: listMemoriesToolSchema,
   update_memory: updateMemoryToolSchema,
   supersede_memory: supersedeMemoryToolSchema,
+  merge_memories: mergeMemoriesToolSchema,
   forget_memory: forgetMemoryToolSchema,
   get_memory_budget: getMemoryBudgetToolSchema,
   maintain_memories: maintainMemoriesToolSchema,

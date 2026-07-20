@@ -27,11 +27,12 @@ export type SearchFilters = EntryFilters & {
 };
 
 /**
- * Current authoritative schema version. Stage 1 introduces explicit
- * `PRAGMA user_version` tracking. v2 loosens the `audit_events.actor`
+ * Current authoritative schema version. Stage 1 introduced explicit
+ * `PRAGMA user_version` tracking. v2 loosened the `audit_events.actor`
  * CHECK constraint to allow structured values like `agent:claude-code`.
+ * v3 adds the `last_accessed_by` JSON column to `memory_entries`.
  */
-export const CURRENT_SCHEMA_VERSION = 2;
+export const CURRENT_SCHEMA_VERSION = 3;
 
 export type AuditFilters = {
   memory_id?: string;
@@ -120,6 +121,20 @@ function decodeEntry(row: Row): MemoryEntry {
 
   const lastAccessedAt = optionalStringCell(row, "last_accessed_at");
   if (lastAccessedAt !== undefined) entry.last_accessed_at = lastAccessedAt;
+
+  const lastAccessedByRaw = optionalStringCell(row, "last_accessed_by");
+  if (lastAccessedByRaw !== undefined && lastAccessedByRaw.length > 0) {
+    try {
+      const parsed = JSON.parse(lastAccessedByRaw) as Record<string, string>;
+      if (parsed && typeof parsed === "object") {
+        entry.last_accessed_by = parsed;
+      }
+    } catch {
+      // Corrupt JSON in storage; treat as empty map. Defensive: the
+      // read path never throws, so a corrupt row is just hidden from
+      // the last_accessed_by check.
+    }
+  }
 
   const expiresAt = optionalStringCell(row, "expires_at");
   if (expiresAt !== undefined) entry.expires_at = expiresAt;
@@ -357,6 +372,7 @@ export class SQLiteMemoryStore {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         last_accessed_at TEXT,
+        last_accessed_by TEXT,
         access_count INTEGER NOT NULL,
         expires_at TEXT,
         review_after TEXT,
@@ -446,7 +462,23 @@ export class SQLiteMemoryStore {
       this.migrate_v1_to_v2();
       return;
     }
+    if (version === 3) {
+      this.migrate_v2_to_v3();
+      return;
+    }
     throw new Error(`No migration registered for schema version ${version}`);
+  }
+
+  private migrate_v2_to_v3(): void {
+    // Add the last_accessed_by JSON column. The column is nullable, so
+    // existing rows are unaffected. The read path defaults to an empty
+    // map when the column is null. The check is idempotent in case
+    // base DDL already added the column (fresh installs are at v3).
+    const cols = this.db.prepare("PRAGMA table_info(memory_entries)").all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === "last_accessed_by")) {
+      this.db.exec("ALTER TABLE memory_entries ADD COLUMN last_accessed_by TEXT");
+    }
+    this.db.exec("PRAGMA user_version = 3");
   }
 
   private migrate_v1_to_v2(): void {
@@ -532,9 +564,9 @@ export class SQLiteMemoryStore {
           `
           INSERT INTO memory_entries (
             id, scope, project_id, project_path, type, topic, title, body, tags_json, source_json,
-            importance, confidence, status, created_at, updated_at, last_accessed_at, access_count,
-            expires_at, review_after, supersedes_json, superseded_by, token_estimate, char_count
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            importance, confidence, status, created_at, updated_at, last_accessed_at, last_accessed_by,
+            access_count, expires_at, review_after, supersedes_json, superseded_by, token_estimate, char_count
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `
         )
         .run(...this.entryParams(entry));
@@ -542,18 +574,37 @@ export class SQLiteMemoryStore {
     });
   }
 
-  getEntry(id: string): MemoryEntry | undefined {
+  getEntry(id: string, accessedBy?: string): MemoryEntry | undefined {
     const entry = this.readEntry(id);
     if (entry === undefined) return undefined;
 
     const lastAccessedAt = new Date().toISOString();
-    this.db
-      .prepare("UPDATE memory_entries SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?")
-      .run(lastAccessedAt, id);
+
+    // Update the per-agent access map. `decodeEntry` already parsed the
+    // JSON column into a `Record<string, string>` (or left it undefined
+    // for rows that have never been read with an actor). We extend that
+    // map; a missing or undefined map is treated as empty.
+    let nextMap: Record<string, string> | undefined;
+    if (accessedBy !== undefined) {
+      const existing = entry.last_accessed_by ?? {};
+      nextMap = { ...existing, [accessedBy]: lastAccessedAt };
+    }
+
+    if (nextMap !== undefined) {
+      this.db
+        .prepare("UPDATE memory_entries SET access_count = access_count + 1, last_accessed_at = ?, last_accessed_by = ? WHERE id = ?")
+        .run(lastAccessedAt, JSON.stringify(nextMap), id);
+    } else {
+      this.db
+        .prepare("UPDATE memory_entries SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ?")
+        .run(lastAccessedAt, id);
+    }
+
     return {
       ...entry,
       access_count: entry.access_count + 1,
-      last_accessed_at: lastAccessedAt
+      last_accessed_at: lastAccessedAt,
+      ...(nextMap !== undefined ? { last_accessed_by: nextMap } : {})
     };
   }
 
@@ -619,6 +670,7 @@ export class SQLiteMemoryStore {
             created_at = ?,
             updated_at = ?,
             last_accessed_at = ?,
+            last_accessed_by = ?,
             access_count = ?,
             expires_at = ?,
             review_after = ?,
@@ -745,6 +797,7 @@ export class SQLiteMemoryStore {
       entry.created_at,
       entry.updated_at,
       entry.last_accessed_at ?? null,
+      entry.last_accessed_by ? encodeJson(entry.last_accessed_by) : null,
       entry.access_count,
       entry.expires_at ?? null,
       entry.review_after ?? null,

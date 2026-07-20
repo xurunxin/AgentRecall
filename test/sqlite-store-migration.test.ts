@@ -24,7 +24,7 @@ describe("SQLiteMemoryStore migrations", () => {
   it("creates a v2 schema on first run", () => {
     store = new SQLiteMemoryStore(dbPath);
     expect(store.getUserVersion()).toBe(CURRENT_SCHEMA_VERSION);
-    expect(CURRENT_SCHEMA_VERSION).toBe(2);
+    expect(CURRENT_SCHEMA_VERSION).toBe(3);
   });
 
   it("is a no-op when schema is already at latest version", () => {

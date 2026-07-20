@@ -1131,7 +1131,8 @@ describe("MemoryService", () => {
       tags: [],
       source: { kind: "agent" },
       importance: 3,
-      confidence: 3
+      confidence: 3,
+      confirm_write: true
     });
     expect(first.ok).toBe(true);
     expect(second.ok).toBe(true);

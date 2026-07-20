@@ -13,6 +13,7 @@ import { checkDataHome } from "./checks/data-home.js";
 import { checkDiskFree } from "./checks/disk-free.js";
 import { checkFtsConsistency } from "./checks/fts-consistency.js";
 import { checkIntegrity } from "./checks/integrity.js";
+import { checkLastAccessedBy } from "./checks/last-accessed-by.js";
 import { checkSchemaVersion } from "./checks/schema-version.js";
 import type { CheckContext, CheckResult, DoctorReport } from "./types.js";
 
@@ -25,7 +26,8 @@ const CHECKS: Array<(ctx: CheckContext) => CheckResult> = [
   checkDiskFree,
   checkAuditHealth,
   checkCapacityHeadroom,
-  checkActorDistribution
+  checkActorDistribution,
+  checkLastAccessedBy
 ];
 
 export function runDoctor(ctx: CheckContext): DoctorReport {

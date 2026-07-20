@@ -34,6 +34,13 @@ export type RememberInput = {
   expires_at?: string;
   review_after?: string;
   supersedes?: string[];
+  /**
+   * Stage 2 forced-confirm flag. When a duplicate candidate is detected
+   * on title or body, the write is rejected unless this is explicitly
+   * set to `true`. The rejected payload includes the matching memory
+   * ids so the agent can decide whether to confirm, merge, or cancel.
+   */
+  confirm_write?: boolean;
 };
 
 export type ValidatedRememberInput = {

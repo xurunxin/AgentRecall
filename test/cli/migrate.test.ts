@@ -36,7 +36,7 @@ describe("migrateCommand", () => {
     const result = migrateCommand({ dataHome, args, store });
     const parsed = JSON.parse(result.stdout);
     expect(parsed.from).toBe(1);
-    expect(parsed.to).toBe(2);
+    expect(parsed.to).toBe(3);
     store.close();
   });
 });

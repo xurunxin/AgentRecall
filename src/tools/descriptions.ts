@@ -53,6 +53,12 @@ const TEXT: Record<MemoryToolName, Record<Segment, string>> = {
     OUTPUT: "{ memory_id } of the new entry. Old entries are marked superseded atomically.",
     FAILURE: "not_found if any old id is missing. invalid_scope on cross-scope replace."
   },
+  merge_memories: {
+    TRIGGER: "When 2+ near-duplicate memories from different sources should collapse to one.",
+    INPUT: "old_memory_ids[] (>=2), replacement, reason, strategy?: keep_first|keep_newest.",
+    OUTPUT: "{ memory_id, merged_from[] }. Old marked superseded; budget is relaxed.",
+    FAILURE: "not_found if any old id is missing. invalid_state if any old is forgotten."
+  },
   forget_memory: {
     TRIGGER: "When a memory is no longer true or relevant. Use sparingly; prefer supersede.",
     INPUT: "id | memory_id, reason.",

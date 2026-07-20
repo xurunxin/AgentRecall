@@ -381,6 +381,7 @@ describe("registerMemoryTools", () => {
       "list_memories",
       "update_memory",
       "supersede_memory",
+      "merge_memories",
       "forget_memory",
       "get_memory_budget",
       "maintain_memories",

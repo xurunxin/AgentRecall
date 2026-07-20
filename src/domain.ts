@@ -64,6 +64,7 @@ export type MemoryEntry = {
   created_at: string;
   updated_at: string;
   last_accessed_at?: string;
+  last_accessed_by?: Record<string, string>;
   access_count: number;
   expires_at?: string;
   review_after?: string;

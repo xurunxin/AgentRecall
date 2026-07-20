@@ -16,6 +16,7 @@ export const memoryToolNames = [
   "list_memories",
   "update_memory",
   "supersede_memory",
+  "merge_memories",
   "forget_memory",
   "get_memory_budget",
   "maintain_memories",
@@ -198,6 +199,9 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
     ),
     supersede_memory: jsonHandler("supersede_memory", memoryToolSchemas.supersede_memory, (input) =>
       service.supersedeMemory(serviceInput<Parameters<MemoryService["supersedeMemory"]>[0]>(input))
+    ),
+    merge_memories: jsonHandler("merge_memories", memoryToolSchemas.merge_memories, (input) =>
+      service.mergeMemories(serviceInput<Parameters<MemoryService["mergeMemories"]>[0]>(input))
     ),
     forget_memory: jsonHandler("forget_memory", memoryToolSchemas.forget_memory, (input) =>
       service.forgetMemory(memoryIdFromInput(input), input.reason)
