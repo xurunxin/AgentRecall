@@ -174,4 +174,50 @@ describe("listCommand", () => {
     expect(recentlyRead.stdout).not.toContain("mem_old");
     store.close();
   });
+
+  it("filters by --updated-since / --updated-until (stage 7)", () => {
+    const { dataHome, store } = setup();
+    // The setup() helper inserts mem_a with updated_at=2026-07-19. Add
+    // a second memory with an older updated_at.
+    store.insertEntry({
+      id: "mem_old",
+      scope: "global",
+      type: "fact",
+      memory_kind: "semantic",
+      topic: "general",
+      title: "old",
+      body: "older",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3,
+      status: "active",
+      created_at: "2026-07-10T00:00:00.000Z",
+      updated_at: "2026-07-10T00:00:00.000Z",
+      access_count: 0,
+      supersedes: [],
+      token_estimate: 1,
+      char_count: 2
+    });
+
+    // --updated-since keeps only mem_a (updated 2026-07-19, since 2026-07-15)
+    const recentlyUpdated = listCommand({
+      dataHome,
+      args: parseArgs(["list", "--updated-since", "2026-07-15T00:00:00.000Z"]),
+      store
+    });
+    expect(recentlyUpdated.stdout).toContain("mem_a");
+    expect(recentlyUpdated.stdout).not.toContain("mem_old");
+    expect(recentlyUpdated.stdout).toContain("1 entries");
+
+    // --updated-until keeps only mem_old
+    const onlyOld = listCommand({
+      dataHome,
+      args: parseArgs(["list", "--updated-until", "2026-07-15T00:00:00.000Z"]),
+      store
+    });
+    expect(onlyOld.stdout).toContain("mem_old");
+    expect(onlyOld.stdout).not.toContain("mem_a");
+    store.close();
+  });
 });

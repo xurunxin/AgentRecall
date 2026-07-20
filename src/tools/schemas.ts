@@ -122,7 +122,12 @@ const entryFilterFields = {
   // comparison is correct for the format.
   since: z.string().datetime({ offset: true }).optional(),
   until: z.string().datetime({ offset: true }).optional(),
-  last_accessed_since: z.string().datetime({ offset: true }).optional()
+  last_accessed_since: z.string().datetime({ offset: true }).optional(),
+  // Stage 7: updated_at filters (parallel to the Stage 6 pair on
+  // created_at). Useful for "what memories have I touched in the
+  // last week?" queries.
+  updated_since: z.string().datetime({ offset: true }).optional(),
+  updated_until: z.string().datetime({ offset: true }).optional()
 };
 
 export const searchMemoriesToolSchema = z
@@ -236,7 +241,10 @@ export const maintainMemoriesToolSchema = z
     action: z.enum(maintenanceActions),
     scope: scopeSchema,
     project_id: nonEmptyString.optional(),
-    project_path: nonEmptyString.optional()
+    project_path: nonEmptyString.optional(),
+    // Stage 7: chunk size for maintenance operations that scan
+    // the whole entries table. Default 500; min 50, max 5000.
+    batch_size: z.number().int().min(50).max(5000).default(500)
   })
   .strict()
   .superRefine(requireProjectIdentity);

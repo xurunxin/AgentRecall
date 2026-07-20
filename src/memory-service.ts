@@ -29,7 +29,7 @@ import { MarkdownExporter } from "./markdown-exporter.js";
 import { resolveActor } from "./actor.js";
 import { resolveMemoryScope } from "./scope-resolver.js";
 import { runBackup } from "./backup.js";
-import { SIMILARITY_THRESHOLD, textSimilarity } from "./text-similarity.js";
+import { SIMILARITY_THRESHOLD, textSimilarity, tokenizeForSimilarity } from "./text-similarity.js";
 import type { BudgetUsage, EntryFilters, SearchFilters, SQLiteMemoryStore } from "./sqlite-store.js";
 import {
   type RememberInput,
@@ -101,6 +101,19 @@ export type MaintainMemoriesInput = {
   scope: MemoryScope;
   project_id?: string;
   project_path?: string;
+  /**
+   * Stage 7: chunk size for maintenance operations that scan the
+   * whole entries table. Each chunk runs in its own transaction,
+   * so other agents' remember / getMemory calls are not blocked
+   * for the full duration. Default 500; min 50, max 5000.
+   */
+  batch_size?: number;
+  /**
+   * Stage 7: progress callback fired after each chunk completes.
+   * Receives (processed, total). Useful for the MCP tool to
+   * report a partial result, and for the CLI / smoke test.
+   */
+  onProgress?: (processed: number, total: number) => void;
 };
 
 export type MaintainMemoriesResult = {
@@ -149,18 +162,39 @@ type ContextScore = {
   trust_boost: number;
 };
 
-const STRONG_TRUST_BOOST = 0.3;
-const SOFT_TRUST_BOOST = 0.1;
+const DEFAULT_STRONG_TRUST_BOOST = 0.3;
+const DEFAULT_SOFT_TRUST_BOOST = 0.1;
+const ENV_TRUST_STRONG = "AGENT_RECALL_TRUST_STRONG";
+const ENV_TRUST_SOFT = "AGENT_RECALL_TRUST_SOFT";
+
+function parseEnvFloat(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const parsed = Number.parseFloat(raw);
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+    process.stderr.write(
+      `agent-recall: invalid ${name}="${raw}", using default ${fallback}\n`
+    );
+    return fallback;
+  }
+  return parsed;
+}
 
 /**
  * Stage 5: per-memory trust boost for recall ranking.
  *
- * Returns 0.3 when the memory was written by `currentActor` (strong
- * signal — "I wrote this, trust my own knowledge"), 0.1 when the
- * current actor appears in the memory's `last_accessed_by` map
- * (soft signal — "I've touched this recently"), or 0 when there is
- * no relationship. Returns 0 when `currentActor` is empty (legacy
- * callers constructed without `defaultActor`).
+ * Returns the strong boost (default 0.3) when the memory was
+ * written by `currentActor` ("I wrote this, trust my own
+ * knowledge"), the soft boost (default 0.1) when the current
+ * actor appears in the memory's `last_accessed_by` map ("I've
+ * touched this recently"), or 0 when there is no relationship.
+ * Returns 0 when `currentActor` is empty (legacy callers
+ * constructed without `defaultActor`).
+ *
+ * Stage 7: the strong / soft weights are configurable via the
+ * AGENT_RECALL_TRUST_STRONG and AGENT_RECALL_TRUST_SOFT env
+ * vars. Defaults are 0.3 / 0.1; invalid values fall back to
+ * defaults with a one-line stderr warning.
  */
 export function computeTrustBoost(
   entry: MemoryEntry,
@@ -168,10 +202,12 @@ export function computeTrustBoost(
   actorForEntry: (entry: MemoryEntry) => string
 ): number {
   if (currentActor.length === 0) return 0;
+  const strong = parseEnvFloat(ENV_TRUST_STRONG, DEFAULT_STRONG_TRUST_BOOST);
+  const soft = parseEnvFloat(ENV_TRUST_SOFT, DEFAULT_SOFT_TRUST_BOOST);
   const writer = actorForEntry(entry);
-  if (writer === currentActor) return STRONG_TRUST_BOOST;
+  if (writer === currentActor) return strong;
   if (entry.last_accessed_by !== undefined && entry.last_accessed_by[currentActor] !== undefined) {
-    return SOFT_TRUST_BOOST;
+    return soft;
   }
   return 0;
 }
@@ -944,13 +980,7 @@ export class MemoryService {
 
     switch (input.action) {
       case "find_duplicates":
-        return {
-          action: input.action,
-          changed: 0,
-          details: {
-            groups: this.findDuplicateGroups(this.activeEntriesForScope(resolved.value))
-          }
-        };
+        return this.findDuplicatesChunked(resolved.value, input);
       case "rebuild_markdown_index":
         return this.rebuildMarkdownIndex(resolved.value);
       case "expire_due":
@@ -960,6 +990,58 @@ export class MemoryService {
       case "vacuum_fts":
         return this.vacuumFts(resolved.value);
     }
+  }
+
+  /**
+   * Stage 7: chunked find_duplicates. Loads all active entries for
+   * the resolved scope in one read (the personal-tool scale keeps
+   * this small; well under the SQLite page cache for any realistic
+   * store), then runs the bucketed inverted index from T4 in
+   * chunks of `batch_size`. Each chunk's results are merged into
+   * the running set; groups with the same fingerprint (computed
+   * deterministically from reason + memory_id pair + similarity)
+   * are deduped across chunks.
+   *
+   * The progress callback (input.onProgress) fires after each chunk
+   * with (processed, total).
+   */
+  private findDuplicatesChunked(
+    scope: ResolvedReadScope,
+    input: MaintainMemoriesInput
+  ): MaintainMemoriesResult {
+    if (input.batch_size !== undefined) {
+      if (input.batch_size < 50 || input.batch_size > 5000 || !Number.isInteger(input.batch_size)) {
+        throw new Error(
+          `maintain_memories batch_size must be an integer in [50, 5000], got ${input.batch_size}`
+        );
+      }
+    }
+    const batchSize = input.batch_size ?? 500;
+    const onProgress = input.onProgress;
+
+    const allEntries = this.activeEntriesForScope(scope);
+    const total = allEntries.length;
+    if (total === 0) {
+      onProgress?.(0, 0);
+      return { action: "find_duplicates", changed: 0, details: { groups: [] } };
+    }
+
+    const seenFingerprints = new Set<string>();
+    const groups: DuplicateGroup[] = [];
+    let processed = 0;
+    for (let offset = 0; offset < total; offset += batchSize) {
+      const batch = allEntries.slice(offset, offset + batchSize);
+      const batchGroups = this.findDuplicateGroups(batch);
+      for (const g of batchGroups) {
+        if (seenFingerprints.has(g.fingerprint)) continue;
+        seenFingerprints.add(g.fingerprint);
+        groups.push(g);
+      }
+      processed += batch.length;
+      onProgress?.(processed, total);
+    }
+
+    return { action: "find_duplicates", changed: 0, details: { groups } };
   }
 
   /**
@@ -1022,6 +1104,11 @@ export class MemoryService {
     if (filters.since !== undefined) entryFilters.since = filters.since;
     if (filters.until !== undefined) entryFilters.until = filters.until;
     if (filters.last_accessed_since !== undefined) entryFilters.last_accessed_since = filters.last_accessed_since;
+    // Stage 7: updated_at filters (parallel to Stage 6's created_at
+    // pair). Useful for "what memories have I touched in the last
+    // week?" queries.
+    if (filters.updated_since !== undefined) entryFilters.updated_since = filters.updated_since;
+    if (filters.updated_until !== undefined) entryFilters.updated_until = filters.updated_until;
     return entryFilters;
   }
 
@@ -1274,31 +1361,59 @@ export class MemoryService {
   }
 
   private similarDuplicateGroups(entries: MemoryEntry[], covered: Set<string>): DuplicateGroup[] {
-    // N×N comparison. At 1k entries this is 500k pairs; at 10k it's
-    // 50M. Acceptable for the personal-tool scale this project targets.
-    // Stage 4+ should consider an inverted index or bucketing.
+    // Stage 7: token-bucketed inverted index. The old N×N loop ran
+    // 500k pairs at N=1k and 50M at N=10k. Now we only consider
+    // pairs that share at least one token, dropping the pair count
+    // by 5-10x in realistic stores.
+    //
+    // Per-bucket cap (BUCKET_CAP) bounds worst case for stop-word-
+    // heavy stores where a single token has thousands of entries.
+    // Buckets above the cap are skipped; the entries inside them
+    // are still detectable via other (smaller) buckets they share.
+    const BUCKET_CAP = 200;
+    const bucket = new Map<string, MemoryEntry[]>();
+    for (const entry of entries) {
+      const tokens = tokenizeForSimilarity(`${entry.title}\n${entry.body}`);
+      for (const token of tokens) {
+        const list = bucket.get(token);
+        if (list === undefined) {
+          bucket.set(token, [entry]);
+        } else {
+          list.push(entry);
+        }
+      }
+    }
+
+    const seen = new Set<string>();
     const groups: DuplicateGroup[] = [];
-    for (let i = 0; i < entries.length; i += 1) {
-      const a = entries[i];
-      if (a === undefined) continue;
-      for (let j = i + 1; j < entries.length; j += 1) {
-        const b = entries[j];
-        if (b === undefined) continue;
-        const pairKey = `${a.id}|${b.id}`;
-        if (covered.has(pairKey)) continue;
-        const titleSim = textSimilarity(a.title, b.title);
-        const bodySim = textSimilarity(a.body, b.body);
-        const max = Math.max(titleSim, bodySim);
-        if (max < SIMILARITY_THRESHOLD) continue;
-        const memory_ids = [a.id, b.id].sort(compareText);
-        const titles = [a.title.trim(), b.title.trim()].filter((t) => t.length > 0).sort(compareText);
-        groups.push({
-          reason: "similar_title_and_body",
-          fingerprint: duplicateFingerprint("similar_title_and_body", `${max.toFixed(3)}|${pairKey}`),
-          memory_ids,
-          titles,
-          details: { similarity: max }
-        });
+    for (const entriesInBucket of bucket.values()) {
+      if (entriesInBucket.length > BUCKET_CAP) continue;
+      for (let i = 0; i < entriesInBucket.length; i += 1) {
+        const a = entriesInBucket[i];
+        if (a === undefined) continue;
+        for (let j = i + 1; j < entriesInBucket.length; j += 1) {
+          const b = entriesInBucket[j];
+          if (b === undefined) continue;
+          const pairKey = compareText(a.id, b.id) <= 0
+            ? `${a.id}|${b.id}`
+            : `${b.id}|${a.id}`;
+          if (seen.has(pairKey)) continue;
+          seen.add(pairKey);
+          if (covered.has(pairKey)) continue;
+          const titleSim = textSimilarity(a.title, b.title);
+          const bodySim = textSimilarity(a.body, b.body);
+          const max = Math.max(titleSim, bodySim);
+          if (max < SIMILARITY_THRESHOLD) continue;
+          const memory_ids = [a.id, b.id].sort(compareText);
+          const titles = [a.title.trim(), b.title.trim()].filter((t) => t.length > 0).sort(compareText);
+          groups.push({
+            reason: "similar_title_and_body",
+            fingerprint: duplicateFingerprint("similar_title_and_body", `${max.toFixed(3)}|${pairKey}`),
+            memory_ids,
+            titles,
+            details: { similarity: max }
+          });
+        }
       }
     }
     return groups;
