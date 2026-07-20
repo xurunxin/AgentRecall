@@ -5,7 +5,106 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
-## [Unreleased] — Stage 2 Conflict and Structure
+## [Unreleased] — Stage 3 Cross-Agent Smarter Dedup
+
+Date: 2026-07-20
+
+### Added
+
+- **Token-set Jaccard similarity module** (`src/text-similarity.ts`).
+  Pure JS, no new dependencies. Exports `tokenizeForSimilarity(text)`,
+  `jaccard(setA, setB)`, `textSimilarity(a, b)`, and a
+  `SIMILARITY_THRESHOLD = 0.7` constant. The tokenizer folds case,
+  strips punctuation, drops a small English stop-word set, and keeps
+  CJK code points.
+- **`near_duplicate` warning code** on `BudgetWarning`. Emitted by
+  `evaluateBudget` when the title or body has token-set Jaccard ≥ 0.7
+  with an existing active memory but the exact-match path doesn't
+  fire. Advisory only — the `remember` call still succeeds. The
+  warning carries `similarity`, `actor` (writer of the matching
+  memory), and `last_accessed_by` so the agent can decide whether
+  to merge, rewrite, or proceed.
+- **`similar_title_and_body` reason on `DuplicateGroup`**. The
+  `maintain_memories` action `find_duplicates` now also reports
+  pairs that are token-similar but not exact-match. A new
+  `coveredPairKeys` helper ensures a pair already reported under
+  one of the existing exact-match reasons is not double-reported.
+  Each similar group carries `details.similarity` in [0, 1].
+- **Drive-by fix from Stage 1**: `commitPreparedRemember` no
+  longer writes a hardcoded `actor: "agent"` to the audit log; the
+  field is omitted so `appendAudit` falls back to the service's
+  `defaultActor` (resolved through `resolveActor`). This restores
+  the structured actor recording (e.g. `agent:claude-code`) that
+  was the original Stage 1 promise.
+
+### Changed
+
+- **`remember` response shape**: the `warnings[]` array on the
+  success result now includes `near_duplicate` entries in addition
+  to the existing `duplicate_candidate` entries. When the caller
+  passes `confirm_write: true`, both warning codes are suppressed
+  from the response (the caller has acknowledged them).
+- **TDD discipline** per task. Each of T1–T5 followed red → green
+  → commit. Test count trajectory: 215 (stage 2) → 238 (+23 from
+  stage 3: 14 text-similarity + 7 remember-confirm + 2 find-
+  duplicates + 0 description-shape).
+
+### Documentation
+
+- `docs/superpowers/specs/2026-07-20-stage-three-cross-agent-dedup.md`
+  — Stage 3 spec covering the Jaccard module, the `near_duplicate`
+  warning, the `similar_title_and_body` group reason, and the
+  limitations of pure token-set similarity (no semantic dedup).
+- `docs/superpowers/plans/2026-07-20-stage-three-cross-agent-dedup.md`
+  — 7-task implementation plan with checkboxes, executable
+  commands, and per-task code blocks.
+- `docs/superpowers/plans/2026-07-20-stage-three-closure.md` —
+  plan-vs-actual, test inventory, architecture decisions, scope
+  for Stage 4.
+- `README.md` — Memory Hygiene section updated to describe
+  near-duplicate detection; the agent example illustrates the
+  "two agents, two phrasings" case the new feature addresses.
+
+### Test Coverage
+
+| Stage | Tests | Files | Notes |
+|---|---|---|---|
+| Baseline (pre-stage-1) | 120 | 10 | All passing |
+| Stage 1 additions | +74 | +14 (CLI files) | actor, sqlite-store-migration, tools-descriptions, backup, doctor + 9 CLI test files |
+| **Stage 1 total** | **194** | **24** | **All passing** |
+| Stage 2 additions | +21 | +4 | sqlite-store-migration-v3, remember-confirm, merge-memories, last-accessed-by |
+| **Stage 2 total** | **215** | **28** | **All passing** |
+| Stage 3 additions | +23 | +1 | text-similarity (new) + extensions to remember-confirm and memory-service |
+| **Stage 3 total** | **238** | **29** | **All passing** |
+
+### Deviations from Plan
+
+The Stage 3 plan called for 7 tasks; the implementation landed all 7
+with these adjustments:
+
+1. **`near_matching_ids` field not added to `RememberResult`**. The
+   plan suggested a convenience field; the implementation reuses the
+   existing `warnings: BudgetWarning[]` field and lets the agent
+   filter by `code === "near_duplicate"`. Smaller surface, no
+   redundant data.
+2. **`coveredPairKeys` helper** in `MemoryService.findDuplicateGroups`
+   tracks which pairs are already covered by exact-match groups, so
+   the N×N similar-detector loop skips them. This was an
+   implementation detail that became necessary when the existing
+   "finds deterministic duplicate groups" test asserted exactly
+   3 groups for two identical-text memories (Jaccard = 1.0).
+3. **`commitPreparedRemember` drive-by fix** was not in the original
+   plan. The Stage 1 closure report flagged it as a known issue;
+   resolving it in T4 was the smallest change that made the new
+   `actor` field on `BudgetWarning` actually carry structured
+   values. Without it, every warning's `actor` would be the legacy
+   `"agent"` regardless of which agent wrote the matching memory.
+4. **`similarDuplicateGroups` is O(n²)**. At 1k memories this is
+   500k pairs; at 10k it's 50M. Acceptable for the personal-tool
+   scale but should be replaced with an inverted index or
+   bucketing in Stage 4+ if memory count grows.
+
+## [0.2.0] — 2026-07-19 — Stage 2 Conflict and Structure
 
 Date: 2026-07-19
 

@@ -29,6 +29,7 @@ import { MarkdownExporter } from "./markdown-exporter.js";
 import { resolveActor } from "./actor.js";
 import { resolveMemoryScope } from "./scope-resolver.js";
 import { runBackup } from "./backup.js";
+import { SIMILARITY_THRESHOLD, textSimilarity } from "./text-similarity.js";
 import type { BudgetUsage, EntryFilters, SearchFilters, SQLiteMemoryStore } from "./sqlite-store.js";
 import {
   type RememberInput,
@@ -88,10 +89,11 @@ export type MaintenanceAction =
   | "find_duplicates";
 
 export type DuplicateGroup = {
-  reason: "same_title_and_body" | "same_title" | "same_body";
+  reason: "same_title_and_body" | "same_title" | "same_body" | "similar_title_and_body";
   fingerprint: string;
   memory_ids: string[];
   titles: string[];
+  details?: { similarity?: number };
 };
 
 export type MaintainMemoriesInput = {
@@ -296,7 +298,11 @@ export class MemoryService {
         );
       }
     }
-    return this.store.transaction(() => ok(this.commitPreparedRemember(prepared.value)));
+    // When the caller has acknowledged the warnings (confirm_write: true),
+    // suppress advisory warnings from the response so the agent doesn't
+    // re-read what it just told us to ignore.
+    const suppressed = input.confirm_write === true ? [] : prepared.value.budget.warnings;
+    return this.store.transaction(() => ok(this.commitPreparedRemember(prepared.value, suppressed)));
   }
 
   private prepareRemember(
@@ -364,15 +370,18 @@ export class MemoryService {
     return ok(result);
   }
 
-  private commitPreparedRemember(prepared: PreparedRemember): RememberResult {
+  private commitPreparedRemember(prepared: PreparedRemember, warnings?: BudgetWarning[]): RememberResult {
     const { entry, budget } = prepared;
     this.store.insertEntry(entry);
+    // Omit `actor` so appendAudit falls back to this.defaultActor
+    // (resolved through resolveActor). Previously this wrote a hardcoded
+    // "agent", which prevented the structured actor (e.g. agent:claude-code)
+    // from being recorded in the audit log.
     this.appendAudit({
       memory_id: entry.id,
       scope: entry.scope,
       ...(entry.project_id !== undefined ? { project_id: entry.project_id } : {}),
       event: "created",
-      actor: "agent",
       metadata: {
         type: entry.type,
         topic: entry.topic
@@ -383,7 +392,7 @@ export class MemoryService {
       memory_id: entry.id,
       status: entry.status,
       budget_after: budget.budget_after,
-      warnings: budget.warnings
+      warnings: warnings ?? budget.warnings
     };
   }
 
@@ -1174,15 +1183,18 @@ export class MemoryService {
 
   private findDuplicateGroups(entries: MemoryEntry[]): DuplicateGroup[] {
     const sortedEntries = [...entries].sort((a, b) => compareText(a.id, b.id));
-    const groups: DuplicateGroup[] = [
+    const exactGroups: DuplicateGroup[] = [
       ...this.duplicateGroupsFor(sortedEntries, "same_title_and_body", (entry) => `${normalizeDuplicateText(entry.title)}\n${normalizeDuplicateText(entry.body)}`),
       ...this.duplicateGroupsFor(sortedEntries, "same_title", (entry) => normalizeDuplicateText(entry.title)),
       ...this.duplicateGroupsFor(sortedEntries, "same_body", (entry) => normalizeDuplicateText(entry.body))
     ];
+    const similarGroups = this.similarDuplicateGroups(sortedEntries, this.coveredPairKeys(exactGroups));
+    const groups: DuplicateGroup[] = [...exactGroups, ...similarGroups];
     const reasonRank: Record<DuplicateGroup["reason"], number> = {
       same_title_and_body: 0,
       same_title: 1,
-      same_body: 2
+      same_body: 2,
+      similar_title_and_body: 3
     };
     return groups.sort((a, b) => {
       const reasonOrder = reasonRank[a.reason] - reasonRank[b.reason];
@@ -1193,6 +1205,53 @@ export class MemoryService {
 
       return compareText(a.fingerprint, b.fingerprint);
     });
+  }
+
+  private coveredPairKeys(groups: DuplicateGroup[]): Set<string> {
+    // For every exact-match group of size >= 2, record the (a|b) pair
+    // keys so the similar-detector can skip pairs that are already
+    // covered by a stronger exact signal.
+    const keys = new Set<string>();
+    for (const group of groups) {
+      const ids = [...group.memory_ids].sort(compareText);
+      for (let i = 0; i < ids.length; i += 1) {
+        for (let j = i + 1; j < ids.length; j += 1) {
+          keys.add(`${ids[i]}|${ids[j]}`);
+        }
+      }
+    }
+    return keys;
+  }
+
+  private similarDuplicateGroups(entries: MemoryEntry[], covered: Set<string>): DuplicateGroup[] {
+    // N×N comparison. At 1k entries this is 500k pairs; at 10k it's
+    // 50M. Acceptable for the personal-tool scale this project targets.
+    // Stage 4+ should consider an inverted index or bucketing.
+    const groups: DuplicateGroup[] = [];
+    for (let i = 0; i < entries.length; i += 1) {
+      const a = entries[i];
+      if (a === undefined) continue;
+      for (let j = i + 1; j < entries.length; j += 1) {
+        const b = entries[j];
+        if (b === undefined) continue;
+        const pairKey = `${a.id}|${b.id}`;
+        if (covered.has(pairKey)) continue;
+        const titleSim = textSimilarity(a.title, b.title);
+        const bodySim = textSimilarity(a.body, b.body);
+        const max = Math.max(titleSim, bodySim);
+        if (max < SIMILARITY_THRESHOLD) continue;
+        const memory_ids = [a.id, b.id].sort(compareText);
+        const titles = [a.title.trim(), b.title.trim()].filter((t) => t.length > 0).sort(compareText);
+        groups.push({
+          reason: "similar_title_and_body",
+          fingerprint: duplicateFingerprint("similar_title_and_body", `${max.toFixed(3)}|${pairKey}`),
+          memory_ids,
+          titles,
+          details: { similarity: max }
+        });
+      }
+    }
+    return groups;
   }
 
   private duplicateGroupsFor(
@@ -1260,7 +1319,34 @@ export class MemoryService {
       (existing) => !options.excludedActiveMemoryIds?.has(existing.id)
     );
     const usage = this.usageFromActiveEntries(existingEntries);
-    return evaluateBudget({ budget, usage, candidate: entry, existingEntries, now: entry.updated_at });
+    const result = evaluateBudget({ budget, usage, candidate: entry, existingEntries, now: entry.updated_at });
+    if (!result.ok) return result;
+    // Stage 3: enrich each warning with the matching memory's writer
+    // actor (from the audit log) and its last_accessed_by map (from
+    // the entry itself) so the agent can decide whether the
+    // candidate is its own stale write or a fresh write by another
+    // agent.
+    const enrichedWarnings = result.value.warnings.map((w) => {
+      const matched = existingEntries.find((e) => e.id === w.memory_id);
+      if (matched === undefined) return w;
+      const enriched: BudgetWarning = { ...w };
+      enriched.actor = this.actorForEntry(matched);
+      if (matched.last_accessed_by !== undefined) {
+        enriched.last_accessed_by = matched.last_accessed_by;
+      }
+      return enriched;
+    });
+    return ok({ ...result.value, warnings: enrichedWarnings });
+  }
+
+  private actorForEntry(entry: MemoryEntry): string {
+    // Walk the audit log to find the first "created" event for this
+    // entry. That event's actor is the canonical writer. Fall back
+    // to the legacy kind if no audit row is found.
+    const events = this.store.getAuditEvents(entry.id);
+    const created = events.find((e) => e.event === "created");
+    if (created !== undefined) return created.actor;
+    return entry.source.kind;
   }
 
   private budgetFor(entry: MemoryEntry): MemoryBudget {

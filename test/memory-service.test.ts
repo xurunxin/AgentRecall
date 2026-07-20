@@ -1163,6 +1163,66 @@ describe("MemoryService", () => {
     store.close();
   });
 
+  it("finds similar (rephrased) duplicate groups via Jaccard", () => {
+    const { store, memory } = service();
+    // two memories with different titles and moderately different bodies
+    // that nonetheless share most content tokens (Jaccard 0.75).
+    const first = memory.remember({
+      scope: "global",
+      type: "lesson",
+      topic: "stack",
+      title: "p1",
+      body: "primary datastore is postgres",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    });
+    const second = memory.remember({
+      scope: "global",
+      type: "lesson",
+      topic: "stack",
+      title: "p2",
+      body: "primary datastore is postgres for the api",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3,
+      confirm_write: true
+    });
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    if (!first.ok || !second.ok) throw new Error("expected similar memories");
+    const pairIds = [first.value.memory_id, second.value.memory_id].sort();
+
+    const result = memory.maintainMemories({ action: "find_duplicates", scope: "global" });
+    const details = result.details as { groups: Array<{ reason: string; memory_ids: string[]; details?: { similarity?: number } }> };
+    const simGroup = details.groups.find((g) => g.reason === "similar_title_and_body");
+    expect(simGroup).toBeDefined();
+    expect(simGroup?.memory_ids).toEqual(pairIds);
+    expect(simGroup?.details?.similarity).toBeGreaterThanOrEqual(0.7);
+    store.close();
+  });
+
+  it("does not flag similar_title_and_body for genuinely different memories", () => {
+    const { store, memory } = service();
+    memory.remember({
+      scope: "global", type: "lesson", topic: "stack",
+      title: "p1", body: "primary datastore is postgres",
+      tags: [], source: { kind: "agent" }, importance: 3, confidence: 3
+    });
+    memory.remember({
+      scope: "global", type: "lesson", topic: "ui",
+      title: "p2", body: "user prefers tabs over spaces",
+      tags: [], source: { kind: "agent" }, importance: 3, confidence: 3
+    });
+    const result = memory.maintainMemories({ action: "find_duplicates", scope: "global" });
+    const details = result.details as { groups: Array<{ reason: string }> };
+    const simGroup = details.groups.find((g) => g.reason === "similar_title_and_body");
+    expect(simGroup).toBeUndefined();
+    store.close();
+  });
+
   it("rebuilds markdown index and audits the export", () => {
     const exportRoot = join(mkdtempSync(join(tmpdir(), "lm-service-export-")), "exports");
     const { store, memory } = service(exportRoot);
