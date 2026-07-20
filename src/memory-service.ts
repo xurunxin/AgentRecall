@@ -146,7 +146,35 @@ type ResolvedReadScope = {
 type ContextScore = {
   entry: MemoryEntry;
   query_score: number;
+  trust_boost: number;
 };
+
+const STRONG_TRUST_BOOST = 0.3;
+const SOFT_TRUST_BOOST = 0.1;
+
+/**
+ * Stage 5: per-memory trust boost for recall ranking.
+ *
+ * Returns 0.3 when the memory was written by `currentActor` (strong
+ * signal — "I wrote this, trust my own knowledge"), 0.1 when the
+ * current actor appears in the memory's `last_accessed_by` map
+ * (soft signal — "I've touched this recently"), or 0 when there is
+ * no relationship. Returns 0 when `currentActor` is empty (legacy
+ * callers constructed without `defaultActor`).
+ */
+export function computeTrustBoost(
+  entry: MemoryEntry,
+  currentActor: string,
+  actorForEntry: (entry: MemoryEntry) => string
+): number {
+  if (currentActor.length === 0) return 0;
+  const writer = actorForEntry(entry);
+  if (writer === currentActor) return STRONG_TRUST_BOOST;
+  if (entry.last_accessed_by !== undefined && entry.last_accessed_by[currentActor] !== undefined) {
+    return SOFT_TRUST_BOOST;
+  }
+  return 0;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -210,6 +238,9 @@ function contextQueryScore(entry: MemoryEntry, tokens: string[]): number {
 function compareContextScores(a: ContextScore, b: ContextScore): number {
   const queryOrder = b.query_score - a.query_score;
   if (queryOrder !== 0) return queryOrder;
+
+  const trustOrder = b.trust_boost - a.trust_boost;
+  if (trustOrder !== 0) return trustOrder;
 
   const importanceOrder = b.entry.importance - a.entry.importance;
   if (importanceOrder !== 0) return importanceOrder;
@@ -881,7 +912,16 @@ export class MemoryService {
       });
     }
 
-    const entries = this.collectContextEntries(resolved.value, input);
+    const collected = this.collectContextEntries(resolved.value, input);
+    // Stage 5: annotate each entry with its trust_boost (so the
+    // exporter can break importance ties in favor of the calling
+    // agent's own or recently-touched memories) and the writer
+    // actor (so the markdown output can show who wrote it).
+    const entries = collected.map((entry) => ({
+      ...entry,
+      trust_boost: computeTrustBoost(entry, this.defaultActor, (e) => this.actorForEntry(e)),
+      writer: this.actorForEntry(entry)
+    }));
     return exporter.buildContextPack({
       title: "AgentRecall Context",
       budget_chars: input.budget_chars,
@@ -996,7 +1036,11 @@ export class MemoryService {
 
     const tokens = queryTokens(input.query);
     return [...byId.values()]
-      .map((entry) => ({ entry, query_score: contextQueryScore(entry, tokens) }))
+      .map((entry) => ({
+        entry,
+        query_score: contextQueryScore(entry, tokens),
+        trust_boost: computeTrustBoost(entry, this.defaultActor, (e) => this.actorForEntry(e))
+      }))
       .sort(compareContextScores)
       .map(({ entry }) => entry);
   }
