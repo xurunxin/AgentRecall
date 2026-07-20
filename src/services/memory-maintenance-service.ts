@@ -20,6 +20,7 @@ import {
   activeEntriesForScope,
   allEntriesForScope,
   appendAudit,
+  assertProjectScope,
   compareLowValueCandidates,
   compareText,
   duplicateFingerprint,
@@ -32,6 +33,7 @@ import type { BudgetUsage, SQLiteMemoryStore } from "../sqlite-store.js";
 import { nowIso, type MemoryAuditEvent, type MemoryEntry, type MemoryScope } from "../domain.js";
 import { MarkdownExporter } from "../markdown-exporter.js";
 import { runBackup } from "../backup.js";
+import { resolveMemoryScope } from "../scope-resolver.js";
 import { createHash } from "node:crypto";
 
 export type MaintenanceAction =
@@ -87,14 +89,44 @@ export class MemoryMaintenanceService {
         );
       }
     }
-    const scope = this.resolveScope(input);
-    if (scope === undefined) {
+    // Stage 10 PR2: route every maintenance call through the
+    // single ProjectIdentityResolver. Pre-PR2 the maintenance
+    // service had its own private `resolveScope` that copied
+    // only `project_id` and silently dropped `project_path`,
+    // causing project_path-only inputs to fall through to a
+    // cross-project "scope=project" filter.
+    const resolved = resolveMemoryScope({
+      scope: input.scope,
+      ...(input.project_id !== undefined ? { project_id: input.project_id } : {}),
+      ...(input.project_path !== undefined ? { project_path: input.project_path } : {})
+    });
+    if (!resolved.ok) {
       return {
         action: input.action,
         changed: 0,
-        details: { error: "invalid_scope", message: "scope could not be resolved" }
+        details: { error: resolved.error, message: resolved.message }
       };
     }
+    // Destructive actions must never run against an
+    // unresolved project. `resolveMemoryScope` guarantees
+    // `project_id !== undefined` whenever `scope === "project"`
+    // and a `project_path` (or explicit `project_id`) was
+    // supplied, so this assertion is the second line of
+    // defense behind the resolver.
+    if (resolved.value.scope === "project" && resolved.value.project_id === undefined) {
+      return {
+        action: input.action,
+        changed: 0,
+        details: {
+          error: "invalid_scope",
+          message: "project scope requires project_id or project_path"
+        }
+      };
+    }
+    const scope: ResolvedReadScope = {
+      scope: resolved.value.scope,
+      ...(resolved.value.project_id !== undefined ? { project_id: resolved.value.project_id } : {})
+    };
     switch (input.action) {
       case "find_duplicates":
         return this.findDuplicatesChunked(scope, input);
@@ -148,6 +180,7 @@ export class MemoryMaintenanceService {
     scope: ResolvedReadScope,
     input: MaintainMemoriesInput
   ): MaintainMemoriesResult {
+    assertProjectScope(scope, "merge_duplicates");
     const strategy: "keep_first" | "keep_newest" = input.strategy ?? "keep_first";
     const dryRun = input.dry_run === true;
     const onProgress = input.onProgress;
@@ -206,6 +239,7 @@ export class MemoryMaintenanceService {
   }
 
   private rebuildMarkdownIndex(scope: ResolvedReadScope): MaintainMemoriesResult {
+    assertProjectScope(scope, "rebuild_markdown_index");
     const exporter = this.ctx.resolveExporter();
     const staged = exporter.stageScope({
       scope: scope.scope,
@@ -247,6 +281,7 @@ export class MemoryMaintenanceService {
   }
 
   private expireDueMemories(scope: ResolvedReadScope, dryRun = false): MaintainMemoriesResult {
+    assertProjectScope(scope, "expire_due");
     const now = nowIso();
     const expired = activeEntriesForScope(this.ctx.store, scope)
       .filter((entry) => isDue(entry.expires_at, now))
@@ -292,6 +327,7 @@ export class MemoryMaintenanceService {
   }
 
   private archiveLowValueMemories(scope: ResolvedReadScope, dryRun = false): MaintainMemoriesResult {
+    assertProjectScope(scope, "archive_low_value");
     const lowValue = activeEntriesForScope(this.ctx.store, scope)
       .filter((entry) => entry.importance <= 2 && entry.confidence <= 2 && entry.access_count === 0 && entry.source.kind !== "user")
       .sort(compareLowValueCandidates);
@@ -521,15 +557,10 @@ export class MemoryMaintenanceService {
     });
   }
 
-  private resolveScope(input: MaintainMemoriesInput): ResolvedReadScope | undefined {
-    if (input.scope === "project" && input.project_id === undefined && input.project_path === undefined) {
-      return undefined;
-    }
-    return {
-      scope: input.scope,
-      ...(input.project_id !== undefined ? { project_id: input.project_id } : {})
-    };
-  }
+  // The private `resolveScope` helper used to live here. It was
+  // removed in Stage 10 PR2 — every entry point must call
+  // `resolveMemoryScope` from `../scope-resolver.js` instead, so
+  // there is exactly one ProjectIdentityResolver in the codebase.
 }
 
 // Re-export so the old top-level helpers used by memory-service.ts still resolve.

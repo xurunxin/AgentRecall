@@ -257,6 +257,29 @@ export function rejectionMetadata(
   return details === undefined ? { error } : { error, ...details };
 }
 
+/**
+ * Stage 10 PR2: assert that a `scope=project` resolved
+ * scope actually carries a non-empty `project_id`. Destructive
+ * maintenance actions must call this on the way in so a stale
+ * `project_id === undefined` (which used to silently fall
+ * through to the cross-project filter) is caught before any
+ * mutation.
+ *
+ * Throws on failure. The maintenance service catches and
+ * converts to a `changed=0` result with
+ * `details.error = "invalid_scope"`.
+ */
+export function assertProjectScope(
+  scope: { scope: "global" | "project"; project_id?: string | undefined },
+  action: string
+): void {
+  if (scope.scope === "project" && (scope.project_id === undefined || scope.project_id.length === 0)) {
+    throw new Error(
+      `assertProjectScope: destructive action '${action}' requires a non-empty project_id`
+    );
+  }
+}
+
 export function auditRejected(
   store: SQLiteMemoryStore,
   defaultActor: string,
