@@ -373,12 +373,15 @@ export class MemoryService {
   private commitPreparedRemember(prepared: PreparedRemember, warnings?: BudgetWarning[]): RememberResult {
     const { entry, budget } = prepared;
     this.store.insertEntry(entry);
+    // Omit `actor` so appendAudit falls back to this.defaultActor
+    // (resolved through resolveActor). Previously this wrote a hardcoded
+    // "agent", which prevented the structured actor (e.g. agent:claude-code)
+    // from being recorded in the audit log.
     this.appendAudit({
       memory_id: entry.id,
       scope: entry.scope,
       ...(entry.project_id !== undefined ? { project_id: entry.project_id } : {}),
       event: "created",
-      actor: "agent",
       metadata: {
         type: entry.type,
         topic: entry.topic
@@ -1314,7 +1317,34 @@ export class MemoryService {
       (existing) => !options.excludedActiveMemoryIds?.has(existing.id)
     );
     const usage = this.usageFromActiveEntries(existingEntries);
-    return evaluateBudget({ budget, usage, candidate: entry, existingEntries, now: entry.updated_at });
+    const result = evaluateBudget({ budget, usage, candidate: entry, existingEntries, now: entry.updated_at });
+    if (!result.ok) return result;
+    // Stage 3: enrich each warning with the matching memory's writer
+    // actor (from the audit log) and its last_accessed_by map (from
+    // the entry itself) so the agent can decide whether the
+    // candidate is its own stale write or a fresh write by another
+    // agent.
+    const enrichedWarnings = result.value.warnings.map((w) => {
+      const matched = existingEntries.find((e) => e.id === w.memory_id);
+      if (matched === undefined) return w;
+      const enriched: BudgetWarning = { ...w };
+      enriched.actor = this.actorForEntry(matched);
+      if (matched.last_accessed_by !== undefined) {
+        enriched.last_accessed_by = matched.last_accessed_by;
+      }
+      return enriched;
+    });
+    return ok({ ...result.value, warnings: enrichedWarnings });
+  }
+
+  private actorForEntry(entry: MemoryEntry): string {
+    // Walk the audit log to find the first "created" event for this
+    // entry. That event's actor is the canonical writer. Fall back
+    // to the legacy kind if no audit row is found.
+    const events = this.store.getAuditEvents(entry.id);
+    const created = events.find((e) => e.event === "created");
+    if (created !== undefined) return created.actor;
+    return entry.source.kind;
   }
 
   private budgetFor(entry: MemoryEntry): MemoryBudget {

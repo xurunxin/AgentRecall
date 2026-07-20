@@ -206,4 +206,42 @@ describe("remember near-duplicate detection (stage 3)", () => {
     const nearWarns = result.value.warnings.filter((w) => w.code === "near_duplicate");
     expect(nearWarns).toEqual([]);
   });
+
+  it("includes the matching memory's writer actor on the near_duplicate warning", () => {
+    // Write the first memory with a different actor
+    const dataHome = mkdtempSync(join(tmpdir(), "lm-actor-"));
+    const sharedStore = new SQLiteMemoryStore(join(dataHome, "memory.sqlite"));
+    const claude = new MemoryService(sharedStore, undefined, "agent:claude-code", dataHome);
+    const cursor = new MemoryService(sharedStore, undefined, "agent:cursor", dataHome);
+
+    const first = claude.remember(baseInput({ title: "p1" }));
+    if (!first.ok) throw new Error("setup");
+    const result = cursor.remember(baseInput({ title: "p2", body: "primary datastore is postgres for the api" }));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const nearWarns = result.value.warnings.filter((w) => w.code === "near_duplicate");
+    expect(nearWarns.length).toBe(1);
+    expect(nearWarns[0]?.actor).toBe("agent:claude-code");
+    sharedStore.close();
+  });
+
+  it("includes the matching memory's last_accessed_by map on the near_duplicate warning", () => {
+    const dataHome = mkdtempSync(join(tmpdir(), "lm-accessed-"));
+    const sharedStore = new SQLiteMemoryStore(join(dataHome, "memory.sqlite"));
+    const claude = new MemoryService(sharedStore, undefined, "agent:claude-code", dataHome);
+    const cursor = new MemoryService(sharedStore, undefined, "agent:cursor", dataHome);
+
+    const first = claude.remember(baseInput({ title: "p1" }));
+    if (!first.ok) throw new Error("setup");
+    // claude reads its own memory (populates last_accessed_by)
+    claude.getMemory(first.value.memory_id, "agent:claude-code");
+    // cursor writes a similar memory
+    const result = cursor.remember(baseInput({ title: "p2", body: "primary datastore is postgres for the api" }));
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const nearWarns = result.value.warnings.filter((w) => w.code === "near_duplicate");
+    expect(nearWarns.length).toBe(1);
+    expect(nearWarns[0]?.last_accessed_by?.["agent:claude-code"]).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    sharedStore.close();
+  });
 });
