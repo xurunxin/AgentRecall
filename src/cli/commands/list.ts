@@ -10,10 +10,16 @@ export function listCommand(ctx: CliContext): CliResult {
   const limit = Number.parseInt(flagString(ctx.args, "limit") ?? "20", 10);
   const offset = Number.parseInt(flagString(ctx.args, "offset") ?? "0", 10);
   const actor = flagString(ctx.args, "actor");
+  const since = flagString(ctx.args, "since");
+  const until = flagString(ctx.args, "until");
+  const lastAccessedSince = flagString(ctx.args, "last-accessed-since");
 
   const filters: Record<string, unknown> = { scope, status, limit, offset };
   if (projectId !== undefined) filters.project_id = projectId;
   if (actor !== undefined) filters.actor = actor;
+  if (since !== undefined) filters.since = since;
+  if (until !== undefined) filters.until = until;
+  if (lastAccessedSince !== undefined) filters.last_accessed_since = lastAccessedSince;
 
   const items = ctx.store.listEntries(filters);
   const json = flagBool(ctx.args, "json");

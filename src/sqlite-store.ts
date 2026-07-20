@@ -26,6 +26,22 @@ export type EntryFilters = {
    * to avoid a join on every read.
    */
   actor?: string;
+  /**
+   * Stage 6: ISO 8601 lower bound on `created_at`. Strings are
+   * compared lexicographically, which is correct for ISO 8601.
+   */
+  since?: string;
+  /**
+   * Stage 6: ISO 8601 upper bound on `created_at`. Strings are
+   * compared lexicographically, which is correct for ISO 8601.
+   */
+  until?: string;
+  /**
+   * Stage 6: ISO 8601 lower bound on `last_accessed_at`. Memories
+   * with `last_accessed_at IS NULL` (never read) are excluded by
+   * design — "never touched" is not "touched since X".
+   */
+  last_accessed_since?: string;
 };
 
 export type SearchFilters = EntryFilters & {
@@ -265,6 +281,19 @@ function buildEntryWhere(filters: EntryFilters, alias: string): { where: string;
     // (memory_id, event) so this is O(1) per memory via the index.
     clauses.push(`${column("id")} IN (SELECT memory_id FROM audit_events WHERE event = 'created' AND actor = ?)`);
     params.push(filters.actor);
+  }
+  if (filters.since !== undefined) {
+    clauses.push(`${column("created_at")} >= ?`);
+    params.push(filters.since);
+  }
+  if (filters.until !== undefined) {
+    clauses.push(`${column("created_at")} <= ?`);
+    params.push(filters.until);
+  }
+  if (filters.last_accessed_since !== undefined) {
+    // Exclude never-read memories by the IS NOT NULL guard.
+    clauses.push(`${column("last_accessed_at")} IS NOT NULL AND ${column("last_accessed_at")} >= ?`);
+    params.push(filters.last_accessed_since);
   }
 
   return {

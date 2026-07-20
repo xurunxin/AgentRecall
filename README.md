@@ -97,8 +97,12 @@ for one-off inspection, health checks, manual backups, and schema migration.
 npm run cli -- doctor
 npm run cli -- list --limit 10
 npm run cli -- list --actor "agent:claude-code"   # only claude-code's writes
+npm run cli -- list --since "2026-07-13"          # only memories created on/after
+npm run cli -- list --actor "agent:claude-code" --since "2026-07-13"  # combine
+npm run cli -- list --last-accessed-since "2026-07-13"  # only memories I've read recently
 npm run cli -- search "postgres" --limit 5
 npm run cli -- search "postgres" --actor "agent:claude-code"
+npm run cli -- search "postgres" --since "2026-07-13"
 npm run cli -- show <memory_id>
 npm run cli -- audit <memory_id>
 npm run cli -- backup
@@ -136,7 +140,7 @@ should not silently overwrite.
 
 ## Doctor
 
-`agent-recall doctor` runs eleven health checks and exits with:
+`agent-recall doctor` runs twelve health checks and exits with:
 
 - `0` — all OK
 - `1` — warnings present, no failures
@@ -161,9 +165,9 @@ maintenance actions (`rebuild_markdown_index`, `expire_due`,
 | --- | --- |
 | `recall_context` | Task-start memory recall entry point. Ranks the calling agent's own knowledge first; each entry is annotated with `[writer: <actor>]`. |
 | `remember` | Store one validated local memory entry. |
-| `search_memories` | Search memories by full-text query and optional metadata filters; `actor` narrows to one writer. |
+| `search_memories` | Search memories by full-text query and optional metadata filters; `actor`, `since`, `last_accessed_since` narrow the result. |
 | `get_memory` | Read one memory entry and its audit history by memory id. |
-| `list_memories` | List memories with optional scope and metadata filters; `actor` narrows to one writer. |
+| `list_memories` | List memories with optional scope and metadata filters; `actor`, `since`, `until`, `last_accessed_since` narrow the result. |
 | `update_memory` | Update mutable fields on an active or archived memory. |
 | `supersede_memory` | Create a replacement memory and mark older memories as superseded. |
 | `forget_memory` | Forget a memory by clearing its body and marking it forgotten. |
@@ -220,6 +224,11 @@ Markdown exports are for inspection and handoff. Manual edits under `exports/` m
 ## Changelog
 
 Stage-level changes are tracked in [`CHANGELOG.md`](./CHANGELOG.md).
+Stage 6 delivered time-window filters on `list_memories` and
+`search_memories` (MCP + CLI: `since`, `until`,
+`last_accessed_since`) and the twelfth doctor check
+`stale_memories`; see the
+[Stage 6 closure report](./docs/superpowers/plans/2026-07-20-stage-six-time-window-closure.md).
 Stage 5 delivered the actor trust boost in `recall_context`
 ranking (+0.3 for the calling agent's own writes, +0.1 for
 recently-touched foreign writes) and a `[writer: X]`

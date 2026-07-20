@@ -16,6 +16,7 @@ import { checkFtsConsistency } from "./checks/fts-consistency.js";
 import { checkIntegrity } from "./checks/integrity.js";
 import { checkLastAccessedBy } from "./checks/last-accessed-by.js";
 import { checkSchemaVersion } from "./checks/schema-version.js";
+import { checkStaleMemories } from "./checks/stale-memories.js";
 import type { CheckContext, CheckResult, DoctorReport } from "./types.js";
 
 const CHECKS: Array<(ctx: CheckContext) => CheckResult> = [
@@ -29,7 +30,8 @@ const CHECKS: Array<(ctx: CheckContext) => CheckResult> = [
   checkCapacityHeadroom,
   checkActorDistribution,
   checkLastAccessedBy,
-  checkActorOwnership
+  checkActorOwnership,
+  checkStaleMemories
 ];
 
 export function runDoctor(ctx: CheckContext): DoctorReport {
