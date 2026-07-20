@@ -36,6 +36,16 @@ Date: 2026-07-20
   `defaultActor` (resolved through `resolveActor`). This restores
   the structured actor recording (e.g. `agent:claude-code`) that
   was the original Stage 1 promise.
+- **MCP-layer wiring fix (post-merge)**: the structured actor and
+  per-agent access map reached the MCP wire protocol. `createService`
+  in `src/index.ts` now passes `resolveActor(undefined)` so the
+  `AGENT_RECALL_ACTOR` env var lands in the audit log. The
+  `get_memory` tool schema accepts an optional `accessed_by` string
+  and the handler forwards it to `MemoryService.getMemory`, so
+  `last_accessed_by` is actually populated when an agent reads a
+  memory through MCP. Without these, the Stage 3 `near_duplicate`
+  warning's `actor` and `last_accessed_by` enrichment could not
+  be observed end-to-end. See commit `ac1656f`.
 
 ### Changed
 
