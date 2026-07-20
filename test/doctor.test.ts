@@ -30,7 +30,7 @@ describe("runDoctor", () => {
     const report = runDoctor(ctx);
     expect(report.exit_code).toBe(0);
     expect(report.summary.fail).toBe(0);
-    expect(report.results.length).toBe(11);
+    expect(report.results.length).toBe(12);
     store.close();
   });
 
@@ -119,6 +119,46 @@ describe("runDoctor", () => {
     const cursorRow = distribution.find((d) => d.actor === "agent:cursor");
     expect(claudeRow?.c).toBe(1);
     expect(cursorRow?.c).toBe(1);
+    store.close();
+  });
+
+  it("reports stale_memories as the 12th check (stage 6)", () => {
+    // Fresh database: nothing stale.
+    let report = runDoctor(ctx);
+    const stale = report.results.find((r) => r.name === "stale_memories");
+    expect(stale?.status).toBe("ok");
+    expect(stale?.message).toContain("0 memories stale");
+
+    // Insert a memory with a created_at 100 days ago and no
+    // last_accessed_at — qualifies as stale.
+    store.insertEntry({
+      id: "mem_stale",
+      scope: "global",
+      type: "fact",
+      memory_kind: "semantic",
+      topic: "t",
+      title: "stale title",
+      body: "stale body",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3,
+      status: "active",
+      created_at: "2026-04-01T00:00:00.000Z",
+      updated_at: "2026-04-01T00:00:00.000Z",
+      access_count: 0,
+      supersedes: [],
+      token_estimate: 1,
+      char_count: 2
+    });
+
+    report = runDoctor(ctx);
+    const staleAfter = report.results.find((r) => r.name === "stale_memories");
+    expect(staleAfter?.status).toBe("ok");
+    expect(staleAfter?.message).toContain("1 memories stale");
+    const details = staleAfter?.details as { count: number; sample: Array<{ id: string }> };
+    expect(details.count).toBe(1);
+    expect(details.sample[0]?.id).toBe("mem_stale");
     store.close();
   });
 
