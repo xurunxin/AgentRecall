@@ -30,7 +30,7 @@ describe("runDoctor", () => {
     const report = runDoctor(ctx);
     expect(report.exit_code).toBe(0);
     expect(report.summary.fail).toBe(0);
-    expect(report.results.length).toBe(10);
+    expect(report.results.length).toBe(11);
     store.close();
   });
 
@@ -39,6 +39,86 @@ describe("runDoctor", () => {
     const backupCheck = report.results.find((r) => r.name === "backup_directory");
     expect(backupCheck?.status).toBe("ok");
     expect(backupCheck?.message).toContain("first run");
+    store.close();
+  });
+
+  it("reports per-actor memory ownership (stage 4)", () => {
+    // Empty database: ownership shows no writers.
+    let report = runDoctor(ctx);
+    let ownership = report.results.find((r) => r.name === "actor_ownership");
+    expect(ownership?.status).toBe("ok");
+    expect(ownership?.message).toContain("no memories");
+
+    // Insert two memories, each with a different created actor.
+    store.insertEntry({
+      id: "mem_o1",
+      scope: "global",
+      type: "fact",
+      memory_kind: "semantic",
+      topic: "t",
+      title: "t1",
+      body: "b1",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3,
+      status: "active",
+      created_at: "2026-07-20T00:00:00.000Z",
+      updated_at: "2026-07-20T00:00:00.000Z",
+      access_count: 0,
+      supersedes: [],
+      token_estimate: 1,
+      char_count: 2
+    });
+    store.appendAudit({
+      id: "aud_o1",
+      memory_id: "mem_o1",
+      scope: "global",
+      event: "created",
+      actor: "agent:claude-code",
+      metadata: {},
+      created_at: "2026-07-20T00:00:00.000Z"
+    });
+    store.insertEntry({
+      id: "mem_o2",
+      scope: "global",
+      type: "fact",
+      memory_kind: "semantic",
+      topic: "t",
+      title: "t2",
+      body: "b2",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3,
+      status: "active",
+      created_at: "2026-07-20T00:00:00.000Z",
+      updated_at: "2026-07-20T00:00:00.000Z",
+      access_count: 0,
+      supersedes: [],
+      token_estimate: 1,
+      char_count: 2
+    });
+    store.appendAudit({
+      id: "aud_o2",
+      memory_id: "mem_o2",
+      scope: "global",
+      event: "created",
+      actor: "agent:cursor",
+      metadata: {},
+      created_at: "2026-07-20T00:00:00.000Z"
+    });
+
+    report = runDoctor(ctx);
+    ownership = report.results.find((r) => r.name === "actor_ownership");
+    expect(ownership?.status).toBe("ok");
+    expect(ownership?.message).toContain("2 entries");
+    expect(ownership?.message).toContain("2 writers");
+    const distribution = (ownership?.details as { distribution: Array<{ actor: string; c: number }> }).distribution;
+    const claudeRow = distribution.find((d) => d.actor === "agent:claude-code");
+    const cursorRow = distribution.find((d) => d.actor === "agent:cursor");
+    expect(claudeRow?.c).toBe(1);
+    expect(cursorRow?.c).toBe(1);
     store.close();
   });
 
