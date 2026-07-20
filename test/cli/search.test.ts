@@ -125,4 +125,56 @@ describe("searchCommand", () => {
     expect(claudeOnly.stdout).toContain("1 matches");
     store.close();
   });
+
+  it("filters by --since (stage 6)", () => {
+    const { dataHome, store } = setup();
+    // setup() inserts mem_s with created_at 2026-07-19. Add an
+    // older matching memory.
+    store.appendAudit({
+      id: "aud_search_3",
+      memory_id: "mem_s",
+      scope: "global",
+      event: "created",
+      actor: "agent:claude-code",
+      metadata: {},
+      created_at: "2026-07-19T00:00:00.000Z"
+    });
+    store.insertEntry({
+      id: "mem_s_old",
+      scope: "global",
+      type: "fact",
+      memory_kind: "semantic",
+      topic: "postgres",
+      title: "Old postgres",
+      body: "postgres setup notes long ago",
+      tags: ["postgres"],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3,
+      status: "active",
+      created_at: "2026-07-01T00:00:00.000Z",
+      updated_at: "2026-07-01T00:00:00.000Z",
+      access_count: 0,
+      supersedes: [],
+      token_estimate: 1,
+      char_count: 2
+    });
+    store.appendAudit({
+      id: "aud_search_4",
+      memory_id: "mem_s_old",
+      scope: "global",
+      event: "created",
+      actor: "agent:claude-code",
+      metadata: {},
+      created_at: "2026-07-01T00:00:00.000Z"
+    });
+
+    // --since 2026-07-15: only mem_s (mem_s_old is older)
+    const recent = searchCommand({
+      dataHome, store, args: parseArgs(["search", "postgres", "--since", "2026-07-15T00:00:00.000Z"])
+    });
+    expect(recent.stdout).toContain("mem_s");
+    expect(recent.stdout).not.toContain("mem_s_old");
+    store.close();
+  });
 });

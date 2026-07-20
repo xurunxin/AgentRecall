@@ -126,4 +126,52 @@ describe("listCommand", () => {
     expect(claudeOnly.stdout).toContain("1 entries");
     store.close();
   });
+
+  it("filters by --since / --until / --last-accessed-since (stage 6)", () => {
+    const { dataHome, store } = setup();
+    // The setup() helper inserts mem_a with created_at=2026-07-19. Add
+    // a second memory with an older created_at and a read timestamp.
+    store.insertEntry({
+      id: "mem_old",
+      scope: "global",
+      type: "fact",
+      memory_kind: "semantic",
+      topic: "general",
+      title: "old",
+      body: "older",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3,
+      status: "active",
+      created_at: "2026-07-10T00:00:00.000Z",
+      updated_at: "2026-07-10T00:00:00.000Z",
+      access_count: 0,
+      supersedes: [],
+      token_estimate: 1,
+      char_count: 2
+    });
+    // Mark mem_a as read recently
+    store.getEntry("mem_a", "agent:claude-code");
+
+    // --since keeps only mem_a (created 2026-07-19, since 2026-07-15)
+    const recent = listCommand({
+      dataHome,
+      args: parseArgs(["list", "--since", "2026-07-15T00:00:00.000Z"]),
+      store
+    });
+    expect(recent.stdout).toContain("mem_a");
+    expect(recent.stdout).not.toContain("mem_old");
+    expect(recent.stdout).toContain("1 entries");
+
+    // --last-accessed-since keeps only mem_a (was read, mem_old was not)
+    const recentlyRead = listCommand({
+      dataHome,
+      args: parseArgs(["list", "--last-accessed-since", "2026-07-19T00:00:00.000Z"]),
+      store
+    });
+    expect(recentlyRead.stdout).toContain("mem_a");
+    expect(recentlyRead.stdout).not.toContain("mem_old");
+    store.close();
+  });
 });
