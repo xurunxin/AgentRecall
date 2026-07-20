@@ -195,6 +195,32 @@ describe("memory tool schemas", () => {
     expect(() => memoryToolSchemas.forget_memory.parse({ id: "mem_1", memory_id: "mem_2", reason: "obsolete" })).toThrow();
   });
 
+  it("list_memories and search_memories accept an optional actor filter (stage 4)", async () => {
+    expect(memoryToolSchemas.list_memories.parse({ scope: "global", actor: "agent:claude-code" })).toMatchObject({
+      scope: "global",
+      actor: "agent:claude-code"
+    });
+    expect(memoryToolSchemas.search_memories.parse({
+      query: "postgres",
+      scope: "global",
+      actor: "agent:claude-code"
+    })).toMatchObject({
+      query: "postgres",
+      scope: "global",
+      actor: "agent:claude-code"
+    });
+
+    // Handlers forward the actor through to MemoryService.
+    const service = fakeService();
+    service.listMemories.mockReturnValue({ items: [] });
+    service.searchMemories.mockReturnValue({ items: [] });
+    const handlers = createMemoryToolHandlers(service);
+    await handlers.list_memories({ scope: "global", actor: "agent:claude-code" });
+    expect(service.listMemories).toHaveBeenCalledWith(expect.objectContaining({ actor: "agent:claude-code" }));
+    await handlers.search_memories({ query: "x", scope: "global", actor: "agent:claude-code" });
+    expect(service.searchMemories).toHaveBeenCalledWith(expect.objectContaining({ actor: "agent:claude-code" }));
+  });
+
   it("get_memory accepts an accessed_by string and the handler forwards it", async () => {
     // Schema accepts and validates the field.
     expect(memoryToolSchemas.get_memory.parse({
