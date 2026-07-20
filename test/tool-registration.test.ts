@@ -505,7 +505,11 @@ describe("registerMemoryTools", () => {
       "forget_memory",
       "get_memory_budget",
       "maintain_memories",
-      "export_memory_context"
+      "export_memory_context",
+      "plan_maintenance",
+      "apply_maintenance",
+      "explain_recall",
+      "list_backups"
     ]);
     expect(registered[0]?.config.description).toContain("[TRIGGER] Call near the start of a coding task");
     for (const tool of registered) {

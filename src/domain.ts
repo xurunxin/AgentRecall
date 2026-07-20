@@ -72,6 +72,24 @@ export type MemoryEntry = {
   superseded_by?: string;
   token_estimate: number;
   char_count: number;
+  /**
+   * Stage 12 PR9: schema v4 row shape. The CAS update
+   * path (spec § 5.6) writes
+   * `WHERE id = ? AND revision = ?` and bumps
+   * `revision = revision + 1`. New rows start at
+   * revision 1. The v3->v4 migration back-fills revision
+   * to 1 for pre-existing rows.
+   */
+  revision: number;
+  writer_actor_id: string;
+  content_hash?: string;
+  pinned: boolean;
+  trust_level: "user_confirmed" | "agent_observed" | "inferred" | "imported";
+  sensitivity: "normal" | "private" | "restricted";
+  valid_from?: string;
+  valid_until?: string;
+  deleted_at?: string;
+  metadata: Record<string, unknown>;
 };
 
 export type ProjectScope = {

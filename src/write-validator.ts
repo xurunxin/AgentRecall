@@ -76,7 +76,16 @@ export type UpdateInput = Partial<
     | "expires_at"
     | "review_after"
   >
->;
+> & {
+  /**
+   * Stage 12 PR9: optimistic-concurrency control (spec
+   * § 5.6). When set, the writer applies the patch only
+   * if the row's `revision` matches `expected_revision`;
+   * otherwise it returns `stale_revision` to the caller
+   * so they can re-read and retry.
+   */
+  expected_revision?: number;
+};
 
 export type ValidatedUpdateInput = UpdateInput;
 
@@ -90,7 +99,8 @@ const MUTABLE_UPDATE_FIELDS = new Set([
   "confidence",
   "status",
   "expires_at",
-  "review_after"
+  "review_after",
+  "expected_revision"
 ]);
 
 export function validateRememberInput(input: unknown): Result<ValidatedRememberInput, ValidationError> {

@@ -380,31 +380,37 @@ describe("MemoryService", () => {
     expect(crossProject).toMatchObject({ ok: false, error: "invalid_scope" });
     expect(memory.searchMemories({ scope: "project", project_id: "repo-a", query: "replacement-cross-scope" }).items).toEqual([]);
     expect(memory.searchMemories({ scope: "project", project_id: "repo-b", query: "replacement-cross-project" }).items).toEqual([]);
-    expect(store.listAuditEvents({ event: "write_rejected" })).toEqual([
-      expect.objectContaining({
-        memory_id: globalOld.value.memory_id,
-        scope: "global",
-        reason: "invalid_scope",
-        metadata: expect.objectContaining({
-          error: "invalid_scope",
+    // listAuditEvents orders by (created_at, id); the two rejections
+    // share a millisecond so the tiebreak on the random id is
+    // order-dependent. Use an order-insensitive assertion: each
+    // expected event must appear, in any position.
+    expect(store.listAuditEvents({ event: "write_rejected" })).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
           memory_id: globalOld.value.memory_id,
-          replacement_scope: "project",
-          replacement_project_id: "repo-a"
-        })
-      }),
-      expect.objectContaining({
-        memory_id: projectOld.value.memory_id,
-        scope: "project",
-        project_id: "repo-a",
-        reason: "invalid_scope",
-        metadata: expect.objectContaining({
-          error: "invalid_scope",
+          scope: "global",
+          reason: "invalid_scope",
+          metadata: expect.objectContaining({
+            error: "invalid_scope",
+            memory_id: globalOld.value.memory_id,
+            replacement_scope: "project",
+            replacement_project_id: "repo-a"
+          })
+        }),
+        expect.objectContaining({
           memory_id: projectOld.value.memory_id,
-          replacement_scope: "project",
-          replacement_project_id: "repo-b"
+          scope: "project",
+          project_id: "repo-a",
+          reason: "invalid_scope",
+          metadata: expect.objectContaining({
+            error: "invalid_scope",
+            memory_id: projectOld.value.memory_id,
+            replacement_scope: "project",
+            replacement_project_id: "repo-b"
+          })
         })
-      })
-    ]);
+      ])
+    );
     store.close();
   });
 

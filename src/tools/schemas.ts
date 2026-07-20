@@ -283,6 +283,42 @@ export const recallContextToolSchema = z
   .strict()
   .superRefine(requireProjectIdentity);
 
+// Stage 12 PR9 (spec § 6.2): plan/apply maintenance.
+export const planMaintenanceToolSchema = z
+  .object({
+    scope: scopeSchema,
+    project_id: nonEmptyString.optional(),
+    /** Cap on the number of merge groups returned in the plan. */
+    max_groups: z.number().int().min(1).max(1000).optional()
+  })
+  .strict()
+  .superRefine(requireProjectIdentity);
+
+export const applyMaintenanceToolSchema = z
+  .object({
+    plan_id: nonEmptyString,
+    confirm: z.literal(true),
+    idempotency_key: nonEmptyString
+  })
+  .strict();
+
+// Stage 12 PR9 (spec § 6.4): explainable recall.
+export const explainRecallToolSchema = z
+  .object({
+    query: nonEmptyString,
+    scope: scopeSchema,
+    project_id: nonEmptyString.optional(),
+    include_global: z.boolean().default(false),
+    top_k: z.number().int().min(1).max(100).default(10)
+  })
+  .strict()
+  .superRefine(requireProjectIdentity);
+
+// Stage 12 PR9 (spec § 6.3, § 6.7): list backups.
+export const listBackupsToolSchema = z
+  .object({})
+  .strict();
+
 export const rememberSchema = rememberToolSchema;
 export const searchSchema = searchMemoriesToolSchema;
 export const getMemorySchema = getMemoryToolSchema;
@@ -294,6 +330,10 @@ export const budgetSchema = getMemoryBudgetToolSchema;
 export const maintainSchema = maintainMemoriesToolSchema;
 export const exportContextSchema = exportMemoryContextToolSchema;
 export const recallContextSchema = recallContextToolSchema;
+export const planMaintenanceSchema = planMaintenanceToolSchema;
+export const applyMaintenanceSchema = applyMaintenanceToolSchema;
+export const explainRecallSchema = explainRecallToolSchema;
+export const listBackupsSchema = listBackupsToolSchema;
 
 export const memoryToolSchemas = {
   recall_context: recallContextToolSchema,
@@ -307,7 +347,11 @@ export const memoryToolSchemas = {
   forget_memory: forgetMemoryToolSchema,
   get_memory_budget: getMemoryBudgetToolSchema,
   maintain_memories: maintainMemoriesToolSchema,
-  export_memory_context: exportMemoryContextToolSchema
+  export_memory_context: exportMemoryContextToolSchema,
+  plan_maintenance: planMaintenanceToolSchema,
+  apply_maintenance: applyMaintenanceToolSchema,
+  explain_recall: explainRecallToolSchema,
+  list_backups: listBackupsToolSchema
 } as const;
 
 export type MemoryToolName = keyof typeof memoryToolSchemas;

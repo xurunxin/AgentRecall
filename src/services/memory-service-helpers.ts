@@ -452,7 +452,18 @@ export function buildEntry(
     ...(input.review_after !== undefined ? { review_after: input.review_after } : {}),
     supersedes: input.supersedes,
     token_estimate: input.token_estimate,
-    char_count: input.char_count
+    char_count: input.char_count,
+    // Stage 12 PR9: schema v4 defaults. A new entry
+    // starts at revision 1; the write service overwrites
+    // writer_actor_id with the resolved caller before
+    // commit. The migration back-fills these for legacy
+    // v3 rows.
+    revision: 1,
+    writer_actor_id: "agent:pending",
+    pinned: false,
+    trust_level: "agent_observed",
+    sensitivity: "normal",
+    metadata: {}
   };
 }
 

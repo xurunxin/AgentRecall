@@ -69,6 +69,39 @@ export type SearchFilters = EntryFilters & {
  */
 export const CURRENT_SCHEMA_VERSION = 4;
 
+/**
+ * Stage 12 PR9: thrown by `updateEntryWithRevision` when
+ * the in-place CAS predicate matches zero rows. Caught
+ * and re-thrown by `runWithBusyRetry`; the write service
+ * catches it at the top level and converts it to the
+ * `stale_revision` error code on the MCP wire.
+ */
+export class ConcurrentRevisionError extends Error {
+  constructor(message = "stale_revision") {
+    super(message);
+    this.name = "ConcurrentRevisionError";
+  }
+  static isThis(value: unknown): value is ConcurrentRevisionError {
+    return value instanceof ConcurrentRevisionError;
+  }
+}
+
+/**
+ * Type-guard for SQLite BUSY errors raised by
+ * `node:sqlite`. SQLITE_LOCKED (6) is not retryable;
+ * only SQLITE_BUSY (5) is.
+ */
+function isSqliteBusyError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const err = error as { code?: string; errcode?: number; errno?: number };
+  if (err.errcode === 5) return true;
+  if (err.errno === 5) return true;
+  if (typeof err.code === "string" && err.code.includes("SQLITE_BUSY")) {
+    return true;
+  }
+  return false;
+}
+
 export type AuditFilters = {
   memory_id?: string;
   scope?: MemoryScope;
@@ -145,7 +178,22 @@ function decodeEntry(row: Row): MemoryEntry {
     access_count: numberCell(row, "access_count"),
     supersedes: decodeJson<string[]>(stringCell(row, "supersedes_json")),
     token_estimate: numberCell(row, "token_estimate"),
-    char_count: numberCell(row, "char_count")
+    char_count: numberCell(row, "char_count"),
+    // Stage 12 PR9: schema v4 row shape. The defaults
+    // match the v3->v4 migration's `addColumnIfMissing`
+    // definitions so a row that has been migrated from
+    // a v3 file decodes cleanly even if a future
+    // migration drops the legacy defaults.
+    revision: numberCell(row, "revision") || 1,
+    writer_actor_id: stringCell(row, "writer_actor_id") || "agent:unknown",
+    pinned: numberCell(row, "pinned") === 1,
+    trust_level: (stringCell(row, "trust_level") ||
+      "agent_observed") as MemoryEntry["trust_level"],
+    sensitivity: (stringCell(row, "sensitivity") ||
+      "normal") as MemoryEntry["sensitivity"],
+    metadata: decodeJson<Record<string, unknown>>(
+      optionalStringCell(row, "metadata_json") ?? "{}"
+    )
   };
 
   const projectId = optionalStringCell(row, "project_id");
@@ -179,6 +227,18 @@ function decodeEntry(row: Row): MemoryEntry {
 
   const supersededBy = optionalStringCell(row, "superseded_by");
   if (supersededBy !== undefined) entry.superseded_by = supersededBy;
+
+  const contentHash = optionalStringCell(row, "content_hash");
+  if (contentHash !== undefined) entry.content_hash = contentHash;
+
+  const validFrom = optionalStringCell(row, "valid_from");
+  if (validFrom !== undefined) entry.valid_from = validFrom;
+
+  const validUntil = optionalStringCell(row, "valid_until");
+  if (validUntil !== undefined) entry.valid_until = validUntil;
+
+  const deletedAt = optionalStringCell(row, "deleted_at");
+  if (deletedAt !== undefined) entry.deleted_at = deletedAt;
 
   return entry;
 }
@@ -919,8 +979,10 @@ export class SQLiteMemoryStore {
           INSERT INTO memory_entries (
             id, scope, project_id, project_path, type, topic, title, body, tags_json, source_json,
             importance, confidence, status, created_at, updated_at, last_accessed_at, last_accessed_by,
-            access_count, expires_at, review_after, supersedes_json, superseded_by, token_estimate, char_count
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            access_count, expires_at, review_after, supersedes_json, superseded_by, token_estimate, char_count,
+            revision, writer_actor_id, content_hash, pinned, trust_level, sensitivity,
+            valid_from, valid_until, deleted_at, metadata_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `
         )
         .run(...this.entryParams(entry));
@@ -1031,7 +1093,17 @@ export class SQLiteMemoryStore {
             supersedes_json = ?,
             superseded_by = ?,
             token_estimate = ?,
-            char_count = ?
+            char_count = ?,
+            revision = ?,
+            writer_actor_id = ?,
+            content_hash = ?,
+            pinned = ?,
+            trust_level = ?,
+            sensitivity = ?,
+            valid_from = ?,
+            valid_until = ?,
+            deleted_at = ?,
+            metadata_json = ?
           WHERE id = ?
         `
         )
@@ -1199,6 +1271,11 @@ export class SQLiteMemoryStore {
   }
 
   private entryParams(entry: MemoryEntry): SQLInputValue[] {
+    // v4 fields use defensive defaults so test fixtures
+    // that still construct entries via the v3 shape
+    // (no `revision` / `writer_actor_id` / `pinned` / etc.)
+    // keep working. The defaults match the SQL
+    // `DEFAULT` clauses and the `buildEntry` helper.
     return [
       entry.id,
       entry.scope,
@@ -1223,8 +1300,146 @@ export class SQLiteMemoryStore {
       encodeJson(entry.supersedes),
       entry.superseded_by ?? null,
       entry.token_estimate,
-      entry.char_count
+      entry.char_count,
+      // Stage 12 PR9: schema v4 row shape (with defaults).
+      entry.revision ?? 1,
+      entry.writer_actor_id ?? "agent:pending",
+      entry.content_hash ?? null,
+      entry.pinned ? 1 : 0,
+      entry.trust_level ?? "agent_observed",
+      entry.sensitivity ?? "normal",
+      entry.valid_from ?? null,
+      entry.valid_until ?? null,
+      entry.deleted_at ?? null,
+      encodeJson(entry.metadata ?? {})
     ];
+  }
+
+  /**
+   * Stage 12 PR9: bounded busy retry. SQLite's
+   * `busy_timeout = 5000` PRAGMA already lets one
+   * process wait for the writer; this helper adds an
+   * extra retry layer for the case where the contention
+   * exceeds busy_timeout (e.g. a long-running
+   * transaction on another connection). 5 retries
+   * with 10ms backoff covers the 8-process stress test
+   * the spec § 5.6 multi-process promise requires.
+   */
+  runWithBusyRetry<T>(
+    fn: () => T,
+    opts: { maxRetries?: number; backoffMs?: number } = {}
+  ): T {
+    const maxRetries = opts.maxRetries ?? 5;
+    const backoffMs = opts.backoffMs ?? 10;
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+      try {
+        return fn();
+      } catch (error) {
+        lastError = error;
+        if (ConcurrentRevisionError.isThis(error)) {
+          // CAS conflict is not a transient I/O error.
+          // The write service maps this to the
+          // `stale_revision` result.
+          throw error;
+        }
+        if (!isSqliteBusyError(error) || attempt === maxRetries) {
+          throw error;
+        }
+        const sleep = backoffMs * (attempt + 1);
+        const end = Date.now() + sleep;
+        while (Date.now() < end) {
+          // spin intentionally; the busy_timeout
+          // PRAGMA already absorbed the single-writer
+          // wait, this loop only fires when multiple
+          // writers all queue simultaneously.
+        }
+      }
+    }
+    throw lastError;
+  }
+
+  /**
+   * Stage 12 PR9: optimistic-concurrency update. Returns
+   * `true` if the row's revision matched `expectedRevision`
+   * and the patch was applied (with the revision bumped),
+   * `false` if the row was concurrently modified. The
+   * write service maps a `false` return to the
+   * `stale_revision` error code on the MCP wire so
+   * clients can retry after re-reading the row.
+   *
+   * The implementation uses the pre-rewrite
+   * `current.revision` for the WHERE clause so a
+   * concurrent UPDATE that already advanced the row
+   * gets matched by zero rows — the same property the
+   * spec § 5.6 CAS contract requires.
+   */
+  updateEntryWithRevision(
+    id: string,
+    patch: EntryPatch,
+    expectedRevision: number
+  ): boolean {
+    const current = this.readEntry(id);
+    if (current === undefined) return false;
+    if (current.revision !== expectedRevision) return false;
+    const next: MemoryEntry = {
+      ...current,
+      ...sanitizeEntryPatch(patch),
+      id: current.id,
+      revision: current.revision + 1,
+      updated_at: nowIso()
+    };
+    return this.runWithBusyRetry(() => {
+      let applied = false;
+      this.transaction(() => {
+        const stmt = this.db.prepare(`
+          UPDATE memory_entries SET
+            scope = ?, project_id = ?, project_path = ?,
+            type = ?, topic = ?, title = ?, body = ?,
+            tags_json = ?, source_json = ?,
+            importance = ?, confidence = ?, status = ?,
+            created_at = ?, updated_at = ?,
+            last_accessed_at = ?, last_accessed_by = ?,
+            access_count = ?, expires_at = ?, review_after = ?,
+            supersedes_json = ?, superseded_by = ?,
+            token_estimate = ?, char_count = ?,
+            revision = ?,
+            writer_actor_id = ?, content_hash = ?,
+            pinned = ?, trust_level = ?, sensitivity = ?,
+            valid_from = ?, valid_until = ?, deleted_at = ?,
+            metadata_json = ?
+          WHERE id = ? AND revision = ?
+        `);
+        const result = stmt.run(
+          next.scope, next.project_id ?? null, next.project_path ?? null,
+          next.type, next.topic, next.title, next.body,
+          encodeJson(next.tags), encodeJson(next.source),
+          next.importance, next.confidence, next.status,
+          next.created_at, next.updated_at,
+          next.last_accessed_at ?? null,
+          next.last_accessed_by ? encodeJson(next.last_accessed_by) : null,
+          next.access_count, next.expires_at ?? null, next.review_after ?? null,
+          encodeJson(next.supersedes), next.superseded_by ?? null,
+          next.token_estimate, next.char_count,
+          next.revision,
+          next.writer_actor_id, next.content_hash ?? null,
+          next.pinned ? 1 : 0, next.trust_level, next.sensitivity,
+          next.valid_from ?? null, next.valid_until ?? null, next.deleted_at ?? null,
+          encodeJson(next.metadata),
+          id,
+          expectedRevision
+        );
+        if (result.changes === 0) {
+          // Concurrent writer won the race; abort the
+          // enclosing transaction so the FTS upsert is
+          // not performed against a stale snapshot.
+          throw new ConcurrentRevisionError();
+        }
+        this.upsertFts(next);
+        applied = true;
+      });
+      return applied;
+    });
   }
 
   private upsertFts(entry: MemoryEntry): void {

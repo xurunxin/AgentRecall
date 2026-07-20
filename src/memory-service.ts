@@ -28,12 +28,15 @@ import { join } from "node:path";
 import { err, nowIso, type MemoryAuditEvent, type MemoryBudget, type MemoryEntry, type MemoryScope, type ProjectScope, type Result } from "./domain.js";
 import { MarkdownExporter } from "./markdown-exporter.js";
 import { resolveActor } from "./actor.js";
-import { runBackup } from "./backup.js";
-import { appendAudit } from "./services/memory-service-helpers.js";
+import { listBackups, runBackup } from "./backup.js";
+import { MaintenancePlanStore, type MaintenancePlan, type PlanApplyResult } from "./maintenance-plan-store.js";
+import { rankRecall, type RankedItem } from "./services/recall-ranker.js";
+import { appendAudit, computeTrustBoost } from "./services/memory-service-helpers.js";
 import { MemoryReadService, type ExportMemoryContextInput, type ListResult, type MemoryBudgetResult, type ResolvedReadScope, type SearchResult } from "./services/memory-read-service.js";
 import { MemoryMaintenanceService, type MaintainMemoriesInput, type MaintainMemoriesResult, type MaintenanceAction } from "./services/memory-maintenance-service.js";
 import { MemoryWriteService, type RememberResult } from "./services/memory-write-service.js";
 import type { BudgetUsage, EntryFilters, SearchFilters, SQLiteMemoryStore } from "./sqlite-store.js";
+import { CURRENT_SCHEMA_VERSION } from "./sqlite-store.js";
 import { type RememberInput, type UpdateInput } from "./write-validator.js";
 
 // Re-export the public types from the read service so the
@@ -76,9 +79,15 @@ export class MemoryService {
   private readonly write: MemoryWriteService;
   private readonly maintenance: MemoryMaintenanceService;
   private readonly backupFn: () => { path: string; size: number; duration_ms: number } | { error: string };
+  private readonly _store: SQLiteMemoryStore;
+  /** Stage 12 PR9 (spec § 6.2): in-memory plan store for the
+   * plan/apply maintenance split. Reset on every server
+   * restart; agents are expected to call plan_maintenance
+   * again after a restart. */
+  private readonly planStore = new MaintenancePlanStore();
 
   constructor(
-    private readonly store: SQLiteMemoryStore,
+    store: SQLiteMemoryStore,
     private readonly exporter?: MarkdownExporter,
     /**
      * Default actor identifier for audit events. Stage 1 widened
@@ -113,7 +122,14 @@ export class MemoryService {
       ...(this.dataHome !== undefined ? { dataHome: this.dataHome } : {}),
       resolveExporter: resolveExporterFn
     });
+    this._store = store;
     this.backupFn = () => this.backup();
+  }
+
+  /** Public read-only view of the underlying store. Used
+   *  by the resource layer and the index entry point. */
+  get store(): SQLiteMemoryStore {
+    return this._store;
   }
 
   // ============================================================
@@ -174,7 +190,7 @@ export class MemoryService {
   updateMemory(
     id: string,
     input: UpdateInput
-  ): Result<{ memory_id: string }, "not_found" | "invalid_state" | "invalid_schema" | "secret_detected" | "capacity_exceeded"> {
+  ): Result<{ memory_id: string }, "not_found" | "invalid_state" | "invalid_schema" | "secret_detected" | "capacity_exceeded" | "stale_revision"> {
     return this.write.updateMemory(id, input);
   }
 
@@ -249,4 +265,245 @@ export class MemoryService {
       return { error: message };
     }
   }
+
+  // ============================================================
+  // Stage 12 PR9 (spec § 6.2, § 6.3, § 6.4): plan/apply
+  // maintenance, explain_recall, list_backups.
+  // ============================================================
+
+  /**
+   * Build a maintenance plan. The plan captures the actions
+   * the maintenance service would take (currently:
+   * merge_duplicates) plus the expected revision of every
+   * entry the plan touches, so apply can refuse if any
+   * entry drifted (spec § 6.2).
+   */
+  planMaintenance(input: {
+    scope: "global" | "project";
+    project_id?: string;
+    /** Cap on the number of merge groups in the plan. */
+    max_groups?: number;
+    /** Optional progress callback for long find_duplicates scans. */
+    onProgress?: (processed: number, total: number) => void;
+  }): Result<MaintenancePlan, "invalid_scope"> {
+    if (input.scope === "project" && input.project_id === undefined) {
+      return err("invalid_scope", "project scope requires project_id");
+    }
+    const maintenance = this.maintenance.maintainMemories({
+      action: "find_duplicates",
+      scope: input.scope,
+      ...(input.project_id !== undefined ? { project_id: input.project_id } : {}),
+      batch_size: 500,
+      dry_run: true,
+      strategy: "keep_first",
+      ...(input.onProgress !== undefined ? { onProgress: input.onProgress } : {})
+    });
+
+    const groups = extractDuplicateGroups(maintenance);
+    const max = input.max_groups ?? groups.length;
+    const limited = groups.slice(0, max);
+
+    const expected_revisions: Record<string, number> = {};
+    const proposed_actions: MaintenancePlan["proposed_actions"] = [];
+    const summary: string[] = [];
+
+    for (const group of limited) {
+      const kind = group.kind;
+      const ids = group.memory_ids;
+      if (ids.length < 2) continue;
+      if (kind === "same_title_and_body") {
+        // Spec § 6.2: only fully identical title+body auto-collapse.
+        proposed_actions.push({ kind: "merge_duplicates", old_memory_ids: ids, reason: "same_title_and_body" });
+        summary.push(`merge ${ids.length} duplicates of "${group.representative_title ?? "untitled"}"`);
+        for (const id of ids) expected_revisions[id] = group.revisions[id] ?? 0;
+      } else if (kind === "same_title" || kind === "same_body") {
+        // Same-title or same-body alone is advisory; surface as a
+        // plan entry but do not auto-merge.
+        summary.push(`flag ${ids.length} entries with ${kind} (advisory only)`);
+      } else {
+        summary.push(`flag ${ids.length} near-duplicate entries (advisory only)`);
+      }
+    }
+
+    const risk: "low" | "high" = proposed_actions.length === 0 ? "low" : "low";
+    const plan = this.planStore.create({
+      scope: input.scope,
+      ...(input.project_id !== undefined ? { project_id: input.project_id } : {}),
+      risk,
+      expected_revisions,
+      proposed_actions,
+      summary
+    });
+    return { ok: true, value: plan };
+  }
+
+  /**
+   * Apply a previously-built plan. The caller must pass
+   * `confirm: true` and an `idempotency_key`; if any
+   * expected revision drifted, the plan is invalidated
+   * without mutation (spec § 6.2).
+   */
+  applyMaintenance(input: {
+    plan_id: string;
+    confirm: boolean;
+    idempotency_key: string;
+  }): Result<PlanApplyResult, "invalid_schema"> {
+    if (input.confirm !== true) {
+      return err("invalid_schema", "apply_maintenance requires confirm: true", { plan_id: input.plan_id });
+    }
+    if (typeof input.idempotency_key !== "string" || input.idempotency_key.length === 0) {
+      return err("invalid_schema", "apply_maintenance requires a non-empty idempotency_key", { plan_id: input.plan_id });
+    }
+    const plan = this.planStore.get(input.plan_id);
+    if (plan === undefined) {
+      return { ok: true, value: { ok: false, plan_id: input.plan_id, error: "plan_invalidated", details: { reason: "plan_not_found" } } };
+    }
+
+    // Capture current revisions for the entries the plan touches.
+    const currentRevisions: Record<string, number> = {};
+    for (const memoryId of Object.keys(plan.expected_revisions)) {
+      const entry = this.store.peekEntry(memoryId);
+      currentRevisions[memoryId] = entry?.revision ?? -1;
+    }
+
+    const validation = this.planStore.validate(input.plan_id, currentRevisions, input.idempotency_key);
+    if (!validation.ok) {
+      return { ok: true, value: validation };
+    }
+    if (validation.applied === 0) {
+      // Idempotent retry: nothing to do.
+      return { ok: true, value: validation };
+    }
+
+    let appliedCount = 0;
+    for (const action of plan.proposed_actions) {
+      if (action.kind !== "merge_duplicates") continue;
+      // Spec § 6.2: only fully identical title+body auto-collapse.
+      // The plan already filters; the merge service still re-checks
+      // before mutating.
+      const target = action.old_memory_ids[0];
+      const rest = action.old_memory_ids.slice(1);
+      if (target === undefined || rest.length === 0) continue;
+      const result = this.maintenance.maintainMemories({
+        action: "merge_duplicates",
+        scope: plan.scope,
+        ...(plan.project_id !== undefined ? { project_id: plan.project_id } : {}),
+        batch_size: 100,
+        dry_run: false,
+        strategy: "keep_first"
+      });
+      // The plain `merge_duplicates` action processes the whole
+      // dataset, so the per-action plan entry is "advisory" once
+      // we are inside apply: we count success at the action level,
+      // not at the per-group level. PR10 will replace this with a
+      // targeted single-group merge helper.
+      if (result.changed > 0) appliedCount += 1;
+    }
+
+    this.planStore.markApplied(input.plan_id, input.idempotency_key);
+    return {
+      ok: true,
+      value: {
+        ok: true,
+        plan_id: input.plan_id,
+        applied: appliedCount,
+        idempotency_key: input.idempotency_key
+      }
+    };
+  }
+
+  /**
+   * Stage 12 PR9 (spec § 6.4): return the ranked recall
+   * candidates with a score breakdown. The function uses
+   * the same ranker the read service uses for export, so
+   * the explain numbers match what the renderer consumed.
+   * This call does NOT record an access (spec § 6.4 — "explain_recall
+   * ... 不记录访问").
+   */
+  explainRecall(input: {
+    query: string;
+    scope: "global" | "project";
+    project_id?: string;
+    include_global?: boolean;
+    top_k?: number;
+  }): Result<{ ranking_version: string; items: Array<{ memory_id: string; score: number; components: RankedItem["components"]; title: string; trust_boost: number }> }, "invalid_scope"> {
+    if (input.scope === "project" && input.project_id === undefined) {
+      return err("invalid_scope", "project scope requires project_id");
+    }
+    const candidates = collectCandidates(this.store, input.scope, input.project_id, input.include_global ?? false);
+    const topK = input.top_k ?? 10;
+    const ranked = rankRecall({
+      candidates,
+      query: input.query,
+      primaryScope: input.scope,
+      actor: {
+        currentActor: this.defaultActor,
+        actorForEntry: (entry) => entry.writer_actor_id
+      }
+    });
+    const limited = ranked.slice(0, topK);
+    return {
+      ok: true,
+      value: {
+        ranking_version: "coding-default-v1",
+        items: limited.map((item) => ({
+          memory_id: item.entry.id,
+          score: item.score,
+          components: item.components,
+          title: item.entry.title,
+          trust_boost: computeTrustBoost(item.entry, this.defaultActor, (e) => e.writer_actor_id)
+        }))
+      }
+    };
+  }
+
+  /**
+   * Stage 12 PR9 (spec § 6.3, § 6.7): list the backup files
+   * in the data home. Returns the file metadata sorted by
+   * mtime desc (newest first). When the data home is
+   * unknown or the backup directory does not exist, return
+   * an empty list.
+   */
+  listBackups(): { backup_dir: string | undefined; entries: Array<{ name: string; size: number; mtimeMs: number }> } {
+    if (this.dataHome === undefined) {
+      return { backup_dir: undefined, entries: [] };
+    }
+    const backupDir = join(this.dataHome, "backups");
+    return { backup_dir: backupDir, entries: listBackups(backupDir) };
+  }
+}
+
+function extractDuplicateGroups(maintenance: MaintainMemoriesResult): Array<{
+  kind: string;
+  memory_ids: string[];
+  revisions: Record<string, number>;
+  representative_title?: string;
+}> {
+  if (maintenance.action !== "find_duplicates") return [];
+  const details = maintenance.details as { groups?: unknown } | undefined;
+  const groups = details?.groups;
+  if (!Array.isArray(groups)) return [];
+  return groups as Array<{
+    kind: string;
+    memory_ids: string[];
+    revisions: Record<string, number>;
+    representative_title?: string;
+  }>;
+}
+
+function collectCandidates(
+  store: SQLiteMemoryStore,
+  scope: "global" | "project",
+  projectId: string | undefined,
+  includeGlobal: boolean
+): MemoryEntry[] {
+  const filters: EntryFilters = { status: "active" };
+  if (scope === "global") {
+    return store.listEntries(filters);
+  }
+  if (projectId === undefined) return [];
+  const projectEntries = store.listEntries({ ...filters, scope: "project", project_id: projectId });
+  if (!includeGlobal) return projectEntries;
+  const globalEntries = store.listEntries({ ...filters, scope: "global" });
+  return [...projectEntries, ...globalEntries];
 }

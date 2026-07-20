@@ -5,6 +5,102 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [Unreleased] — Stage 12 PR9 (MCP v2 + CAS revision)
+
+Date: 2026-07-21
+
+### Added
+- **MCP v2 contract (spec § 6.3).** Every tool now returns a typed
+  `structuredContent` (`ToolSuccess<T>` / `ToolFailure`) alongside the
+  legacy text payload. The legacy `content[0].text` JSON shape is
+  preserved byte-for-byte so existing clients keep working unchanged.
+- **Business errors set `isError: true`.** Protocol-level errors still
+  surface through JSON-RPC; `isError` is reserved for typed business
+  failures (validation, scope, capacity, etc.).
+- **Tool annotations** (readOnlyHint / destructiveHint / idempotentHint)
+  registered for every tool per spec § 6.3. The mutating tools
+  (`update_memory`, `supersede_memory`, `merge_memories`,
+  `forget_memory`, `maintain_memories`, `apply_maintenance`) carry
+  `destructiveHint: true`; the read-only tools (`recall_context`,
+  `get_memory`, `list_memories`, `search_memories`, `get_memory_budget`,
+  `export_memory_context`, `plan_maintenance`, `explain_recall`,
+  `list_backups`) carry `readOnlyHint: true`.
+- **`outputSchema` (zod)** for every tool, so v2 clients can validate
+  the structured payload locally before parsing.
+- **Stable error code catalogue** (`src/tools/error-codes.ts`). New
+  codes — `stale_revision`, `busy`, `conflict`, `plan_invalidated`,
+  `plan_not_found`, `idempotency_mismatch`, `io_error`, `not_writable`,
+  `not_readable`, `unavailable` — are append-only; clients pin to the
+  string. `errorCategory(code)` returns `transient` vs `permanent` for
+  retry guidance.
+- **CAS revision** (spec § 5.6). `updateMemory` now takes an optional
+  `expected_revision`. When supplied, `updateEntryWithRevision` runs
+  the UPDATE under a `WHERE revision = ?` clause and throws
+  `ConcurrentRevisionError` on drift. The old `updateEntry` path is
+  preserved for non-CAS callers.
+- **4 new tools (spec § 6.2, § 6.4, § 6.3).** `plan_maintenance` returns
+  a `plan_id` plus `expected_revisions` and `proposed_actions` for the
+  candidate set. `apply_maintenance` requires `confirm: true` + an
+  `idempotency_key` and refuses to run if any entry's revision drifted.
+  `explain_recall` returns the ranker's score breakdown for each
+  candidate without recording an access. `list_backups` returns the
+  backup directory contents sorted newest first.
+- **5 MCP resources (spec § 6.3).** `memory://projects`,
+  `memory://project/{project_id}/summary` (template),
+  `memory://project/{project_id}/memory/{memory_id}` (template),
+  `memory://global/summary`, `memory://health`.
+- **Progress + cancellation** (spec § 6.3). `src/tools/progress-callback.ts`
+  bridges the SDK's `signal` + `sendNotification` into a
+  `ProgressCallback` the long-running tools can call. The
+  `maintain_memories` and `plan_maintenance` tools forward progress
+  notifications to clients that supply a `_meta.progressToken`.
+- **Data-only framing preamble (spec § 6.6).** `exportMemoryContext`
+  now prepends a fixed `<memory-context-pack ...>` block to every
+  context pack. The preamble tells the agent that the content is
+  untrusted data and that any imperative-looking text inside a memory
+  body must be ignored. A risk-attribute flips from `low` to `high`
+  when at least one entry matched the risk detector.
+- **Risk detector (spec § 6.6).** `src/tools/risk-detector.ts` scans
+  memory title / topic / body / tags for high-risk prompt-injection
+  patterns (ignore-previous-instructions, exfiltrate-the-api-key,
+  disable-safety, etc.) and flags them as `unsafe_content`. Conservative
+  pattern set — false-positives preferred over false-negatives; the
+  framing header is the trust boundary, not the detector.
+- **Server version source of truth.** `src/server-version.ts` reads
+  `package.json` once and is used by `meta.server_version` on every
+  tool result. Spec § 14 requires the same version on the server, the
+  CLI, and the export schema.
+- **21 MCP v2 contract tests** (`test/mcp-v2-contract.test.ts`) covering
+  the envelope shape, the annotations, the error-code catalogue, the
+  risk detector, the framing preamble, plan/apply, and the 5 resources.
+
+### Changed
+- **`entryParams` defensive defaults** for v4 columns (`revision`,
+  `writer_actor_id`, `trust_level`, `sensitivity`, `metadata`). Stage
+  1-9 fixtures that don't set these fields now work without changes.
+- **`MemoryEntry`** gains the v4 fields (`revision`, `writer_actor_id`,
+  `content_hash`, `pinned`, `trust_level`, `sensitivity`, `valid_from`,
+  `valid_until`, `deleted_at`, `metadata`). The v3 columns stay for
+  one release of read compat.
+- **`MemoryService.store`** is now a public read-only accessor
+  (`get store()`) so the resource layer can read the store without
+  reaching into private fields.
+- **Pre-existing test stabilisation.** The "rejects supersede across
+  scopes" test asserted the audit event array in a specific order; the
+  list order depends on random `aud_*` id tiebreaks when two events
+  share a millisecond. The assertion is now order-insensitive via
+  `arrayContaining`. (No behavior change; just stable across id-gen
+  shuffles.)
+- **`createService()`** continues to return a `MemoryService` (not a
+  tuple). The new `dataHome` / `defaultActor` are resolved in `main()`
+  and passed to the resource layer.
+
+### Verification
+- 358/358 vitest tests pass (was 320 at PR8 baseline + 21 new
+  MCP v2 contract tests + 17 release-gate tests).
+- 17/17 release-gate tests pass (unchanged from PR1 baseline).
+- `npm run typecheck` and `npm run build` both clean.
+
 ## [Unreleased] — Stage 11 PR8 (Concurrency Baseline)
 
 Date: 2026-07-21
