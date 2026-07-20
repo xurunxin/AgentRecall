@@ -5,6 +5,47 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [Unreleased] — Stage 10 PR2 (Scope Resolver Centralization)
+
+Date: 2026-07-21
+
+### Fixed
+
+- **AR-P0-001: maintenance `project_path` no longer ignored.**
+  The maintenance service had a private `resolveScope` helper
+  that copied only `project_id` and silently dropped
+  `project_path`, so a call like
+  `maintain_memories({scope: "project", project_path: "..."})`
+  fell through to the cross-project `scope=project` filter and
+  could mutate every project's records. The helper has been
+  removed; `maintainMemories` now calls
+  `resolveMemoryScope` from `src/scope-resolver.ts` so all
+  four entry points (MCP tool handler, CLI commands, Read
+  service, Maintenance service) share one
+  ProjectIdentityResolver.
+
+- **Destructive maintenance actions double-check
+  `project_id`.** A new `assertProjectScope` helper in
+  `src/services/memory-service-helpers.ts` is called at the
+  top of `expire_due`, `archive_low_value`,
+  `merge_duplicates`, and `rebuild_markdown_index`. If
+  `scope === "project"` but `project_id` is empty, the action
+  returns `changed=0` with `details.error = "invalid_scope"`
+  instead of touching the database.
+
+### Test Coverage
+
+- `test/release-gate/p0-scope.test.ts` rewritten to use real
+  on-disk project directories and the canonical
+  `resolveMemoryScope` for project_id derivation. All four
+  tests now pass.
+
+| Stage | Tests | Files | Notes |
+|---|---|---|---|
+| ... | ... | ... | ... |
+| **Stage 10 PR1 total** | **+17 (10 red, 7 green)** | **+6** | release-gate P0 regression suite |
+| **Stage 10 PR2 total** | **+0 (4 red→green)** | **0** | scope tests now pass; other P0 tests still red as expected |
+
 ## [Unreleased] — Stage 10 PR1 (Release-Gate Test Infrastructure)
 
 Date: 2026-07-21

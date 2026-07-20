@@ -13,12 +13,14 @@
 //
 // Reference: spec § 5.1 AR-P0-001 "统一项目作用域解析".
 
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync } from "node:fs";
+import { realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { MemoryService } from "../../src/memory-service.js";
 import { SQLiteMemoryStore } from "../../src/sqlite-store.js";
+import { resolveMemoryScope } from "../../src/scope-resolver.js";
 import type { MemoryEntry } from "../../src/domain.js";
 
 function setup() {
@@ -54,12 +56,34 @@ function makeEntry(overrides: Partial<MemoryEntry> = {}): MemoryEntry {
   } as MemoryEntry;
 }
 
+/**
+ * Build a real on-disk project directory and resolve it through
+ * the canonical ProjectIdentityResolver. The maintenance service
+ * now derives the project_id from project_path, so the entry's
+ * project_id must match the resolver's output for the
+ * project-scoped filter to find it.
+ */
+function createProjectDir(dataHome: string, leaf: string): { path: string; project_id: string } {
+  const raw = join(dataHome, leaf);
+  mkdirSync(raw, { recursive: true });
+  const canonical = realpathSync.native(raw);
+  const resolved = resolveMemoryScope({ scope: "project", project_path: canonical });
+  if (!resolved.ok) {
+    throw new Error(`resolveMemoryScope failed: ${resolved.error} ${resolved.message}`);
+  }
+  if (resolved.value.project_id === undefined) {
+    throw new Error("resolveMemoryScope returned no project_id");
+  }
+  return { path: canonical, project_id: resolved.value.project_id };
+}
+
 describe("release-gate p0-scope (AR-P0-001)", () => {
   let service: MemoryService;
   let store: SQLiteMemoryStore;
+  let dataHome: string;
 
   beforeEach(() => {
-    ({ service, store } = setup());
+    ({ service, store, dataHome } = setup());
   });
   afterEach(() => {
     try {
@@ -70,11 +94,13 @@ describe("release-gate p0-scope (AR-P0-001)", () => {
   });
 
   it("archive_low_value scoped to project_path only affects the target project", () => {
-    // Project A: 2 low-value records (will be archived).
+    const projA = createProjectDir(dataHome, "projA");
+    const projB = createProjectDir(dataHome, "projB");
+
     store.insertEntry(makeEntry({
       id: "mem_a_low_1",
-      project_id: "proj_a",
-      project_path: "/tmp/projA",
+      project_id: projA.project_id,
+      project_path: projA.path,
       title: "a low 1",
       body: "a low 1 body",
       importance: 1,
@@ -82,76 +108,69 @@ describe("release-gate p0-scope (AR-P0-001)", () => {
     }));
     store.insertEntry(makeEntry({
       id: "mem_a_low_2",
-      project_id: "proj_a",
-      project_path: "/tmp/projA",
+      project_id: projA.project_id,
+      project_path: projA.path,
       title: "a low 2",
       body: "a low 2 body",
       importance: 1,
       confidence: 1
     }));
-    // Project B: 1 low-value record (must NOT be archived).
     store.insertEntry(makeEntry({
       id: "mem_b_low_1",
-      project_id: "proj_b",
-      project_path: "/tmp/projB",
+      project_id: projB.project_id,
+      project_path: projB.path,
       title: "b low 1",
       body: "b low 1 body",
       importance: 1,
       confidence: 1
     }));
 
-    // Call maintainMemories with only project_path, no project_id.
-    // The fix in PR2 must derive project_id from project_path.
     service.maintainMemories({
       action: "archive_low_value",
       scope: "project",
-      project_path: "/tmp/projA"
+      project_path: projA.path
     });
 
     const a1 = store.peekEntry("mem_a_low_1");
     const a2 = store.peekEntry("mem_a_low_2");
     const b1 = store.peekEntry("mem_b_low_1");
 
-    // After the fix, project A's low-value records are archived.
     expect(a1?.status).toBe("archived");
     expect(a2?.status).toBe("archived");
-    // Project B's record MUST be untouched (this is the P0-001 invariant).
     expect(b1?.status).toBe("active");
   });
 
   it("expire_due scoped to project_path only expires the target project", () => {
+    const projA = createProjectDir(dataHome, "projA");
+    const projB = createProjectDir(dataHome, "projB");
+
     const pastExpiry = "2026-01-01T00:00:00.000Z";
     store.insertEntry(makeEntry({
       id: "mem_a_expired",
-      project_id: "proj_a",
-      project_path: "/tmp/projA",
+      project_id: projA.project_id,
+      project_path: projA.path,
       expires_at: pastExpiry
     }));
     store.insertEntry(makeEntry({
       id: "mem_b_expired",
-      project_id: "proj_b",
-      project_path: "/tmp/projB",
+      project_id: projB.project_id,
+      project_path: projB.path,
       expires_at: pastExpiry
     }));
 
     service.maintainMemories({
       action: "expire_due",
       scope: "project",
-      project_path: "/tmp/projA"
+      project_path: projA.path
     });
 
     const a = store.peekEntry("mem_a_expired");
     const b = store.peekEntry("mem_b_expired");
     expect(a?.status).toBe("forgotten");
-    // Project B's expired record must NOT be touched.
     expect(b?.status).toBe("active");
   });
 
   it("scope=global with project_path is rejected as scope_mismatch (no silent degradation)", () => {
-    // The spec requires scope_mismatch / invalid_scope when global is
-    // paired with a project identifier. The fix must surface this as
-    // an error rather than silently dropping the project_path and
-    // running the maintenance against the global scope.
     store.insertEntry(makeEntry({
       id: "mem_global_1",
       project_id: undefined,
@@ -160,29 +179,19 @@ describe("release-gate p0-scope (AR-P0-001)", () => {
     }));
 
     let thrown: unknown = undefined;
+    let result: { changed: number; details: unknown } | undefined = undefined;
     try {
-      service.maintainMemories({
+      result = service.maintainMemories({
         action: "archive_low_value",
         scope: "global",
-        project_path: "/tmp/projA"
+        project_path: "/some/global/project_path"
       });
     } catch (error) {
       thrown = error;
     }
-    // Either an exception is thrown, or the result reports an error.
-    // Either way, the global record must not be touched.
     const g = store.peekEntry("mem_global_1");
     expect(g?.status).toBe("active");
-    // We do not require a specific exception shape; the spec
-    // permits Result<T, "scope_mismatch"> OR throw — both are
-    // acceptable surfaces, as long as the silent-degrade path
-    // (return ok + no state change OR return ok + corrupt state)
-    // is not taken.
     if (thrown === undefined) {
-      // If the call returned without throwing, it must have been an
-      // error result, not a successful one. We can't introspect the
-      // raw Result from maintainMemories here, but we can assert
-      // the global record wasn't archived (already covered above).
       expect(true).toBe(true);
     }
   });
@@ -198,14 +207,11 @@ describe("release-gate p0-scope (AR-P0-001)", () => {
     } catch (error) {
       thrown = error;
     }
-    // Either thrown, or result.details reports invalid_scope.
     if (result !== undefined) {
       const details = result.details as { error?: string };
       expect(details.error).toBe("invalid_scope");
       expect(result.changed).toBe(0);
     }
-    // We don't strictly require thrown; we just require no mutation
-    // occurred.
     expect(thrown === undefined || (thrown as Error).message.length > 0).toBe(true);
   });
 });
