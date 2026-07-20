@@ -159,7 +159,7 @@ maintenance actions (`rebuild_markdown_index`, `expire_due`,
 
 | Tool | Description |
 | --- | --- |
-| `recall_context` | Task-start memory recall entry point. Call this near the beginning of a coding task to retrieve relevant global or project context. |
+| `recall_context` | Task-start memory recall entry point. Ranks the calling agent's own knowledge first; each entry is annotated with `[writer: <actor>]`. |
 | `remember` | Store one validated local memory entry. |
 | `search_memories` | Search memories by full-text query and optional metadata filters; `actor` narrows to one writer. |
 | `get_memory` | Read one memory entry and its audit history by memory id. |
@@ -183,7 +183,7 @@ maintenance actions (`rebuild_markdown_index`, `expire_due`,
 
 ## Memory Hygiene
 
-- At task start, prefer `recall_context` with the current task query and, when available, the current project path.
+- At task start, prefer `recall_context` with the current task query and, when available, the current project path. The output ranks the calling agent's own knowledge first (matching the `AGENT_RECALL_ACTOR` env var) and annotates each entry with `[writer: <actor>]` so authorship is visible at a glance.
 - Keep each memory atomic: one preference, decision, constraint, lesson, or debugging fact per entry.
 - Search before writing to avoid duplicate or near-duplicate memories.
 - **Cross-agent dedup**: a `remember` that rephrases an existing memory
@@ -220,6 +220,11 @@ Markdown exports are for inspection and handoff. Manual edits under `exports/` m
 ## Changelog
 
 Stage-level changes are tracked in [`CHANGELOG.md`](./CHANGELOG.md).
+Stage 5 delivered the actor trust boost in `recall_context`
+ranking (+0.3 for the calling agent's own writes, +0.1 for
+recently-touched foreign writes) and a `[writer: X]`
+annotation on each recall entry; see the
+[Stage 5 closure report](./docs/superpowers/plans/2026-07-20-stage-five-recall-trust-closure.md).
 Stage 4 delivered the `actor` filter on `list_memories` and
 `search_memories` (MCP + CLI), and the eleventh doctor check
 `actor_ownership`; see the

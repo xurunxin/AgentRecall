@@ -5,7 +5,99 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
-## [Unreleased] — Stage 4 Per-Agent Memory View
+## [Unreleased] — Stage 5 Recall Ranking by Actor Trust
+
+Date: 2026-07-20
+
+### Added
+
+- **Per-memory `trust_boost` in recall ranking**. `recall_context`
+  now ranks memories higher when they were written by the
+  calling agent (strong signal, +0.3) or recently touched
+  by the calling agent (soft signal, +0.1). Computed at
+  recall time from `audit_events.actor` (writer lookup)
+  and `memory_entries.last_accessed_by` (recent-touch
+  check). The new `computeTrustBoost` helper is exported
+  for unit tests.
+- **`[writer: X]` annotation** in the recall markdown
+  output. Each entry's section title now includes the
+  writer's actor (e.g. `## Some title [writer: agent:claude-code]`),
+  so the agent and the human reader can see at a glance
+  who wrote each piece of context.
+
+### Changed
+
+- **Recall order**: previously `query_score` → `importance` →
+  `confidence` → `updated_at` → `id`. Now `query_score` →
+  `trust_boost` → `importance` → `confidence` →
+  `updated_at` → `id`. Same-actor memories outrank
+  foreign memories with the same query relevance; foreign
+  memories that the calling agent has touched recently
+  outrank untouched ones.
+- **Markdown exporter**: `compareEntries` now considers
+  `trust_boost` as a tie-breaker after `importance`.
+  Legacy entries (no `trust_boost` field) tie at 0 and
+  fall through to `confidence` / `updated_at` / `id`, so
+  the existing behavior is preserved for callers that
+  don't set the field.
+- **Test count**: 252 (stage 4) → 261 (+9 from stage 5:
+  6 unit tests for `computeTrustBoost`, 3 ranking
+  integration tests for the new recall order, plus the
+  writer-annotation assertion rolled into the same-actor
+  test).
+
+### Documentation
+
+- `docs/superpowers/specs/2026-07-20-stage-five-recall-trust.md`
+  — Stage 5 spec covering the trust model, the boost
+  tiers, the SQL cost, and the deferral list.
+- `docs/superpowers/plans/2026-07-20-stage-five-recall-trust.md`
+  — 6-task implementation plan.
+- `docs/superpowers/plans/2026-07-20-stage-five-recall-trust-closure.md`
+  — this closure report.
+- `README.md` — Memory Hygiene section now mentions
+  per-agent recall preference; Tool table mentions the
+  new `[writer: X]` annotation in the `recall_context`
+  output.
+
+### Test Coverage
+
+| Stage | Tests | Files | Notes |
+|---|---|---|---|
+| Baseline (pre-stage-1) | 120 | 10 | All passing |
+| Stage 1 | +74 | +14 | actor, sqlite-store-migration, tools-descriptions, backup, doctor + 9 CLI test files |
+| **Stage 1 total** | **194** | **24** | **All passing** |
+| Stage 2 | +21 | +4 | sqlite-store-migration-v3, remember-confirm, merge-memories, last-accessed-by |
+| **Stage 2 total** | **215** | **28** | **All passing** |
+| Stage 3 | +23 | +1 | text-similarity (new) + extensions to remember-confirm and memory-service |
+| **Stage 3 total** | **239** | **29** | **All passing** |
+| Stage 4 | +13 | +2 | sqlite-store-actor-filter, memory-service-actor-filter + extensions to list, search, doctor, tool-registration |
+| **Stage 4 total** | **252** | **31** | **All passing** |
+| Stage 5 | +9 | +1 | memory-service-recall-trust (new) covering trust helper + ranking + writer annotation |
+| **Stage 5 total** | **261** | **32** | **All passing** |
+
+### Deviations from Plan
+
+The Stage 5 plan called for 6 tasks; all 6 executed with
+these adjustments:
+
+1. **T3 (writer annotation) extended to `ContextPackInput`**
+   rather than introducing a separate wrapper type. The
+   optional `writer` field lives alongside `trust_boost`
+   on the entries passed to the exporter.
+2. **T4 (comprehensive ranking tests) was rolled into T2**.
+   The 3 integration tests in `test/memory-service-recall-trust.test.ts`
+   cover the same-actor, recent-touch, and legacy cases
+   together with the unit tests for `computeTrustBoost`,
+   in a single file. The plan's separate "comprehensive"
+   task became redundant.
+3. **Test debug log noise**: during T2 implementation,
+   the test file initially missed `scope: "global"` in
+   the `exportMemoryContext` input (the field is required;
+   the early-return path produces an empty pack). After
+   fixing, all tests pass cleanly.
+
+## [0.4.0] — 2026-07-20 — Stage 4 Per-Agent Memory View
 
 Date: 2026-07-20
 
