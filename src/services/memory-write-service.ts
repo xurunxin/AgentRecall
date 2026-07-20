@@ -187,7 +187,6 @@ export class MemoryWriteService {
         scope: current.scope,
         ...(current.project_id !== undefined ? { project_id: current.project_id } : {}),
         event,
-        actor: "agent",
         metadata: { fields: Object.keys(validated.value).sort() }
       });
       return ok({ memory_id: id });
@@ -309,7 +308,6 @@ export class MemoryWriteService {
           scope: old.scope,
           ...(old.project_id !== undefined ? { project_id: old.project_id } : {}),
           event: "superseded",
-          actor: "agent",
           reason: input.reason,
           metadata: {
             superseded_by: created.memory_id
@@ -431,7 +429,6 @@ export class MemoryWriteService {
           scope: old.scope,
           ...(old.project_id !== undefined ? { project_id: old.project_id } : {}),
           event: "superseded",
-          actor: "agent",
           reason: input.reason,
           metadata: {
             superseded_by: created.memory_id,
@@ -470,7 +467,6 @@ export class MemoryWriteService {
         scope: current.scope,
         ...(current.project_id !== undefined ? { project_id: current.project_id } : {}),
         event: "forgotten",
-        actor: "agent",
         reason,
         metadata: { released_chars }
       });

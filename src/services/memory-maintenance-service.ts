@@ -257,8 +257,8 @@ export class MemoryMaintenanceService {
           scope: scope.scope,
           ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
           event: "markdown_exported",
-          actor: "agent",
-          metadata: paths
+          actor: "system:export",
+          metadata: { ...paths, requested_by: this.ctx.defaultActor }
         });
         this.appendMaintenanceAudit(scope, "rebuild_markdown_index", changed, paths);
         return {
@@ -313,9 +313,12 @@ export class MemoryMaintenanceService {
           scope: entryRef.scope,
           ...(entryRef.project_id !== undefined ? { project_id: entryRef.project_id } : {}),
           event: "forgotten",
-          actor: "agent",
+          actor: "system:expiry",
           reason: "expired by maintain_memories",
-          metadata: { expires_at: entry.expires_at ?? "" }
+          metadata: {
+            expires_at: entry.expires_at ?? "",
+            requested_by: this.ctx.defaultActor
+          }
         });
         forgotten.push({ memory_id: entry.id, expires_at: entry.expires_at ?? "" });
       }
@@ -354,9 +357,12 @@ export class MemoryMaintenanceService {
           scope: entry.scope,
           ...(entry.project_id !== undefined ? { project_id: entry.project_id } : {}),
           event: "archived",
-          actor: "agent",
+          actor: "system:archive",
           reason: "low importance, low confidence, never accessed",
-          metadata: { reason: "low importance, low confidence, never accessed" }
+          metadata: {
+            reason: "low importance, low confidence, never accessed",
+            requested_by: this.ctx.defaultActor
+          }
         });
         archived.push({ memory_id: entry.id, reason: "low importance, low confidence, never accessed" });
       }
@@ -514,9 +520,12 @@ export class MemoryMaintenanceService {
           scope: keepTarget.scope,
           ...(keepTarget.project_id !== undefined ? { project_id: keepTarget.project_id } : {}),
           event: "superseded",
-          actor: "agent",
+          actor: "system:dedup",
           reason,
-          metadata: { superseded_by: keepTarget.id }
+          metadata: {
+            superseded_by: keepTarget.id,
+            requested_by: this.ctx.defaultActor
+          }
         });
       }
     });
@@ -532,7 +541,12 @@ export class MemoryMaintenanceService {
         event: "backup_created",
         actor: "system:backup",
         reason: "backup_created",
-        metadata: { path: result.path, size: result.size, duration_ms: result.durationMs }
+        metadata: {
+          path: result.path,
+          size: result.size,
+          duration_ms: result.durationMs,
+          requested_by: this.ctx.defaultActor
+        }
       });
     } catch {
       // Backup failures after a successful maintenance are
@@ -551,9 +565,14 @@ export class MemoryMaintenanceService {
       scope: scope.scope,
       ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
       event: "maintenance_run",
-      actor: "agent",
+      actor: "system:maintenance",
       reason: action,
-      metadata: { action, changed, ...details }
+      metadata: {
+        action,
+        changed,
+        ...details,
+        requested_by: this.ctx.defaultActor
+      }
     });
   }
 
