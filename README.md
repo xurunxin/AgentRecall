@@ -184,6 +184,14 @@ maintenance actions (`rebuild_markdown_index`, `expire_due`,
 - At task start, prefer `recall_context` with the current task query and, when available, the current project path.
 - Keep each memory atomic: one preference, decision, constraint, lesson, or debugging fact per entry.
 - Search before writing to avoid duplicate or near-duplicate memories.
+- **Cross-agent dedup**: a `remember` that rephrases an existing memory
+  by ≥ 0.7 token-set Jaccard returns the new memory **and** an
+  advisory `near_duplicate` warning in `warnings[]`. The warning
+  carries `actor` (who wrote the original) and `last_accessed_by`
+  (when it was last touched) so the agent can decide whether to
+  `merge_memories`, rewrite to be more distinct, or accept the
+  duplicate. The exact-match `duplicate_candidate` path is still a
+  hard block that requires `confirm_write: true`.
 - Use project scope for repository-specific facts, paths, commands, and debugging lessons.
 - Use global scope only for cross-project preferences and stable operating constraints.
 - Prefer high-confidence, durable facts. Archive or supersede stale entries instead of accumulating contradictions.
@@ -210,6 +218,10 @@ Markdown exports are for inspection and handoff. Manual edits under `exports/` m
 ## Changelog
 
 Stage-level changes are tracked in [`CHANGELOG.md`](./CHANGELOG.md).
+Stage 3 delivered token-set Jaccard similarity, the `near_duplicate`
+advisory on `remember`, and the `similar_title_and_body` group on
+`maintain_memories find_duplicates`; see the
+[Stage 3 closure report](./docs/superpowers/plans/2026-07-20-stage-three-closure.md).
 Stage 2 delivered `merge_memories`, `confirm_write`, the
 `last_accessed_by` column (with v2 → v3 migration), and a tenth doctor
 check; see the [Stage 2 closure report](./docs/superpowers/plans/2026-07-19-stage-two-closure.md).
