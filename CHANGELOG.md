@@ -5,6 +5,62 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [Unreleased] — Stage 10 PR1 (Release-Gate Test Infrastructure)
+
+Date: 2026-07-21
+
+### Added
+
+- **`test/release-gate/` — release-gate P0 regression
+  suite**. Five new test files (plus a `test/helpers/request-context.ts`
+  helper) lock down the invariants the v1 upgrade spec § 5
+  (AR-P0-001 … AR-P0-006) requires before P0 bugs can ship
+  again:
+  - `p0-scope.test.ts` — project scope safety (AR-P0-001):
+    maintenance actions scoped to one project must not touch
+    another; `scope=global + project_path` is rejected;
+    `scope=project` without any project identifier is rejected.
+  - `p0-actor.test.ts` — RequestContext / actor propagation
+    (AR-P0-002): every mutation and maintenance audit must
+    record the structured caller; system actors must record
+    the requester in metadata.
+  - `p0-ranking.test.ts` — recall ranking & ContextPacker
+    (AR-P0-003): query relevance is the primary sort key;
+    the exporter does not re-sort; an oversized first block
+    does not lock out subsequent in-budget entries.
+  - `p0-migration.test.ts` — explicit migration protocol
+    (AR-P0-004): opening a v2 store in default mode does not
+    change `user_version`; only an explicit `runMigrations()`
+    advances the schema.
+  - `p0-backup.test.ts` — destructive-action backup safety
+    (AR-P0-005): a failed pre-mutation backup causes the
+    destructive action to return `changed=0` (or throw); the
+    audit log never claims `backup_created` for a backup that
+    did not actually happen.
+
+### Test Coverage
+
+| Stage | Tests | Files | Notes |
+|---|---|---|---|
+| ... | ... | ... | ... |
+| **Stage 9 total** | **320** | **41** | **All passing** |
+| **Stage 10 PR1** | **+17 (10 red, 7 green)** | **+6** | red tests prove the P0 bugs are present today; green tests are invariants that already hold |
+
+### Deviations from Plan
+
+None. The 10 red tests are the proof of life for the
+P0 bugs called out in `docs/superpowers/plans/2026-07-21-v1-upgrade-master-plan.md`
+§ 2.1: the fix in Stage 10 PR2 (scope), PR3 (actor), PR4
+(ranking), and PR5 (migration + backup) must turn every
+red test green, while leaving the 320 pre-existing tests
+untouched.
+
+### Documentation
+
+- `docs/superpowers/plans/2026-07-21-v1-upgrade-master-plan.md`
+  — master plan covering Stage 10–13, all 11 PRs, the
+  verifier-driven acceptance loop, and the per-PR scope.
+
 ## [Unreleased] — Stage 9 Facade Split
 
 Date: 2026-07-21
