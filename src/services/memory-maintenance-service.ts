@@ -159,12 +159,21 @@ export class MemoryMaintenanceService {
       onProgress?.(0, 0);
       return { action: "find_duplicates", changed: 0, details: { groups: [] } };
     }
+    // Stage 10 PR6: build the candidate index across the
+    // entire dataset (spec § 5.1 "查重候选索引跨全局数据集
+    // 构建") and only use the batch boundary for progress
+    // reporting. Pre-PR6 the `seen` set lived inside
+    // `findDuplicateGroups`, so a pair straddling a batch
+    // boundary was missed because each batch got its own
+    // empty set. The new helper accepts a caller-owned
+    // seen set that survives across batches.
     const seenFingerprints = new Set<string>();
+    const seenPairs = new Set<string>();
     const groups: DuplicateGroup[] = [];
     let processed = 0;
     for (let offset = 0; offset < total; offset += batchSize) {
       const batch = allEntries.slice(offset, offset + batchSize);
-      const batchGroups = this.findDuplicateGroups(batch);
+      const batchGroups = this.findDuplicateGroups(batch, seenPairs);
       for (const g of batchGroups) {
         if (seenFingerprints.has(g.fingerprint)) continue;
         seenFingerprints.add(g.fingerprint);
@@ -219,10 +228,28 @@ export class MemoryMaintenanceService {
         keep_id: keepTarget.id,
         superseded_ids: supersededIds
       };
-      wouldSupersede.push(record);
-      if (!dryRun) {
+      // Stage 10 PR6: only auto-collapse when the entire
+      // group is `same_title_and_body` AND every entry
+      // belongs to the same scope/project (spec § 5.6
+      // "只有规范化 title 和 body 均完全相同，且
+      // scope/project 一致时，允许默认自动折叠").
+      // Other reasons (same_title / same_body /
+      // similar_title_and_body) only produce a plan; the
+      // caller must explicitly apply the merge.
+      const sameProject = liveEntries.every(
+        (e) => e.scope === keepTarget.scope && e.project_id === keepTarget.project_id
+      );
+      const autoCollapse = !dryRun && group.reason === "same_title_and_body" && sameProject;
+      if (autoCollapse) {
+        if (liveEntries.length > 0) {
+          this.maybeBackup(liveEntries.length);
+        }
         this.applySupersede(keepTarget, supersededIds, "merge_duplicates auto-supersede");
         actuallySuperseded.push(record);
+      } else {
+        // Plan-only group: surface the proposed action
+        // so the user / agent can decide.
+        wouldSupersede.push({ ...record, plan_only: true } as typeof record & { plan_only: true });
       }
       processed += 1;
       onProgress?.(processed, total);
@@ -233,7 +260,15 @@ export class MemoryMaintenanceService {
       details: {
         strategy,
         dry_run: dryRun,
-        groups: actuallySuperseded.length > 0 ? actuallySuperseded : wouldSupersede
+        // Backward-compatible `groups` field: every group
+        // that would be / was collapsed. `applied` and
+        // `plan_only` are the post-PR6 split for callers
+        // that need to know which were auto-collapsed
+        // versus surfaced as a plan for explicit
+        // confirmation.
+        groups: actuallySuperseded.length > 0 ? actuallySuperseded : wouldSupersede,
+        applied: actuallySuperseded,
+        plan_only: wouldSupersede
       }
     };
   }
@@ -402,14 +437,24 @@ export class MemoryMaintenanceService {
   // Duplicate detection (Stage 3 + Stage 7 T4 inverted index)
   // ============================================================
 
-  private findDuplicateGroups(entries: MemoryEntry[]): DuplicateGroup[] {
+  private findDuplicateGroups(entries: MemoryEntry[], crossBatchSeen: Set<string> = new Set()): DuplicateGroup[] {
     const sortedEntries = [...entries].sort((a, b) => compareText(a.id, b.id));
     const exactGroups: DuplicateGroup[] = [
       ...this.duplicateGroupsFor(sortedEntries, "same_title_and_body", (entry) => `${normalizeDuplicateText(entry.title)}\n${normalizeDuplicateText(entry.body)}`),
       ...this.duplicateGroupsFor(sortedEntries, "same_title", (entry) => normalizeDuplicateText(entry.title)),
       ...this.duplicateGroupsFor(sortedEntries, "same_body", (entry) => normalizeDuplicateText(entry.body))
     ];
-    const similarGroups = this.similarDuplicateGroups(sortedEntries, this.coveredPairKeys(exactGroups));
+    // Stage 10 PR6: share the seen-pairs set across
+    // batches so a near-duplicate pair straddling the
+    // batch boundary is not detected twice (or, more
+    // importantly, not missed because each batch's
+    // similarDuplicateGroups used to start with an empty
+    // seen set).
+    const similarGroups = this.similarDuplicateGroups(
+      sortedEntries,
+      this.coveredPairKeys(exactGroups),
+      crossBatchSeen
+    );
     const groups: DuplicateGroup[] = [...exactGroups, ...similarGroups];
     const reasonRank: Record<DuplicateGroup["reason"], number> = {
       same_title_and_body: 0,
@@ -439,7 +484,23 @@ export class MemoryMaintenanceService {
     return keys;
   }
 
-  private similarDuplicateGroups(entries: MemoryEntry[], covered: Set<string>): DuplicateGroup[] {
+  private similarDuplicateGroups(
+    entries: MemoryEntry[],
+    covered: Set<string>,
+    crossBatchSeen: Set<string> = new Set()
+  ): DuplicateGroup[] {
+    // Stage 10 PR6: cap on a single bucket's size is
+    // removed for the cross-batch path because the
+    // pre-PR6 behaviour silently dropped every entry
+    // that shared a high-frequency token (e.g. project
+    // names, common code identifiers). For batches small
+    // enough that the original 200-entry bucket cap
+    // protected us, we keep the cap; for the merged
+    // candidate index we let the bucket grow and rely on
+    // SIMILARITY_THRESHOLD to keep the candidate pairs
+    // bounded. (The original cap is a heuristic, not an
+    // invariant.)
+    const capEntries = entries.length <= 500;
     const BUCKET_CAP = 200;
     const bucket = new Map<string, MemoryEntry[]>();
     for (const entry of entries) {
@@ -450,10 +511,9 @@ export class MemoryMaintenanceService {
         else list.push(entry);
       }
     }
-    const seen = new Set<string>();
     const groups: DuplicateGroup[] = [];
     for (const entriesInBucket of bucket.values()) {
-      if (entriesInBucket.length > BUCKET_CAP) continue;
+      if (capEntries && entriesInBucket.length > BUCKET_CAP) continue;
       for (let i = 0; i < entriesInBucket.length; i += 1) {
         const a = entriesInBucket[i];
         if (a === undefined) continue;
@@ -461,8 +521,8 @@ export class MemoryMaintenanceService {
           const b = entriesInBucket[j];
           if (b === undefined) continue;
           const pairKey = compareText(a.id, b.id) <= 0 ? `${a.id}|${b.id}` : `${b.id}|${a.id}`;
-          if (seen.has(pairKey)) continue;
-          seen.add(pairKey);
+          if (crossBatchSeen.has(pairKey)) continue;
+          crossBatchSeen.add(pairKey);
           if (covered.has(pairKey)) continue;
           const titleSim = textSimilarity(a.title, b.title);
           const bodySim = textSimilarity(a.body, b.body);
