@@ -5,6 +5,101 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [Unreleased] — Stage 8 Maintenance Rich
+
+Date: 2026-07-20
+
+### Added
+
+- **`merge_duplicates` action on `maintain_memories`**.
+  Walks the duplicate groups from `find_duplicates` and
+  auto-supersedes all but the keep target. Strategy:
+  `keep_first` (lowest id, default) or `keep_newest`
+  (most recently created). For each group, the keep
+  target stays active; every other active memory in
+  the group is marked `status: "superseded"` with
+  `superseded_by = keep_id`. One `superseded` audit
+  event is written per merge. Groups of size 1
+  (after filtering out already-superseded entries)
+  are skipped.
+- **Export format switch**. `ExportScopeInput` gains
+  a `format` field (`"markdown"` | `"json"` |
+  `"yaml"`, default `"markdown"` for backward
+  compat). The CLI `export` command gains
+  `--format markdown|json|yaml`. The new
+  `FormatRouter` (in `src/format-exporters.ts`)
+  picks the right exporter. JSON output is stable
+  (sorted top-level keys) and per-topic. YAML output
+  is hand-rolled (no new deps); strings that look like
+  booleans / numbers / null are quoted to avoid YAML
+  interpretation.
+- **`dry_run` flag on `maintain_memories`**. For
+  mutating actions (`archive_low_value`,
+  `expire_due`, `merge_duplicates`), `dry_run: true`
+  returns the would-be changes without writing.
+  Read-only actions (`find_duplicates`,
+  `rebuild_markdown_index`, `vacuum_fts`) ignore the
+  flag. The shape per action is documented in the
+  Stage 8 spec; users can call `dry_run: true` first
+  to preview, then call again to actually commit.
+
+### Changed
+
+- **Test count**: 301 (stage 7) → 320 (+19 from
+  stage 8: 5 merge-duplicates, 10 format-exporters,
+  4 maintenance-dry-run).
+- **`maintain_memories` schema gains `dry_run` and
+  `strategy` fields** (defaults `false` and
+  `"keep_first"`). Existing callers that omit them
+  get the new defaults transparently.
+- **`maintenanceActions` enum gains `merge_duplicates`**
+  as a 6th action. `find_duplicates` is now read-only
+  (it was already, but it's now joined by the
+  mutating `merge_duplicates`).
+
+### Documentation
+
+- `docs/superpowers/specs/2026-07-20-stage-eight-maintenance-rich.md`
+  — Stage 8 spec covering the three sub-tasks.
+- `docs/superpowers/plans/2026-07-20-stage-eight-maintenance-rich.md`
+  — 5-task implementation plan.
+- `docs/superpowers/plans/2026-07-20-stage-eight-maintenance-rich-closure.md`
+  — closure report.
+- `README.md` — Maintenance section: brief note about
+  `merge_duplicates`, `dry_run`, and the `--format`
+  switch on `export`. Tools table updated.
+
+### Test Coverage
+
+| Stage | Tests | Files | Notes |
+|---|---|---|---|
+| Baseline (pre-stage-1) | 120 | 10 | All passing |
+| Stage 1 | +74 | +14 | actor, sqlite-store-migration, tools-descriptions, backup, doctor + 9 CLI test files |
+| **Stage 1 total** | **194** | **24** | **All passing** |
+| Stage 2 | +21 | +4 | sqlite-store-migration-v3, remember-confirm, merge-memories, last-accessed-by |
+| **Stage 2 total** | **215** | **28** | **All passing** |
+| Stage 3 | +23 | +1 | text-similarity + extensions to remember-confirm and memory-service |
+| **Stage 3 total** | **239** | **29** | **All passing** |
+| Stage 4 | +13 | +2 | sqlite-store-actor-filter, memory-service-actor-filter + extensions to list, search, doctor, tool-registration |
+| **Stage 4 total** | **252** | **31** | **All passing** |
+| Stage 5 | +9 | +1 | memory-service-recall-trust covering trust helper + ranking + writer annotation |
+| **Stage 5 total** | **261** | **32** | **All passing** |
+| Stage 6 | +12 | +1 | sqlite-store-time-window + extensions to tool-registration, list, search, doctor |
+| **Stage 6 total** | **273** | **33** | **All passing** |
+| Stage 7 | +28 | +5 | updated_at + staleness-config + trust-config + find-duplicates-bucketed + maintenance-chunking |
+| **Stage 7 total** | **301** | **38** | **All passing** |
+| Stage 8 | +19 | +3 | merge-duplicates + format-exporters + maintenance-dry-run |
+| **Stage 8 total** | **320** | **41** | **All passing** |
+
+### Deviations from Plan
+
+None significant. The plan called for 5 sub-tasks
+(T1-T3 features + T4 docs + T5 verify/push/merge);
+all executed as planned. The `merge_duplicates` and
+`dry_run` flags landed together because the
+maintain_memories schema change touches both
+naturally; the closure report notes this.
+
 ## [Unreleased] — Stage 7 Maintenance & Polish
 
 Date: 2026-07-20
@@ -204,6 +299,35 @@ Date: 2026-07-20
   reports count and top-5 oldest. Always `ok`;
   informational only. (Stage 7 makes the 90-day
   constant configurable via `AGENT_RECALL_STALE_DAYS`.)
+
+## [0.7.0] — 2026-07-20 — Stage 7 Maintenance & Polish
+
+Date: 2026-07-20
+
+### Added
+
+- `updated_since` / `updated_until` filters on
+  `list_memories` and `search_memories`
+  (parallel to Stage 6's `since` / `until`).
+- `AGENT_RECALL_STALE_DAYS` env var (default 90;
+  invalid → fallback with stderr warning).
+- `AGENT_RECALL_TRUST_STRONG` and
+  `AGENT_RECALL_TRUST_SOFT` env vars (default
+  0.3 / 0.1; invalid → fallback with stderr
+  warning).
+- Token-bucketed inverted index for
+  `find_duplicates` (5-10x pair count reduction;
+  200-entry fixture drops from 33s to 27ms).
+- `maintain_memories` gains `batch_size` (default
+  500, min 50, max 5000) and `onProgress` callback
+  for chunked maintenance.
+
+### Deferred
+
+- T2/T4 facade split (pure refactor, zero user-
+  visible change) deferred to Stage 8 per user
+  memory: "deferred to Stage 3 is fine — does not
+  change user-facing behavior".
 
 ## [0.5.0] — 2026-07-20 — Stage 5 Recall Ranking by Actor Trust
 
