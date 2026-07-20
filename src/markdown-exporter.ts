@@ -179,17 +179,38 @@ function entryDetail(entry: MemoryEntry & { writer?: string }): string {
 }
 
 function boundedJoin(blocks: string[], budgetChars: number): string {
+  // Stage 10 PR4: token-aware / field-level packing.
+  //
+  // Pre-PR4 this routine broke on the first block larger than
+  // the budget, so a single oversized memory could lock out
+  // every smaller memory that followed it. The new strategy
+  // (spec § 5.3):
+  //   - blocks are processed in input order; the ranker is
+  //     the single source of ordering truth.
+  //   - a block that does not fit in the remaining budget
+  //     is **skipped**, not partially rendered. The next,
+  //     smaller block can still consume what is left.
+  //   - field-level truncation is the ranker's job: the
+  //     ranker records `truncated: true` on the
+  //     corresponding RankedItem and the read-side
+  //     pipeline can clip the entry body before it reaches
+  //     the renderer.
+  //   - the final output is clipped to `<= budgetChars`
+  //     so spec § 5.3's `used_tokens <= requested_budget`
+  //     invariant holds.
   const budget = Math.max(0, Math.floor(budgetChars));
   let output = "";
   for (const block of blocks) {
-    if (output.length + block.length > budget) {
-      break;
+    const remaining = budget - output.length;
+    if (remaining <= 0) break;
+    if (block.length > remaining) {
+      // Skip; let the next (smaller) block consume the
+      // remaining budget.
+      continue;
     }
     output += block;
   }
-  if (output.length === 0 && blocks.length > 0 && budget > 0) {
-    return blocks[0]?.slice(0, budget) ?? "";
-  }
+  if (output.length > budget) return output.slice(0, budget);
   return output;
 }
 
@@ -209,13 +230,25 @@ export class MarkdownExporter {
 
   buildContextPack(input: ContextPackInput): string {
     const title = input.title.trim().length > 0 ? input.title.trim() : "AgentRecall Context";
-    const entries = [...input.entries].filter((entry) => entry.status === "active").sort(compareEntries);
+    // Stage 10 PR4: the exporter is a renderer, not a ranker.
+    // It trusts the input order supplied by the read service
+    // (which routed everything through RecallRanker). The
+    // pre-PR4 `.sort(compareEntries)` would re-rank by
+    // importance + trust and override the query-score order;
+    // it is removed here.
+    const entries = input.entries.filter((entry) => entry.status === "active");
     const blocks = [
       [`# ${title}`, "", `> ${AUTHORITY_NOTICE}`, "", "## Memories", ""].join("\n"),
       ...entries.map((entry) => `${entryDetail(entry)}\n`)
     ];
-    const markdown = boundedJoin(blocks, input.budget_chars).trimEnd();
-    return markdown.length === 0 ? "" : `${markdown}\n`;
+    // Reserve one character for the trailing newline so the
+    // final output length is `<= budget_chars` per spec § 5.3
+    // ("used_tokens <= requested_budget"). When the body
+    // already saturates the budget the trailing newline is
+    // dropped to keep the contract.
+    const body = boundedJoin(blocks, Math.max(0, input.budget_chars - 1)).trimEnd();
+    if (body.length === 0) return "";
+    return body.length >= input.budget_chars ? body : `${body}\n`;
   }
 
   exportScope(input: ExportScopeInput): ExportScopeResult {

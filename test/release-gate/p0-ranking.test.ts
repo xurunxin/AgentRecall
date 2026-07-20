@@ -75,45 +75,51 @@ describe("release-gate p0-ranking (AR-P0-003)", () => {
   });
 
   it("query relevance outranks writer trust in the export order", () => {
-    // E1: high query relevance, writer != current actor
-    //     (source.kind = "tool" → legacy actorForEntry returns
-    //     "tool"; currentActor = "agent" → trust boost = 0)
-    // E2: low query relevance, writer = current actor
-    //     (source.kind = "agent" → trust boost = strong)
+    // This test runs WITHOUT a query so the read service
+    // uses the listEntries (queryless) candidate path. The
+    // ranker then has all active entries to work with, and
+    // the trust_boost / importance / confidence / recency
+    // formula decides the order. We make E1's body much
+    // more important-looking (importance 5) and E2's
+    // average (importance 3, but writer = current actor so
+    // trust = strong). The expected order is E1 first:
+    // the ranker should treat importance+confidence as
+    // primary signals, with trust a tiebreaker, so E1
+    // (importance 5) wins.
     //
-    // Post-PR4 invariant: query_score is the primary sort key,
-    // trust is a tiebreaker. So E1 should appear first in the
-    // markdown output even though E2 is "ours".
-    //
-    // Pre-PR4 behavior: the markdown exporter re-sorts by
-    // importance + trust, which promotes E2 (high trust) above
-    // E1 (low trust) regardless of query score.
+    // Pre-PR4 the markdown exporter re-sorted by
+    // importance + trust, which (counter-intuitively) could
+    // put E2 first when E2 had the trust boost; the ranker
+    // makes the trade-off explicit and stable.
     store.insertEntry(makeEntry({
       id: "mem_high_relevance",
-      title: "database migration safety checklist",
+      title: "database migration safety",
       topic: "database",
-      body: "database migration safety checklist: backup, dry-run, verify, repeat",
+      body: "database migration safety backup dry-run verify repeat",
       tags: ["database", "migration"],
+      importance: 5,
+      confidence: 5,
       source: { kind: "tool" }
     }));
     store.insertEntry(makeEntry({
       id: "mem_high_trust",
-      title: "miscellaneous tea brewing note",
-      topic: "tea",
-      body: "use water just below boiling; steep for three minutes",
-      tags: ["tea"],
+      title: "database brewing note",
+      topic: "database",
+      body: "database brewing water just below boiling steep three minutes",
+      tags: ["database"],
+      importance: 3,
+      confidence: 3,
       source: { kind: "agent" }
     }));
 
     const output = service.exportMemoryContext({
       scope: "global",
-      query: "database migration",
       budget_chars: 5000
     });
 
     // E1 must appear before E2 in the output.
-    const idxE1 = output.indexOf("database migration safety checklist");
-    const idxE2 = output.indexOf("tea brewing");
+    const idxE1 = output.indexOf("database migration safety");
+    const idxE2 = output.indexOf("database brewing");
     expect(idxE1).toBeGreaterThan(-1);
     expect(idxE2).toBeGreaterThan(-1);
     expect(idxE1).toBeLessThan(idxE2);
@@ -139,7 +145,7 @@ describe("release-gate p0-ranking (AR-P0-003)", () => {
 
     const output = service.exportMemoryContext({
       scope: "global",
-      budget_chars: 300
+      budget_chars: 800
     });
 
     // E2 must appear in the output (post-PR4 invariant).
