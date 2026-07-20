@@ -1001,9 +1001,9 @@ export class MemoryService {
       case "rebuild_markdown_index":
         return this.rebuildMarkdownIndex(resolved.value);
       case "expire_due":
-        return this.expireDueMemories(resolved.value);
+        return this.expireDueMemories(resolved.value, input.dry_run === true);
       case "archive_low_value":
-        return this.archiveLowValueMemories(resolved.value);
+        return this.archiveLowValueMemories(resolved.value, input.dry_run === true);
       case "vacuum_fts":
         return this.vacuumFts(resolved.value);
     }
@@ -1377,11 +1377,27 @@ export class MemoryService {
     }
   }
 
-  private expireDueMemories(scope: ResolvedReadScope): MaintainMemoriesResult {
+  private expireDueMemories(scope: ResolvedReadScope, dryRun = false): MaintainMemoriesResult {
     const now = nowIso();
     const expired = this.activeEntriesForScope(scope)
       .filter((entry) => isDue(entry.expires_at, now))
       .sort((a, b) => compareText(a.expires_at ?? "", b.expires_at ?? "") || compareText(a.id, b.id));
+
+    if (dryRun) {
+      const sample = expired.slice(0, 10).map((e) => ({
+        id: e.id,
+        expires_at: e.expires_at ?? ""
+      }));
+      return {
+        action: "expire_due",
+        changed: 0,
+        details: {
+          dry_run: true,
+          would_expire_count: expired.length,
+          would_expire_sample: sample
+        }
+      };
+    }
 
     return this.store.transaction(() => {
       const forgotten: Array<{ memory_id: string; expires_at: string }> = [];
@@ -1408,10 +1424,28 @@ export class MemoryService {
     });
   }
 
-  private archiveLowValueMemories(scope: ResolvedReadScope): MaintainMemoriesResult {
+  private archiveLowValueMemories(scope: ResolvedReadScope, dryRun = false): MaintainMemoriesResult {
     const lowValue = this.activeEntriesForScope(scope)
       .filter((entry) => entry.importance <= 2 && entry.confidence <= 2 && entry.access_count === 0 && entry.source.kind !== "user")
       .sort(compareLowValueCandidates);
+
+    if (dryRun) {
+      const sample = lowValue.slice(0, 10).map((e) => ({
+        id: e.id,
+        importance: e.importance,
+        confidence: e.confidence,
+        access_count: e.access_count
+      }));
+      return {
+        action: "archive_low_value",
+        changed: 0,
+        details: {
+          dry_run: true,
+          would_archive_count: lowValue.length,
+          would_archive_sample: sample
+        }
+      };
+    }
 
     return this.store.transaction(() => {
       const archived: Array<{ memory_id: string; reason: string }> = [];
