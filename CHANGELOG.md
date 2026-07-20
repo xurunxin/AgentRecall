@@ -112,6 +112,15 @@ across `test/memory-service.test.ts`,
 `test/memory-service-recall-trust.test.ts`. All pass
 post-fix.
 
+### Added
+
+- `AGENTS.md` — project-wide collaboration rules for AI coding
+  agents (and human contributors). Eight working principles
+  (查档求证 / 对齐需求 / 请示规则 / 复用存量 / 完备测例 /
+  恪守规范 / 坦诚存疑 / 分步迭代), plus scope and enforcement
+  notes. Consumed automatically by OpenCode / Codex / Cursor /
+  Aider / Devin / Gemini CLI on cold start.
+
 ## [0.8.0] — Stage 8 Maintenance Rich
 
 Date: 2026-07-20
