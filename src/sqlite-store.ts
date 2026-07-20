@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
+import { nowIso } from "./domain.js";
 import type {
   AuditEventName,
   MemoryAuditEvent,
@@ -66,7 +67,7 @@ export type SearchFilters = EntryFilters & {
  * CHECK constraint to allow structured values like `agent:claude-code`.
  * v3 adds the `last_accessed_by` JSON column to `memory_entries`.
  */
-export const CURRENT_SCHEMA_VERSION = 3;
+export const CURRENT_SCHEMA_VERSION = 4;
 
 export type AuditFilters = {
   memory_id?: string;
@@ -598,6 +599,10 @@ export class SQLiteMemoryStore {
       this.migrate_v2_to_v3();
       return;
     }
+    if (version === 4) {
+      this.migrate_v3_to_v4();
+      return;
+    }
     throw new Error(`No migration registered for schema version ${version}`);
   }
 
@@ -611,6 +616,208 @@ export class SQLiteMemoryStore {
       this.db.exec("ALTER TABLE memory_entries ADD COLUMN last_accessed_by TEXT");
     }
     this.db.exec("PRAGMA user_version = 3");
+  }
+
+  /**
+   * Stage 11 PR7: v3 -> v4 schema migration. Spec § 6.5
+   * describes the schema v4 layout; this migration
+   * introduces every v4-only field on `memory_entries`
+   * and the v4-only tables, then re-backs the writer
+   * actor id from the audit log (idempotent), splits
+   * `last_accessed_by` JSON into the `memory_accesses`
+   * table, and lifts `supersedes_json` into
+   * `memory_relations`. The migration is fully
+   * transactional; if any step throws the user_version
+   * is left at 3 and the database is untouched.
+   */
+  private migrate_v3_to_v4(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.addColumnIfMissing(
+        "memory_entries",
+        "revision",
+        "INTEGER NOT NULL DEFAULT 1"
+      );
+      this.addColumnIfMissing(
+        "memory_entries",
+        "writer_actor_id",
+        "TEXT NOT NULL DEFAULT 'agent:unknown'"
+      );
+      this.addColumnIfMissing(
+        "memory_entries",
+        "content_hash",
+        "TEXT"
+      );
+      this.addColumnIfMissing("memory_entries", "pinned", "INTEGER NOT NULL DEFAULT 0");
+      this.addColumnIfMissing(
+        "memory_entries",
+        "trust_level",
+        "TEXT NOT NULL DEFAULT 'agent_observed'"
+      );
+      this.addColumnIfMissing(
+        "memory_entries",
+        "sensitivity",
+        "TEXT NOT NULL DEFAULT 'normal'"
+      );
+      this.addColumnIfMissing("memory_entries", "valid_from", "TEXT");
+      this.addColumnIfMissing("memory_entries", "valid_until", "TEXT");
+      this.addColumnIfMissing("memory_entries", "deleted_at", "TEXT");
+      this.addColumnIfMissing(
+        "memory_entries",
+        "metadata_json",
+        "TEXT NOT NULL DEFAULT '{}'"
+      );
+
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_revisions (
+          memory_id TEXT NOT NULL,
+          revision INTEGER NOT NULL,
+          snapshot_json TEXT NOT NULL,
+          changed_by TEXT NOT NULL,
+          request_id TEXT NOT NULL,
+          change_reason TEXT,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (memory_id, revision)
+        ) STRICT;
+
+        CREATE TABLE IF NOT EXISTS memory_accesses (
+          memory_id TEXT NOT NULL,
+          actor_id TEXT NOT NULL,
+          access_count INTEGER NOT NULL DEFAULT 0,
+          first_accessed_at TEXT NOT NULL,
+          last_accessed_at TEXT NOT NULL,
+          PRIMARY KEY (memory_id, actor_id)
+        ) STRICT;
+
+        CREATE TABLE IF NOT EXISTS project_aliases (
+          project_id TEXT NOT NULL,
+          alias_type TEXT NOT NULL,
+          alias_value TEXT NOT NULL,
+          normalized_value TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (alias_type, normalized_value)
+        ) STRICT;
+
+        CREATE TABLE IF NOT EXISTS mutation_requests (
+          actor_id TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          request_hash TEXT NOT NULL,
+          result_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (actor_id, idempotency_key)
+        ) STRICT;
+
+        CREATE TABLE IF NOT EXISTS memory_relations (
+          from_memory_id TEXT NOT NULL,
+          to_memory_id TEXT NOT NULL,
+          relation_type TEXT NOT NULL,
+          confidence REAL,
+          metadata_json TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (from_memory_id, to_memory_id, relation_type)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS memory_accesses_actor_idx
+          ON memory_accesses(actor_id, last_accessed_at);
+        CREATE INDEX IF NOT EXISTS memory_relations_to_idx
+          ON memory_relations(to_memory_id, relation_type);
+        CREATE INDEX IF NOT EXISTS memory_relations_type_idx
+          ON memory_relations(relation_type, created_at);
+      `);
+
+      // Back-fill writer_actor_id from the audit log so the
+      // pre-existing v3 entries have a canonical writer.
+      // Pre-PR7 the canonical writer was reconstructed on
+      // every read by scanning the audit log; post-PR7 the
+      // canonical writer is stored on the row and the
+      // audit scan is only used as a fallback. Missing or
+      // unmatched entries default to 'agent:unknown'.
+      this.db.exec(`
+        UPDATE memory_entries
+           SET writer_actor_id = COALESCE(
+             (SELECT actor FROM audit_events
+                WHERE audit_events.memory_id = memory_entries.id
+                  AND audit_events.event = 'created'
+                ORDER BY audit_events.created_at ASC
+                LIMIT 1),
+             writer_actor_id
+           )
+         WHERE writer_actor_id = 'agent:unknown' AND
+               EXISTS (SELECT 1 FROM audit_events
+                          WHERE audit_events.memory_id = memory_entries.id
+                            AND audit_events.event = 'created');
+      `);
+
+      // Lift the legacy `last_accessed_by` JSON map into
+      // `memory_accesses`. Pre-PR7 the column was a free-
+      // form JSON object; post-PR7 it is left in place for
+      // one release cycle of read-compat, and the
+      // canonical access data lives in the new table.
+      const legacyRows = this.db
+        .prepare("SELECT id, last_accessed_by FROM memory_entries WHERE last_accessed_by IS NOT NULL")
+        .all() as Array<{ id: string; last_accessed_by: string }>;
+      const insertAccess = this.db.prepare(`
+        INSERT OR REPLACE INTO memory_accesses
+          (memory_id, actor_id, access_count, first_accessed_at, last_accessed_at)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+      for (const row of legacyRows) {
+        let parsed: Record<string, unknown> | undefined;
+        try {
+          parsed = JSON.parse(row.last_accessed_by) as Record<string, unknown>;
+        } catch {
+          continue;
+        }
+        if (parsed === null || typeof parsed !== "object") continue;
+        for (const [actor, value] of Object.entries(parsed)) {
+          if (typeof value !== "string") continue;
+          insertAccess.run(row.id, actor, 1, value, value);
+        }
+      }
+
+      // Lift `supersedes_json` into `memory_relations`
+      // (relation_type = 'supersedes'). Pre-PR7 a single
+      // entry could supersede multiple others; the JSON
+      // column was the only way to express that. Post-PR7
+      // the canonical graph is in `memory_relations`.
+      const supersedeRows = this.db
+        .prepare("SELECT id, supersedes_json, created_at FROM memory_entries WHERE supersedes_json IS NOT NULL AND supersedes_json != '[]'")
+        .all() as Array<{ id: string; supersedes_json: string; created_at: string }>;
+      const insertRelation = this.db.prepare(`
+        INSERT OR IGNORE INTO memory_relations
+          (from_memory_id, to_memory_id, relation_type, confidence, metadata_json, created_at)
+        VALUES (?, ?, 'supersedes', 1.0, '{}', ?)
+      `);
+      for (const row of supersedeRows) {
+        let targets: string[] = [];
+        try {
+          const parsed = JSON.parse(row.supersedes_json) as unknown;
+          if (Array.isArray(parsed)) {
+            targets = parsed.filter((v): v is string => typeof v === "string");
+          }
+        } catch {
+          continue;
+        }
+        for (const target of targets) {
+          insertRelation.run(row.id, target, row.created_at);
+        }
+      }
+
+      this.db.exec("PRAGMA user_version = 4");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  private addColumnIfMissing(table: string, column: string, definition: string): void {
+    const cols = this.db
+      .prepare(`PRAGMA table_info(${table})`)
+      .all() as Array<{ name: string }>;
+    if (!cols.some((c) => c.name === column)) {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
   }
 
   private migrate_v1_to_v2(): void {
@@ -854,6 +1061,71 @@ export class SQLiteMemoryStore {
       .prepare(`SELECT * FROM audit_events ${where} ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?`)
       .all(...params, limit, offset)
       .map(decodeAudit);
+  }
+
+  /**
+   * Stage 11 PR7: idempotency cache accessors. The
+   * `mutation_requests` table stores the canonical
+   * result of a mutating operation so a retry with the
+   * same `(actor, key)` can replay the result without
+   * re-running the mutation. Lookups return
+   * `undefined` when no row exists; `upsert` writes
+   * the row and is used both for the initial record
+   * and for the (rare) refresh-on-conflict path.
+   */
+  lookupMutationRequest(actor: string, key: string):
+    | { request_hash: string; result_json: string }
+    | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT request_hash, result_json FROM mutation_requests WHERE actor_id = ? AND idempotency_key = ?"
+      )
+      .get(actor, key) as { request_hash: string; result_json: string } | undefined;
+    return row;
+  }
+
+  upsertMutationRequest(
+    actor: string,
+    key: string,
+    requestHash: string,
+    resultJson: string
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO mutation_requests (actor_id, idempotency_key, request_hash, result_json, created_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(actor_id, idempotency_key) DO UPDATE SET
+           request_hash = excluded.request_hash,
+           result_json = excluded.result_json`
+      )
+      .run(actor, key, requestHash, resultJson, nowIso());
+  }
+
+  /**
+   * Stage 11 PR7: atomic access UPSERT (spec § 5.6).
+   * Two agents accessing the same memory in the same
+   * SQLite write window both end up with their own row
+   * in `memory_accesses` rather than overwriting each
+   * other's last_accessed_at. The legacy
+   * `last_accessed_by` JSON column is still written
+   * (for read-back compat with the v3 schema) but the
+   * canonical access data is now in this table.
+   */
+  recordAccess(
+    memoryId: string,
+    actorId: string,
+    timestamp: string
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO memory_accesses
+            (memory_id, actor_id, access_count, first_accessed_at, last_accessed_at)
+         VALUES (?, ?, 1, ?, ?)
+         ON CONFLICT(memory_id, actor_id) DO UPDATE SET
+           access_count = access_count + 1,
+           last_accessed_at = excluded.last_accessed_at`
+      )
+      .run(memoryId, actorId, timestamp, timestamp);
   }
 
   getBudgetUsage(filters: { scope: MemoryScope; project_id?: string }): BudgetUsage {

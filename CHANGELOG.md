@@ -5,6 +5,57 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [Unreleased] — Stage 11 PR7 (Schema v4)
+
+Date: 2026-07-21
+
+### Added
+
+- **Schema v4** (`CURRENT_SCHEMA_VERSION` bumped 3 -> 4):
+  - `memory_entries` gains `revision`, `writer_actor_id`,
+    `content_hash`, `pinned`, `trust_level`, `sensitivity`,
+    `valid_from`, `valid_until`, `deleted_at`,
+    `metadata_json`.
+  - New `memory_revisions` table (immutable per-revision
+    snapshot; audit log keeps event-level data, revisions
+    keep re-buildable state).
+  - New `memory_accesses` table (per-actor access
+    tracking, with `INSERT ... ON CONFLICT DO UPDATE` so
+    two agents accessing the same memory in the same
+    write window both keep their own row).
+  - New `project_aliases` table (stable project identity
+    beyond realpath hash; v4 only stores the table, the
+    resolver is wired in Stage 12 / Stage 13).
+  - New `mutation_requests` table (idempotency cache
+    keyed by `(actor_id, idempotency_key)`).
+  - New `memory_relations` table (explicit
+    supersedes / duplicate_of / conflicts_with /
+    derived_from / supports / invalidates graph).
+
+- **Idempotency helpers** (`src/services/idempotency.ts`):
+  - `lookupIdempotency(store, actor, key, requestHash)`
+    returns one of `{fresh, replay, rejected: 'idempotency_key_reuse'}`.
+  - `recordIdempotency(store, actor, key, requestHash, result)`
+    persists the result so a retry with the same key
+    replays the original outcome.
+
+### Changed
+
+- **v3 -> v4 data migration** (transactional, idempotent):
+  - `writer_actor_id` back-filled from the audit log.
+  - Legacy `last_accessed_by` JSON map lifted into
+    `memory_accesses` (one row per (memory, actor)).
+  - Legacy `supersedes_json` array lifted into
+    `memory_relations` (relation_type = 'supersedes').
+
+### Test Coverage
+
+| Stage | Tests | Files | Notes |
+|---|---|---|---|
+| ... | ... | ... | ... |
+| **Stage 10 PR6 total** | **+0** | **+0** | no new tests; closes the Stage 10 P0 release gate |
+| **Stage 11 PR7 total** | **+0 (3 fixture updates)** | **+1 (idempotency)** | v1 / v2 / v3 fixtures migrate to v4; legacy v3 columns kept one release cycle for read-back compat |
+
 ## [Unreleased] — Stage 10 PR6 (Cross-Batch Dedup + Conservative Merge)
 
 Date: 2026-07-21
