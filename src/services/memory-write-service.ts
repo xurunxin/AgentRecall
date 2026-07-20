@@ -37,7 +37,7 @@ import {
 } from "./memory-service-helpers.js";
 
 type RememberError = "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate";
-type UpdateError = "not_found" | "invalid_state" | "invalid_schema" | "secret_detected" | "capacity_exceeded";
+type UpdateError = "not_found" | "invalid_state" | "invalid_schema" | "secret_detected" | "capacity_exceeded" | "stale_revision";
 type SupersedeError = RememberError | "not_found" | "invalid_state";
 type ForgetError = "not_found";
 
@@ -180,6 +180,42 @@ export class MemoryWriteService {
       return err("capacity_exceeded", "capacity exceeded", budgetResult.details);
     }
     const event = current.status === "active" && patch.status === "archived" ? "archived" : "updated";
+    // Stage 12 PR9: optimistic-concurrency control. When
+    // the caller passes `expected_revision`, route the
+    // write through `updateEntryWithRevision` so a
+    // concurrent writer wins the race and we surface
+    // `stale_revision` instead of silently overwriting.
+    if (validated.value.expected_revision !== undefined) {
+      const expected = validated.value.expected_revision;
+      const applied = this.ctx.store.updateEntryWithRevision(
+        id,
+        patch as Parameters<SQLiteMemoryStore["updateEntry"]>[1],
+        expected
+      );
+      if (!applied) {
+        const currentRevision = this.ctx.store.peekEntry(id)?.revision;
+        auditRejectedForEntry(
+          this.ctx.store,
+          this.ctx.defaultActor,
+          current,
+          "stale_revision",
+          { memory_id: id, expected_revision: expected, current_revision: currentRevision }
+        );
+        return err("stale_revision", "memory revision has changed; re-read and retry", {
+          memory_id: id,
+          expected_revision: expected,
+          current_revision: currentRevision
+        });
+      }
+      appendAudit(this.ctx.store, this.ctx.defaultActor, {
+        memory_id: id,
+        scope: current.scope,
+        ...(current.project_id !== undefined ? { project_id: current.project_id } : {}),
+        event,
+        metadata: { fields: Object.keys(validated.value).sort() }
+      });
+      return ok({ memory_id: id });
+    }
     return this.ctx.store.transaction(() => {
       this.ctx.store.updateEntry(id, patch as Parameters<SQLiteMemoryStore["updateEntry"]>[1]);
       appendAudit(this.ctx.store, this.ctx.defaultActor, {

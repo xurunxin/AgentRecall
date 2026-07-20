@@ -29,6 +29,7 @@ import {
 } from "../domain.js";
 import { MarkdownExporter } from "../markdown-exporter.js";
 import { resolveMemoryScope } from "../scope-resolver.js";
+import { CURRENT_SCHEMA_VERSION } from "../sqlite-store.js";
 import type { BudgetUsage, EntryFilters, SearchFilters, SQLiteMemoryStore } from "../sqlite-store.js";
 import {
   actorForEntry,
@@ -40,6 +41,8 @@ import {
   usageFromActiveEntries
 } from "./memory-service-helpers.js";
 import { RANKING_VERSION, rankRecall, type RankedItem } from "./recall-ranker.js";
+import { detectRisksInEntry } from "../tools/risk-detector.js";
+import { dataOnlyFramingPreamble } from "../tools/data-only-framing.js";
 
 export type ResolvedReadScope = {
   scope: MemoryScope;
@@ -222,7 +225,30 @@ export class MemoryReadService {
       ),
       writer: actorForEntry(this.ctx.store, entry)
     }));
-    return exporter.buildContextPack({
+    // Stage 12 PR9 (spec § 6.6): prepend the data-only
+    // framing preamble so the agent prompt treats the
+    // context pack as untrusted data. We compute the
+    // pack first (so the budget is correct), then walk
+    // the entries once to detect any unsafe_content
+    // patterns. The preamble's `risk` attribute flips
+    // from "low" to "high" when at least one entry
+    // matched.
+    let riskLevel: "low" | "high" = "low";
+    for (const entry of collected) {
+      if (detectRisksInEntry({ title: entry.title, topic: entry.topic, body: entry.body, tags: entry.tags }).unsafe_content) {
+        riskLevel = "high";
+        break;
+      }
+    }
+    const preamble = dataOnlyFramingPreamble({
+      scope: resolved.value.scope,
+      ...(resolved.value.project_id !== undefined ? { projectId: resolved.value.project_id } : {}),
+      riskLevel,
+      packEntryCount: entries.length,
+      generatedAt: new Date().toISOString(),
+      schemaVersion: CURRENT_SCHEMA_VERSION
+    });
+    return preamble + exporter.buildContextPack({
       title: "AgentRecall Context",
       budget_chars: input.budget_chars,
       entries

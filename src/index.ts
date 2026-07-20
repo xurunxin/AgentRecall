@@ -8,7 +8,9 @@ import { MarkdownExporter } from "./markdown-exporter.js";
 import { MemoryService } from "./memory-service.js";
 import { SQLiteMemoryStore } from "./sqlite-store.js";
 import { registerMemoryTools } from "./tools/register-tools.js";
+import { registerMemoryResources } from "./mcp/resources.js";
 import { resolveActor } from "./actor.js";
+import { serverVersion } from "./server-version.js";
 
 export function serverName(): string {
   return "agent-recall";
@@ -45,12 +47,19 @@ export async function main(): Promise<void> {
         "Set AGENT_RECALL_SUPPRESS_MCP_DEPRECATION=1 to silence this message."
     );
   }
-  const service = createService();
+  const dataHome = resolveDataHome();
+  const service = createService(dataHome);
+  const defaultActor = resolveActor(undefined);
   const server = new McpServer({
     name: serverName(),
-    version: "0.1.0"
+    version: serverVersion()
   });
   registerMemoryTools(server, service);
+  registerMemoryResources(server, {
+    store: service.store,
+    dataHome,
+    defaultActor
+  });
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
