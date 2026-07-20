@@ -5,7 +5,83 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
-## [Unreleased] — Stage 5 Recall Ranking by Actor Trust
+## [Unreleased] — Stage 6 Per-Agent Time-Window Filters
+
+Date: 2026-07-20
+
+### Added
+
+- **Three new time-window filters on the read path**:
+  `since` (ISO 8601 lower bound on `created_at`), `until`
+  (upper bound), and `last_accessed_since` (lower bound
+  on `last_accessed_at`). All optional; combine freely
+  with the existing `actor` filter from Stage 4 and with
+  each other.
+- **`stale_memories` doctor check** (the 12th). Walks
+  `memory_entries` for rows where `last_accessed_at IS
+  NULL` or older than 90 days. Reports the count and the
+  top-5 oldest. Always `ok`; informational only. The
+  90-day threshold is a constant in code; not yet
+  configurable.
+
+### Changed
+
+- **Test count**: 261 (stage 5) → 273 (+12 from stage 6:
+  8 sqlite-store-time-window, 1 tool-registration, 2
+  CLI, 1 doctor).
+- **`doctor` now reports 12 checks** (was 11). All still
+  pass on a healthy database.
+
+### Documentation
+
+- `docs/superpowers/specs/2026-07-20-stage-six-time-window.md`
+  — Stage 6 spec covering the three filters, the new
+  check, and the SQL cost.
+- `docs/superpowers/plans/2026-07-20-stage-six-time-window.md`
+  — 7-task implementation plan.
+- `docs/superpowers/plans/2026-07-20-stage-six-time-window-closure.md`
+  — this closure report.
+- `README.md` — Memory Hygiene section: brief note about
+  recency queries; Tools table: mention `since` / `until` /
+  `last_accessed_since`; CLI examples updated.
+
+### Test Coverage
+
+| Stage | Tests | Files | Notes |
+|---|---|---|---|
+| Baseline (pre-stage-1) | 120 | 10 | All passing |
+| Stage 1 | +74 | +14 | actor, sqlite-store-migration, tools-descriptions, backup, doctor + 9 CLI test files |
+| **Stage 1 total** | **194** | **24** | **All passing** |
+| Stage 2 | +21 | +4 | sqlite-store-migration-v3, remember-confirm, merge-memories, last-accessed-by |
+| **Stage 2 total** | **215** | **28** | **All passing** |
+| Stage 3 | +23 | +1 | text-similarity + extensions to remember-confirm and memory-service |
+| **Stage 3 total** | **239** | **29** | **All passing** |
+| Stage 4 | +13 | +2 | sqlite-store-actor-filter, memory-service-actor-filter + extensions to list, search, doctor, tool-registration |
+| **Stage 4 total** | **252** | **31** | **All passing** |
+| Stage 5 | +9 | +1 | memory-service-recall-trust covering trust helper + ranking + writer annotation |
+| **Stage 5 total** | **261** | **32** | **All passing** |
+| Stage 6 | +12 | +1 | sqlite-store-time-window + extensions to tool-registration, list, search, doctor |
+| **Stage 6 total** | **273** | **33** | **All passing** |
+
+### Deviations from Plan
+
+The Stage 6 plan called for 7 tasks; all 7 executed with
+these minor adjustments:
+
+1. **T2 and T3 merged into a single commit** because the
+   service-layer forwarding (T2) and the MCP schema
+   addition (T3) both required the same conceptual change
+   to the `entryFiltersForRead` helper and the
+   `entryFilterFields` Zod object. Splitting them would
+   have been artificial.
+2. **`--until` is only on `list`, not on `search`**. The
+   FTS ordering already sorts by relevance, not by date,
+   so an upper bound on `created_at` is rarely useful
+   for search; deferred to keep the CLI surface small.
+   The MCP `search_memories` schema does still accept
+   `until` for completeness.
+
+## [0.5.0] — 2026-07-20 — Stage 5 Recall Ranking by Actor Trust
 
 Date: 2026-07-20
 
