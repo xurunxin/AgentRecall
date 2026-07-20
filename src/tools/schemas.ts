@@ -7,7 +7,8 @@ const maintenanceActions = [
   "expire_due",
   "rebuild_markdown_index",
   "vacuum_fts",
-  "find_duplicates"
+  "find_duplicates",
+  "merge_duplicates"
 ] as const;
 
 const nonEmptyString = z.string().trim().min(1);
@@ -244,7 +245,12 @@ export const maintainMemoriesToolSchema = z
     project_path: nonEmptyString.optional(),
     // Stage 7: chunk size for maintenance operations that scan
     // the whole entries table. Default 500; min 50, max 5000.
-    batch_size: z.number().int().min(50).max(5000).default(500)
+    batch_size: z.number().int().min(50).max(5000).default(500),
+    // Stage 8: when true, mutating actions return the would-be
+    // changes without writing. Read-only actions ignore this.
+    dry_run: z.boolean().default(false),
+    // Stage 8: merge_duplicates strategy.
+    strategy: z.enum(["keep_first", "keep_newest"]).default("keep_first")
   })
   .strict()
   .superRefine(requireProjectIdentity);

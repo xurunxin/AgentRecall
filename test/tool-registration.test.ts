@@ -475,7 +475,9 @@ describe("createMemoryToolHandlers", () => {
     expect(service.maintainMemories).toHaveBeenCalledWith({
       action: "find_duplicates",
       scope: "global",
-      batch_size: 500
+      batch_size: 500,
+      dry_run: false,
+      strategy: "keep_first"
     });
   });
 });
