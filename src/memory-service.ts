@@ -1229,9 +1229,11 @@ export class MemoryService {
     // Stage 4+ should consider an inverted index or bucketing.
     const groups: DuplicateGroup[] = [];
     for (let i = 0; i < entries.length; i += 1) {
+      const a = entries[i];
+      if (a === undefined) continue;
       for (let j = i + 1; j < entries.length; j += 1) {
-        const a = entries[i];
         const b = entries[j];
+        if (b === undefined) continue;
         const pairKey = `${a.id}|${b.id}`;
         if (covered.has(pairKey)) continue;
         const titleSim = textSimilarity(a.title, b.title);
