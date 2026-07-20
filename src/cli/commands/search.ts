@@ -11,10 +11,12 @@ export function searchCommand(ctx: CliContext): CliResult {
   }
   const scope = (flagString(ctx.args, "scope") ?? "global") as "global" | "project";
   const projectId = flagString(ctx.args, "project-id");
+  const actor = flagString(ctx.args, "actor");
   const limit = Number.parseInt(flagString(ctx.args, "limit") ?? "10", 10);
 
   const filters: SearchFilters = { query, scope, status: "active", limit };
   if (projectId !== undefined) filters.project_id = projectId;
+  if (actor !== undefined) filters.actor = actor;
 
   const items = ctx.store.searchEntries(filters);
   const json = flagBool(ctx.args, "json");

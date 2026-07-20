@@ -69,4 +69,60 @@ describe("searchCommand", () => {
     expect(result.stdout).toContain("no matches");
     store.close();
   });
+
+  it("filters by --actor (stage 4)", () => {
+    const { dataHome, store } = setup();
+    store.appendAudit({
+      id: "aud_search_1",
+      memory_id: "mem_s",
+      scope: "global",
+      event: "created",
+      actor: "agent:claude-code",
+      metadata: {},
+      created_at: "2026-07-19T00:00:00.000Z"
+    });
+    // Add a second matching memory written by a different actor
+    store.insertEntry({
+      id: "mem_s2",
+      scope: "global",
+      type: "fact",
+      memory_kind: "semantic",
+      topic: "postgres",
+      title: "Postgres tuning",
+      body: "shared_buffers for postgres workloads",
+      tags: ["postgres"],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3,
+      status: "active",
+      created_at: "2026-07-19T00:00:00.000Z",
+      updated_at: "2026-07-19T00:00:00.000Z",
+      access_count: 0,
+      supersedes: [],
+      token_estimate: 1,
+      char_count: 2
+    });
+    store.appendAudit({
+      id: "aud_search_2",
+      memory_id: "mem_s2",
+      scope: "global",
+      event: "created",
+      actor: "agent:cursor",
+      metadata: {},
+      created_at: "2026-07-19T00:00:00.000Z"
+    });
+
+    // No filter: both rows
+    const all = searchCommand({ dataHome, args: parseArgs(["search", "postgres"]), store });
+    expect(all.stdout).toContain("2 matches");
+
+    // Filter to claude-code: only mem_s
+    const claudeOnly = searchCommand({
+      dataHome, store, args: parseArgs(["search", "postgres", "--actor", "agent:claude-code"])
+    });
+    expect(claudeOnly.stdout).toContain("mem_s");
+    expect(claudeOnly.stdout).not.toContain("mem_s2");
+    expect(claudeOnly.stdout).toContain("1 matches");
+    store.close();
+  });
 });

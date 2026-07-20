@@ -72,4 +72,58 @@ describe("listCommand", () => {
     expect(result.stdout).not.toContain("\x1b[");
     store.close();
   });
+
+  it("filters by --actor (stage 4)", () => {
+    const { dataHome, store } = setup();
+    store.appendAudit({
+      id: "aud_test_1",
+      memory_id: "mem_a",
+      scope: "global",
+      event: "created",
+      actor: "agent:claude-code",
+      metadata: {},
+      created_at: "2026-07-19T00:00:00.000Z"
+    });
+    // Add a second memory written by a different actor
+    store.insertEntry({
+      id: "mem_b",
+      scope: "global",
+      type: "fact",
+      memory_kind: "semantic",
+      topic: "general",
+      title: "world",
+      body: "again",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3,
+      status: "active",
+      created_at: "2026-07-19T00:00:00.000Z",
+      updated_at: "2026-07-19T00:00:00.000Z",
+      access_count: 0,
+      supersedes: [],
+      token_estimate: 1,
+      char_count: 2
+    });
+    store.appendAudit({
+      id: "aud_test_2",
+      memory_id: "mem_b",
+      scope: "global",
+      event: "created",
+      actor: "agent:cursor",
+      metadata: {},
+      created_at: "2026-07-19T00:00:00.000Z"
+    });
+
+    // No filter: both rows
+    const all = listCommand({ dataHome, args: parseArgs(["list"]), store });
+    expect(all.stdout).toContain("2 entries");
+
+    // Filter to claude-code: only mem_a
+    const claudeOnly = listCommand({ dataHome, args: parseArgs(["list", "--actor", "agent:claude-code"]), store });
+    expect(claudeOnly.stdout).toContain("mem_a");
+    expect(claudeOnly.stdout).not.toContain("mem_b");
+    expect(claudeOnly.stdout).toContain("1 entries");
+    store.close();
+  });
 });
