@@ -146,7 +146,35 @@ type ResolvedReadScope = {
 type ContextScore = {
   entry: MemoryEntry;
   query_score: number;
+  trust_boost: number;
 };
+
+const STRONG_TRUST_BOOST = 0.3;
+const SOFT_TRUST_BOOST = 0.1;
+
+/**
+ * Stage 5: per-memory trust boost for recall ranking.
+ *
+ * Returns 0.3 when the memory was written by `currentActor` (strong
+ * signal — "I wrote this, trust my own knowledge"), 0.1 when the
+ * current actor appears in the memory's `last_accessed_by` map
+ * (soft signal — "I've touched this recently"), or 0 when there is
+ * no relationship. Returns 0 when `currentActor` is empty (legacy
+ * callers constructed without `defaultActor`).
+ */
+export function computeTrustBoost(
+  entry: MemoryEntry,
+  currentActor: string,
+  actorForEntry: (entry: MemoryEntry) => string
+): number {
+  if (currentActor.length === 0) return 0;
+  const writer = actorForEntry(entry);
+  if (writer === currentActor) return STRONG_TRUST_BOOST;
+  if (entry.last_accessed_by !== undefined && entry.last_accessed_by[currentActor] !== undefined) {
+    return SOFT_TRUST_BOOST;
+  }
+  return 0;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
