@@ -149,18 +149,39 @@ type ContextScore = {
   trust_boost: number;
 };
 
-const STRONG_TRUST_BOOST = 0.3;
-const SOFT_TRUST_BOOST = 0.1;
+const DEFAULT_STRONG_TRUST_BOOST = 0.3;
+const DEFAULT_SOFT_TRUST_BOOST = 0.1;
+const ENV_TRUST_STRONG = "AGENT_RECALL_TRUST_STRONG";
+const ENV_TRUST_SOFT = "AGENT_RECALL_TRUST_SOFT";
+
+function parseEnvFloat(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const parsed = Number.parseFloat(raw);
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
+    process.stderr.write(
+      `agent-recall: invalid ${name}="${raw}", using default ${fallback}\n`
+    );
+    return fallback;
+  }
+  return parsed;
+}
 
 /**
  * Stage 5: per-memory trust boost for recall ranking.
  *
- * Returns 0.3 when the memory was written by `currentActor` (strong
- * signal — "I wrote this, trust my own knowledge"), 0.1 when the
- * current actor appears in the memory's `last_accessed_by` map
- * (soft signal — "I've touched this recently"), or 0 when there is
- * no relationship. Returns 0 when `currentActor` is empty (legacy
- * callers constructed without `defaultActor`).
+ * Returns the strong boost (default 0.3) when the memory was
+ * written by `currentActor` ("I wrote this, trust my own
+ * knowledge"), the soft boost (default 0.1) when the current
+ * actor appears in the memory's `last_accessed_by` map ("I've
+ * touched this recently"), or 0 when there is no relationship.
+ * Returns 0 when `currentActor` is empty (legacy callers
+ * constructed without `defaultActor`).
+ *
+ * Stage 7: the strong / soft weights are configurable via the
+ * AGENT_RECALL_TRUST_STRONG and AGENT_RECALL_TRUST_SOFT env
+ * vars. Defaults are 0.3 / 0.1; invalid values fall back to
+ * defaults with a one-line stderr warning.
  */
 export function computeTrustBoost(
   entry: MemoryEntry,
@@ -168,10 +189,12 @@ export function computeTrustBoost(
   actorForEntry: (entry: MemoryEntry) => string
 ): number {
   if (currentActor.length === 0) return 0;
+  const strong = parseEnvFloat(ENV_TRUST_STRONG, DEFAULT_STRONG_TRUST_BOOST);
+  const soft = parseEnvFloat(ENV_TRUST_SOFT, DEFAULT_SOFT_TRUST_BOOST);
   const writer = actorForEntry(entry);
-  if (writer === currentActor) return STRONG_TRUST_BOOST;
+  if (writer === currentActor) return strong;
   if (entry.last_accessed_by !== undefined && entry.last_accessed_by[currentActor] !== undefined) {
-    return SOFT_TRUST_BOOST;
+    return soft;
   }
   return 0;
 }
