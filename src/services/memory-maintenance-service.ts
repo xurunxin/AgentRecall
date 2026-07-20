@@ -32,7 +32,7 @@ import type { ResolvedReadScope } from "./memory-read-service.js";
 import type { BudgetUsage, SQLiteMemoryStore } from "../sqlite-store.js";
 import { nowIso, type MemoryAuditEvent, type MemoryEntry, type MemoryScope } from "../domain.js";
 import { MarkdownExporter } from "../markdown-exporter.js";
-import { runBackup } from "../backup.js";
+import { runBackup, verifyBackup } from "../backup.js";
 import { resolveMemoryScope } from "../scope-resolver.js";
 import { createHash } from "node:crypto";
 
@@ -295,6 +295,15 @@ export class MemoryMaintenanceService {
         details: { dry_run: true, would_expire_count: expired.length, would_expire_sample: sample }
       };
     }
+    if (expired.length > 0) {
+      // Pre-mutation backup. Runs OUTSIDE the store
+      // transaction (VACUUM INTO cannot execute while a
+      // BEGIN IMMEDIATE is open on the same connection).
+      // Throws on failure; the caller sees the
+      // `backup_failed` error and the mutation does not
+      // run.
+      this.maybeBackup(expired.length);
+    }
     return this.ctx.store.transaction(() => {
       const forgotten: Array<{ memory_id: string; expires_at: string }> = [];
       for (const entry of expired) {
@@ -324,7 +333,6 @@ export class MemoryMaintenanceService {
       }
       const details = { expired: forgotten };
       this.appendMaintenanceAudit(scope, "expire_due", forgotten.length, details);
-      this.maybeBackup(forgotten.length);
       return { action: "expire_due", changed: forgotten.length, details };
     });
   }
@@ -348,6 +356,11 @@ export class MemoryMaintenanceService {
         details: { dry_run: true, would_archive_count: lowValue.length, would_archive_sample: sample }
       };
     }
+    if (lowValue.length > 0) {
+      // Pre-mutation backup (see expireDueMemories for the
+      // rationale on the out-of-transaction placement).
+      this.maybeBackup(lowValue.length);
+    }
     return this.ctx.store.transaction(() => {
       const archived: Array<{ memory_id: string; reason: string }> = [];
       for (const entry of lowValue) {
@@ -368,7 +381,6 @@ export class MemoryMaintenanceService {
       }
       const details = { archived };
       this.appendMaintenanceAudit(scope, "archive_low_value", archived.length, details);
-      this.maybeBackup(archived.length);
       return { action: "archive_low_value", changed: archived.length, details };
     });
   }
@@ -533,26 +545,32 @@ export class MemoryMaintenanceService {
 
   private maybeBackup(changed: number): void {
     if (changed <= 0 || this.ctx.dataHome === undefined) return;
-    try {
-      const backupDir = join(this.ctx.dataHome, "backups");
-      const result = runBackup(this.ctx.store.backupHandle(), { backupDir });
-      appendAudit(this.ctx.store, this.ctx.defaultActor, {
-        scope: "global",
-        event: "backup_created",
-        actor: "system:backup",
-        reason: "backup_created",
-        metadata: {
-          path: result.path,
-          size: result.size,
-          duration_ms: result.durationMs,
-          requested_by: this.ctx.defaultActor
-        }
-      });
-    } catch {
-      // Backup failures after a successful maintenance are
-      // non-fatal. The audit row from the failed backup is
-      // emitted elsewhere (in the public backup() method).
-    }
+    // Stage 10 PR5: backup failures are now fatal. A
+    // destructive maintenance that wants to back up before
+    // mutating must fail loud instead of silently
+    // emitting a `backup_created` audit row that points at
+    // a file that does not exist. Callers must invoke this
+    // OUTSIDE the store transaction (VACUUM INTO cannot
+    // run against a connection holding an open
+    // transaction), and the corresponding entry mutations
+    // have already committed by the time we get here.
+    const backupDir = join(this.ctx.dataHome, "backups");
+    const result = runBackup(this.ctx.store.backupHandle(), { backupDir });
+    const verified = verifyBackup(result.path);
+    appendAudit(this.ctx.store, this.ctx.defaultActor, {
+      scope: "global",
+      event: "backup_created",
+      actor: "system:backup",
+      reason: "backup_created",
+      metadata: {
+        path: result.path,
+        size: result.size,
+        duration_ms: result.durationMs,
+        schema_version: verified.schemaVersion,
+        quick_check: verified.quickCheck,
+        requested_by: this.ctx.defaultActor
+      }
+    });
   }
 
   private appendMaintenanceAudit(

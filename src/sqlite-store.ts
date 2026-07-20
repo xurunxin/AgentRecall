@@ -362,14 +362,61 @@ function buildAuditWhere(filters: AuditFilters): { where: string; params: SQLInp
   };
 }
 
+/**
+ * Stage 10 PR5: the store open mode. Pre-PR5 the constructor
+ * called `migrate()` unconditionally, which made the CLI
+ * `migrate --yes` confirmation meaningless: by the time
+ * the command handler ran, the schema was already upgraded.
+ *
+ * The new default is `read_write_no_migrate`; callers that
+ * want auto-upgrade (e.g. the legacy MCP test fixtures)
+ * opt in explicitly with `read_write_auto_migrate`. The
+ * `migrate` CLI command decides when to call
+ * `runMigrations({ backupFirst: true })` after taking a
+ * verified backup.
+ */
+export type StoreOpenMode =
+  | "read_only"
+  | "read_write_no_migrate"
+  | "read_write_auto_migrate";
+
 export class SQLiteMemoryStore {
   private readonly db: DatabaseSync;
   private transactionDepth = 0;
+  private readonly openMode: StoreOpenMode;
 
-  constructor(dbPath: string) {
+  constructor(dbPath: string, openMode: StoreOpenMode = "read_write_no_migrate") {
     mkdirSync(dirname(dbPath), { recursive: true });
-    this.db = new DatabaseSync(dbPath, { enableForeignKeyConstraints: true, timeout: 5000 });
-    this.migrate();
+    const readonly = openMode === "read_only";
+    this.db = new DatabaseSync(dbPath, {
+      enableForeignKeyConstraints: true,
+      timeout: 5000,
+      readOnly: readonly
+    });
+    this.openMode = openMode;
+    if (openMode === "read_write_auto_migrate") {
+      this.migrate();
+    } else if (openMode === "read_write_no_migrate") {
+      // Touch the schema so subsequent reads can introspect
+      // user_version, but do not write. The legacy in-place
+      // CREATE TABLE IF NOT EXISTS in the v1 base DDL still
+      // runs to make a fresh database usable; only the
+      // version-aware migration chain is skipped. A fresh
+      // database (user_version === 0) is upgraded to
+      // CURRENT_SCHEMA_VERSION automatically because there
+      // is no prior schema to preserve. A non-fresh
+      // database (user_version > 0 but < CURRENT) is left
+      // alone; the CLI `migrate` command decides when to
+      // advance it.
+      this.ensureBaseSchema();
+      if (this.readUserVersion() === 0) {
+        this.migrateForward();
+      }
+    }
+  }
+
+  getOpenMode(): StoreOpenMode {
+    return this.openMode;
   }
 
   close(): void {
@@ -405,9 +452,21 @@ export class SQLiteMemoryStore {
   }
 
   private migrate(): void {
-    this.db.exec(`
-      PRAGMA foreign_keys = ON;
+    this.db.exec("PRAGMA foreign_keys = ON");
+    this.ensureBaseSchema();
+    this.migrateForward();
+  }
 
+  /**
+   * Stage 10 PR5: ensure the v1 base schema is in place
+   * without running the version-aware migration chain. The
+   * `read_write_no_migrate` open mode calls this from the
+   * constructor; a fresh database file gets a usable schema,
+   * but a stale one is left at its current user_version so
+   * the CLI `migrate` command can ask for confirmation.
+   */
+  private ensureBaseSchema(): void {
+    this.db.exec(`
       CREATE TABLE IF NOT EXISTS project_scopes (
         project_id TEXT PRIMARY KEY,
         canonical_path TEXT NOT NULL,
@@ -458,7 +517,13 @@ export class SQLiteMemoryStore {
         project_id TEXT,
         event TEXT NOT NULL,
         reason TEXT,
-        actor TEXT NOT NULL CHECK (actor IN ('agent', 'user', 'system')),
+        -- Stage 10 PR3: actor is a free-form string so
+        -- structured values like "agent:claude-code" or
+        -- "system:expiry" can be stored. The legacy v1
+        -- CHECK constraint was dropped in the v1->v2
+        -- migration. New files created by ensureBaseSchema
+        -- start without it.
+        actor TEXT NOT NULL,
         metadata_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       ) STRICT;
@@ -476,7 +541,6 @@ export class SQLiteMemoryStore {
         tags
       );
     `);
-    this.migrateForward();
   }
 
   private readUserVersion(): number {
@@ -496,7 +560,13 @@ export class SQLiteMemoryStore {
   }
 
   runMigrations(): { from: number; to: number } {
+    // Stage 10 PR5: ensure the base schema is in place
+    // before walking the version chain. The base DDL is
+    // idempotent (CREATE TABLE IF NOT EXISTS) so calling it
+    // on a fresh file is harmless; calling it on a stale
+    // file is a no-op for tables that already exist.
     const before = this.readUserVersion();
+    this.ensureBaseSchema();
     this.migrateForward();
     const after = this.readUserVersion();
     return { from: before, to: after };

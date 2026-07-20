@@ -5,6 +5,58 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [Unreleased] — Stage 10 PR5 (Store Open Mode + Verified Backup)
+
+Date: 2026-07-21
+
+### Changed
+
+- **AR-P0-004 / AR-P0-005: store open mode + verified
+  pre-mutation backup.** The `SQLiteMemoryStore`
+  constructor no longer auto-migrates. The new
+  `StoreOpenMode` parameter accepts `read_only`,
+  `read_write_no_migrate` (default), and
+  `read_write_auto_migrate` (legacy opt-in). The base
+  DDL is always applied so a fresh database is usable
+  immediately; a non-fresh database at a stale
+  `user_version` is left at its current version so the
+  CLI `migrate` command decides when to advance. The
+  audit_events actor CHECK constraint is removed from
+  the base DDL so structured values like
+  `agent:claude-code` can be stored on a fresh DB
+  without first running the v1 -> v2 migration.
+
+- **Maintenance `maybeBackup` is no longer swallowed.**
+  The pre-mutation backup now runs OUTSIDE the store
+  transaction (per spec § 5.5 protocol) and any
+  exception aborts the destructive action with
+  `backup_failed`. The `catch {}` that previously
+  swallowed the exception is gone. The audit row now
+  records the verified `schema_version` and
+  `quick_check` result so the operator can confirm
+  the backup is real.
+
+### Added
+
+- `backup.ts` exports two new helpers:
+  - `verifyBackup(filePath)` — opens the file on an
+    independent read-only connection, runs
+    `PRAGMA quick_check`, and reports the
+    `schemaVersion`. Throws on any failure.
+  - `restoreBackup({ backupFile, targetDbPath, liveDbHandle, backupDir? })`
+    — takes a pre-restore live backup, writes the
+    restore bytes to a temp file next to the target,
+    verifies it, then renames into place. Throws if any
+    step fails; the live DB is untouched on error.
+
+### Test Coverage
+
+| Stage | Tests | Files | Notes |
+|---|---|---|---|
+| ... | ... | ... | ... |
+| **Stage 10 PR4 total** | **+0 (4 red→green)** | **+1 (recall-ranker)** | ranking tests now pass |
+| **Stage 10 PR5 total** | **+0 (3 red→green)** | **0** | migration + backup tests now pass; **all 17 release-gate P0 tests now pass** |
+
 ## [Unreleased] — Stage 10 PR4 (RecallRanker + ContextPacker)
 
 Date: 2026-07-21
