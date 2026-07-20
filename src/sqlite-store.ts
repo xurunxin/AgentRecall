@@ -395,6 +395,21 @@ export class SQLiteMemoryStore {
       readOnly: readonly
     });
     this.openMode = openMode;
+    // Stage 11 PR8: WAL + busy retry baseline (spec
+    // section 5.6). Read-only connections skip the WAL
+    // PRAGMAs because they have no effect on a snapshot
+    // reader; busy_timeout still applies so an
+    // unexpectedly-shared connection does not error.
+    if (!readonly) {
+      this.db.exec(`
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA busy_timeout = 5000;
+        PRAGMA wal_autocheckpoint = 1000;
+      `);
+    } else {
+      this.db.exec(`PRAGMA busy_timeout = 5000;`);
+    }
     if (openMode === "read_write_auto_migrate") {
       this.migrate();
     } else if (openMode === "read_write_no_migrate") {
