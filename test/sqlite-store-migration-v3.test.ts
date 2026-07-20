@@ -67,6 +67,12 @@ describe("SQLiteMemoryStore v2 -> v3 migration", () => {
     db.close();
 
     store = new SQLiteMemoryStore(dbPath);
+    // Stage 10 PR5: the default open mode is
+    // read_write_no_migrate, so a non-fresh v2 DB stays at
+    // v2 until the caller explicitly runs the migration
+    // chain. The migration test now opts in explicitly
+    // (mirroring the post-PR5 CLI `migrate --yes` flow).
+    store.runMigrations();
     expect(store.getUserVersion()).toBe(3);
 
     // Pre-existing row is preserved; new column is null.

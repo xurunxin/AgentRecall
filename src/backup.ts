@@ -11,9 +11,17 @@
 // stage 2 introduces concurrent writers, this needs to move to an off-lock
 // path (e.g. copying the WAL separately, or using the online backup API).
 
-import { existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
-import type { DatabaseSync } from "node:sqlite";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  renameSync,
+  statSync,
+  unlinkSync
+} from "node:fs";
+import { dirname, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 export type BackupResult = {
   path: string;
@@ -113,4 +121,106 @@ export function listBackups(backupDir: string): BackupListEntry[] {
       return { name, size: stat.size, mtimeMs: stat.mtimeMs };
     })
     .sort((a, b) => b.mtimeMs - a.mtimeMs);
+}
+
+/**
+ * Stage 10 PR5: verify a backup file in isolation. Opens
+ * the file on an independent read-only connection, runs
+ * `PRAGMA quick_check`, and reports the schema version
+ * (read from `user_version`). Returns an object suitable
+ * for audit metadata: callers can compare `schema_version`
+ * against the live DB's user_version to confirm the backup
+ * captures the same schema the caller is about to mutate.
+ *
+ * Throws on any IO or check failure. A destructive action
+ * that gets a `verifyBackup` failure must abort without
+ * mutating the live DB.
+ */
+export type VerifiedBackup = {
+  path: string;
+  size: number;
+  schemaVersion: number;
+  quickCheck: string;
+};
+
+export function verifyBackup(filePath: string): VerifiedBackup {
+  if (!existsSync(filePath)) {
+    throw new BackupError(`Backup file not found: ${filePath}`);
+  }
+  const probe = new DatabaseSync(filePath, { readOnly: true });
+  try {
+    const check = probe.prepare("PRAGMA quick_check").get() as
+      | { quick_check: string | number }
+      | undefined;
+    const versionRow = probe.prepare("PRAGMA user_version").get() as
+      | { user_version: number }
+      | undefined;
+    const quickCheck = check === undefined ? "ok" : String(check.quick_check);
+    if (quickCheck !== "ok") {
+      throw new BackupError(`Backup quick_check failed: ${quickCheck}`);
+    }
+    const schemaVersion =
+      versionRow === undefined ? 0 : Number(versionRow.user_version);
+    const stat = statSync(filePath);
+    return {
+      path: filePath,
+      size: stat.size,
+      schemaVersion,
+      quickCheck
+    };
+  } finally {
+    probe.close();
+  }
+}
+
+/**
+ * Stage 10 PR5: restore a backup file onto the live DB
+ * path. Pre-restore we take a verified backup of the live
+ * DB; the restore itself writes the backup bytes to a
+ * temp file next to the target, verifies it, and renames
+ * it into place. On any failure the live DB is untouched.
+ *
+ * The caller is responsible for closing the live
+ * `SQLiteMemoryStore` instance before calling this.
+ */
+export type RestoreResult = {
+  liveBackupPath: string;
+  liveBackupVerified: VerifiedBackup;
+  targetPath: string;
+  targetVerified: VerifiedBackup;
+};
+
+export function restoreBackup(opts: {
+  backupFile: string;
+  targetDbPath: string;
+  liveDbHandle: DatabaseSync;
+  /** Optional override for the pre-restore live backup
+   *  directory. Defaults to `<dirname(targetDbPath)>/backups`. */
+  backupDir?: string;
+}): RestoreResult {
+  const liveBackupDir = opts.backupDir ?? join(dirname(opts.targetDbPath), "backups");
+  const liveBackup = runBackup(opts.liveDbHandle, { backupDir: liveBackupDir });
+  const liveVerified = verifyBackup(liveBackup.path);
+
+  const targetDir = dirname(opts.targetDbPath);
+  if (!existsSync(targetDir)) mkdirSync(targetDir, { recursive: true });
+  const tempTarget = join(targetDir, `.restore-${process.pid}-${Date.now()}.sqlite`);
+  try {
+    copyFileSync(opts.backupFile, tempTarget);
+    const targetVerified = verifyBackup(tempTarget);
+    renameSync(tempTarget, opts.targetDbPath);
+    return {
+      liveBackupPath: liveBackup.path,
+      liveBackupVerified: liveVerified,
+      targetPath: opts.targetDbPath,
+      targetVerified
+    };
+  } catch (error) {
+    try {
+      unlinkSync(tempTarget);
+    } catch {
+      // Best-effort cleanup; do not mask the original error.
+    }
+    throw error;
+  }
 }
