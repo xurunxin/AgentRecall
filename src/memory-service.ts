@@ -239,6 +239,9 @@ function compareContextScores(a: ContextScore, b: ContextScore): number {
   const queryOrder = b.query_score - a.query_score;
   if (queryOrder !== 0) return queryOrder;
 
+  const trustOrder = b.trust_boost - a.trust_boost;
+  if (trustOrder !== 0) return trustOrder;
+
   const importanceOrder = b.entry.importance - a.entry.importance;
   if (importanceOrder !== 0) return importanceOrder;
 
@@ -909,7 +912,14 @@ export class MemoryService {
       });
     }
 
-    const entries = this.collectContextEntries(resolved.value, input);
+    const collected = this.collectContextEntries(resolved.value, input);
+    // Stage 5: annotate each entry with its trust_boost so the
+    // exporter can break importance ties in favor of the calling
+    // agent's own (or recently-touched) memories.
+    const entries = collected.map((entry) => ({
+      ...entry,
+      trust_boost: computeTrustBoost(entry, this.defaultActor, (e) => this.actorForEntry(e))
+    }));
     return exporter.buildContextPack({
       title: "AgentRecall Context",
       budget_chars: input.budget_chars,
@@ -1024,7 +1034,11 @@ export class MemoryService {
 
     const tokens = queryTokens(input.query);
     return [...byId.values()]
-      .map((entry) => ({ entry, query_score: contextQueryScore(entry, tokens) }))
+      .map((entry) => ({
+        entry,
+        query_score: contextQueryScore(entry, tokens),
+        trust_boost: computeTrustBoost(entry, this.defaultActor, (e) => this.actorForEntry(e))
+      }))
       .sort(compareContextScores)
       .map(({ entry }) => entry);
   }

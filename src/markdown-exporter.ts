@@ -7,7 +7,7 @@ import type { BudgetUsage } from "./sqlite-store.js";
 export type ContextPackInput = {
   title: string;
   budget_chars: number;
-  entries: MemoryEntry[];
+  entries: Array<MemoryEntry & { trust_boost?: number }>;
 };
 
 export type ExportScopeInput = {
@@ -102,9 +102,16 @@ function topicFilenameMap(topics: string[]): Map<string, string> {
   return result;
 }
 
-function compareEntries(a: MemoryEntry, b: MemoryEntry): number {
+function compareEntries(a: MemoryEntry & { trust_boost?: number }, b: MemoryEntry & { trust_boost?: number }): number {
   const importanceOrder = b.importance - a.importance;
   if (importanceOrder !== 0) return importanceOrder;
+
+  // Stage 5: when importance ties, the calling actor's own
+  // memories (or recently-touched ones) rank higher. Legacy
+  // entries without trust_boost tie at 0 and fall through to
+  // confidence / updated_at / id.
+  const trustOrder = (b.trust_boost ?? 0) - (a.trust_boost ?? 0);
+  if (trustOrder !== 0) return trustOrder;
 
   const confidenceOrder = b.confidence - a.confidence;
   if (confidenceOrder !== 0) return confidenceOrder;
