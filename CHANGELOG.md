@@ -5,6 +5,52 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [Unreleased] — Stage 10 PR6 (Cross-Batch Dedup + Conservative Merge)
+
+Date: 2026-07-21
+
+### Changed
+
+- **AR-P0-001 dedup safety: cross-batch candidate
+  preservation.** `findDuplicatesChunked` now threads a
+  `crossBatchSeen` set through `findDuplicateGroups` and
+  `similarDuplicateGroups` so the near-duplicate index
+  survives across batches. The pre-PR6 helper rebuilt
+  the index per batch with a fresh empty set, so a
+  near-duplicate pair straddling the batch boundary was
+  missed. The bucket cap of 200 entries is now only
+  enforced on the small-batch (entries.length <= 500)
+  path where it was load-bearing as a protection; the
+  cross-batch index relies on `SIMILARITY_THRESHOLD` to
+  bound candidate pairs and lets the bucket grow.
+
+- **Conservative `merge_duplicates`.** Per spec § 5.6
+  "只有规范化 title 和 body 均完全相同，且 scope/project
+  一致时，允许默认自动折叠". `mergeDuplicates` now only
+  auto-collapses groups whose `reason ===
+  "same_title_and_body"` AND whose entries all share the
+  same scope / `project_id`. Other reasons
+  (`same_title`, `same_body`,
+  `similar_title_and_body`) surface as a `plan_only`
+  group in the result. The legacy `details.groups` field
+  stays populated for backward compatibility, alongside
+  the new `applied` and `plan_only` split.
+
+### Test Coverage
+
+| Stage | Tests | Files | Notes |
+|---|---|---|---|
+| ... | ... | ... | ... |
+| **Stage 10 PR5 total** | **+0 (3 red→green)** | **0** | migration + backup tests now pass |
+| **Stage 10 PR6 total** | **+0** | **+0** | no new tests; closes the Stage 10 P0 release gate. **All 320 pre-existing tests + all 17 release-gate P0 tests now pass.** |
+
+> **Stage 10 exit criteria met.** All six P0 bugs
+> (AR-P0-001 … AR-P0-006) are now fixed; every P0
+> release-gate regression test turns green; no pre-PR
+> behaviour was unintentionally broken. Stage 11
+> (schema v4 + concurrency) and beyond proceed on a
+> green Stage 10 base.
+
 ## [Unreleased] — Stage 10 PR5 (Store Open Mode + Verified Backup)
 
 Date: 2026-07-21
