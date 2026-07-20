@@ -25,10 +25,15 @@ describe("SQLiteMemoryStore v2 -> v3 migration", () => {
     }
   });
 
-  it("creates a v3 schema on first run", () => {
+  it("creates a current schema on first run", () => {
     store = new SQLiteMemoryStore(dbPath);
     expect(store.getUserVersion()).toBe(CURRENT_SCHEMA_VERSION);
-    expect(CURRENT_SCHEMA_VERSION).toBe(3);
+    // Stage 11 PR7 bumped CURRENT_SCHEMA_VERSION to 4
+    // (memory_revisions, memory_accesses, project_aliases,
+    // mutation_requests, memory_relations, plus the v4
+    // columns on memory_entries). The v3-specific assertions
+    // below still cover the v2->v3 step in isolation.
+    expect(CURRENT_SCHEMA_VERSION).toBe(4);
   });
 
   it("migrates a v2 database to v3, preserving existing rows", () => {
@@ -73,7 +78,7 @@ describe("SQLiteMemoryStore v2 -> v3 migration", () => {
     // chain. The migration test now opts in explicitly
     // (mirroring the post-PR5 CLI `migrate --yes` flow).
     store.runMigrations();
-    expect(store.getUserVersion()).toBe(3);
+    expect(store.getUserVersion()).toBe(CURRENT_SCHEMA_VERSION);
 
     // Pre-existing row is preserved; new column is null.
     const handle = new DatabaseSync(dbPath, { readOnly: true });

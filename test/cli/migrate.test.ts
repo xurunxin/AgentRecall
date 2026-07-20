@@ -36,7 +36,11 @@ describe("migrateCommand", () => {
     const result = migrateCommand({ dataHome, args, store });
     const parsed = JSON.parse(result.stdout);
     expect(parsed.from).toBe(1);
-    expect(parsed.to).toBe(3);
+    // Stage 11 PR7: CURRENT_SCHEMA_VERSION is now 4
+    // (memory_revisions / memory_accesses / project_aliases
+    // / mutation_requests / memory_relations + v4 columns
+    // on memory_entries).
+    expect(parsed.to).toBe(4);
     store.close();
   });
 });

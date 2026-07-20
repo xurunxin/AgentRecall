@@ -21,10 +21,16 @@ describe("SQLiteMemoryStore migrations", () => {
     store?.close();
   });
 
-  it("creates a v2 schema on first run", () => {
+  it("creates a current schema on first run", () => {
     store = new SQLiteMemoryStore(dbPath);
     expect(store.getUserVersion()).toBe(CURRENT_SCHEMA_VERSION);
-    expect(CURRENT_SCHEMA_VERSION).toBe(3);
+    // Stage 11 PR7 bumped CURRENT_SCHEMA_VERSION to 4
+    // (memory_revisions / memory_accesses / project_aliases
+    // / mutation_requests / memory_relations + the v4
+    // columns on memory_entries). The v1->v2 chain is
+    // still exercised by the "migrates a v1 database to
+    // current" test below.
+    expect(CURRENT_SCHEMA_VERSION).toBe(4);
   });
 
   it("is a no-op when schema is already at latest version", () => {
