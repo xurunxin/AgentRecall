@@ -101,7 +101,18 @@ export type MemoryAuditEvent = {
   project_id?: string;
   event: AuditEventName;
   reason?: string;
-  actor: "agent" | "user" | "system";
+  /**
+   * Stage 10 PR3: actor is now a free-form string. The legacy
+   * `agent` / `user` / `system` values are still produced (and
+   * read) for backward compatibility, but new writes from
+   * service code use the structured `kind:name` form
+   * (e.g. `agent:claude-code`, `system:expiry`). The v1 → v2
+   * migration already relaxed the SQLite CHECK constraint to
+   * accept any TEXT, so structured values pass the schema.
+   * Use `parseActor` from `./actor.js` to recover the kind
+   * and name components.
+   */
+  actor: string;
   metadata: Record<string, unknown>;
   created_at: string;
 };

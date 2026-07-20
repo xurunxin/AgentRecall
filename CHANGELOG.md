@@ -5,6 +5,53 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [Unreleased] — Stage 10 PR3 (RequestContext / Actor Propagation)
+
+Date: 2026-07-21
+
+### Changed
+
+- **AR-P0-002: every mutation and maintenance audit event now
+  records the real caller.** Pre-PR3 hardcoded `actor: "agent"`
+  on every write and maintenance path, making the audit log
+  useless for cross-agent accountability. The five
+  `actor: "agent"` literals in
+  `src/services/memory-write-service.ts` (`updateMemory`,
+  `supersedeMemory`, `mergeMemories`, `forgetMemory` paths)
+  and the five in
+  `src/services/memory-maintenance-service.ts`
+  (`rebuild_markdown_index`, `expire_due`,
+  `archive_low_value`, `applySupersede` for `merge_duplicates`,
+  `appendMaintenanceAudit`) have been removed. The audit row
+  now carries the structured `defaultActor` (e.g.
+  `agent:claude-code`) supplied by the caller.
+
+- **System maintenance events distinguish executor from
+  requester.** The maintenance actions now emit
+  `system:export`, `system:expiry`, `system:archive`,
+  `system:dedup`, and `system:maintenance` as their `actor`
+  field, and stash the original requester in
+  `metadata.requested_by` so audit replay can show who asked
+  for the work. The pre-existing `system:backup` event for
+  post-mutation snapshots was updated to include
+  `requested_by` as well.
+
+- **`MemoryAuditEvent.actor` widened from
+  `"agent" | "user" | "system"` to `string`.** The v1 → v2
+  migration already relaxed the SQLite CHECK constraint to
+  accept any TEXT, so the new structured values are stored
+  unchanged. The `parseActor` helper in `src/actor.ts` is the
+  canonical way to recover the kind / name components from
+  an actor string.
+
+### Test Coverage
+
+| Stage | Tests | Files | Notes |
+|---|---|---|---|
+| ... | ... | ... | ... |
+| **Stage 10 PR2 total** | **+0 (4 red→green)** | **0** | scope tests now pass |
+| **Stage 10 PR3 total** | **+0 (5 red→green)** | **0** | actor tests now pass; remaining red are ranking/migration/backup P0 bugs |
+
 ## [Unreleased] — Stage 10 PR2 (Scope Resolver Centralization)
 
 Date: 2026-07-21
