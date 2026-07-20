@@ -296,7 +296,11 @@ export class MemoryService {
         );
       }
     }
-    return this.store.transaction(() => ok(this.commitPreparedRemember(prepared.value)));
+    // When the caller has acknowledged the warnings (confirm_write: true),
+    // suppress advisory warnings from the response so the agent doesn't
+    // re-read what it just told us to ignore.
+    const suppressed = input.confirm_write === true ? [] : prepared.value.budget.warnings;
+    return this.store.transaction(() => ok(this.commitPreparedRemember(prepared.value, suppressed)));
   }
 
   private prepareRemember(
@@ -364,7 +368,7 @@ export class MemoryService {
     return ok(result);
   }
 
-  private commitPreparedRemember(prepared: PreparedRemember): RememberResult {
+  private commitPreparedRemember(prepared: PreparedRemember, warnings?: BudgetWarning[]): RememberResult {
     const { entry, budget } = prepared;
     this.store.insertEntry(entry);
     this.appendAudit({
@@ -383,7 +387,7 @@ export class MemoryService {
       memory_id: entry.id,
       status: entry.status,
       budget_after: budget.budget_after,
-      warnings: budget.warnings
+      warnings: warnings ?? budget.warnings
     };
   }
 

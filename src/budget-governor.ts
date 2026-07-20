@@ -1,10 +1,14 @@
 import { err, ok, type MemoryBudget, type MemoryEntry, type Result } from "./domain.js";
 import type { BudgetUsage } from "./sqlite-store.js";
+import { SIMILARITY_THRESHOLD, textSimilarity } from "./text-similarity.js";
 
 export type BudgetWarning = {
-  code: "duplicate_candidate";
+  code: "duplicate_candidate" | "near_duplicate";
   memory_id: string;
   reason: string;
+  similarity?: number;
+  actor?: string;
+  last_accessed_by?: Record<string, string>;
 };
 
 export type CandidateAction =
@@ -121,17 +125,32 @@ export function rankCleanupCandidates(entries: MemoryEntry[], now: string): Cand
 
 export function evaluateBudget(input: BudgetInput): Result<BudgetAccepted, "capacity_exceeded"> {
   const existingEntries = input.existingEntries ?? [];
-  const warnings: BudgetWarning[] = existingEntries
-    .filter(
-      (entry) =>
-        entry.status === "active" &&
-        (sameText(entry.title, input.candidate.title) || sameText(entry.body, input.candidate.body))
-    )
-    .map((entry) => ({
-      code: "duplicate_candidate",
-      memory_id: entry.id,
-      reason: "existing active memory has the same title or body"
-    }));
+  const warnings: BudgetWarning[] = [];
+  for (const entry of existingEntries) {
+    if (entry.status !== "active") continue;
+    if (sameText(entry.title, input.candidate.title) || sameText(entry.body, input.candidate.body)) {
+      warnings.push({
+        code: "duplicate_candidate",
+        memory_id: entry.id,
+        reason: "existing active memory has the same title or body"
+      });
+      continue;
+    }
+    // Stage 3: near-duplicate detection via token-set Jaccard. Advisory
+    // only — surfaces in the success response's `warnings` array; the
+    // caller decides whether to merge, rewrite, or proceed.
+    const titleSim = textSimilarity(entry.title, input.candidate.title);
+    const bodySim = textSimilarity(entry.body, input.candidate.body);
+    const max = Math.max(titleSim, bodySim);
+    if (max >= SIMILARITY_THRESHOLD) {
+      warnings.push({
+        code: "near_duplicate",
+        memory_id: entry.id,
+        reason: `near-duplicate by token-set Jaccard (${max.toFixed(3)} >= ${SIMILARITY_THRESHOLD})`,
+        similarity: max
+      });
+    }
+  }
 
   const countsAgainstActiveBudget = input.candidate.status === "active";
   const topicChars = cloneTopicChars(input.usage.topic_chars);
