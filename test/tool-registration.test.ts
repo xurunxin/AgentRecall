@@ -472,7 +472,11 @@ describe("createMemoryToolHandlers", () => {
     );
     expect(service.forgetMemory).toHaveBeenCalledWith("mem_1", "obsolete");
     expect(service.getMemoryBudget).toHaveBeenCalledWith({ scope: "global" });
-    expect(service.maintainMemories).toHaveBeenCalledWith({ action: "find_duplicates", scope: "global" });
+    expect(service.maintainMemories).toHaveBeenCalledWith({
+      action: "find_duplicates",
+      scope: "global",
+      batch_size: 500
+    });
   });
 });
 

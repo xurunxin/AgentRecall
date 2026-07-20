@@ -101,6 +101,19 @@ export type MaintainMemoriesInput = {
   scope: MemoryScope;
   project_id?: string;
   project_path?: string;
+  /**
+   * Stage 7: chunk size for maintenance operations that scan the
+   * whole entries table. Each chunk runs in its own transaction,
+   * so other agents' remember / getMemory calls are not blocked
+   * for the full duration. Default 500; min 50, max 5000.
+   */
+  batch_size?: number;
+  /**
+   * Stage 7: progress callback fired after each chunk completes.
+   * Receives (processed, total). Useful for the MCP tool to
+   * report a partial result, and for the CLI / smoke test.
+   */
+  onProgress?: (processed: number, total: number) => void;
 };
 
 export type MaintainMemoriesResult = {
@@ -967,13 +980,7 @@ export class MemoryService {
 
     switch (input.action) {
       case "find_duplicates":
-        return {
-          action: input.action,
-          changed: 0,
-          details: {
-            groups: this.findDuplicateGroups(this.activeEntriesForScope(resolved.value))
-          }
-        };
+        return this.findDuplicatesChunked(resolved.value, input);
       case "rebuild_markdown_index":
         return this.rebuildMarkdownIndex(resolved.value);
       case "expire_due":
@@ -983,6 +990,58 @@ export class MemoryService {
       case "vacuum_fts":
         return this.vacuumFts(resolved.value);
     }
+  }
+
+  /**
+   * Stage 7: chunked find_duplicates. Loads all active entries for
+   * the resolved scope in one read (the personal-tool scale keeps
+   * this small; well under the SQLite page cache for any realistic
+   * store), then runs the bucketed inverted index from T4 in
+   * chunks of `batch_size`. Each chunk's results are merged into
+   * the running set; groups with the same fingerprint (computed
+   * deterministically from reason + memory_id pair + similarity)
+   * are deduped across chunks.
+   *
+   * The progress callback (input.onProgress) fires after each chunk
+   * with (processed, total).
+   */
+  private findDuplicatesChunked(
+    scope: ResolvedReadScope,
+    input: MaintainMemoriesInput
+  ): MaintainMemoriesResult {
+    if (input.batch_size !== undefined) {
+      if (input.batch_size < 50 || input.batch_size > 5000 || !Number.isInteger(input.batch_size)) {
+        throw new Error(
+          `maintain_memories batch_size must be an integer in [50, 5000], got ${input.batch_size}`
+        );
+      }
+    }
+    const batchSize = input.batch_size ?? 500;
+    const onProgress = input.onProgress;
+
+    const allEntries = this.activeEntriesForScope(scope);
+    const total = allEntries.length;
+    if (total === 0) {
+      onProgress?.(0, 0);
+      return { action: "find_duplicates", changed: 0, details: { groups: [] } };
+    }
+
+    const seenFingerprints = new Set<string>();
+    const groups: DuplicateGroup[] = [];
+    let processed = 0;
+    for (let offset = 0; offset < total; offset += batchSize) {
+      const batch = allEntries.slice(offset, offset + batchSize);
+      const batchGroups = this.findDuplicateGroups(batch);
+      for (const g of batchGroups) {
+        if (seenFingerprints.has(g.fingerprint)) continue;
+        seenFingerprints.add(g.fingerprint);
+        groups.push(g);
+      }
+      processed += batch.length;
+      onProgress?.(processed, total);
+    }
+
+    return { action: "find_duplicates", changed: 0, details: { groups } };
   }
 
   /**

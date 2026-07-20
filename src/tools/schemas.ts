@@ -241,7 +241,10 @@ export const maintainMemoriesToolSchema = z
     action: z.enum(maintenanceActions),
     scope: scopeSchema,
     project_id: nonEmptyString.optional(),
-    project_path: nonEmptyString.optional()
+    project_path: nonEmptyString.optional(),
+    // Stage 7: chunk size for maintenance operations that scan
+    // the whole entries table. Default 500; min 50, max 5000.
+    batch_size: z.number().int().min(50).max(5000).default(500)
   })
   .strict()
   .superRefine(requireProjectIdentity);
