@@ -96,7 +96,9 @@ for one-off inspection, health checks, manual backups, and schema migration.
 # via npm script (no build required)
 npm run cli -- doctor
 npm run cli -- list --limit 10
+npm run cli -- list --actor "agent:claude-code"   # only claude-code's writes
 npm run cli -- search "postgres" --limit 5
+npm run cli -- search "postgres" --actor "agent:claude-code"
 npm run cli -- show <memory_id>
 npm run cli -- audit <memory_id>
 npm run cli -- backup
@@ -134,7 +136,7 @@ should not silently overwrite.
 
 ## Doctor
 
-`agent-recall doctor` runs ten health checks and exits with:
+`agent-recall doctor` runs eleven health checks and exits with:
 
 - `0` — all OK
 - `1` — warnings present, no failures
@@ -159,9 +161,9 @@ maintenance actions (`rebuild_markdown_index`, `expire_due`,
 | --- | --- |
 | `recall_context` | Task-start memory recall entry point. Call this near the beginning of a coding task to retrieve relevant global or project context. |
 | `remember` | Store one validated local memory entry. |
-| `search_memories` | Search memories by full-text query and optional metadata filters. |
+| `search_memories` | Search memories by full-text query and optional metadata filters; `actor` narrows to one writer. |
 | `get_memory` | Read one memory entry and its audit history by memory id. |
-| `list_memories` | List memories with optional scope and metadata filters. |
+| `list_memories` | List memories with optional scope and metadata filters; `actor` narrows to one writer. |
 | `update_memory` | Update mutable fields on an active or archived memory. |
 | `supersede_memory` | Create a replacement memory and mark older memories as superseded. |
 | `forget_memory` | Forget a memory by clearing its body and marking it forgotten. |
@@ -218,6 +220,10 @@ Markdown exports are for inspection and handoff. Manual edits under `exports/` m
 ## Changelog
 
 Stage-level changes are tracked in [`CHANGELOG.md`](./CHANGELOG.md).
+Stage 4 delivered the `actor` filter on `list_memories` and
+`search_memories` (MCP + CLI), and the eleventh doctor check
+`actor_ownership`; see the
+[Stage 4 closure report](./docs/superpowers/plans/2026-07-20-stage-four-closure.md).
 Stage 3 delivered token-set Jaccard similarity, the `near_duplicate`
 advisory on `remember`, and the `similar_title_and_body` group on
 `maintain_memories find_duplicates`; see the

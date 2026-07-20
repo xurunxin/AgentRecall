@@ -5,7 +5,77 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
-## [Unreleased] — Stage 3 Cross-Agent Smarter Dedup
+## [Unreleased] — Stage 4 Per-Agent Memory View
+
+Date: 2026-07-20
+
+### Added
+
+- **`actor` filter on the read path**. `list_memories` and
+  `search_memories` (MCP tools, CLI commands) now accept an optional
+  `actor` field that narrows results to memories whose "created"
+  audit row was written by the given actor. Implemented as a
+  subquery in the `WHERE` clause (rather than a join) so callers
+  that don't use the filter pay no cost.
+- **`actor_ownership` doctor check** (the 11th). Walks the audit
+  log for `event = 'created'` rows and reports the per-actor
+  memory distribution. Always `ok`; pairs with the existing
+  `actor_distribution` check, which counts all audit events
+  (created, updated, deleted, etc.) rather than entries.
+
+### Changed
+
+- **Test count**: 239 (stage 3) → 252 (+13 from stage 4: 6
+  sqlite-store, 3 memory-service, 1 tool-registration, 2 CLI, 1
+  doctor). TDD per task, red → green → commit.
+- **`doctor` now reports 11 checks** (was 10). All still pass on a
+  healthy database.
+
+### Documentation
+
+- `docs/superpowers/specs/2026-07-20-stage-four-per-agent-view.md`
+  — full Stage 4 spec covering the actor filter, the doctor
+  check, the SQL strategy, and the deferral list.
+- `docs/superpowers/plans/2026-07-20-stage-four-per-agent-view.md`
+  — 7-task implementation plan.
+- `docs/superpowers/plans/2026-07-20-stage-four-closure.md` — this
+  implementation closure report.
+- `README.md` — Tools table note about the new filter; CLI
+  examples updated; Doctor section now mentions "eleven health
+  checks".
+
+### Test Coverage
+
+| Stage | Tests | Files | Notes |
+|---|---|---|---|
+| Baseline (pre-stage-1) | 120 | 10 | All passing |
+| Stage 1 additions | +74 | +14 (CLI files) | actor, sqlite-store-migration, tools-descriptions, backup, doctor + 9 CLI test files |
+| **Stage 1 total** | **194** | **24** | **All passing** |
+| Stage 2 additions | +21 | +4 | sqlite-store-migration-v3, remember-confirm, merge-memories, last-accessed-by |
+| **Stage 2 total** | **215** | **28** | **All passing** |
+| Stage 3 additions | +23 | +1 | text-similarity (new) + extensions to remember-confirm and memory-service |
+| **Stage 3 total** | **239** | **29** | **All passing** |
+| Stage 4 additions | +13 | +2 | sqlite-store-actor-filter, memory-service-actor-filter (new) + extensions to list, search, doctor, tool-registration |
+| **Stage 4 total** | **252** | **31** | **All passing** |
+
+### Deviations from Plan
+
+The Stage 4 plan called for 7 tasks; all 7 were executed with
+these minor adjustments:
+
+1. **Subquery vs. JOIN**: the plan called for a subquery, which
+   is what shipped. Confirmed in code review: the audit log is
+   small relative to entries and indexed on (memory_id, event),
+   so the subquery is O(1) per memory.
+2. **`entryFilterFields` shared schema**: the plan called for
+   adding `actor` to both list and search schemas separately;
+   the implementation adds it to the shared `entryFilterFields`
+   object so both schemas pick it up automatically.
+3. **No CLI test for `actor` on the JSON output path** — the
+   existing `--json` tests already cover the JSON serialization
+   path; the new `--actor` test only adds the filter assertion.
+
+## [0.3.0] — 2026-07-19 — Stage 3 Cross-Agent Smarter Dedup
 
 Date: 2026-07-20
 
