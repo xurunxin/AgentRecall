@@ -1,19 +1,14 @@
 import {
-  estimateIndexChars,
-  evaluateBudget,
   rankCleanupCandidates,
   type BudgetAccepted,
   type BudgetWarning,
   type CandidateAction
 } from "./budget-governor.js";
-import { createHash } from "node:crypto";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import {
   DEFAULT_GLOBAL_BUDGET,
-  DEFAULT_PROJECT_BUDGET,
   computeEntrySize,
-  createAuditId,
   createMemoryId,
   err,
   nowIso,
@@ -38,6 +33,32 @@ import {
   validateRememberInput,
   validateUpdateInput
 } from "./write-validator.js";
+import {
+  actorForEntry,
+  activeEntriesFor,
+  appendAudit,
+  auditRejected,
+  auditRejectedForEntry,
+  auditRejectedForScope,
+  budgetFor,
+  buildEntry,
+  compareContextScores,
+  compareLowValueCandidates,
+  compareText,
+  computeTrustBoost,
+  contextQueryScore,
+  duplicateFingerprint,
+  ensureProjectScope,
+  evaluateEntryBudget,
+  isDue,
+  matchesReplacementScope,
+  normalizeDuplicateText,
+  queryTokens,
+  rejectionMetadata,
+  usageFromActiveEntries,
+  type ContextScore,
+  type EvaluateEntryBudgetResult
+} from "./services/memory-service-helpers.js";
 
 export type RememberResult = {
   memory_id: string;
@@ -171,152 +192,9 @@ type ResolvedReadScope = {
   project_id?: string;
 };
 
-type ContextScore = {
-  entry: MemoryEntry;
-  query_score: number;
-  trust_boost: number;
-};
-
-const DEFAULT_STRONG_TRUST_BOOST = 0.3;
-const DEFAULT_SOFT_TRUST_BOOST = 0.1;
-const ENV_TRUST_STRONG = "AGENT_RECALL_TRUST_STRONG";
-const ENV_TRUST_SOFT = "AGENT_RECALL_TRUST_SOFT";
-
-function parseEnvFloat(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (raw === undefined) return fallback;
-  const parsed = Number.parseFloat(raw);
-  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) {
-    process.stderr.write(
-      `agent-recall: invalid ${name}="${raw}", using default ${fallback}\n`
-    );
-    return fallback;
-  }
-  return parsed;
-}
-
-/**
- * Stage 5: per-memory trust boost for recall ranking.
- *
- * Returns the strong boost (default 0.3) when the memory was
- * written by `currentActor` ("I wrote this, trust my own
- * knowledge"), the soft boost (default 0.1) when the current
- * actor appears in the memory's `last_accessed_by` map ("I've
- * touched this recently"), or 0 when there is no relationship.
- * Returns 0 when `currentActor` is empty (legacy callers
- * constructed without `defaultActor`).
- *
- * Stage 7: the strong / soft weights are configurable via the
- * AGENT_RECALL_TRUST_STRONG and AGENT_RECALL_TRUST_SOFT env
- * vars. Defaults are 0.3 / 0.1; invalid values fall back to
- * defaults with a one-line stderr warning.
- */
-export function computeTrustBoost(
-  entry: MemoryEntry,
-  currentActor: string,
-  actorForEntry: (entry: MemoryEntry) => string
-): number {
-  if (currentActor.length === 0) return 0;
-  const strong = parseEnvFloat(ENV_TRUST_STRONG, DEFAULT_STRONG_TRUST_BOOST);
-  const soft = parseEnvFloat(ENV_TRUST_SOFT, DEFAULT_SOFT_TRUST_BOOST);
-  const writer = actorForEntry(entry);
-  if (writer === currentActor) return strong;
-  if (entry.last_accessed_by !== undefined && entry.last_accessed_by[currentActor] !== undefined) {
-    return soft;
-  }
-  return 0;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function safeScopeFromInput(input: unknown): MemoryScope {
-  return isRecord(input) && input.scope === "project" ? "project" : "global";
-}
-
-function safeProjectIdFromInput(input: unknown): string | undefined {
-  return isRecord(input) && typeof input.project_id === "string" ? input.project_id : undefined;
-}
-
-function compareText(a: string, b: string): number {
-  if (a < b) return -1;
-  if (a > b) return 1;
-  return 0;
-}
-
-function parseTimestamp(value: string | undefined): number | undefined {
-  if (value === undefined) return undefined;
-  const timestamp = Date.parse(value);
-  return Number.isFinite(timestamp) ? timestamp : undefined;
-}
-
-function isDue(timestamp: string | undefined, now: string): boolean {
-  const dueAt = parseTimestamp(timestamp);
-  const current = parseTimestamp(now);
-  return dueAt !== undefined && current !== undefined && dueAt <= current;
-}
-
-function normalizeDuplicateText(value: string): string {
-  return value.trim().toLowerCase().replace(/\s+/g, " ");
-}
-
-function duplicateFingerprint(reason: DuplicateGroup["reason"], key: string): string {
-  return createHash("sha256").update(`${reason}\n${key}`).digest("hex").slice(0, 12);
-}
-
-function queryTokens(query: string | undefined): string[] {
-  if (query === undefined) return [];
-  return [...new Set((query.toLowerCase().match(/[\p{L}\p{N}_]+/gu) ?? []).filter((token) => token.length > 0))].sort();
-}
-
-function contextQueryScore(entry: MemoryEntry, tokens: string[]): number {
-  if (tokens.length === 0) return 0;
-  const title = entry.title.toLowerCase();
-  const topic = entry.topic.toLowerCase();
-  const tags = entry.tags.join(" ").toLowerCase();
-  const body = entry.body.toLowerCase();
-  let score = 0;
-  for (const token of tokens) {
-    if (title.includes(token)) score += 8;
-    if (topic.includes(token)) score += 4;
-    if (tags.includes(token)) score += 3;
-    if (body.includes(token)) score += 1;
-  }
-  return score;
-}
-
-function compareContextScores(a: ContextScore, b: ContextScore): number {
-  const queryOrder = b.query_score - a.query_score;
-  if (queryOrder !== 0) return queryOrder;
-
-  const trustOrder = b.trust_boost - a.trust_boost;
-  if (trustOrder !== 0) return trustOrder;
-
-  const importanceOrder = b.entry.importance - a.entry.importance;
-  if (importanceOrder !== 0) return importanceOrder;
-
-  const confidenceOrder = b.entry.confidence - a.entry.confidence;
-  if (confidenceOrder !== 0) return confidenceOrder;
-
-  const updatedOrder = compareText(b.entry.updated_at, a.entry.updated_at);
-  if (updatedOrder !== 0) return updatedOrder;
-
-  return compareText(a.entry.id, b.entry.id);
-}
-
-function compareLowValueCandidates(a: MemoryEntry, b: MemoryEntry): number {
-  const importanceOrder = a.importance - b.importance;
-  if (importanceOrder !== 0) return importanceOrder;
-
-  const confidenceOrder = a.confidence - b.confidence;
-  if (confidenceOrder !== 0) return confidenceOrder;
-
-  const updatedOrder = compareText(a.updated_at, b.updated_at);
-  if (updatedOrder !== 0) return updatedOrder;
-
-  return compareText(a.id, b.id);
-}
+// Stage 9: computeTrustBoost is now re-exported from
+// services/memory-service-helpers.ts for backward compat.
+export { computeTrustBoost } from "./services/memory-service-helpers.js";
 
 export class MemoryService {
   constructor(
@@ -601,16 +479,12 @@ export class MemoryService {
     const next: MemoryEntry = { ...current, ...patch, id: current.id };
     const existingEntries = this.activeEntriesFor(next).filter((entry) => entry.id !== id);
     const budget = this.budgetFor(next);
-    const budgetResult = evaluateBudget({
-      budget,
-      usage: this.usageFromActiveEntries(existingEntries),
-      candidate: next,
-      existingEntries,
-      now: patch.updated_at
+    const budgetResult = evaluateEntryBudget(this.store, next, budget, {
+      excludedActiveMemoryIds: new Set([id])
     });
     if (!budgetResult.ok) {
       this.auditRejectedForEntry(current, "capacity_exceeded", budgetResult.details);
-      return err("capacity_exceeded", budgetResult.message, budgetResult.details);
+      return err("capacity_exceeded", `capacity exceeded`, budgetResult.details);
     }
 
     const event = current.status === "active" && patch.status === "archived" ? "archived" : "updated";
@@ -936,8 +810,7 @@ export class MemoryService {
     if (input.scope === "project" && input.project_id === undefined) {
       return err("invalid_scope", "project budget requires project_id");
     }
-    const budget =
-      input.scope === "global" ? DEFAULT_GLOBAL_BUDGET : this.store.getProjectScope(input.project_id ?? "")?.budget ?? DEFAULT_PROJECT_BUDGET;
+    const budget = budgetFor(this.store, { scope: input.scope, project_id: input.project_id });
     const usage = this.store.getBudgetUsage(input);
     const activeEntries = this.store.listEntries({
       scope: input.scope,
@@ -1659,78 +1532,35 @@ export class MemoryService {
     budget: MemoryBudget,
     options: PrepareRememberOptions = {}
   ): Result<BudgetAccepted, "capacity_exceeded"> {
-    const existingEntries = this.activeEntriesFor(entry).filter(
-      (existing) => !options.excludedActiveMemoryIds?.has(existing.id)
-    );
-    const usage = this.usageFromActiveEntries(existingEntries);
-    const result = evaluateBudget({ budget, usage, candidate: entry, existingEntries, now: entry.updated_at });
+    const result = evaluateEntryBudget(this.store, entry, budget, options);
     if (!result.ok) return result;
-    // Stage 3: enrich each warning with the matching memory's writer
-    // actor (from the audit log) and its last_accessed_by map (from
-    // the entry itself) so the agent can decide whether the
-    // candidate is its own stale write or a fresh write by another
-    // agent.
-    const enrichedWarnings = result.value.warnings.map((w) => {
-      const matched = existingEntries.find((e) => e.id === w.memory_id);
-      if (matched === undefined) return w;
-      const enriched: BudgetWarning = { ...w };
-      enriched.actor = this.actorForEntry(matched);
-      if (matched.last_accessed_by !== undefined) {
-        enriched.last_accessed_by = matched.last_accessed_by;
-      }
-      return enriched;
-    });
-    return ok({ ...result.value, warnings: enrichedWarnings });
+    return ok(result.value);
   }
 
   private actorForEntry(entry: MemoryEntry): string {
-    // Walk the audit log to find the first "created" event for this
-    // entry. That event's actor is the canonical writer. Fall back
-    // to the legacy kind if no audit row is found.
-    const events = this.store.getAuditEvents(entry.id);
-    const created = events.find((e) => e.event === "created");
-    if (created !== undefined) return created.actor;
-    return entry.source.kind;
+    return actorForEntry(this.store, entry);
   }
 
   private budgetFor(entry: MemoryEntry): MemoryBudget {
-    if (entry.scope === "global") {
-      return DEFAULT_GLOBAL_BUDGET;
-    }
-    return this.store.getProjectScope(entry.project_id ?? "")?.budget ?? DEFAULT_PROJECT_BUDGET;
+    return budgetFor(this.store, entry);
   }
 
   private activeEntriesFor(entry: Pick<MemoryEntry, "scope" | "project_id">): MemoryEntry[] {
-    return this.store.listEntries({
-      scope: entry.scope,
-      ...(entry.project_id !== undefined ? { project_id: entry.project_id } : {}),
-      status: "active",
-      limit: 10_000
-    });
+    return activeEntriesFor(this.store, entry);
   }
 
   private usageFromActiveEntries(entries: MemoryEntry[]): BudgetUsage {
-    const topic_chars: Record<string, number> = {};
-    let active_chars = 0;
-    let index_chars = 0;
-
-    for (const entry of entries) {
-      active_chars += entry.char_count;
-      topic_chars[entry.topic] = (topic_chars[entry.topic] ?? 0) + entry.char_count;
-      index_chars += estimateIndexChars(entry.title, entry.topic, entry.tags);
-    }
-
-    return {
-      active_entries: entries.length,
-      active_chars,
-      topic_chars,
-      index_chars
-    };
+    return usageFromActiveEntries(entries);
   }
 
   private ensureProjectScope(project_id: string, project_path: string, display_name: string): ProjectScope {
-    const existing = this.store.getProjectScope(project_id);
-    return existing ?? this.configureProjectBudget(project_id, DEFAULT_PROJECT_BUDGET, project_path, display_name);
+    return ensureProjectScope(
+      this.store,
+      (id, budget, path, name) => this.configureProjectBudget(id, budget, path, name),
+      project_id,
+      project_path,
+      display_name
+    );
   }
 
   private buildEntry(
@@ -1739,68 +1569,19 @@ export class MemoryService {
     timestamp: string,
     project: { project_id?: string; project_path?: string }
   ): MemoryEntry {
-    return {
-      id: createMemoryId(),
-      scope,
-      ...(project.project_id !== undefined ? { project_id: project.project_id } : {}),
-      ...(project.project_path !== undefined ? { project_path: project.project_path } : {}),
-      type: input.type,
-      topic: input.topic,
-      title: input.title,
-      body: input.body,
-      tags: input.tags,
-      source: input.source,
-      importance: input.importance,
-      confidence: input.confidence,
-      status: input.status,
-      created_at: timestamp,
-      updated_at: timestamp,
-      access_count: 0,
-      ...(input.expires_at !== undefined ? { expires_at: input.expires_at } : {}),
-      ...(input.review_after !== undefined ? { review_after: input.review_after } : {}),
-      supersedes: input.supersedes,
-      token_estimate: input.token_estimate,
-      char_count: input.char_count
-    };
+    return buildEntry(input, scope, timestamp, project, createMemoryId());
   }
 
   private appendAudit(input: Omit<MemoryAuditEvent, "id" | "created_at" | "actor"> & { actor?: string }): void {
-    const event: MemoryAuditEvent = {
-      id: createAuditId(),
-      scope: input.scope,
-      event: input.event,
-      actor: resolveActor(input.actor ?? this.defaultActor) as MemoryAuditEvent["actor"],
-      metadata: input.metadata,
-      created_at: nowIso()
-    };
-    if (input.memory_id !== undefined) event.memory_id = input.memory_id;
-    if (input.project_id !== undefined) event.project_id = input.project_id;
-    if (input.reason !== undefined) event.reason = input.reason;
-    this.store.appendAudit(event);
+    appendAudit(this.store, this.defaultActor, input);
   }
 
   private auditRejected(input: unknown, error: string, details: Record<string, unknown> | undefined): void {
-    const project_id = safeProjectIdFromInput(input);
-    this.appendAudit({
-      scope: safeScopeFromInput(input),
-      ...(project_id !== undefined ? { project_id } : {}),
-      event: "write_rejected",
-      actor: "system",
-      reason: error,
-      metadata: this.rejectionMetadata(error, details)
-    });
+    auditRejected(this.store, this.defaultActor, input, error, details);
   }
 
   private auditRejectedForEntry(entry: MemoryEntry, error: string, details: Record<string, unknown> | undefined): void {
-    this.appendAudit({
-      memory_id: entry.id,
-      scope: entry.scope,
-      ...(entry.project_id !== undefined ? { project_id: entry.project_id } : {}),
-      event: "write_rejected",
-      actor: "system",
-      reason: error,
-      metadata: this.rejectionMetadata(error, details)
-    });
+    auditRejectedForEntry(this.store, this.defaultActor, entry, error, details);
   }
 
   private auditRejectedForScope(
@@ -1809,17 +1590,10 @@ export class MemoryService {
     error: string,
     details: Record<string, unknown> | undefined
   ): void {
-    this.appendAudit({
-      scope,
-      ...(project_id !== undefined ? { project_id } : {}),
-      event: "write_rejected",
-      actor: "system",
-      reason: error,
-      metadata: this.rejectionMetadata(error, details)
-    });
+    auditRejectedForScope(this.store, this.defaultActor, scope, project_id, error, details);
   }
 
   private rejectionMetadata(error: string, details: Record<string, unknown> | undefined): Record<string, unknown> {
-    return details === undefined ? { error } : { error, ...details };
+    return rejectionMetadata(error, details);
   }
 }
