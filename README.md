@@ -98,11 +98,13 @@ npm run cli -- doctor
 npm run cli -- list --limit 10
 npm run cli -- list --actor "agent:claude-code"   # only claude-code's writes
 npm run cli -- list --since "2026-07-13"          # only memories created on/after
+npm run cli -- list --updated-since "2026-07-13"  # only memories touched on/after
 npm run cli -- list --actor "agent:claude-code" --since "2026-07-13"  # combine
 npm run cli -- list --last-accessed-since "2026-07-13"  # only memories I've read recently
 npm run cli -- search "postgres" --limit 5
 npm run cli -- search "postgres" --actor "agent:claude-code"
 npm run cli -- search "postgres" --since "2026-07-13"
+npm run cli -- search "postgres" --updated-since "2026-07-13"
 npm run cli -- show <memory_id>
 npm run cli -- audit <memory_id>
 npm run cli -- backup
@@ -165,14 +167,14 @@ maintenance actions (`rebuild_markdown_index`, `expire_due`,
 | --- | --- |
 | `recall_context` | Task-start memory recall entry point. Ranks the calling agent's own knowledge first; each entry is annotated with `[writer: <actor>]`. |
 | `remember` | Store one validated local memory entry. |
-| `search_memories` | Search memories by full-text query and optional metadata filters; `actor`, `since`, `last_accessed_since` narrow the result. |
+| `search_memories` | Search memories by full-text query and optional metadata filters; `actor`, `since`, `last_accessed_since`, `updated_since` narrow the result. |
 | `get_memory` | Read one memory entry and its audit history by memory id. |
-| `list_memories` | List memories with optional scope and metadata filters; `actor`, `since`, `until`, `last_accessed_since` narrow the result. |
+| `list_memories` | List memories with optional scope and metadata filters; `actor`, `since`, `until`, `last_accessed_since`, `updated_since`, `updated_until` narrow the result. |
 | `update_memory` | Update mutable fields on an active or archived memory. |
 | `supersede_memory` | Create a replacement memory and mark older memories as superseded. |
 | `forget_memory` | Forget a memory by clearing its body and marking it forgotten. |
 | `get_memory_budget` | Report budget usage and cleanup candidates for a scope. |
-| `maintain_memories` | Run local maintenance actions such as export rebuilds, expiry, cleanup, FTS vacuum, or duplicate detection. |
+| `maintain_memories` | Run local maintenance actions such as export rebuilds, expiry, cleanup, FTS vacuum, or duplicate detection. Stage 7 accepts `batch_size` (default 500, min 50, max 5000) to chunk scan-the-table operations. |
 | `merge_memories` | Merge two or more active memories into a single replacement. Requires `confirm_write` semantics; relaxes budget to allow post-merge cap. |
 | `export_memory_context` | Export selected memories as a bounded markdown context pack. |
 
@@ -184,6 +186,40 @@ maintenance actions (`rebuild_markdown_index`, `expire_due`,
 - `update_memory` accepts either a `patch` object or top-level update fields, but not both.
 - `remember` rejects unknown fields and only accepts supported memory types, source kinds, ratings, and writable statuses.
 - Service errors are returned as structured JSON text. `export_memory_context` returns markdown text.
+
+## Configuration
+
+The server reads these env vars at runtime (no restart needed; the next
+call picks up the new value). All have safe defaults; setting an
+invalid value falls back to the default with a one-line stderr warning.
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `AGENT_RECALL_HOME` | `~/.agent-recall` | Where the SQLite file, backups, and exports live. The legacy `LOCAL_MEMORY_MCP_HOME` is honored if this is unset. |
+| `AGENT_RECALL_ACTOR` | `agent` | Default actor name for audit rows. Set to `agent:claude-code`, `agent:cursor`, etc. in your MCP client config so per-agent view, trust_boost, and last_accessed_by work end-to-end. |
+| `AGENT_RECALL_STALE_DAYS` | `90` | Threshold for the `stale_memories` doctor check. Must be a positive integer. |
+| `AGENT_RECALL_TRUST_STRONG` | `0.3` | Recall `trust_boost` for memories the calling agent wrote. Must be in `[0, 1]`. |
+| `AGENT_RECALL_TRUST_SOFT` | `0.1` | Recall `trust_boost` for memories the calling agent recently touched. Must be in `[0, 1]`. |
+| `AGENT_RECALL_SUPPRESS_MCP_DEPRECATION` | unset | Set to `1` to silence the one-time MCP server deprecation notice. |
+
+Example multi-agent MCP config:
+
+```json
+{
+  "mcpServers": {
+    "agent-recall-mcp": {
+      "command": "node",
+      "args": ["/path/to/agent-recall/dist/src/index.js"],
+      "env": {
+        "AGENT_RECALL_HOME": "/path/to/agent-recall-data",
+        "AGENT_RECALL_ACTOR": "agent:claude-code",
+        "AGENT_RECALL_STALE_DAYS": "60",
+        "AGENT_RECALL_TRUST_STRONG": "0.4"
+      }
+    }
+  }
+}
+```
 
 ## Memory Hygiene
 
@@ -224,6 +260,13 @@ Markdown exports are for inspection and handoff. Manual edits under `exports/` m
 ## Changelog
 
 Stage-level changes are tracked in [`CHANGELOG.md`](./CHANGELOG.md).
+Stage 7 delivered `updated_since` / `updated_until` filters,
+`AGENT_RECALL_STALE_DAYS` / `AGENT_RECALL_TRUST_STRONG` /
+`AGENT_RECALL_TRUST_SOFT` env vars, a token-bucketed
+inverted index for `find_duplicates` (5-10x pair count
+reduction), and chunked maintenance via the new
+`batch_size` parameter on `maintain_memories`; see the
+[Stage 7 spec](./docs/superpowers/specs/2026-07-20-stage-seven-polish.md).
 Stage 6 delivered time-window filters on `list_memories` and
 `search_memories` (MCP + CLI: `since`, `until`,
 `last_accessed_since`) and the twelfth doctor check

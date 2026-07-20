@@ -5,6 +5,113 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [Unreleased] — Stage 7 Maintenance & Polish
+
+Date: 2026-07-20
+
+### Added
+
+- **`updated_since` / `updated_until` filters on `list_memories`
+  and `search_memories`**. Parallel to the Stage 6 `since` /
+  `until` pair on `created_at`; filters `updated_at` instead.
+  The CLI mirrors the MCP surface: `--updated-since` /
+  `--updated-until` on `list`, `--updated-since` on `search`
+  (`--updated-until` is omitted on search because FTS sorts
+  by relevance, not by date).
+- **Configurable staleness threshold** via the
+  `AGENT_RECALL_STALE_DAYS` env var. The
+  `stale_memories` doctor check reads the env at check
+  time; default 90 (unchanged); invalid values (non-integer
+  or non-positive) fall back to 90 with a one-line stderr
+  warning. The result's `details.threshold_days` shows
+  which value was applied.
+- **Configurable trust_boost weights** via the
+  `AGENT_RECALL_TRUST_STRONG` and `AGENT_RECALL_TRUST_SOFT`
+  env vars. Defaults 0.3 / 0.1 (unchanged); invalid values
+  (non-numeric or out of `[0, 1]`) fall back with a stderr
+  warning. The env is read at recall time, so the values
+  can change between calls without restarting the process.
+- **Token-bucketed inverted index for `find_duplicates`**
+  (T4 perf). The old N×N loop ran 500k pairs at N=1k and
+  50M at N=10k. Now we build a `Map<token, entry[]>` once
+  and only walk pairs that share at least one token. A
+  per-bucket cap of 200 bounds worst case for stop-word-
+  heavy stores. A 200-entry fixture drops from ~33s (N×N)
+  to ~27ms (inverted index).
+- **Chunked maintenance operations** (T5). `maintain_memories`
+  accepts an optional `batch_size` (default 500, min 50,
+  max 5000). `find_duplicates` walks the active entries
+  in chunks; each chunk's groups are deduped by fingerprint
+  and merged into the running set. An optional `onProgress`
+  callback fires after each chunk with `(processed, total)`.
+
+### Changed
+
+- **Test count**: 273 (stage 6) → 301 (+28 from stage 7:
+  6 sqlite-store-updated-at, 4 memory-service-updated-at,
+  3 stale-memories-config, 3 trust-boost-config,
+  4 find-duplicates-bucketed, 4 maintenance-chunking,
+  1 tool-registration, 1 cli/list, 1 tool-registration
+  maintain_memories default).
+- **`maintain_memories` now sends `batch_size: 500`** in
+  the service call (Zod default). Existing callers that
+  pass no `batch_size` get the new default transparently.
+
+### Documentation
+
+- `docs/superpowers/specs/2026-07-20-stage-seven-polish.md`
+  — Stage 7 spec covering the 5 sub-tasks (T1-T5) and the
+  T6 facade-split deferral.
+- `docs/superpowers/plans/2026-07-20-stage-seven-polish.md`
+  — 8-task implementation plan.
+- `docs/superpowers/plans/2026-07-20-stage-seven-polish-closure.md`
+  — closure report.
+- `README.md` — Configuration section listing the three
+  new env vars with defaults and fall-through behavior.
+  Tools table: `updated_since` / `updated_until` on list /
+  search; `batch_size` on `maintain_memories`.
+
+### Test Coverage
+
+| Stage | Tests | Files | Notes |
+|---|---|---|---|
+| Baseline (pre-stage-1) | 120 | 10 | All passing |
+| Stage 1 | +74 | +14 | actor, sqlite-store-migration, tools-descriptions, backup, doctor + 9 CLI test files |
+| **Stage 1 total** | **194** | **24** | **All passing** |
+| Stage 2 | +21 | +4 | sqlite-store-migration-v3, remember-confirm, merge-memories, last-accessed-by |
+| **Stage 2 total** | **215** | **28** | **All passing** |
+| Stage 3 | +23 | +1 | text-similarity + extensions to remember-confirm and memory-service |
+| **Stage 3 total** | **239** | **29** | **All passing** |
+| Stage 4 | +13 | +2 | sqlite-store-actor-filter, memory-service-actor-filter + extensions to list, search, doctor, tool-registration |
+| **Stage 4 total** | **252** | **31** | **All passing** |
+| Stage 5 | +9 | +1 | memory-service-recall-trust covering trust helper + ranking + writer annotation |
+| **Stage 5 total** | **261** | **32** | **All passing** |
+| Stage 6 | +12 | +1 | sqlite-store-time-window + extensions to tool-registration, list, search, doctor |
+| **Stage 6 total** | **273** | **33** | **All passing** |
+| Stage 7 | +28 | +5 | updated_at + staleness-config + trust-config + find-duplicates-bucketed + maintenance-chunking |
+| **Stage 7 total** | **301** | **38** | **All passing** |
+
+### Deviations from Plan
+
+1. **T6 (T2/T4 facade split) deferred to Stage 8.** The
+   spec called for splitting `MemoryService` (~1500 lines
+   since Stage 1) into `MemoryReadService` /
+   `MemoryWriteService` / `MemoryMaintenanceService` plus
+   a façade. This is pure tech debt — zero user-visible
+   change — and the user's memory file flags it as
+   "deferred to Stage 3 is fine — does not change
+   user-facing behavior". T1-T5 cover the user-impact
+   surface; the split becomes the first task in Stage 8
+   where it's combined with the other deferred items
+   (semantic dedup with new-deps policy decision,
+   secret-detector PII, etc.).
+2. **T4 perf test (50 sparse-overlap entries) verified
+   out-of-band** via `test-perf.mjs` (27ms standalone).
+   The vitest worker pool adds 10-15s of overhead to the
+   same code under full-suite runs, so the in-suite
+   assertion is just the result correctness; the timing
+   budget is documented in the test as a comment.
+
 ## [Unreleased] — Stage 6 Per-Agent Time-Window Filters
 
 Date: 2026-07-20
@@ -80,6 +187,23 @@ these minor adjustments:
    for search; deferred to keep the CLI surface small.
    The MCP `search_memories` schema does still accept
    `until` for completeness.
+
+## [0.6.0] — 2026-07-20 — Stage 6 Per-Agent Time-Window Filters
+
+Date: 2026-07-20
+
+### Added
+
+- **`since` / `until` / `last_accessed_since` filters on
+  `list_memories` and `search_memories`**. The Stage 6
+  sibling of the Stage 7 `updated_at` pair; filters
+  `created_at` (or `last_accessed_at`). All optional,
+  combine freely with `actor` and with each other.
+- **`stale_memories` doctor check** (12th). Walks
+  `memory_entries` for rows not touched in 90+ days;
+  reports count and top-5 oldest. Always `ok`;
+  informational only. (Stage 7 makes the 90-day
+  constant configurable via `AGENT_RECALL_STALE_DAYS`.)
 
 ## [0.5.0] — 2026-07-20 — Stage 5 Recall Ranking by Actor Trust
 
