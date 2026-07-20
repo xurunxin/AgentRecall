@@ -5,7 +5,114 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
-## [Unreleased] — Stage 8 Maintenance Rich
+## [Unreleased] — Stage 9 Facade Split
+
+Date: 2026-07-21
+
+### Changed
+
+- **Internal refactor — `MemoryService` is now a façade over
+  three sub-services**. The 1670-line `MemoryService` class
+  (accumulated across Stages 1-8) has been split into
+  `MemoryReadService`, `MemoryWriteService`, and
+  `MemoryMaintenanceService`, all in `src/services/`. The
+  shared helpers (audit append, budget evaluation, actor
+  lookup, env-var reads, comparison) live in
+  `src/services/memory-service-helpers.ts` so the three
+  sub-services can depend on a single source of truth
+  without depending on each other or on `MemoryService`
+  itself. **Public API is byte-for-byte unchanged**: every
+  constructor parameter, every public method, every public
+  type re-export, every audit event payload, and every
+  error code is preserved. No new tests, no user-visible
+  behavior change.
+- **Test count**: 320 (stage 8) → 320 (no new tests; pure
+  refactor). The 320 tests from Stages 1-8 must all pass
+  against the new façade.
+
+### Documentation
+
+- `docs/superpowers/specs/2026-07-21-stage-nine-facade-split.md`
+  — Stage 9 spec covering the 7 sub-tasks (T1-T7).
+- `docs/superpowers/plans/2026-07-21-stage-nine-facade-split.md`
+  — implementation plan.
+- `docs/superpowers/plans/2026-07-21-stage-nine-facade-split-closure.md`
+  — closure report (landed in T6).
+- `README.md` — Architecture section: one paragraph
+  describing the read / write / maintenance sub-service
+  split; tools table and per-client env setup unchanged.
+
+### Test Coverage
+
+| Stage | Tests | Files | Notes |
+|---|---|---|---|
+| Baseline (pre-stage-1) | 120 | 10 | All passing |
+| Stage 1 | +74 | +14 | actor, sqlite-store-migration, tools-descriptions, backup, doctor + 9 CLI test files |
+| **Stage 1 total** | **194** | **24** | **All passing** |
+| Stage 2 | +21 | +4 | sqlite-store-migration-v3, remember-confirm, merge-memories, last-accessed-by |
+| **Stage 2 total** | **215** | **28** | **All passing** |
+| Stage 3 | +23 | +1 | text-similarity + extensions to remember-confirm and memory-service |
+| **Stage 3 total** | **239** | **29** | **All passing** |
+| Stage 4 | +13 | +2 | sqlite-store-actor-filter, memory-service-actor-filter + extensions to list, search, doctor, tool-registration |
+| **Stage 4 total** | **252** | **31** | **All passing** |
+| Stage 5 | +9 | +1 | memory-service-recall-trust covering trust helper + ranking + writer annotation |
+| **Stage 5 total** | **261** | **32** | **All passing** |
+| Stage 6 | +12 | +1 | sqlite-store-time-window + extensions to tool-registration, list, search, doctor |
+| **Stage 6 total** | **273** | **33** | **All passing** |
+| Stage 7 | +28 | +5 | updated_at + staleness-config + trust-config + find-duplicates-bucketed + maintenance-chunking |
+| **Stage 7 total** | **301** | **38** | **All passing** |
+| Stage 8 | +19 | +3 | merge-duplicates + format-exporters + maintenance-dry-run |
+| **Stage 8 total** | **320** | **41** | **All passing** |
+| Stage 9 | +0 | +0 | pure refactor: helpers + 3 sub-services + façade |
+| **Stage 9 total** | **320** | **41** | **All passing** |
+
+### Deviations from Plan
+
+The plan called for 7 sub-tasks (T1-T7) and all executed
+as planned. Three bugs were caught and fixed during T5
+façade wiring — none changed the public API, all preserved
+behavior, but they would have shipped as regressions if the
+split had been merged without running the full test suite:
+
+1. **`updateMemory` rejected valid updates with
+   `secret_detected` or `invalid_schema` without writing a
+   `write_rejected` audit tied to the memory_id.** The
+   original pre-split code peeks `current` first, then
+   validates; if the validation fails, the audit is
+   attached to `current` via `auditRejectedForEntry`. The
+   initial Stage 9 `updateMemory` extracted the validation
+   step to run before the peek, which routed the rejection
+   audit to the input (no `memory_id`). Fix: reorder the
+   method to peek → status-check → validate; rejections
+   always land on `current`.
+2. **`commitPreparedRemember` overrode `defaultActor` with
+   a hardcoded `"agent"`** when writing the `created`
+   audit event. This broke the per-actor filter, the
+   near-duplicate writer annotation, and the recall
+   trust_boost ranking — all three rely on the audit's
+   `actor` field being the calling service's
+   `defaultActor`. The original pre-split code omits
+   `actor` from the audit call so `appendAudit` falls
+   through to `this.defaultActor` via `resolveActor`.
+   Fix: drop the `actor: "agent"` field from the
+   `commitPreparedRemember` audit.
+3. **`searchMemories` did not honor `include_global: true`.**
+   The original pre-split code does a manual second
+   `searchEntries` against the global scope and prepends
+   the global items to the project results, sliced to
+   `limit`. The Stage 9 read service initially passed
+   `include_global` straight to `store.searchEntries`,
+   which has no such concept. Fix: replicate the
+   pre-split merge in the read service.
+
+These three issues together affected 6 distinct tests
+across `test/memory-service.test.ts`,
+`test/memory-service-actor-filter.test.ts`,
+`test/remember-confirm.test.ts`, and
+`test/memory-service-recall-trust.test.ts`. All pass
+post-fix.
+
+## [0.8.0] — Stage 8 Maintenance Rich
 
 Date: 2026-07-20
 

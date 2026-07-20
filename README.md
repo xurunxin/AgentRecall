@@ -10,6 +10,34 @@ SQLite is the source of truth. Markdown files are deterministic exports for revi
 - npm
 - An MCP-compatible client that can launch a stdio server
 
+## Architecture
+
+`MemoryService` is a 253-line façade over three sub-services in
+`src/services/`:
+
+- `MemoryReadService` — `getMemory`, `listMemories`, `searchMemories`,
+  `getMemoryBudget`, `exportMemoryContext`.
+- `MemoryWriteService` — `remember`, `updateMemory`, `supersedeMemory`,
+  `mergeMemories`, `forgetMemory`, `configureProjectBudget`.
+- `MemoryMaintenanceService` — `maintainMemories` (and the per-action
+  implementations: `findDuplicates`, `mergeDuplicates`,
+  `rebuildMarkdownIndex`, `expireDueMemories`, `archiveLowValueMemories`,
+  `vacuumFts`).
+
+Shared helpers (audit append, budget evaluation, actor lookup, env-var
+reads, comparison functions) live in
+`src/services/memory-service-helpers.ts`. The façade holds the
+`SQLiteMemoryStore`, the optional `MarkdownExporter`, the default
+actor, and the data home, and wires them into each sub-service via
+shared `ReadContext` / `WriteContext` / `MaintenanceContext` shapes.
+`backup()` lives on the façade for historical reasons (Stage 1).
+
+The public API (`new MemoryService(store, exporter?, defaultActor?, dataHome?)`
+plus every public method) is byte-for-byte the same as before Stage 9.
+The split was driven purely by maintainability — the class had
+accumulated 1670 lines across Stages 1-8 — with zero user-visible
+behavior change.
+
 ## Setup
 
 Install dependencies, build the TypeScript output, then run the built stdio server:
