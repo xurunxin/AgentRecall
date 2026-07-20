@@ -109,6 +109,8 @@ npm run cli -- show <memory_id>
 npm run cli -- audit <memory_id>
 npm run cli -- backup
 npm run cli -- migrate --yes
+npm run cli -- export --format json              # Stage 8: json / yaml / markdown
+npm run cli -- export --format yaml
 ```
 
 After `npm run build`, the same commands are available via the `agent-recall`
@@ -174,7 +176,7 @@ maintenance actions (`rebuild_markdown_index`, `expire_due`,
 | `supersede_memory` | Create a replacement memory and mark older memories as superseded. |
 | `forget_memory` | Forget a memory by clearing its body and marking it forgotten. |
 | `get_memory_budget` | Report budget usage and cleanup candidates for a scope. |
-| `maintain_memories` | Run local maintenance actions such as export rebuilds, expiry, cleanup, FTS vacuum, or duplicate detection. Stage 7 accepts `batch_size` (default 500, min 50, max 5000) to chunk scan-the-table operations. |
+| `maintain_memories` | Run local maintenance actions: `archive_low_value`, `expire_due`, `rebuild_markdown_index`, `vacuum_fts`, `find_duplicates`, `merge_duplicates`. Stage 7 adds `batch_size` (default 500, min 50, max 5000). Stage 8 adds `dry_run` (default false) for mutating actions and `strategy` (`keep_first` / `keep_newest`) for `merge_duplicates`. |
 | `merge_memories` | Merge two or more active memories into a single replacement. Requires `confirm_write` semantics; relaxes budget to allow post-merge cap. |
 | `export_memory_context` | Export selected memories as a bounded markdown context pack. |
 
@@ -260,6 +262,16 @@ Markdown exports are for inspection and handoff. Manual edits under `exports/` m
 ## Changelog
 
 Stage-level changes are tracked in [`CHANGELOG.md`](./CHANGELOG.md).
+Stage 8 delivered three user-facing maintenance-path
+improvements: the new `merge_duplicates` action on
+`maintain_memories` (auto-supersedes all but the keep
+target for each duplicate group), the `dry_run` flag
+on `maintain_memories` (preview what would change
+without writing), and the export format switch
+(`--format markdown|json|yaml` on `agent-recall export`)
+with a new `FormatRouter` that picks the right
+exporter; see the
+[Stage 8 spec](./docs/superpowers/specs/2026-07-20-stage-eight-maintenance-rich.md).
 Stage 7 delivered `updated_since` / `updated_until` filters,
 `AGENT_RECALL_STALE_DAYS` / `AGENT_RECALL_TRUST_STRONG` /
 `AGENT_RECALL_TRUST_SOFT` env vars, a token-bucketed

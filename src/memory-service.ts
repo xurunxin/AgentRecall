@@ -86,7 +86,8 @@ export type MaintenanceAction =
   | "expire_due"
   | "rebuild_markdown_index"
   | "vacuum_fts"
-  | "find_duplicates";
+  | "find_duplicates"
+  | "merge_duplicates";
 
 export type DuplicateGroup = {
   reason: "same_title_and_body" | "same_title" | "same_body" | "similar_title_and_body";
@@ -114,6 +115,20 @@ export type MaintainMemoriesInput = {
    * report a partial result, and for the CLI / smoke test.
    */
   onProgress?: (processed: number, total: number) => void;
+  /**
+   * Stage 8: when true, maintenance actions that mutate state
+   * (`archive_low_value`, `expire_due`, `merge_duplicates`)
+   * return the would-be changes without writing them. Read-
+   * only actions (`find_duplicates`, `rebuild_markdown_index`,
+   * `vacuum_fts`) ignore this flag.
+   */
+  dry_run?: boolean;
+  /**
+   * Stage 8: merge_duplicates strategy. `keep_first` (default)
+   * picks the lowest id as the keep target; `keep_newest` picks
+   * the most recently created memory. Ignored by other actions.
+   */
+  strategy?: "keep_first" | "keep_newest";
 };
 
 export type MaintainMemoriesResult = {
@@ -981,12 +996,14 @@ export class MemoryService {
     switch (input.action) {
       case "find_duplicates":
         return this.findDuplicatesChunked(resolved.value, input);
+      case "merge_duplicates":
+        return this.mergeDuplicates(resolved.value, input);
       case "rebuild_markdown_index":
         return this.rebuildMarkdownIndex(resolved.value);
       case "expire_due":
-        return this.expireDueMemories(resolved.value);
+        return this.expireDueMemories(resolved.value, input.dry_run === true);
       case "archive_low_value":
-        return this.archiveLowValueMemories(resolved.value);
+        return this.archiveLowValueMemories(resolved.value, input.dry_run === true);
       case "vacuum_fts":
         return this.vacuumFts(resolved.value);
     }
@@ -1042,6 +1059,134 @@ export class MemoryService {
     }
 
     return { action: "find_duplicates", changed: 0, details: { groups } };
+  }
+
+  /**
+   * Stage 8: merge_duplicates. Walks the duplicate groups
+   * from find_duplicates and supersedes all but the keep
+   * target. The keep target is selected by `strategy`:
+   * `keep_first` picks the lowest id (alphabetical),
+   * `keep_newest` picks the most recently created memory.
+   * Each merge writes one `superseded` audit event per
+   * superseded memory.
+   *
+   * When `dry_run` is true, the function returns the
+   * would-be merges without writing anything.
+   */
+  private mergeDuplicates(
+    scope: ResolvedReadScope,
+    input: MaintainMemoriesInput
+  ): MaintainMemoriesResult {
+    if (input.batch_size !== undefined) {
+      if (input.batch_size < 50 || input.batch_size > 5000 || !Number.isInteger(input.batch_size)) {
+        throw new Error(
+          `maintain_memories batch_size must be an integer in [50, 5000], got ${input.batch_size}`
+        );
+      }
+    }
+
+    const strategy: "keep_first" | "keep_newest" = input.strategy ?? "keep_first";
+    const dryRun = input.dry_run === true;
+    const onProgress = input.onProgress;
+
+    const allEntries = this.activeEntriesForScope(scope);
+    // Filter to active entries only (the inactive ones
+    // are not in any duplicate group's keep-target race).
+    const groups = this.findDuplicateGroups(allEntries);
+
+    // For each group, pick the keep target by strategy.
+    // Then mark the others as superseded.
+    const wouldSupersede: Array<{
+      reason: DuplicateGroup["reason"];
+      keep_id: string;
+      superseded_ids: string[];
+    }> = [];
+    const actuallySuperseded: Array<{
+      reason: DuplicateGroup["reason"];
+      keep_id: string;
+      superseded_ids: string[];
+    }> = [];
+
+    let processed = 0;
+    const total = groups.length;
+    onProgress?.(0, total);
+
+    for (const group of groups) {
+      // Only consider groups with at least 2 ACTIVE entries
+      // (others may have been superseded by a previous run).
+      const liveEntries: MemoryEntry[] = [];
+      for (const id of group.memory_ids) {
+        const entry = this.store.peekEntry(id);
+        if (entry !== undefined && entry.status === "active") liveEntries.push(entry);
+      }
+      if (liveEntries.length < 2) {
+        processed += 1;
+        onProgress?.(processed, total);
+        continue;
+      }
+
+      const keepTarget = this.pickKeepTarget(liveEntries, strategy);
+      const supersededIds = liveEntries
+        .filter((e) => e.id !== keepTarget.id)
+        .map((e) => e.id)
+        .sort(compareText);
+
+      const record = {
+        reason: group.reason,
+        keep_id: keepTarget.id,
+        superseded_ids: supersededIds
+      };
+      wouldSupersede.push(record);
+
+      if (!dryRun) {
+        this.applySupersede(keepTarget, supersededIds, "merge_duplicates auto-supersede");
+        actuallySuperseded.push(record);
+      }
+
+      processed += 1;
+      onProgress?.(processed, total);
+    }
+
+    return {
+      action: "merge_duplicates",
+      changed: actuallySuperseded.length === 0 ? 0 : actuallySuperseded.reduce((acc, r) => acc + r.superseded_ids.length, 0),
+      details: {
+        strategy,
+        dry_run: dryRun,
+        groups: actuallySuperseded.length > 0 ? actuallySuperseded : wouldSupersede
+      }
+    };
+  }
+
+  private pickKeepTarget(entries: MemoryEntry[], strategy: "keep_first" | "keep_newest"): MemoryEntry {
+    if (strategy === "keep_newest") {
+      return [...entries].sort((a, b) => compareText(b.created_at, a.created_at))[0]!;
+    }
+    // keep_first: lowest id alphabetically.
+    return [...entries].sort((a, b) => compareText(a.id, b.id))[0]!;
+  }
+
+  private applySupersede(keepTarget: MemoryEntry, supersededIds: string[], reason: string): void {
+    this.store.transaction(() => {
+      for (const oldId of supersededIds) {
+        this.store.updateEntry(oldId, {
+          status: "superseded",
+          superseded_by: keepTarget.id,
+          updated_at: nowIso()
+        });
+        this.appendAudit({
+          memory_id: oldId,
+          scope: keepTarget.scope,
+          ...(keepTarget.project_id !== undefined ? { project_id: keepTarget.project_id } : {}),
+          event: "superseded",
+          actor: "agent",
+          reason,
+          metadata: {
+            superseded_by: keepTarget.id
+          }
+        });
+      }
+    });
   }
 
   /**
@@ -1232,11 +1377,27 @@ export class MemoryService {
     }
   }
 
-  private expireDueMemories(scope: ResolvedReadScope): MaintainMemoriesResult {
+  private expireDueMemories(scope: ResolvedReadScope, dryRun = false): MaintainMemoriesResult {
     const now = nowIso();
     const expired = this.activeEntriesForScope(scope)
       .filter((entry) => isDue(entry.expires_at, now))
       .sort((a, b) => compareText(a.expires_at ?? "", b.expires_at ?? "") || compareText(a.id, b.id));
+
+    if (dryRun) {
+      const sample = expired.slice(0, 10).map((e) => ({
+        id: e.id,
+        expires_at: e.expires_at ?? ""
+      }));
+      return {
+        action: "expire_due",
+        changed: 0,
+        details: {
+          dry_run: true,
+          would_expire_count: expired.length,
+          would_expire_sample: sample
+        }
+      };
+    }
 
     return this.store.transaction(() => {
       const forgotten: Array<{ memory_id: string; expires_at: string }> = [];
@@ -1263,10 +1424,28 @@ export class MemoryService {
     });
   }
 
-  private archiveLowValueMemories(scope: ResolvedReadScope): MaintainMemoriesResult {
+  private archiveLowValueMemories(scope: ResolvedReadScope, dryRun = false): MaintainMemoriesResult {
     const lowValue = this.activeEntriesForScope(scope)
       .filter((entry) => entry.importance <= 2 && entry.confidence <= 2 && entry.access_count === 0 && entry.source.kind !== "user")
       .sort(compareLowValueCandidates);
+
+    if (dryRun) {
+      const sample = lowValue.slice(0, 10).map((e) => ({
+        id: e.id,
+        importance: e.importance,
+        confidence: e.confidence,
+        access_count: e.access_count
+      }));
+      return {
+        action: "archive_low_value",
+        changed: 0,
+        details: {
+          dry_run: true,
+          would_archive_count: lowValue.length,
+          would_archive_sample: sample
+        }
+      };
+    }
 
     return this.store.transaction(() => {
       const archived: Array<{ memory_id: string; reason: string }> = [];
