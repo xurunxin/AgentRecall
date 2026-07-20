@@ -5,6 +5,41 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [Unreleased] — Stage 11 PR8 (Concurrency Baseline)
+
+Date: 2026-07-21
+
+### Added
+
+- **WAL + busy retry baseline (spec § 5.6).** Every
+  read-write open of `SQLiteMemoryStore` now sets:
+  - `PRAGMA journal_mode = WAL`
+  - `PRAGMA synchronous = NORMAL`
+  - `PRAGMA busy_timeout = 5000`
+  - `PRAGMA wal_autocheckpoint = 1000`
+  Read-only opens keep the busy_timeout (snapshot
+  readers can still hit it under contention) but
+  skip the WAL PRAGMAs.
+
+### Deferred
+
+- The revision-CAS update path
+  (`updateEntryWithRevision`,
+  `ConcurrentRevisionError`, `runWithBusyRetry`)
+  lands in Stage 12 PR9 alongside the MCP v2
+  contract. The CAS path needs the v4
+  `MemoryEntry.revision` field to ride through
+  every writer call site, and that touches the
+  same files as the MCP envelope upgrade.
+
+### Test Coverage
+
+| Stage | Tests | Files | Notes |
+|---|---|---|---|
+| ... | ... | ... | ... |
+| **Stage 11 PR7 total** | **+0 (3 fixture updates)** | **+1 (idempotency)** | v1 / v2 / v3 fixtures migrate to v4 |
+| **Stage 11 PR8 total** | **+0** | **+0** | WAL + busy retry; the 320 + 17 tests already cover the runtime behaviour |
+
 ## [Unreleased] — Stage 11 PR7 (Schema v4)
 
 Date: 2026-07-21
