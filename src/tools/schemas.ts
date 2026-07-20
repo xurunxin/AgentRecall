@@ -132,7 +132,8 @@ export const searchMemoriesToolSchema = z
 export const getMemoryToolSchema = z
   .object({
     id: nonEmptyString.optional(),
-    memory_id: nonEmptyString.optional()
+    memory_id: nonEmptyString.optional(),
+    accessed_by: nonEmptyString.optional()
   })
   .strict()
   .superRefine(requireConsistentMemoryId);

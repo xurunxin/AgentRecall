@@ -189,7 +189,8 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
     ),
     get_memory: jsonHandler("get_memory", memoryToolSchemas.get_memory, (input) => {
       const memoryId = memoryIdFromInput(input);
-      return service.getMemory(memoryId) ?? asNotFoundMemoryResult(memoryId);
+      const accessedBy = input.accessed_by;
+      return service.getMemory(memoryId, accessedBy) ?? asNotFoundMemoryResult(memoryId);
     }),
     list_memories: jsonHandler("list_memories", memoryToolSchemas.list_memories, (input) =>
       service.listMemories(serviceInput<Parameters<MemoryService["listMemories"]>[0]>(input))

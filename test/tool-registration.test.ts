@@ -194,6 +194,28 @@ describe("memory tool schemas", () => {
     expect(() => memoryToolSchemas.update_memory.parse({ id: "mem_1", memory_id: "mem_2", title: "Updated" })).toThrow();
     expect(() => memoryToolSchemas.forget_memory.parse({ id: "mem_1", memory_id: "mem_2", reason: "obsolete" })).toThrow();
   });
+
+  it("get_memory accepts an accessed_by string and the handler forwards it", async () => {
+    // Schema accepts and validates the field.
+    expect(memoryToolSchemas.get_memory.parse({
+      memory_id: "mem_1",
+      accessed_by: "agent:claude-code"
+    })).toEqual({
+      memory_id: "mem_1",
+      accessed_by: "agent:claude-code"
+    });
+
+    // Handler forwards the value through to MemoryService.getMemory.
+    const service = fakeService();
+    service.getMemory.mockReturnValue({ entry: { id: "mem_1" }, audit: [] });
+    const handlers = createMemoryToolHandlers(service);
+    await handlers.get_memory({ memory_id: "mem_1", accessed_by: "agent:claude-code" });
+    expect(service.getMemory).toHaveBeenCalledWith("mem_1", "agent:claude-code");
+
+    // And omits the second arg when accessed_by is absent.
+    await handlers.get_memory({ memory_id: "mem_2" });
+    expect(service.getMemory).toHaveBeenLastCalledWith("mem_2", undefined);
+  });
 });
 
 describe("createMemoryToolHandlers", () => {

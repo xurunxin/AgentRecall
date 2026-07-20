@@ -8,6 +8,7 @@ import { MarkdownExporter } from "./markdown-exporter.js";
 import { MemoryService } from "./memory-service.js";
 import { SQLiteMemoryStore } from "./sqlite-store.js";
 import { registerMemoryTools } from "./tools/register-tools.js";
+import { resolveActor } from "./actor.js";
 
 export function serverName(): string {
   return "agent-recall";
@@ -31,7 +32,9 @@ export function resolveDataHome(env: NodeJS.ProcessEnv = process.env): string {
 export function createService(dataHome = resolveDataHome()): MemoryService {
   const store = new SQLiteMemoryStore(join(dataHome, "memory.sqlite"));
   const exporter = new MarkdownExporter(join(dataHome, "exports"));
-  return new MemoryService(store, exporter, undefined, dataHome);
+  // Resolve AGENT_RECALL_ACTOR -> structured actor (e.g. agent:claude-code).
+  // Falls back to "agent:unknown" inside resolveActor when the env var is unset.
+  return new MemoryService(store, exporter, resolveActor(undefined), dataHome);
 }
 
 export async function main(): Promise<void> {
