@@ -20,7 +20,7 @@ const TEXT: Record<MemoryToolName, Record<Segment, string>> = {
   remember: {
     TRIGGER: "After learning a durable, reusable user/project fact, decision, or procedure.",
     INPUT: "scope, type, topic, title, body, tags, source, importance, confidence.",
-    OUTPUT: "{ memory_id, status, budget_after, warnings[] }. warnings flag duplicates.",
+    OUTPUT: "{memory_id, status, budget_after, warnings[]}. dup blocks, near_dup is advisory.",
     FAILURE: "capacity_exceeded -> run maintain_memories. secret_detected -> strip and retry."
   },
   search_memories: {
@@ -74,7 +74,7 @@ const TEXT: Record<MemoryToolName, Record<Segment, string>> = {
   maintain_memories: {
     TRIGGER: "For cleanup, or as a fallback when remember returns capacity_exceeded.",
     INPUT: "action: archive_low_value|expire_due|rebuild_index|vacuum_fts|find_duplicates.",
-    OUTPUT: "{ action, changed, details }. expire_due forgets; find_duplicates is read-only.",
+    OUTPUT: "{action, changed, details}. find_duplicates -> same|similar groups (read-only).",
     FAILURE: "invalid_scope. vacuum_fts may be a no-op if the engine does not support it."
   },
   export_memory_context: {
