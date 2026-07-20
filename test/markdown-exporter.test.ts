@@ -34,11 +34,26 @@ function entry(overrides: Partial<MemoryEntry> = {}): MemoryEntry {
 
 describe("MarkdownExporter", () => {
   it("builds bounded context with metadata, deterministic ordering, and no forgotten bodies", () => {
+    // Stage 10 PR4: the exporter is a renderer, not a ranker.
+    // The input order is the ranker output, so this test
+    // supplies the entries in the order the (post-PR4)
+    // RecallRanker would have produced.
     const exporter = new MarkdownExporter(join(mkdtempSync(join(tmpdir(), "lm-export-")), "exports"));
     const markdown = exporter.buildContextPack({
       title: "Context",
       budget_chars: 700,
       entries: [
+        entry({
+          id: "mem_high",
+          scope: "project",
+          project_id: "repo-123",
+          title: "High priority",
+          body: "Important project context.",
+          tags: ["project", "tests"],
+          importance: 5,
+          confidence: 5,
+          updated_at: "2026-06-13T00:01:00.000Z"
+        }),
         entry({
           id: "mem_low",
           title: "Low priority",
@@ -58,17 +73,6 @@ describe("MarkdownExporter", () => {
           status: "archived",
           title: "Archived",
           body: "archived body should not appear by default"
-        }),
-        entry({
-          id: "mem_high",
-          scope: "project",
-          project_id: "repo-123",
-          title: "High priority",
-          body: "Important project context.",
-          tags: ["project", "tests"],
-          importance: 5,
-          confidence: 5,
-          updated_at: "2026-06-13T00:01:00.000Z"
         })
       ]
     });

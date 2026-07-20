@@ -39,6 +39,7 @@ import {
   queryTokens,
   usageFromActiveEntries
 } from "./memory-service-helpers.js";
+import { RANKING_VERSION, rankRecall, type RankedItem } from "./recall-ranker.js";
 
 export type ResolvedReadScope = {
   scope: MemoryScope;
@@ -74,6 +75,13 @@ export type ExportMemoryContextInput = {
   budget_chars: number;
   types?: string[];
   topics?: string[];
+  /**
+   * Stage 10 PR4: cap on how many ranked items the
+   * renderer should consume. Defaults to no cap (i.e. every
+   * ranked entry is included in the order the ranker
+   * produced).
+   */
+  max_items?: number;
 };
 
 type ListServiceFilters = EntryFilters & { project_path?: string };
@@ -280,25 +288,78 @@ export class MemoryReadService {
         }
       }
     }
-    const tokens = queryTokens(input.query);
-    return [...byId.values()]
-      .map((entry) => ({
-        entry,
-        query_score: contextQueryScore(entry, tokens),
-        trust_boost: 0
+    // Stage 10 PR4: route all candidate ordering through the
+    // single RecallRanker. The pre-PR4 code inlined a
+    // query_score sort with `trust_boost: 0` hardcoded; the
+    // markdown exporter then re-sorted by importance + trust,
+    // overriding the read-side ranking. With a single ranker
+    // the export preserves the ranker order end-to-end.
+    const ranked: RankedItem[] = rankRecall({
+      candidates: [...byId.values()],
+      query: input.query ?? "",
+      primaryScope: scope.scope,
+      actor: {
+        currentActor: this.ctx.defaultActor,
+        actorForEntry: (e) => actorForEntry(this.ctx.store, e)
+      },
+      ...(input.max_items !== undefined ? { topK: input.max_items } : {})
+    });
+    return ranked.map((r) => r.entry);
+  }
+
+  /**
+   * Stage 10 PR4: explain_recall tool entry point. Returns
+   * the ranker's score breakdown without recording access
+   * (separate from `exportMemoryContext`).
+   */
+  explainRecall(input: ExportMemoryContextInput): {
+    ranking_version: string;
+    items: Array<{
+      memory_id: string;
+      title: string;
+      score: number;
+      components: RankedItem["components"];
+    }>;
+  } {
+    const resolved = this.resolveReadScope(input);
+    if (!resolved.ok) {
+      return { ranking_version: RANKING_VERSION, items: [] };
+    }
+    const scope: ResolvedReadScope = {
+      scope: resolved.value.scope,
+      ...(resolved.value.project_id !== undefined ? { project_id: resolved.value.project_id } : {})
+    };
+    const scopes: ResolvedReadScope[] = [
+      ...(scope.scope === "project" && input.include_global ? [{ scope: "global" as const }] : []),
+      scope
+    ];
+    const byId = new Map<string, MemoryEntry>();
+    for (const readScope of scopes) {
+      for (const entry of this.contextEntriesForScope(readScope, input.query)) {
+        if (this.matchesContextFilters(entry, input)) {
+          byId.set(entry.id, entry);
+        }
+      }
+    }
+    const ranked = rankRecall({
+      candidates: [...byId.values()],
+      query: input.query ?? "",
+      primaryScope: scope.scope,
+      actor: {
+        currentActor: this.ctx.defaultActor,
+        actorForEntry: (e) => actorForEntry(this.ctx.store, e)
+      },
+      ...(input.max_items !== undefined ? { topK: input.max_items } : {})
+    });
+    return {
+      ranking_version: RANKING_VERSION,
+      items: ranked.map((r) => ({
+        memory_id: r.entry.id,
+        title: r.entry.title,
+        score: r.score,
+        components: r.components
       }))
-      .sort((a, b) => {
-        const queryOrder = b.query_score - a.query_score;
-        if (queryOrder !== 0) return queryOrder;
-        const importanceOrder = b.entry.importance - a.entry.importance;
-        if (importanceOrder !== 0) return importanceOrder;
-        const confidenceOrder = b.entry.confidence - a.entry.confidence;
-        if (confidenceOrder !== 0) return confidenceOrder;
-        const updatedOrder = compareText(b.entry.updated_at, a.entry.updated_at);
-        if (updatedOrder !== 0) return updatedOrder;
-        return compareText(a.entry.id, b.entry.id);
-      })
-      .map((s) => s.entry);
+    };
   }
 
   private contextEntriesForScope(scope: ResolvedReadScope, query: string | undefined): MemoryEntry[] {

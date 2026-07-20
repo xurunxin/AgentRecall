@@ -5,6 +5,54 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [Unreleased] — Stage 10 PR4 (RecallRanker + ContextPacker)
+
+Date: 2026-07-21
+
+### Added
+
+- **`src/services/recall-ranker.ts`** — the single source of
+  truth for recall ordering. Implements the spec § 5.3
+  weighted formula (0.50 lexical, 0.12 scope, 0.10 trust,
+  0.08 importance, 0.06 confidence, 0.06 recency, 0.04
+  access, 0.04 feedback) with explicit stale / conflict /
+  unsafe penalties. Returns `RankedItem[]` together with
+  the per-component score breakdown so `explain_recall`
+  can render the same numbers the renderer consumed.
+- **`MemoryReadService.explainRecall`** — read-side entry
+  point that returns the ranker's score breakdown without
+  recording access (separate from `exportMemoryContext`).
+
+### Changed
+
+- **Read service routes every collect through the
+  `RecallRanker`.** The pre-PR4 `collectContextEntries`
+  inlined a `trust_boost: 0` sort and the markdown
+  exporter re-sorted by importance + trust, so neither
+  the query-score order nor the trust boost was stable
+  end-to-end. Post-PR4 the ranker is the single source of
+  ordering truth; the exporter trusts the input order.
+- **Markdown exporter is a pure renderer.** `buildContextPack`
+  no longer sorts its input. The packer (`boundedJoin`)
+  drops blocks that would overflow the remaining budget
+  rather than breaking the loop, so a single oversized
+  memory can no longer lock out every smaller memory
+  that follows. The `buildContextPack` reserves one
+  character for the trailing newline so the final output
+  length is `<= budget_chars` per spec § 5.3.
+- The `MarkdownExporter` unit test that pre-PR4 assumed
+  the renderer re-sorts by importance is updated to feed
+  the entries in the order the (post-PR4) RecallRanker
+  would have produced.
+
+### Test Coverage
+
+| Stage | Tests | Files | Notes |
+|---|---|---|---|
+| ... | ... | ... | ... |
+| **Stage 10 PR3 total** | **+0 (5 red→green)** | **0** | actor tests now pass |
+| **Stage 10 PR4 total** | **+0 (4 red→green)** | **+1 (recall-ranker)** | ranking tests now pass; remaining red are migration/backup P0 bugs |
+
 ## [Unreleased] — Stage 10 PR3 (RequestContext / Actor Propagation)
 
 Date: 2026-07-21
