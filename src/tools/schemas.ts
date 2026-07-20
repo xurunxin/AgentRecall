@@ -117,7 +117,12 @@ const entryFilterFields = {
   tags: stringListSchema,
   limit: z.number().int().positive().optional(),
   offset: z.number().int().nonnegative().optional(),
-  actor: nonEmptyString.optional()
+  actor: nonEmptyString.optional(),
+  // Stage 6: ISO 8601 date or datetime strings. Lexicographic
+  // comparison is correct for the format.
+  since: z.string().datetime({ offset: true }).optional(),
+  until: z.string().datetime({ offset: true }).optional(),
+  last_accessed_since: z.string().datetime({ offset: true }).optional()
 };
 
 export const searchMemoriesToolSchema = z

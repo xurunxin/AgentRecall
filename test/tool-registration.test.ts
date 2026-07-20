@@ -221,6 +221,38 @@ describe("memory tool schemas", () => {
     expect(service.searchMemories).toHaveBeenCalledWith(expect.objectContaining({ actor: "agent:claude-code" }));
   });
 
+  it("list_memories and search_memories accept time-window filters (stage 6)", () => {
+    // ISO 8601 datetime strings are accepted on both schemas.
+    const parsed = memoryToolSchemas.list_memories.parse({
+      scope: "global",
+      since: "2026-07-13T00:00:00.000Z",
+      until: "2026-07-20T00:00:00.000Z",
+      last_accessed_since: "2026-07-15T00:00:00.000Z"
+    });
+    expect(parsed).toMatchObject({
+      scope: "global",
+      since: "2026-07-13T00:00:00.000Z",
+      until: "2026-07-20T00:00:00.000Z",
+      last_accessed_since: "2026-07-15T00:00:00.000Z"
+    });
+
+    // Invalid (non-ISO) values are rejected.
+    expect(() => memoryToolSchemas.list_memories.parse({ scope: "global", since: "yesterday" })).toThrow();
+    expect(() => memoryToolSchemas.search_memories.parse({ query: "x", scope: "global", until: "2026/07/20" })).toThrow();
+
+    // Handlers forward the fields to the service.
+    const service = fakeService();
+    service.listMemories.mockReturnValue({ items: [] });
+    service.searchMemories.mockReturnValue({ items: [] });
+    const handlers = createMemoryToolHandlers(service);
+    return handlers.list_memories({ scope: "global", since: "2026-07-13T00:00:00.000Z" }).then(() => {
+      expect(service.listMemories).toHaveBeenCalledWith(expect.objectContaining({ since: "2026-07-13T00:00:00.000Z" }));
+      return handlers.search_memories({ query: "x", scope: "global", last_accessed_since: "2026-07-15T00:00:00.000Z" });
+    }).then(() => {
+      expect(service.searchMemories).toHaveBeenCalledWith(expect.objectContaining({ last_accessed_since: "2026-07-15T00:00:00.000Z" }));
+    });
+  });
+
   it("get_memory accepts an accessed_by string and the handler forwards it", async () => {
     // Schema accepts and validates the field.
     expect(memoryToolSchemas.get_memory.parse({

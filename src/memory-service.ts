@@ -1017,6 +1017,11 @@ export class MemoryService {
     if (filters.limit !== undefined) entryFilters.limit = filters.limit;
     if (filters.offset !== undefined) entryFilters.offset = filters.offset;
     if (filters.actor !== undefined) entryFilters.actor = filters.actor;
+    // Stage 6: time-window filters (ISO 8601 strings; lexicographic
+    // comparison is correct for the format).
+    if (filters.since !== undefined) entryFilters.since = filters.since;
+    if (filters.until !== undefined) entryFilters.until = filters.until;
+    if (filters.last_accessed_since !== undefined) entryFilters.last_accessed_since = filters.last_accessed_since;
     return entryFilters;
   }
 
