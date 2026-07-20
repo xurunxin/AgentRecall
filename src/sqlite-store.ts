@@ -20,6 +20,12 @@ export type EntryFilters = {
   tags?: string[];
   limit?: number;
   offset?: number;
+  /**
+   * Stage 4: filter to memories whose "created" audit row was written
+   * by the given actor. Implemented as a subquery in the WHERE clause
+   * to avoid a join on every read.
+   */
+  actor?: string;
 };
 
 export type SearchFilters = EntryFilters & {
@@ -252,6 +258,13 @@ function buildEntryWhere(filters: EntryFilters, alias: string): { where: string;
   for (const tag of filters.tags ?? []) {
     clauses.push(`EXISTS (SELECT 1 FROM json_each(${column("tags_json")}) WHERE value = ?)`);
     params.push(tag);
+  }
+  if (filters.actor !== undefined) {
+    // Subquery: only include entries whose "created" audit row was
+    // written by the given actor. The audit log is keyed by
+    // (memory_id, event) so this is O(1) per memory via the index.
+    clauses.push(`${column("id")} IN (SELECT memory_id FROM audit_events WHERE event = 'created' AND actor = ?)`);
+    params.push(filters.actor);
   }
 
   return {

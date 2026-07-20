@@ -6,6 +6,7 @@
 
 import { nowIso } from "../domain.js";
 import { checkActorDistribution } from "./checks/actor-distribution.js";
+import { checkActorOwnership } from "./checks/actor-ownership.js";
 import { checkAuditHealth } from "./checks/audit-health.js";
 import { checkBackupDirectory } from "./checks/backup-directory.js";
 import { checkCapacityHeadroom } from "./checks/capacity-headroom.js";
@@ -27,7 +28,8 @@ const CHECKS: Array<(ctx: CheckContext) => CheckResult> = [
   checkAuditHealth,
   checkCapacityHeadroom,
   checkActorDistribution,
-  checkLastAccessedBy
+  checkLastAccessedBy,
+  checkActorOwnership
 ];
 
 export function runDoctor(ctx: CheckContext): DoctorReport {

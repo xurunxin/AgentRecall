@@ -67,7 +67,7 @@ describe("last_accessed_by", () => {
     expect(accessed?.entry.last_accessed_by).toBeUndefined();
   });
 
-  it("surfaces in the doctor report (10th check)", () => {
+  it("surfaces in the doctor report (one of the checks)", () => {
     const r = service.remember(baseInput());
     if (!r.ok) throw new Error("setup");
     service.getMemory(r.value.memory_id, "agent:claude-code");
@@ -77,7 +77,9 @@ describe("last_accessed_by", () => {
       now: () => new Date("2026-07-19T20:00:00.000Z")
     };
     const report = runDoctor(ctx);
-    expect(report.results.length).toBe(10);
+    // Stage 4 added actor_ownership as the 11th check; we don't pin
+    // the exact count here, only that last_accessed_by is present.
+    expect(report.results.length).toBeGreaterThanOrEqual(10);
     const labCheck = report.results.find((r) => r.name === "last_accessed_by");
     expect(labCheck?.status).toBe("ok");
     expect(labCheck?.message).toContain("1 entries");

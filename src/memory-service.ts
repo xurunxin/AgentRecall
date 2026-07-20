@@ -976,6 +976,7 @@ export class MemoryService {
     if (filters.tags !== undefined) entryFilters.tags = filters.tags;
     if (filters.limit !== undefined) entryFilters.limit = filters.limit;
     if (filters.offset !== undefined) entryFilters.offset = filters.offset;
+    if (filters.actor !== undefined) entryFilters.actor = filters.actor;
     return entryFilters;
   }
 

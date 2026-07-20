@@ -25,7 +25,7 @@ const TEXT: Record<MemoryToolName, Record<Segment, string>> = {
   },
   search_memories: {
     TRIGGER: "Before writing, or when you need a specific past fact about the project or user.",
-    INPUT: "query, scope, project_id, type?, topic?, tags?, limit? (10), include_global?",
+    INPUT: "query, scope, project_id, type?, topic?, tags?, actor?, limit? (10).",
     OUTPUT: "items[] FTS bm25: id, scope, type, topic, title, tags, source, updated_at.",
     FAILURE: "Empty on no hits. Broaden scope (include_global) or relax topic/type filters."
   },
@@ -37,8 +37,8 @@ const TEXT: Record<MemoryToolName, Record<Segment, string>> = {
   },
   list_memories: {
     TRIGGER: "When you need a flat dump of memories, not a relevance-ranked search.",
-    INPUT: "scope, project_id, status? (active), type?, topic?, tags?, limit?, offset?",
-    OUTPUT: "{ items[] } ordered by updated_at desc.",
+    INPUT: "scope, project_id, type?, topic?, tags?, actor?, status, limit, offset?",
+    OUTPUT: "{ items[] } ordered by updated_at desc, optionally filtered by writer.",
     FAILURE: "Empty list = no active memories in scope. Use get_memory_budget first."
   },
   update_memory: {

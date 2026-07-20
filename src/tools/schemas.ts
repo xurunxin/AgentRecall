@@ -116,7 +116,8 @@ const entryFilterFields = {
   status: statusSchema.default("active"),
   tags: stringListSchema,
   limit: z.number().int().positive().optional(),
-  offset: z.number().int().nonnegative().optional()
+  offset: z.number().int().nonnegative().optional(),
+  actor: nonEmptyString.optional()
 };
 
 export const searchMemoriesToolSchema = z
