@@ -5,6 +5,45 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [Unreleased] — Stage 14 PR-A (Migrate Pre-Backup)
+
+Date: 2026-07-21
+
+### Changed
+
+- **`agent-recall migrate --yes`** (spec § 5.4 AR-P0-004 / § 14). The CLI
+  command now takes a verified pre-migration backup BEFORE advancing
+  `user_version`, and prints a `restore --from <path> --confirm` line on
+  stdout so the user can roll back. Pre-PR-A the command called
+  `store.runMigrations()` directly with no short-circuit on backup
+  failure and no documented rollback path. The store still uses
+  `read_write_no_migrate`; PR-A only tightens the CLI surface. The
+  post-migration state on disk is unchanged: same schema, same user_version.
+
+### Added
+
+- **`test/release-gate/p0-migration-backup.test.ts`** (5 tests). Locks down
+  the new invariant:
+    1. `migrate --yes` writes a backup under `<dataHome>/backups/`,
+       verifies it with `PRAGMA quick_check`, and prints the restore hint.
+    2. A failed pre-mutation backup returns exit 2 with `backup_failed`
+       and does NOT advance `user_version`.
+    3. The backup's `user_version` matches the pre-migration version
+       (captures the pre-migration state, not the post-migration state).
+    4. `--json` output includes `backup.path`, `backup.schema_version`,
+       `backup.quick_check`, and `backup.restore_command`.
+    5. A no-op migration (already at the current version) still takes a
+       backup and prints the restore hint.
+
+### Verification
+
+- 396/396 vitest tests pass (391 baseline + 5 new in
+  `p0-migration-backup.test.ts`).
+- `npm run typecheck` clean.
+- The 3 pre-existing CLI `migrate` tests still pass: the human-readable
+  output still contains "migrated", the JSON shape still exposes `from` and
+  `to`, and the no-`--yes` path still refuses.
+
 ## [Unreleased] — Stage 13 PR11 (CI Matrix)
 
 Date: 2026-07-21
