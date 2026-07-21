@@ -840,7 +840,13 @@ export class MemoryWriteService {
         topic: entry.topic,
         type: entry.type,
         importance: entry.importance,
-        confidence: entry.confidence
+        confidence: entry.confidence,
+        // Stage 14 PR-C (spec § 9.1 audit_revision_gap):
+        // every mutation event must carry the post-image
+        // revision in its metadata so the audit consumer
+        // can correlate the event with the matching
+        // `memory_revisions` row.
+        revision: entry.revision
       }
     }, ctx);
     const usage = this.ctx.store.getBudgetUsage({

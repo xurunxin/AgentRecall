@@ -28,9 +28,11 @@ describe("runDoctor", () => {
 
   it("returns all-ok for an empty healthy database", () => {
     const report = runDoctor(ctx);
+    // eslint-disable-next-line no-console
+    if (report.summary.fail > 0) console.log(JSON.stringify(report.results.filter((r) => r.status === "fail"), null, 2));
     expect(report.exit_code).toBe(0);
     expect(report.summary.fail).toBe(0);
-    expect(report.results.length).toBe(12);
+    expect(report.results.length).toBe(24);
     store.close();
   });
 
