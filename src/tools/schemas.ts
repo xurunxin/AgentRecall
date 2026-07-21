@@ -103,7 +103,12 @@ export const rememberToolSchema = z
     expires_at: nonEmptyString.optional(),
     confirm_write: z.boolean().optional(),
     review_after: nonEmptyString.optional(),
-    supersedes: stringListSchema
+    supersedes: stringListSchema,
+    // Stage 14 PR-B2 (spec § 5.6): when the client retries a
+    // remember after a network blip, the same key replays
+    // the original result (idempotency_key_reuse on key
+    // collision with a different request body).
+    idempotency_key: nonEmptyString.optional()
   })
   .strict()
   .superRefine(requireProjectIdentity);
@@ -177,7 +182,12 @@ export const updateMemoryToolSchema = z
     id: nonEmptyString.optional(),
     memory_id: nonEmptyString.optional(),
     patch: updatePatchSchema.optional(),
-    ...updatePatchFields
+    ...updatePatchFields,
+    // Stage 14 PR-B2 (spec § 5.6): optional idempotency
+    // key. When set, retries with the same key replay the
+    // original mutation; collisions with a different body
+    // surface as idempotency_key_reuse.
+    idempotency_key: nonEmptyString.optional()
   })
   .strict()
   .superRefine((input, context) => {
@@ -207,7 +217,8 @@ export const supersedeMemoryToolSchema = z
   .object({
     old_memory_ids: z.array(nonEmptyString).min(1),
     replacement: rememberToolSchema,
-    reason: nonEmptyString
+    reason: nonEmptyString,
+    idempotency_key: nonEmptyString.optional()
   })
   .strict();
 
@@ -216,7 +227,8 @@ export const mergeMemoriesToolSchema = z
     old_memory_ids: z.array(nonEmptyString).min(2),
     replacement: rememberToolSchema,
     reason: nonEmptyString,
-    strategy: z.enum(["keep_first", "keep_newest"]).default("keep_first")
+    strategy: z.enum(["keep_first", "keep_newest"]).default("keep_first"),
+    idempotency_key: nonEmptyString.optional()
   })
   .strict();
 
@@ -224,7 +236,19 @@ export const forgetMemoryToolSchema = z
   .object({
     id: nonEmptyString.optional(),
     memory_id: nonEmptyString.optional(),
-    reason: nonEmptyString
+    reason: nonEmptyString,
+    // Stage 14 PR-B2 (spec § 5.6): idempotency key on the
+    // forget operation as a whole; a network retry of the
+    // same call replays the original `not_found` /
+    // success result. A retry with a different body
+    // surfaces `idempotency_mismatch`.
+    idempotency_key: nonEmptyString.optional(),
+    // Stage 14 PR-B2 (spec § 5.6): optimistic-concurrency
+    // control. When the caller knows the entry's current
+    // revision, pass it here so a concurrent writer wins
+    // the race and we surface `not_found` (the row has
+    // already moved) instead of clobbering the new state.
+    expected_revision: z.number().int().nonnegative().optional()
   })
   .strict()
   .superRefine(requireConsistentMemoryId);

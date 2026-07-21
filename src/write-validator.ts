@@ -41,6 +41,15 @@ export type RememberInput = {
    * ids so the agent can decide whether to confirm, merge, or cancel.
    */
   confirm_write?: boolean;
+  /**
+   * Stage 14 PR-B2 (spec § 5.6): optional idempotency key. When
+   * set, a retry of the same request body replays the original
+   * result without re-running the mutation. A retry with a
+   * different body under the same key surfaces
+   * `idempotency_key_reuse` so the caller can detect a
+   * client-side bug.
+   */
+  idempotency_key?: string;
 };
 
 export type ValidatedRememberInput = {
@@ -85,6 +94,11 @@ export type UpdateInput = Partial<
    * so they can re-read and retry.
    */
   expected_revision?: number;
+  /**
+   * Stage 14 PR-B2 (spec § 5.6): optional idempotency key.
+   * Same semantics as on `RememberInput`.
+   */
+  idempotency_key?: string;
 };
 
 export type ValidatedUpdateInput = UpdateInput;
@@ -100,7 +114,16 @@ const MUTABLE_UPDATE_FIELDS = new Set([
   "status",
   "expires_at",
   "review_after",
-  "expected_revision"
+  "expected_revision",
+  // Stage 14 PR-B2 (spec § 5.6): idempotency_key is
+  // allowed on the update payload (it is a control
+  // field, not a memory field) but it is not propagated
+  // to the entry row; `validateUpdateInput` only
+  // validates the keys are allowed, not that they
+  // produce entry changes. `idempotency_key` is read
+  // by the write service's `checkIdempotency` helper
+  // before any state change.
+  "idempotency_key"
 ]);
 
 export function validateRememberInput(input: unknown): Result<ValidatedRememberInput, ValidationError> {
@@ -233,6 +256,20 @@ export function validateUpdateInput(input: unknown): Result<ValidatedUpdateInput
   if ("review_after" in input) {
     const reviewAfter = parseOptionalNonEmptyString(input, "review_after", issues);
     if (reviewAfter !== undefined) value.review_after = reviewAfter;
+  }
+  // Stage 12 PR9: optimistic-concurrency control. The
+  // validator keeps `expected_revision` in the validated
+  // shape so the write service can route the write
+  // through `updateEntryWithRevision`. Without this
+  // copy, the CAS branch in `updateMemory` is never
+  // reached and the optimistic-concurrency contract
+  // silently degrades to a non-CAS overwrite.
+  if ("expected_revision" in input) {
+    if (typeof input.expected_revision === "number" && Number.isInteger(input.expected_revision) && input.expected_revision >= 0) {
+      value.expected_revision = input.expected_revision;
+    } else {
+      issues.push("expected_revision");
+    }
   }
   if (issues.length > 0) {
     return invalidSchema(issues);
