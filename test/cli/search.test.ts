@@ -81,6 +81,9 @@ describe("searchCommand", () => {
       metadata: {},
       created_at: "2026-07-19T00:00:00.000Z"
     });
+    // Stage 14 PR-B1: stamp writer_actor_id on the row to match
+    // the audit row.
+    store.updateEntry("mem_s", { writer_actor_id: "agent:claude-code", updated_at: "2026-07-19T00:00:00.000Z" });
     // Add a second matching memory written by a different actor
     store.insertEntry({
       id: "mem_s2",
@@ -100,7 +103,17 @@ describe("searchCommand", () => {
       access_count: 0,
       supersedes: [],
       token_estimate: 1,
-      char_count: 2
+      char_count: 2,
+      revision: 1,
+      writer_actor_id: "agent:cursor",
+      content_hash: undefined,
+      pinned: false,
+      trust_level: "agent_observed",
+      sensitivity: "normal",
+      valid_from: undefined,
+      valid_until: undefined,
+      deleted_at: undefined,
+      metadata: {}
     });
     store.appendAudit({
       id: "aud_search_2",

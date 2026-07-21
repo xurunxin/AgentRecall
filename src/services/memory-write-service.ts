@@ -10,6 +10,15 @@
 // emit audit events for accepted writes and rejected
 // writes (so the agent and the human reviewer can see
 // what happened).
+//
+// Stage 14 PR-B1 (spec § 5.2 AR-P0-002): every public method
+// takes an optional `RequestContext` as its last parameter.
+// When present, it (a) replaces the `WriteContext.defaultActor`
+// for the audit `actor` field and (b) attaches the request's
+// trace fields (request_id, session_id, tool_call_id, etc.) to
+// the audit `metadata`. When absent, the legacy behaviour
+// (process-wide `defaultActor`) is preserved so pre-PR-B1
+// callers and tests keep working.
 
 import { nowIso, err, ok, type MemoryEntry, type MemoryBudget, type MemoryScope, type ProjectScope, type Result } from "../domain.js";
 import type { SQLiteMemoryStore } from "../sqlite-store.js";
@@ -22,6 +31,7 @@ import {
 } from "../write-validator.js";
 import { resolveMemoryScope } from "../scope-resolver.js";
 import { computeEntrySize, createMemoryId } from "../domain.js";
+import type { RequestContext } from "../request-context.js";
 import {
   activeEntriesFor,
   appendAudit,
@@ -127,8 +137,8 @@ export class MemoryWriteService {
     });
   }
 
-  remember(input: RememberInput): Result<RememberResult, RememberError> {
-    const prepared = this.prepareRemember(input, true);
+  remember(input: RememberInput, ctx?: RequestContext): Result<RememberResult, RememberError> {
+    const prepared = this.prepareRemember(input, true, ctx);
     if (!prepared.ok) {
       return prepared;
     }
@@ -142,7 +152,8 @@ export class MemoryWriteService {
           this.ctx.defaultActor,
           input,
           "duplicate_candidate",
-          { matching_ids: matchingIds }
+          { matching_ids: matchingIds },
+          ctx
         );
         return err(
           "duplicate_candidate",
@@ -153,13 +164,14 @@ export class MemoryWriteService {
     }
     const suppressed = input.confirm_write === true ? [] : prepared.value.budget.warnings;
     return this.ctx.store.transaction(() =>
-      ok(this.commitPreparedRemember(prepared.value, suppressed))
+      ok(this.commitPreparedRemember(prepared.value, suppressed, ctx))
     );
   }
 
   updateMemory(
     id: string,
-    input: UpdateInput
+    input: UpdateInput,
+    ctx?: RequestContext
   ): Result<{ memory_id: string }, UpdateError> {
     // Stage 9: peek the current entry first so every rejection
     // path (invalid_state, secret_detected, invalid_schema) can
@@ -173,7 +185,7 @@ export class MemoryWriteService {
       auditRejectedForEntry(this.ctx.store, this.ctx.defaultActor, current, "invalid_state", {
         memory_id: id,
         status: current.status
-      });
+      }, ctx);
       return err("invalid_state", "only active or archived memories can be updated", {
         memory_id: id,
         status: current.status
@@ -182,7 +194,7 @@ export class MemoryWriteService {
 
     const validated = validateUpdateInput(input);
     if (!validated.ok) {
-      auditRejectedForEntry(this.ctx.store, this.ctx.defaultActor, current, validated.error, validated.details);
+      auditRejectedForEntry(this.ctx.store, this.ctx.defaultActor, current, validated.error, validated.details, ctx);
       return err(validated.error, validated.message, validated.details);
     }
 
@@ -205,7 +217,7 @@ export class MemoryWriteService {
       excludedActiveMemoryIds: new Set([id])
     });
     if (!budgetResult.ok) {
-      auditRejectedForEntry(this.ctx.store, this.ctx.defaultActor, current, "capacity_exceeded", budgetResult.details);
+      auditRejectedForEntry(this.ctx.store, this.ctx.defaultActor, current, "capacity_exceeded", budgetResult.details, ctx);
       return err("capacity_exceeded", "capacity exceeded", budgetResult.details);
     }
     const event = current.status === "active" && patch.status === "archived" ? "archived" : "updated";
@@ -228,7 +240,8 @@ export class MemoryWriteService {
           this.ctx.defaultActor,
           current,
           "stale_revision",
-          { memory_id: id, expected_revision: expected, current_revision: currentRevision }
+          { memory_id: id, expected_revision: expected, current_revision: currentRevision },
+          ctx
         );
         return err("stale_revision", "memory revision has changed; re-read and retry", {
           memory_id: id,
@@ -242,7 +255,7 @@ export class MemoryWriteService {
         ...(current.project_id !== undefined ? { project_id: current.project_id } : {}),
         event,
         metadata: { fields: Object.keys(validated.value).sort() }
-      });
+      }, ctx);
       return ok({ memory_id: id });
     }
     return this.ctx.store.transaction(() => {
@@ -253,7 +266,7 @@ export class MemoryWriteService {
         ...(current.project_id !== undefined ? { project_id: current.project_id } : {}),
         event,
         metadata: { fields: Object.keys(validated.value).sort() }
-      });
+      }, ctx);
       return ok({ memory_id: id });
     });
   }
@@ -262,18 +275,19 @@ export class MemoryWriteService {
     old_memory_ids: string[];
     replacement: RememberInput;
     reason: string;
-  }): Result<{ memory_id: string }, SupersedeError> {
+  }, ctx?: RequestContext): Result<{ memory_id: string }, SupersedeError> {
     const oldIds = [...new Set(input.old_memory_ids)];
     if (oldIds.length === 0 || oldIds.some((id) => id.trim().length === 0)) {
       auditRejected(this.ctx.store, this.ctx.defaultActor, input.replacement, "invalid_schema", {
         old_memory_ids_count: oldIds.length
-      });
+      }, ctx);
       return err("invalid_schema", "supersede requires at least one old memory id");
     }
 
     const resolvedReplacement = this.resolveRememberInput(
       { ...input.replacement, supersedes: oldIds },
-      true
+      true,
+      ctx
     );
     if (!resolvedReplacement.ok) return resolvedReplacement;
     const replacement = resolvedReplacement.value.entry;
@@ -288,7 +302,8 @@ export class MemoryWriteService {
           replacement.scope,
           replacement.project_id,
           "not_found",
-          { memory_id: oldId }
+          { memory_id: oldId },
+          ctx
         );
         return err("not_found", "memory not found", { memory_id: oldId });
       }
@@ -296,7 +311,7 @@ export class MemoryWriteService {
         auditRejectedForEntry(this.ctx.store, this.ctx.defaultActor, old, "invalid_state", {
           memory_id: oldId,
           status: old.status
-        });
+        }, ctx);
         return err("invalid_state", "only active or archived memories can be superseded", {
           memory_id: oldId,
           status: old.status
@@ -310,7 +325,7 @@ export class MemoryWriteService {
           memory_id: old.id,
           replacement_scope: replacement.scope,
           replacement_project_id: replacement.project_id ?? null
-        });
+        }, ctx);
         return err("invalid_scope", "superseded memories must match replacement scope and project_id", {
           memory_id: old.id,
           replacement_scope: replacement.scope,
@@ -328,7 +343,8 @@ export class MemoryWriteService {
           replacement.scope,
           replacement.project_id,
           "invalid_scope",
-          undefined
+          undefined,
+          ctx
         );
         return err("invalid_scope", "project scope requires project_id or project_path");
       }
@@ -351,7 +367,8 @@ export class MemoryWriteService {
         replacement.scope,
         replacement.project_id,
         "capacity_exceeded",
-        budgetResult.details
+        budgetResult.details,
+        ctx
       );
       return err(budgetResult.error, budgetResult.message, budgetResult.details);
     }
@@ -361,7 +378,7 @@ export class MemoryWriteService {
     };
 
     return this.ctx.store.transaction(() => {
-      const created = this.commitPreparedRemember(prepared);
+      const created = this.commitPreparedRemember(prepared, undefined, ctx);
       for (const old of oldEntries) {
         this.ctx.store.updateEntry(old.id, {
           status: "superseded",
@@ -377,7 +394,7 @@ export class MemoryWriteService {
           metadata: {
             superseded_by: created.memory_id
           }
-        });
+        }, ctx);
       }
       return ok({ memory_id: created.memory_id });
     });
@@ -388,17 +405,18 @@ export class MemoryWriteService {
     replacement: RememberInput;
     reason: string;
     strategy?: "keep_first" | "keep_newest";
-  }): Result<{ memory_id: string; merged_from?: string[] }, SupersedeError> {
+  }, ctx?: RequestContext): Result<{ memory_id: string; merged_from?: string[] }, SupersedeError> {
     const oldIds = [...new Set(input.old_memory_ids)];
     if (oldIds.length < 2) {
       auditRejected(this.ctx.store, this.ctx.defaultActor, input.replacement, "invalid_schema", {
         old_memory_ids_count: oldIds.length
-      });
+      }, ctx);
       return err("invalid_schema", "merge requires at least two old memory ids");
     }
     const resolvedReplacement = this.resolveRememberInput(
       { ...input.replacement, supersedes: oldIds },
-      true
+      true,
+      ctx
     );
     if (!resolvedReplacement.ok) return resolvedReplacement;
     const replacement = resolvedReplacement.value.entry;
@@ -413,7 +431,8 @@ export class MemoryWriteService {
           replacement.scope,
           replacement.project_id,
           "not_found",
-          { memory_id: oldId }
+          { memory_id: oldId },
+          ctx
         );
         return err("not_found", "memory not found", { memory_id: oldId });
       }
@@ -421,7 +440,7 @@ export class MemoryWriteService {
         auditRejectedForEntry(this.ctx.store, this.ctx.defaultActor, old, "invalid_state", {
           memory_id: oldId,
           status: old.status
-        });
+        }, ctx);
         return err("invalid_state", "only active or archived memories can be merged", {
           memory_id: oldId,
           status: old.status
@@ -435,7 +454,7 @@ export class MemoryWriteService {
           memory_id: old.id,
           replacement_scope: replacement.scope,
           replacement_project_id: replacement.project_id ?? null
-        });
+        }, ctx);
         return err("invalid_scope", "merged memories must match replacement scope and project_id", {
           memory_id: old.id,
           replacement_scope: replacement.scope,
@@ -468,7 +487,8 @@ export class MemoryWriteService {
         replacement.scope,
         replacement.project_id,
         "capacity_exceeded",
-        budgetResult.details
+        budgetResult.details,
+        ctx
       );
       return err(budgetResult.error, budgetResult.message, budgetResult.details);
     }
@@ -482,7 +502,7 @@ export class MemoryWriteService {
       : oldEntries.reduce((acc, e) => (acc === undefined || e.created_at < acc.created_at ? e : acc)).id;
 
     return this.ctx.store.transaction(() => {
-      const created = this.commitPreparedRemember(prepared);
+      const created = this.commitPreparedRemember(prepared, undefined, ctx);
       for (const old of oldEntries) {
         this.ctx.store.updateEntry(old.id, {
           status: "superseded",
@@ -500,7 +520,7 @@ export class MemoryWriteService {
             canonical: old.id === canonicalId,
             merged_count: oldEntries.length
           }
-        });
+        }, ctx);
       }
       return ok({
         memory_id: created.memory_id,
@@ -511,7 +531,8 @@ export class MemoryWriteService {
 
   forgetMemory(
     id: string,
-    reason: string
+    reason: string,
+    ctx?: RequestContext
   ): Result<{ memory_id: string; released_chars: number }, ForgetError> {
     const current = this.ctx.store.peekEntry(id);
     if (current === undefined) {
@@ -534,7 +555,7 @@ export class MemoryWriteService {
         event: "forgotten",
         reason,
         metadata: { released_chars }
-      });
+      }, ctx);
       return ok({ memory_id: id, released_chars });
     });
   }
@@ -546,16 +567,17 @@ export class MemoryWriteService {
   private prepareRemember(
     input: RememberInput,
     auditRejections: boolean,
+    ctx?: RequestContext,
     options: PrepareRememberOptions = {}
   ): Result<PreparedRemember, RememberError> {
-    const resolved = this.resolveRememberInput(input, auditRejections);
+    const resolved = this.resolveRememberInput(input, auditRejections, ctx);
     if (!resolved.ok) return resolved;
 
     let budget = DEFAULT_GLOBAL_BUDGET;
     if (resolved.value.entry.scope === "project") {
       const projectId = resolved.value.entry.project_id;
       if (projectId === undefined) {
-        if (auditRejections) auditRejected(this.ctx.store, this.ctx.defaultActor, input, "invalid_scope", undefined);
+        if (auditRejections) auditRejected(this.ctx.store, this.ctx.defaultActor, input, "invalid_scope", undefined, ctx);
         return err("invalid_scope", "project scope requires project_id or project_path");
       }
       budget = ensureProjectScope(
@@ -568,7 +590,7 @@ export class MemoryWriteService {
     }
     const budgetResult = evaluateEntryBudget(this.ctx.store, resolved.value.entry, budget, options);
     if (!budgetResult.ok) {
-      if (auditRejections) auditRejected(this.ctx.store, this.ctx.defaultActor, input, "capacity_exceeded", budgetResult.details);
+      if (auditRejections) auditRejected(this.ctx.store, this.ctx.defaultActor, input, "capacity_exceeded", budgetResult.details, ctx);
       return err(budgetResult.error, budgetResult.message, budgetResult.details);
     }
     return ok({
@@ -579,20 +601,21 @@ export class MemoryWriteService {
 
   private resolveRememberInput(
     input: RememberInput,
-    auditRejections: boolean
+    auditRejections: boolean,
+    ctx?: RequestContext
   ): Result<ResolvedRemember, RememberError> {
     const validated = validateRememberInput(input);
     if (!validated.ok) {
-      if (auditRejections) auditRejected(this.ctx.store, this.ctx.defaultActor, input, validated.error, validated.details);
+      if (auditRejections) auditRejected(this.ctx.store, this.ctx.defaultActor, input, validated.error, validated.details, ctx);
       return validated;
     }
     const resolved = resolveMemoryScope(validated.value);
     if (!resolved.ok) {
-      if (auditRejections) auditRejected(this.ctx.store, this.ctx.defaultActor, input, resolved.error, resolved.details);
+      if (auditRejections) auditRejected(this.ctx.store, this.ctx.defaultActor, input, resolved.error, resolved.details, ctx);
       return resolved;
     }
     if (resolved.value.scope === "project" && resolved.value.project_id === undefined) {
-      if (auditRejections) auditRejected(this.ctx.store, this.ctx.defaultActor, input, "invalid_scope", undefined);
+      if (auditRejections) auditRejected(this.ctx.store, this.ctx.defaultActor, input, "invalid_scope", undefined, ctx);
       return err("invalid_scope", "project scope requires project_id or project_path");
     }
     return ok({
@@ -613,17 +636,23 @@ export class MemoryWriteService {
 
   private commitPreparedRemember(
     prepared: PreparedRemember,
-    warnings?: PreparedRemember["budget"]["warnings"]
+    warnings?: PreparedRemember["budget"]["warnings"],
+    ctx?: RequestContext
   ): RememberResult {
-    const entry = prepared.entry;
+    // Stage 14 PR-B1 (spec § 5.2 #5): stamp writer_actor_id on
+    // the entry from the resolved caller. Pre-PR-B1 the column
+    // was left at the `agent:pending` default and the actor
+    // filter on listEntries / searchEntries walked the audit log
+    // (N+1) to recover the writer. Post-PR-B1 the writer lives
+    // on the row and the filter is a single equality predicate.
+    const writer = ctx?.actor_id ?? this.ctx.defaultActor;
+    const entry: MemoryEntry = { ...prepared.entry, writer_actor_id: writer };
     this.ctx.store.insertEntry(entry);
-    // Omit `actor` so appendAudit falls back to this.defaultActor
-    // (resolved through resolveActor). The "created" event is the
-    // canonical writer record used by `actorForEntry` for trust
-    // boost and near-duplicate advisory, so the actor here MUST
-    // reflect the calling service's identity, not a hardcoded
-    // "agent".
-    appendAudit(this.ctx.store, this.ctx.defaultActor, {
+    // The "created" event is the canonical audit record used by
+    // `actorForEntry` (with audit-log fallback) for trust boost
+    // and near-duplicate advisory. Its actor must match the
+    // stamped `writer_actor_id` on the row.
+    appendAudit(this.ctx.store, writer, {
       memory_id: entry.id,
       scope: entry.scope,
       ...(entry.project_id !== undefined ? { project_id: entry.project_id } : {}),
@@ -634,7 +663,7 @@ export class MemoryWriteService {
         importance: entry.importance,
         confidence: entry.confidence
       }
-    });
+    }, ctx);
     const usage = this.ctx.store.getBudgetUsage({
       scope: entry.scope,
       ...(entry.project_id !== undefined ? { project_id: entry.project_id } : {})

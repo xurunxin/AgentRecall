@@ -131,7 +131,8 @@ type EntryPatchField =
   | "supersedes"
   | "superseded_by"
   | "token_estimate"
-  | "char_count";
+  | "char_count"
+  | "writer_actor_id";
 
 export type EntryPatch = Partial<Pick<MemoryEntry, EntryPatchField>> & Pick<MemoryEntry, "updated_at">;
 
@@ -305,7 +306,8 @@ const ENTRY_PATCH_FIELDS = [
   "supersedes",
   "superseded_by",
   "token_estimate",
-  "char_count"
+  "char_count",
+  "writer_actor_id"
 ] as const satisfies readonly EntryPatchField[];
 
 function sanitizeEntryPatch(patch: EntryPatch): EntryPatch {
@@ -349,10 +351,14 @@ function buildEntryWhere(filters: EntryFilters, alias: string): { where: string;
     params.push(tag);
   }
   if (filters.actor !== undefined) {
-    // Subquery: only include entries whose "created" audit row was
-    // written by the given actor. The audit log is keyed by
-    // (memory_id, event) so this is O(1) per memory via the index.
-    clauses.push(`${column("id")} IN (SELECT memory_id FROM audit_events WHERE event = 'created' AND actor = ?)`);
+    // Stage 14 PR-B1 (spec § 5.2 #5): the canonical writer lives
+    // on `memory_entries.writer_actor_id` (filled by the v3->v4
+    // migration from the audit log). The pre-PR-B1 subquery
+    // against `audit_events` was a per-row N+1 — every filter
+    // check had to walk the audit log. The writer column is
+    // indexed by the primary key lookup, so the filter is a
+    // single equality predicate.
+    clauses.push(`${column("writer_actor_id")} = ?`);
     params.push(filters.actor);
   }
   if (filters.since !== undefined) {

@@ -213,6 +213,29 @@ describe("Stable error codes (spec § 6.3)", () => {
     ]));
   });
 
+  it("exposes the v1.0 spec-named codes in addition to the legacy aliases", () => {
+    // Spec § 8.3: stage 14 PR-B1 adds the spec-named codes
+    // `scope_mismatch`, `project_identity_conflict`,
+    // `unsafe_content`, `db_busy`, `migration_required`,
+    // `backup_failed`, `maintenance_plan_stale`, `cancelled`,
+    // and the explicit `duplicate_candidate` /
+    // `idempotency_key_reuse` aliases. The legacy names
+    // (`duplicate`, `busy`, `idempotency_mismatch`,
+    // `plan_invalidated`) are kept for backward compatibility.
+    expect(STABLE_ERROR_CODES).toEqual(expect.arrayContaining([
+      "scope_mismatch",
+      "project_identity_conflict",
+      "unsafe_content",
+      "duplicate_candidate",
+      "db_busy",
+      "idempotency_key_reuse",
+      "maintenance_plan_stale",
+      "migration_required",
+      "backup_failed",
+      "cancelled"
+    ]));
+  });
+
   it("classifies codes as transient or permanent", () => {
     expect(errorCategory("busy")).toBe("transient");
     expect(errorCategory("io_error")).toBe("transient");
@@ -220,7 +243,9 @@ describe("Stable error codes (spec § 6.3)", () => {
     expect(errorCategory("unavailable")).toBe("transient");
     expect(errorCategory("internal_error")).toBe("transient");
     expect(errorCategory("invalid_schema")).toBe("permanent");
-    expect(errorCategory("stale_revision")).toBe("permanent");
+    // Spec § 8.3 marks stale_revision as retryable: the
+    // caller should re-read the latest value and retry.
+    expect(errorCategory("stale_revision")).toBe("transient");
     expect(errorCategory("plan_invalidated")).toBe("permanent");
     expect(errorCategory("nonsense_code")).toBe("permanent");
   });

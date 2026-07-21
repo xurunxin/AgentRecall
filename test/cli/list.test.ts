@@ -84,6 +84,10 @@ describe("listCommand", () => {
       metadata: {},
       created_at: "2026-07-19T00:00:00.000Z"
     });
+    // Stage 14 PR-B1: stamp writer_actor_id on the row to match
+    // the audit row (the pre-PR-B1 filter used the audit log as
+    // a subquery; post-PR-B1 it reads `writer_actor_id` directly).
+    store.updateEntry("mem_a", { writer_actor_id: "agent:claude-code", updated_at: "2026-07-19T00:00:00.000Z" });
     // Add a second memory written by a different actor
     store.insertEntry({
       id: "mem_b",
@@ -103,7 +107,17 @@ describe("listCommand", () => {
       access_count: 0,
       supersedes: [],
       token_estimate: 1,
-      char_count: 2
+      char_count: 2,
+      revision: 1,
+      writer_actor_id: "agent:cursor",
+      content_hash: undefined,
+      pinned: false,
+      trust_level: "agent_observed",
+      sensitivity: "normal",
+      valid_from: undefined,
+      valid_until: undefined,
+      deleted_at: undefined,
+      metadata: {}
     });
     store.appendAudit({
       id: "aud_test_2",

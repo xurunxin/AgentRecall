@@ -19,6 +19,15 @@
 // `registerMemoryResources` (see `./resources.ts`) — the MCP
 // v2 spec lets tools and resources coexist on the same
 // server.
+//
+// Stage 14 PR-B1 (spec § 5.2 AR-P0-002): every tool handler
+// builds a `RequestContext` from the MCP `extra` envelope
+// (clientInfo, sessionId, signal, progressToken, JSON-RPC
+// id) and threads it through the service call. The actor
+// for the audit event is the resolved `ctx.actor_id`; the
+// trace fields (request_id / session_id / tool_call_id /
+// client_name / client_version) are mixed into the event's
+// metadata by the `appendAudit` helper.
 
 import type { CallToolResult, ServerNotification } from "@modelcontextprotocol/sdk/types.js";
 import { z, type ZodType } from "zod";
@@ -30,6 +39,7 @@ import { memoryToolDescriptions } from "./descriptions.js";
 import { buildEnvelopeResult, type ToolEnvelope } from "./mcp-envelope.js";
 import { memoryToolSchemas, type MemoryToolName } from "./schemas.js";
 import { makeProgressCallback, type ProgressLikeExtra } from "./progress-callback.js";
+import { buildRequestContext, type RequestContext } from "../request-context.js";
 
 export type MemoryToolHandler = (input: unknown, extra?: HandlerExtra) => Promise<CallToolResult>;
 export type MemoryToolHandlers = Record<MemoryToolName, MemoryToolHandler>;
@@ -216,10 +226,39 @@ function adaptProgress(
   };
 }
 
+/**
+ * Build a RequestContext from the MCP `extra` envelope. The
+ * session id is stable for the lifetime of the MCP connection
+ * (the SDK pins one `sessionId` per transport). The request id
+ * is fresh per tool call so retried requests get a distinct
+ * audit trail unless the client explicitly re-uses the same
+ * JSON-RPC id (in which case the SDK forwards the same id and
+ * `buildRequestContext` preserves it).
+ */
+function buildToolRequestContext(
+  extra: HandlerExtra | undefined,
+  override: { actor?: string; project_id?: string } = {}
+): RequestContext {
+  const meta = (extra?._meta ?? {}) as {
+    clientName?: string;
+    clientVersion?: string;
+    sessionId?: string;
+    progressToken?: string | number;
+  };
+  return buildRequestContext({
+    ...(override.actor !== undefined ? { actor_override: override.actor } : {}),
+    ...(meta.clientName !== undefined ? { client_name: meta.clientName } : {}),
+    ...(meta.clientVersion !== undefined ? { client_version: meta.clientVersion } : {}),
+    ...(meta.sessionId !== undefined ? { session_id: meta.sessionId } : {}),
+    ...(extra !== undefined ? { tool_call_id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}` } : {}),
+    ...(override.project_id !== undefined ? { project_id: override.project_id } : {})
+  });
+}
+
 function envelopeHandler<T>(
   toolName: MemoryToolName,
   schema: ZodType<T>,
-  run: (input: T, extra: HandlerExtra | undefined) => unknown | Promise<unknown>
+  run: (input: T, extra: HandlerExtra | undefined, ctx: RequestContext) => unknown | Promise<unknown>
 ): (input: unknown, extra?: HandlerExtra) => Promise<CallToolResult> {
   return async (input: unknown, extra?: HandlerExtra) => {
     const started = Date.now();
@@ -252,8 +291,15 @@ function envelopeHandler<T>(
       });
     }
 
+    // Stage 14 PR-B1: build a per-call RequestContext from the
+    // MCP `extra` envelope. The actor is the resolved
+    // `AGENT_RECALL_ACTOR` env / fallback; the trace fields
+    // (request_id, session_id, tool_call_id, client_name,
+    // client_version) are derived from the SDK envelope.
+    const ctx = buildToolRequestContext(extra);
+
     try {
-      const raw = await run(parsed.data, extra);
+      const raw = await run(parsed.data, extra, ctx);
       const duration = Date.now() - started;
       const failure = asResultFailure(raw);
       if (failure !== undefined) {
@@ -293,7 +339,7 @@ function envelopeHandler<T>(
 function textEnvelopeHandler<T>(
   toolName: MemoryToolName,
   schema: ZodType<T>,
-  run: (input: T, extra: HandlerExtra | undefined) => string | Promise<string>
+  run: (input: T, extra: HandlerExtra | undefined, ctx: RequestContext) => string | Promise<string>
 ): (input: unknown, extra?: HandlerExtra) => Promise<CallToolResult> {
   return async (input: unknown, extra?: HandlerExtra) => {
     const started = Date.now();
@@ -325,8 +371,10 @@ function textEnvelopeHandler<T>(
         durationMs: Date.now() - started
       });
     }
+    // Stage 14 PR-B1: build a per-call RequestContext.
+    const ctx = buildToolRequestContext(extra);
     try {
-      const text = await run(parsed.data, extra);
+      const text = await run(parsed.data, extra, ctx);
       const legacy: CallToolResult = textResult(text);
       // For text tools the v2 success payload is the markdown
       // body wrapped under `data: { markdown }`. Clients that
@@ -360,11 +408,11 @@ function asNotFoundMemoryResult(memoryId: string): { ok: false; error: "not_foun
 
 export function createMemoryToolHandlers(service: MemoryService): MemoryToolHandlers {
   return {
-    recall_context: textEnvelopeHandler("recall_context", memoryToolSchemas.recall_context, (input) =>
-      service.exportMemoryContext(serviceInput<Parameters<MemoryService["exportMemoryContext"]>[0]>(input))
+    recall_context: textEnvelopeHandler("recall_context", memoryToolSchemas.recall_context, (input, _extra, ctx) =>
+      service.exportMemoryContext(serviceInput<Parameters<MemoryService["exportMemoryContext"]>[0]>(input), ctx)
     ),
-    remember: envelopeHandler("remember", memoryToolSchemas.remember, (input) =>
-      service.remember(serviceInput<Parameters<MemoryService["remember"]>[0]>(input))
+    remember: envelopeHandler("remember", memoryToolSchemas.remember, (input, _extra, ctx) =>
+      service.remember(serviceInput<Parameters<MemoryService["remember"]>[0]>(input), ctx)
     ),
     search_memories: envelopeHandler("search_memories", memoryToolSchemas.search_memories, (input) =>
       service.searchMemories(serviceInput<Parameters<MemoryService["searchMemories"]>[0]>(input))
@@ -377,30 +425,30 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
     list_memories: envelopeHandler("list_memories", memoryToolSchemas.list_memories, (input) =>
       service.listMemories(serviceInput<Parameters<MemoryService["listMemories"]>[0]>(input))
     ),
-    update_memory: envelopeHandler("update_memory", memoryToolSchemas.update_memory, (input) =>
-      service.updateMemory(memoryIdFromInput(input), patchFromUpdateInput(input))
+    update_memory: envelopeHandler("update_memory", memoryToolSchemas.update_memory, (input, _extra, ctx) =>
+      service.updateMemory(memoryIdFromInput(input), patchFromUpdateInput(input), ctx)
     ),
-    supersede_memory: envelopeHandler("supersede_memory", memoryToolSchemas.supersede_memory, (input) =>
-      service.supersedeMemory(serviceInput<Parameters<MemoryService["supersedeMemory"]>[0]>(input))
+    supersede_memory: envelopeHandler("supersede_memory", memoryToolSchemas.supersede_memory, (input, _extra, ctx) =>
+      service.supersedeMemory(serviceInput<Parameters<MemoryService["supersedeMemory"]>[0]>(input), ctx)
     ),
-    merge_memories: envelopeHandler("merge_memories", memoryToolSchemas.merge_memories, (input) =>
-      service.mergeMemories(serviceInput<Parameters<MemoryService["mergeMemories"]>[0]>(input))
+    merge_memories: envelopeHandler("merge_memories", memoryToolSchemas.merge_memories, (input, _extra, ctx) =>
+      service.mergeMemories(serviceInput<Parameters<MemoryService["mergeMemories"]>[0]>(input), ctx)
     ),
-    forget_memory: envelopeHandler("forget_memory", memoryToolSchemas.forget_memory, (input) =>
-      service.forgetMemory(memoryIdFromInput(input), input.reason)
+    forget_memory: envelopeHandler("forget_memory", memoryToolSchemas.forget_memory, (input, _extra, ctx) =>
+      service.forgetMemory(memoryIdFromInput(input), input.reason, ctx)
     ),
     get_memory_budget: envelopeHandler("get_memory_budget", memoryToolSchemas.get_memory_budget, (input) =>
       service.getMemoryBudget(serviceInput<Parameters<MemoryService["getMemoryBudget"]>[0]>(input))
     ),
-    maintain_memories: envelopeHandler("maintain_memories", memoryToolSchemas.maintain_memories, (input, extra) => {
+    maintain_memories: envelopeHandler("maintain_memories", memoryToolSchemas.maintain_memories, (input, extra, ctx) => {
       const progress = adaptProgress(extra, "maintain_memories");
       return service.maintainMemories({
         ...serviceInput<Parameters<MemoryService["maintainMemories"]>[0]>(input),
         ...(progress !== undefined ? { onProgress: progress } : {})
-      });
+      }, ctx);
     }),
-    export_memory_context: textEnvelopeHandler("export_memory_context", memoryToolSchemas.export_memory_context, (input) =>
-      service.exportMemoryContext(serviceInput<Parameters<MemoryService["exportMemoryContext"]>[0]>(input))
+    export_memory_context: textEnvelopeHandler("export_memory_context", memoryToolSchemas.export_memory_context, (input, _extra, ctx) =>
+      service.exportMemoryContext(serviceInput<Parameters<MemoryService["exportMemoryContext"]>[0]>(input), ctx)
     ),
     // Stage 12 PR9: plan/apply maintenance, explain, list_backups.
     plan_maintenance: envelopeHandler("plan_maintenance", memoryToolSchemas.plan_maintenance, (input, extra) => {

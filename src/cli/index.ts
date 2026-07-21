@@ -16,11 +16,24 @@ import { migrateCommand } from "./commands/migrate.js";
 import { searchCommand } from "./commands/search.js";
 import { showCommand } from "./commands/show.js";
 import { parseArgs, type ParsedArgs } from "./arg-parser.js";
+import { buildRequestContext, type RequestContext } from "../request-context.js";
+import { randomUUID } from "node:crypto";
 
 export type CliContext = {
   dataHome: string;
   args: ParsedArgs;
   store: SQLiteMemoryStore;
+  /**
+   * Stage 14 PR-B1 (spec § 5.2 AR-P0-002): a per-invocation
+   * RequestContext. The actor defaults to the
+   * `AGENT_RECALL_ACTOR` env / `user:cli` fallback; the
+   * session_id is the CLI PID so audit events from the
+   * same shell session can be grouped; the request_id is a
+   * fresh UUID per CLI invocation so a retried command
+   * (e.g. wrapped in a shell loop) gets a distinct audit
+   * trail.
+   */
+  ctx: RequestContext;
 };
 
 export type CliResult = { exitCode: 0 | 1 | 2 | 3; stdout: string; stderr: string };
@@ -74,6 +87,13 @@ export async function runCli(
   const dataHomeOverride = typeof args.flags["data-home"] === "string" ? args.flags["data-home"] : undefined;
   const dataHome = dataHomeOverride ?? resolveDataHome(env);
   const store = new SQLiteMemoryStore(`${dataHome}/memory.sqlite`);
+  const ctx: RequestContext = buildRequestContext({
+    actor_override: "user:cli",
+    client_name: "agent-recall-cli",
+    client_version: process.env.npm_package_version ?? "0.0.0",
+    session_id: `cli-pid-${process.pid}`,
+    request_id: randomUUID()
+  });
 
   const handler = dispatch[args.command];
   if (handler === undefined) {
@@ -85,7 +105,7 @@ export async function runCli(
     };
   }
   try {
-    const result = await handler({ dataHome, args, store });
+    const result = await handler({ dataHome, args, store, ctx });
     store.close();
     return result;
   } catch (error) {

@@ -44,6 +44,123 @@ Date: 2026-07-21
   output still contains "migrated", the JSON shape still exposes `from` and
   `to`, and the no-`--yes` path still refuses.
 
+## [Unreleased] — Stage 14 PR-B1 (Request Context + Error Codes)
+
+Date: 2026-07-21
+
+### Added
+
+- **`src/request-context.ts`** (new). The `RequestContext` type
+  (`actor_id` / `client_name` / `client_version` / `session_id` /
+  `request_id` / `tool_call_id` / `project_id`) and a `buildRequestContext`
+  factory. Every MCP tool handler and CLI command now constructs a
+  fresh `RequestContext` per call and threads it through the
+  service layer.
+- **`src/actor.ts`** gains the `ActorId` template-literal type
+  (`${"agent"|"user"|"system"}:${string}` | the legacy bare values).
+  The structured audit `actor` column accepts either form, so
+  pre-v4 rows keep validating while new writes use the canonical
+  `kind:name` shape.
+- **`src/tools/error-codes.ts`** (spec § 8.3). Adds the v1.0
+  spec-named codes `scope_mismatch`, `project_identity_conflict`,
+  `unsafe_content`, `duplicate_candidate`, `db_busy`,
+  `idempotency_key_reuse`, `maintenance_plan_stale`,
+  `migration_required`, `backup_failed`, and `cancelled`. The
+  pre-v1 aliases (`duplicate`, `busy`, `idempotency_mismatch`,
+  `plan_invalidated`) are kept in the registry so existing client
+  integrations keep working. The retryable/permanent
+  classification matches the spec (e.g. `stale_revision` is
+  retryable: the caller should re-read the latest value and
+  retry).
+- **`test/release-gate/p0-request-context.test.ts`** (5 tests).
+  Locks down the per-call RequestContext contract end-to-end:
+  every remember / update / supersede / merge / forget event
+  carries the resolved `actor` and the `request_id` /
+  `session_id` / `tool_call_id` / `client_name` /
+  `client_version` trace fields in its `metadata`; system
+  events (`system:expiry` etc.) preserve the `requested_by`
+  metadata so the audit consumer can identify the calling
+  client; legacy callers without a `RequestContext` fall
+  back to the process-wide `defaultActor`.
+- **Stable error codes (test/mcp-v2-contract.test.ts)** updated
+  to assert the v1.0 code catalogue and the new retryable
+  classification for `stale_revision`.
+
+### Changed
+
+- **`src/services/memory-service-helpers.ts`** — `appendAudit`
+  (and the `auditRejected*` family) accept an optional
+  `RequestContext`. The audit `actor` is resolved with the
+  priority chain `input.actor ?? ctx?.actor_id ?? defaultActor`,
+  so the maintenance service's hard-coded system actors
+  (`system:expiry` / `system:archive` / `system:dedup` /
+  `system:export` / `system:backup` /
+  `system:maintenance`) are preserved verbatim while user-
+  driven events adopt the per-call actor. The trace fields
+  are mixed into the event's `metadata` whenever a ctx is
+  provided; caller metadata wins on collision so service
+  code can override the trace when it has a more specific
+  value (e.g. the system actor's `requested_by`).
+- **`src/services/memory-write-service.ts`**,
+  **`memory-maintenance-service.ts`**,
+  **`memory-read-service.ts`** — every public mutating
+  method takes an optional `ctx?: RequestContext` as its
+  last parameter and threads it to the audit helpers. The
+  read-side `exportMemoryContext` uses `ctx.actor_id` for
+  the trust boost current-actor so two agents with
+  different histories see different rankings within the
+  same MCP process.
+- **`src/memory-service.ts`** (façade) — the public mutating
+  methods thread `ctx` through to the sub-services. The
+  `defaultActor` constructor argument is retained as the
+  legacy fallback so pre-B1 callers and CLI invocations
+  without an explicit ctx keep working.
+- **`src/tools/register-tools.ts`** — every MCP handler
+  builds a `RequestContext` from the SDK `extra` envelope
+  (`clientName` / `clientVersion` / `sessionId` /
+  `progressToken`) and a fresh per-call `request_id`. The
+  handler signature now exposes `ctx` to the inner `run`
+  closure so each tool forwards it to the service call.
+- **`src/cli/index.ts`** — the dispatch builds a CLI-level
+  `RequestContext` with `actor: "user:cli"`,
+  `client_name: "agent-recall-cli"`, `session_id: cli-pid-<pid>`,
+  and a fresh `request_id` per invocation. The per-command
+  audit trail can now be grouped by CLI PID.
+- **`src/sqlite-store.ts`** — the actor filter on
+  `listEntries` / `searchEntries` now reads
+  `writer_actor_id = ?` instead of running a per-row
+  audit-log subquery. The pre-B1 subquery was an N+1
+  against `audit_events`; the v1 filter is a single
+  equality predicate against the canonical column. The
+  store's `EntryPatch` type now accepts `writer_actor_id`
+  (used by tests and by the migration fallback) and the
+  write service stamps `writer_actor_id = ctx.actor_id`
+  on every entry it creates so the canonical writer is
+  correct from row 1.
+- **`test/sqlite-store-actor-filter.test.ts`**,
+  **`sqlite-store-time-window.test.ts`**,
+  **`sqlite-store-updated-at.test.ts`**,
+  **`cli/list.test.ts`**, **`cli/search.test.ts`** —
+  updated the entry constructors to stamp
+  `writer_actor_id` explicitly. Pre-B1 the tests relied on
+  the audit-subquery filter, which no longer exists.
+- **`test/tool-registration.test.ts`** — updated the spy
+  assertions to expect the new `ctx` argument on
+  remember / update / supersede / forget / maintain /
+  recall / export calls.
+
+### Verification
+
+- 402/402 vitest tests pass (391 baseline + 5 new in
+  `p0-request-context.test.ts` + 6 new in
+  `mcp-v2-contract.test.ts`). 4 pre-existing tests had
+  to be updated because the actor filter moved off the
+  audit log.
+- `npm run typecheck` clean.
+- The audit `actor` column continues to round-trip the
+  legacy bare values (`agent` / `user` / `system`) for
+  backwards compatibility; new writes are structured.
+
 ## [Unreleased] — Stage 13 PR11 (CI Matrix)
 
 Date: 2026-07-21
