@@ -471,6 +471,45 @@ export class MemoryService {
     const backupDir = join(this.dataHome, "backups");
     return { backup_dir: backupDir, entries: listBackups(backupDir) };
   }
+
+  /**
+   * Stage 13 PR10 (spec § 6.7): peek a memory entry by
+   * id without recording an access. Used by the
+   * importer's conflict-resolution path so a `replace`
+   * can compare revisions without bumping the live
+   * entry's access count.
+   */
+  peekMemoryById(id: string): MemoryEntry | undefined {
+    return this._store.peekEntry(id);
+  }
+
+  /**
+   * Stage 13 PR10 (spec § 6.7): insert an entry that
+   * came from a prior export, preserving the source id.
+   * The validation pipeline (scope / secret / budget)
+   * runs the same way as `remember`, but the id is
+   * taken from the entry instead of being generated.
+   *
+   * Throws on validation failure or on a duplicate id
+   * (the caller is expected to have already checked
+   * via `peekMemoryById`).
+   */
+  insertImportedEntry(entry: MemoryEntry, actor: string): void {
+    // Stage 13 PR10: importers go through the same
+    // validation as live remember — we delegate to the
+    // write service and reuse its audit + scope guards.
+    this.write.insertImportedEntry(entry, actor);
+  }
+
+  /**
+   * Stage 13 PR10: alternate name used by the import
+   * path. The planImport + applyImport flow calls
+   * this so the audit event's actor is the caller's
+   * default actor, not the system.
+   */
+  writeInsertImportedEntry(entry: MemoryEntry, actor: string): void {
+    this.write.insertImportedEntry(entry, actor);
+  }
 }
 
 function extractDuplicateGroups(maintenance: MaintainMemoriesResult): Array<{

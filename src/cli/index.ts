@@ -7,9 +7,10 @@
 import { resolveDataHome } from "../index.js";
 import { SQLiteMemoryStore } from "../sqlite-store.js";
 import { auditCommand } from "./commands/audit.js";
-import { backupCommand } from "./commands/backup.js";
+import { backupCommand, restoreCommand } from "./commands/backup.js";
 import { doctorCommand } from "./commands/doctor.js";
 import { exportCommand } from "./commands/export.js";
+import { importCommand } from "./commands/import.js";
 import { listCommand } from "./commands/list.js";
 import { migrateCommand } from "./commands/migrate.js";
 import { searchCommand } from "./commands/search.js";
@@ -35,8 +36,10 @@ Commands:
   search     Full-text search
   audit      Show audit events for a memory
   doctor     Run health checks
-  export     Trigger markdown export
+  export     Trigger export (markdown / json / yaml)
+  import     Replay an export into the live store
   backup     Run a manual backup
+  restore    Restore from a verified backup
   migrate    Run schema migrations
   help       Show this help
 
@@ -57,7 +60,9 @@ const dispatch: Record<string, CommandHandler> = {
   audit: auditCommand,
   doctor: doctorCommand,
   export: exportCommand,
+  import: importCommand,
   backup: backupCommand,
+  restore: restoreCommand,
   migrate: migrateCommand
 };
 

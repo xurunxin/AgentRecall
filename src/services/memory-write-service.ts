@@ -98,6 +98,35 @@ export class MemoryWriteService {
     return scope;
   }
 
+  /**
+   * Stage 13 PR10 (spec § 6.7): insert an entry from a
+   * prior export, preserving the original id. Used by
+   * the import path. The entry's scope / secret /
+   * revision / project fields are assumed to be valid
+   * (the exporter produced them from a validated live
+   * entry). The function still emits the standard
+   * `created` audit event so the actor chain stays
+   * intact.
+   */
+  insertImportedEntry(entry: MemoryEntry, actor: string): void {
+    this.ctx.store.insertEntry(entry);
+    appendAudit(this.ctx.store, actor, {
+      memory_id: entry.id,
+      scope: entry.scope,
+      ...(entry.project_id !== undefined ? { project_id: entry.project_id } : {}),
+      event: "created",
+      reason: "imported",
+      metadata: {
+        topic: entry.topic,
+        type: entry.type,
+        importance: entry.importance,
+        confidence: entry.confidence,
+        imported_from: "export",
+        source_revision: entry.revision
+      }
+    });
+  }
+
   remember(input: RememberInput): Result<RememberResult, RememberError> {
     const prepared = this.prepareRemember(input, true);
     if (!prepared.ok) {
