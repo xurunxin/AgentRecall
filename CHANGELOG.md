@@ -453,6 +453,34 @@ Date: 2026-07-21
   smoke test) still passes against the 24-check
   run.
 
+## [Unreleased] — Stage 14 PR-D (Cleanup)
+
+Date: 2026-07-21
+
+### Changed
+
+- **`README.md`** — the "Doctor" section's check count
+  bumped from 12 to 24 to match `runDoctor`'s actual
+  output post-PR-C, with a split between the
+  operational group (Stage 1-7) and the v1.0
+  acceptance group (Stage 14 / spec § 9.1). The
+  "Changelog" section grew a new Stage 14 v1.0
+  summary paragraph covering PR-A / PR-B1 / PR-B2 /
+  PR-C, with the 12 v1.0 doctor checks named
+  explicitly.
+
+### Verification
+
+- 422/422 vitest tests pass (PR-C baseline).
+- 55/55 test files, 0 failures.
+- `npm run typecheck` clean.
+- `test/doctor.test.ts` still passes (24-check
+  result, locked by `p0-doctor-checks.test.ts`).
+- No source code changes in PR-D; the diff is
+  documentation-only plus a regression-lock test
+  that the README / CHANGELOG / doctor check
+  counts stay consistent across releases.
+
 ## [Unreleased] — Stage 13 PR11 (CI Matrix)
 
 Date: 2026-07-21

@@ -174,11 +174,23 @@ should not silently overwrite.
 
 ## Doctor
 
-`agent-recall doctor` runs twelve health checks and exits with:
+`agent-recall doctor` runs **24** health checks and exits with:
 
 - `0` — all OK
 - `1` — warnings present, no failures
 - `2` — at least one failure (data integrity, missing data home, etc.)
+
+The checks come in three groups:
+
+- **Operational (Stage 1-7)**: data_home, integrity, schema_version,
+  fts_consistency, backup_directory, disk_free, audit_health,
+  capacity_headroom, actor_distribution, last_accessed_by,
+  actor_ownership, stale_memories.
+- **v1.0 acceptance (Stage 14 / spec § 9.1)**: scope_safety,
+  revision_integrity, journal_mode, sqlite_runtime, lock_health,
+  backup_verification, project_alias_collision, ranking_health,
+  export_collision, audit_revision_gap, secret_policy_version,
+  idempotency_integrity.
 
 Use it as a periodic self-check or before/after risky operations like
 schema upgrades or hand-edits to the SQLite file. `--json` is supported for
@@ -292,6 +304,19 @@ Markdown exports are for inspection and handoff. Manual edits under `exports/` m
 ## Changelog
 
 Stage-level changes are tracked in [`CHANGELOG.md`](./CHANGELOG.md).
+Stage 14 delivered the v1.0 acceptance bar (per spec § 9.1):
+`migrate --yes` now takes a verified pre-migration backup before
+advancing the schema (PR-A); every mutating tool accepts a
+`RequestContext` so two clients sharing one MCP process are
+distinguishable, and nine v1.0 error codes are wired in
+(`scope_mismatch`, `project_identity_conflict`, `unsafe_content`,
+`duplicate_candidate`, `db_busy`, `idempotency_key_reuse`,
+`maintenance_plan_stale`, `migration_required`, `backup_failed`,
+`cancelled`) — see PR-B1; idempotency replay / mismatch CAS,
+`memory_revisions` post-image snapshots, atomic per-actor access
+tracking, and the 8-process concurrency stress test — see PR-B2;
+and the 12 v1.0 acceptance health checks the doctor runs
+(see "Doctor" above) — see PR-C.
 Stage 8 delivered three user-facing maintenance-path
 improvements: the new `merge_duplicates` action on
 `maintain_memories` (auto-supersedes all but the keep
