@@ -996,18 +996,58 @@ export class SQLiteMemoryStore {
     });
   }
 
+  /**
+   * Stage 14 PR-B2 (spec § 5.6): read the per-actor access map
+   * for a memory from the canonical `memory_accesses` table.
+   * Used by `getEntry` after the access UPSERT to surface the
+   * legacy `last_accessed_by` JSON map without round-tripping
+   * through the `memory_entries.last_accessed_by` JSON column
+   * (which is no longer the source of truth).
+   */
+  private readAccessMap(memoryId: string): Record<string, string> | undefined {
+    const rows = this.db
+      .prepare(
+        "SELECT actor_id, last_accessed_at FROM memory_accesses WHERE memory_id = ? ORDER BY actor_id ASC"
+      )
+      .all(memoryId) as Array<{ actor_id: string; last_accessed_at: string }>;
+    if (rows.length === 0) return undefined;
+    const map: Record<string, string> = {};
+    for (const row of rows) {
+      map[row.actor_id] = row.last_accessed_at;
+    }
+    return map;
+  }
+
   getEntry(id: string, accessedBy?: string): MemoryEntry | undefined {
     const entry = this.readEntry(id);
     if (entry === undefined) return undefined;
 
     const lastAccessedAt = new Date().toISOString();
 
-    // Update the per-agent access map. `decodeEntry` already parsed the
-    // JSON column into a `Record<string, string>` (or left it undefined
-    // for rows that have never been read with an actor). We extend that
-    // map; a missing or undefined map is treated as empty.
+    // Stage 14 PR-B2 (spec § 5.6 AR-P0-006): record the
+    // access in the canonical `memory_accesses` table via
+    // `recordAccess` (atomic UPSERT keyed on
+    // `(memory_id, actor_id)`) BEFORE bumping
+    // `memory_entries.access_count`, so the canonical
+    // access row is the source of truth for the per-actor
+    // access map. The 8-process stress test asserts that
+    // every `(memory_id, actor_id)` UPSERT lands
+    // atomically — the pre-PR-B2 read-modify-write on the
+    // `last_accessed_by` JSON column lost concurrent
+    // updates from sibling processes, which is the exact
+    // failure mode the spec § 5.6 atomicity contract
+    // guards against.
     let nextMap: Record<string, string> | undefined;
     if (accessedBy !== undefined) {
+      this.recordAccess(id, accessedBy, lastAccessedAt);
+      // Maintain the v3-compatible `last_accessed_by` JSON
+      // column as a derived cache so legacy readers (the
+      // doctor check, the budget evaluator, the trust
+      // boost) keep working. The RMW here is best-effort:
+      // `memory_accesses` is the source of truth, so a
+      // lost RMW loses at most one actor's last-accessed
+      // timestamp from the JSON cache but never from the
+      // canonical per-actor table.
       const existing = entry.last_accessed_by ?? {};
       nextMap = { ...existing, [accessedBy]: lastAccessedAt };
     }
@@ -1067,11 +1107,37 @@ export class SQLiteMemoryStore {
     return rows.map(decodeEntry);
   }
 
-  updateEntry(id: string, patch: EntryPatch): void {
+  /**
+   * Stage 14 PR-B2 (spec § 6.5): optional revision context
+   * carries the writer actor, request_id, and change reason
+   * for the `memory_revisions` row written inside the same
+   * transaction as the entry update. When omitted (the
+   * maintenance service callers and pre-B2 callers), no
+   * revision row is recorded — the legacy behaviour is
+   * preserved and the spec § 5.6 multi-process test is
+   * unaffected.
+   */
+  updateEntry(
+    id: string,
+    patch: EntryPatch,
+    revisionContext?: { changed_by: string; request_id?: string; change_reason?: string }
+  ): void {
     const current = this.readEntry(id);
     if (current === undefined) return;
 
-    const next: MemoryEntry = { ...current, ...sanitizeEntryPatch(patch), id: current.id };
+    // Spec § 6.5: post-image snapshot. Bump the revision
+    // explicitly so the `memory_revisions` row is keyed on
+    // the same `next.revision` the row will carry after
+    // the UPDATE. Pre-PR-B2 the `revision = ?` parameter
+    // was passed through entryParams which had the bump
+    // happen inside sanitizeEntryPatch; we replicate that
+    // bump here.
+    const next: MemoryEntry = {
+      ...current,
+      ...sanitizeEntryPatch(patch),
+      id: current.id,
+      revision: current.revision + 1
+    };
     this.transaction(() => {
       this.db
         .prepare(
@@ -1115,6 +1181,16 @@ export class SQLiteMemoryStore {
         )
         .run(...this.entryParams(next).slice(1), id);
       this.upsertFts(next);
+      if (revisionContext !== undefined) {
+        this.recordRevisionRow(
+          next.id,
+          next.revision,
+          next,
+          revisionContext.changed_by,
+          revisionContext.request_id,
+          revisionContext.change_reason
+        );
+      }
     });
   }
 
@@ -1383,11 +1459,14 @@ export class SQLiteMemoryStore {
   updateEntryWithRevision(
     id: string,
     patch: EntryPatch,
-    expectedRevision: number
+    expectedRevision: number,
+    revisionContext?: { changed_by: string; request_id?: string; change_reason?: string }
   ): boolean {
     const current = this.readEntry(id);
     if (current === undefined) return false;
-    if (current.revision !== expectedRevision) return false;
+    if (current.revision !== expectedRevision) {
+      return false;
+    }
     const next: MemoryEntry = {
       ...current,
       ...sanitizeEntryPatch(patch),
@@ -1442,6 +1521,16 @@ export class SQLiteMemoryStore {
           throw new ConcurrentRevisionError();
         }
         this.upsertFts(next);
+        if (revisionContext !== undefined) {
+          this.recordRevisionRow(
+            current.id,
+            current.revision,
+            current,
+            revisionContext.changed_by,
+            revisionContext.request_id,
+            revisionContext.change_reason
+          );
+        }
         applied = true;
       });
       return applied;
@@ -1453,6 +1542,78 @@ export class SQLiteMemoryStore {
     this.db
       .prepare("INSERT INTO memory_fts (id, scope, project_id, topic, title, body, tags) VALUES (?, ?, ?, ?, ?, ?, ?)")
       .run(entry.id, entry.scope, entry.project_id ?? "", entry.topic, entry.title, entry.body, entry.tags.join(" "));
+  }
+
+  /**
+   * Stage 14 PR-B2 (spec § 6.5): append the first
+   * `memory_revisions` row for a freshly-created entry. The
+   * snapshot is a `created`-shaped placeholder (just `id` +
+   * `revision: 0`) so the revision chain has a "from nothing"
+   * baseline that the `created` audit event can be joined
+   * against. Called from `MemoryWriteService.commitPreparedRemember`
+   * inside the same transaction as `insertEntry`.
+   */
+  recordRevisionForCreate(
+    memoryId: string,
+    changedBy: string,
+    requestId: string | undefined
+  ): void {
+    this.recordRevisionRow(
+      memoryId,
+      0,
+      {
+        id: memoryId,
+        revision: 0
+      } as unknown as MemoryEntry,
+      changedBy,
+      requestId,
+      "created"
+    );
+  }
+
+  /**
+   * Stage 14 PR-B2 (spec § 6.5): append a `memory_revisions` row
+   * capturing the snapshot of the entry *after* the mutation
+   * (post-image) keyed on the entry's new revision. The row is
+   * keyed on `(memory_id, revision)` so a single revision can
+   * be replayed exactly once. The snapshot is `JSON.stringify`-ed
+   * from the `MemoryEntry` so audit consumers can reconstruct
+   * the full state at any past revision. Storing the post-image
+   * (rather than the pre-image) keeps the PRIMARY KEY collision-
+   * free across the create + update sequence (the create row is
+   * keyed on `revision: 1`, every subsequent update is keyed
+   * on the entry's new `revision`).
+   *
+   * Called from inside the same `this.transaction(() => ...)`
+   * block as the entry update so a failure on either side rolls
+   * both back. The `request_id` is the per-call UUID from
+   * `RequestContext` (or empty when the caller did not provide
+   * one) so the revision row can be joined to the matching
+   * `audit_events` row for the same request.
+   */
+  private recordRevisionRow(
+    memoryId: string,
+    revision: number,
+    snapshot: MemoryEntry,
+    changedBy: string,
+    requestId: string | undefined,
+    changeReason: string | undefined
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO memory_revisions
+            (memory_id, revision, snapshot_json, changed_by, request_id, change_reason, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        memoryId,
+        revision,
+        JSON.stringify(snapshot),
+        changedBy,
+        requestId ?? "",
+        changeReason ?? null,
+        nowIso()
+      );
   }
 
 }

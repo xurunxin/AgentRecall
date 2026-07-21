@@ -184,7 +184,7 @@ export class MemoryService {
     return this.write.configureProjectBudget(project_id, budget, canonical_path, display_name);
   }
 
-  remember(input: RememberInput, ctx?: RequestContext): Result<RememberResult, "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate"> {
+  remember(input: RememberInput, ctx?: RequestContext): Result<RememberResult, "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate" | "idempotency_mismatch"> {
     return this.write.remember(input, ctx);
   }
 
@@ -192,7 +192,7 @@ export class MemoryService {
     id: string,
     input: UpdateInput,
     ctx?: RequestContext
-  ): Result<{ memory_id: string }, "not_found" | "invalid_state" | "invalid_schema" | "secret_detected" | "capacity_exceeded" | "stale_revision"> {
+  ): Result<{ memory_id: string }, "not_found" | "invalid_state" | "invalid_schema" | "secret_detected" | "capacity_exceeded" | "stale_revision" | "idempotency_mismatch"> {
     return this.write.updateMemory(id, input, ctx);
   }
 
@@ -200,7 +200,8 @@ export class MemoryService {
     old_memory_ids: string[];
     replacement: RememberInput;
     reason: string;
-  }, ctx?: RequestContext): Result<{ memory_id: string }, "not_found" | "invalid_state" | "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate"> {
+    idempotency_key?: string;
+  }, ctx?: RequestContext): Result<{ memory_id: string }, "not_found" | "invalid_state" | "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate" | "idempotency_mismatch"> {
     return this.write.supersedeMemory(input, ctx);
   }
 
@@ -209,16 +210,18 @@ export class MemoryService {
     replacement: RememberInput;
     reason: string;
     strategy?: "keep_first" | "keep_newest";
-  }, ctx?: RequestContext): Result<{ memory_id: string; merged_from?: string[] }, "not_found" | "invalid_state" | "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate"> {
+    idempotency_key?: string;
+  }, ctx?: RequestContext): Result<{ memory_id: string; merged_from?: string[] }, "not_found" | "invalid_state" | "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate" | "idempotency_mismatch"> {
     return this.write.mergeMemories(input, ctx);
   }
 
   forgetMemory(
     id: string,
     reason: string,
-    ctx?: RequestContext
-  ): Result<{ memory_id: string; released_chars: number }, "not_found"> {
-    return this.write.forgetMemory(id, reason, ctx);
+    ctx?: RequestContext,
+    options?: { idempotency_key?: string; expected_revision?: number }
+  ): Result<{ memory_id: string; released_chars: number }, "not_found" | "idempotency_mismatch"> {
+    return this.write.forgetMemory(id, reason, ctx, options);
   }
 
   // ============================================================

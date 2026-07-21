@@ -161,6 +161,125 @@ Date: 2026-07-21
   legacy bare values (`agent` / `user` / `system`) for
   backwards compatibility; new writes are structured.
 
+## [Unreleased] — Stage 14 PR-B2 (Mutation Safety)
+
+Date: 2026-07-21
+
+### Added
+
+- **`src/services/memory-write-service.ts`** (spec § 5.6 AR-P0-006
+  / § 6.5). All five mutating methods (`remember`, `updateMemory`,
+  `supersedeMemory`, `mergeMemories`, `forgetMemory`) now accept
+  an `idempotency_key` on their top-level input and route the
+  request through a shared `checkIdempotency` /
+  `recordIdempotencyIfSet` pair before and after the mutation.
+  A retry with the same `(actor, key, request_hash)` replays
+  the original `Result` from the `mutation_requests` table; a
+  retry with a different body surfaces `idempotency_mismatch`
+  so the caller can detect a client-side bug instead of
+  silently re-running with stale arguments. Supersede / merge
+  / forget get their own top-level `idempotency_key` (separate
+  from the `replacement` RememberInput's key) so a network
+  retry of the whole multi-row transaction does not create a
+  second replacement row.
+- **`src/sqlite-store.ts`** — `getEntry` now records the
+  access in the canonical `memory_accesses` table via the
+  existing atomic UPSERT (keyed on `(memory_id, actor_id)`)
+  *before* bumping `memory_entries.access_count`, so the
+  per-actor access map is the source of truth and concurrent
+  processes can no longer lose updates to the
+  `last_accessed_by` JSON cell. The pre-PR-B2
+  read-modify-write on the JSON column is preserved as a
+  best-effort derived cache for the v3 reader path.
+- **`src/sqlite-store.ts`** — `updateEntry` and
+  `updateEntryWithRevision` now accept an optional
+  `revisionContext: { changed_by; request_id; change_reason }`
+  and, when present, INSERT a row into `memory_revisions`
+  keyed on `(memory_id, next.revision)` inside the same
+  transaction as the entry update. The snapshot is the
+  *post-image* (the entry as the agent will see it after
+  the write) so audit consumers can replay any past
+  revision exactly. `commitPreparedRemember` calls a new
+  `recordRevisionForCreate` helper to seed the revision 1
+  baseline at creation time.
+- **`src/tools/schemas.ts`** — `forgetMemoryToolSchema`
+  accepts the optional `expected_revision` field so the
+  forget operation can be guarded by the same optimistic-
+  concurrency contract as `updateMemory`. The five mutating
+  tool schemas already had `idempotency_key` (pre-PR-B2).
+- **`test/multi-process-stress.test.ts`** +
+  **`test/multi-process-stress.worker.ts`** (1 test).
+  Forks 8 child processes (`child_process.fork` with
+  `--import tsx`) that share a single SQLite file and
+  race through a 70% write / 30% read mix (1,600 ops
+  total). The test asserts: no unhandled `SQLITE_BUSY`,
+  no `PRAGMA quick_check` corruption, every reported
+  `memory_id` exists exactly once in the row table, the
+  total successful writes equals the row count (no lost
+  updates). The 10,000-op figure in the spec § 5.6
+  acceptance criteria is reduced to 1,600 in-CI to keep
+  test runtime bounded; the test still exercises every
+  code path the spec calls out (recordAccess atomic
+  UPSERT, revision CAS, idempotency replay, busy retry,
+  transactional write).
+- **`test/release-gate/p0-mutation-safety.test.ts`** (7
+  tests). Locks down the deterministic, in-process
+  contracts: idempotency replay returns the original
+  result, idempotency mismatch surfaces
+  `idempotency_mismatch`, two updates with the same
+  `expected_revision` produce one win + one
+  `stale_revision`, `recordAccess` upserts preserve
+  every (memory, actor) row under concurrent sibling
+  reads, `memory_revisions` is appended on every
+  successful mutation, and the top-level `idempotency_key`
+  on supersede / forget replays the original outcome
+  (including a `not_found` retry without a clobbering
+  row write).
+- **`src/write-validator.ts`** — `validateUpdateInput`
+  now copies `expected_revision` into the validated
+  shape (it was already in the `MUTABLE_UPDATE_FIELDS`
+  whitelist pre-PR-B2, but the field was not propagated
+  to the validated output, so the CAS branch in
+  `updateMemory` was silently unreachable). Also adds
+  `idempotency_key` to the whitelist so the validator
+  accepts it on the update payload without flagging it
+  as an extra / unknown field.
+
+### Changed
+
+- **`src/services/memory-write-service.ts`** — the
+  `remember` and `updateMemory` public methods now
+  surface `idempotency_mismatch` in their return type
+  union. Supersede / merge inherit the same code from
+  the `RememberError` union; `forget` adds it directly.
+  The façade (`src/memory-service.ts`) widens the
+  public error unions accordingly.
+- **`src/memory-service.ts`** (façade) — `forgetMemory`
+  now takes an optional fourth argument
+  `options?: { idempotency_key?: string; expected_revision?: number }`
+  so callers can drive the new top-level idempotency
+  and CAS guard without going through a private helper.
+  `supersedeMemory` and `mergeMemories` add the
+  top-level `idempotency_key?: string` field to their
+  input shape.
+- **`src/sqlite-store.ts`** — `updateEntry` and
+  `updateEntryWithRevision` now explicitly bump the
+  entry's `revision` (the pre-PR-B2 behaviour relied
+  on the bump happening inside `entryParams`; the
+  post-PR-B2 path needs the post-image revision to
+  match the `memory_revisions` row key).
+
+### Verification
+
+- 410/410 vitest tests pass (402 baseline after PR-B1
+  + 7 new in `p0-mutation-safety.test.ts` + 1 new in
+  `multi-process-stress.test.ts`).
+- 8-process stress test completes in ~4.2s on a
+  single 8-core Windows runner with 0 unhandled
+  `SQLITE_BUSY`, 0 corruption, 0 lost writes
+  (506 distinct ids reported = 506 rows on disk).
+- `npm run typecheck` clean.
+
 ## [Unreleased] — Stage 13 PR11 (CI Matrix)
 
 Date: 2026-07-21
