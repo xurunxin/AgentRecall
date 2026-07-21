@@ -1,5 +1,50 @@
+# Build artefacts
 node_modules/
 dist/
 coverage/
+
+# Local data homes (legacy + current naming)
 .local-memory-mcp/
+.agent-recall/
+
+# SQLite sidecars that the live database grows
+# alongside. These are *not* the database itself
+# (memory.sqlite) but its write-ahead log + shared
+# memory file. They must be excluded so the
+# database-only backup copies cleanly; left in
+# place they create spurious git diffs whenever
+# the live DB is touched.
+*.sqlite-wal
+*.sqlite-shm
+
+# Pre-restore backup artefacts produced by
+# `agent-recall restore --confirm`. They sit next
+# to `memory.sqlite` in the data home and are
+# named `memory.sqlite.pre-restore.<ts>`.
+memory.sqlite.pre-restore.*
+
+# Test scratch directories created by the
+# portability / import tests. They are produced
+# under the system temp dir (tmpdir()) so the
+# gitignore is a belt-and-suspenders safety net
+# in case a test ever writes into the repo root.
+tmp-*
+.tmp/
+
+# Verbose log files
 *.log
+
+# Editor / OS scratch
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Per-PR worktrees (the CI matrix runs in a clean
+# checkout, but local development uses git
+# worktree add under .worktrees/).
+.worktrees/
+
+# Local-only memory-mcp scratch (the agent runs
+# its own .codegraph + similar tools here).
+.codegraph/
