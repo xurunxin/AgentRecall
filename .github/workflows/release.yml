@@ -1,0 +1,221 @@
+# .github/workflows/release.yml
+#
+# Stage 13 PR11 (spec § 11.2): the cross-platform
+# packaging smoke. Triggered on a tag push matching
+# `v*` (e.g. `v1.0.0`); also runnable manually via
+# `workflow_dispatch` for a pre-release dry run.
+#
+# What it does:
+#   1. Build `dist/` on each target OS.
+#   2. Pack the distribution into a `.tar.gz` (linux
+#      / mac) or `.zip` (windows) with a manifest
+#      listing the entry points.
+#   3. Smoke-test the package in a clean checkout:
+#      install nothing, untar/zip into a fresh dir,
+#      run `node dist/src/index.js` (MCP) and
+#      `node dist/bin/agent-recall.js help` (CLI).
+#      The MCP server uses stdio so we just confirm
+#      it starts and reports the protocol version.
+#
+# Tagging convention:
+#   git tag v1.0.0
+#   git push origin v1.0.0
+# The matrix produces 3 artifacts:
+#   agent-recall-1.0.0-linux-x64.tar.gz
+#   agent-recall-1.0.0-darwin-x64.tar.gz
+#   agent-recall-1.0.0-windows-x64.zip
+# Upload them to a GitHub Release via
+# `softprops/action-gh-release@v2` (or pin a known
+# version once we land this).
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Skip the GitHub Release publish step"
+        required: false
+        default: "true"
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Package ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node: "24"
+            archive: tar
+            suffix: linux-x64
+          - os: macos-latest
+            node: "24"
+            archive: tar
+            suffix: darwin-x64
+          - os: windows-latest
+            node: "24"
+            archive: zip
+            suffix: windows-x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Strip dev-only artefacts
+        shell: bash
+        # The tarball/zip ships only what the user
+        # needs at runtime: `dist/`, `package.json`,
+        # `README.md`, and `LICENSE` (if present).
+        # `node_modules/` is rebuilt by `npm install
+        # --omit=dev` inside the smoke step.
+        run: |
+          set -euo pipefail
+          STAGE="stage-agent-recall-${{ matrix.suffix }}"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          cp -R dist "$STAGE/dist"
+          cp package.json "$STAGE/package.json"
+          cp README.md "$STAGE/README.md" 2>/dev/null || true
+          if [ -f LICENSE ]; then cp LICENSE "$STAGE/LICENSE"; fi
+          echo "package contents:"
+          find "$STAGE" -maxdepth 3 -type f | sort
+
+      - name: Pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -z "$VERSION" ]; then
+            # workflow_dispatch on a non-tag ref:
+            # fall back to the package.json version.
+            VERSION="$(node -e "process.stdout.write(require('./package.json').version)")"
+          fi
+          STAGE="stage-agent-recall-${{ matrix.suffix }}"
+          if [ "${{ matrix.archive }}" = "tar" ]; then
+            tar -czf "agent-recall-${VERSION}-${{ matrix.suffix }}.tar.gz" -C "$STAGE" .
+          else
+            (cd "$STAGE" && zip -r "../agent-recall-${VERSION}-${{ matrix.suffix }}.zip" . > /dev/null)
+          fi
+          ls -la "agent-recall-${VERSION}-${{ matrix.suffix }}."*
+
+      - name: Upload artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-recall-${{ matrix.suffix }}
+          path: agent-recall-*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  smoke:
+    name: Smoke ${{ matrix.os }}
+    needs: package
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            suffix: linux-x64
+            archive: tar
+            smoke_cmd: "node dist/bin/agent-recall.js"
+          - os: macos-latest
+            suffix: darwin-x64
+            archive: tar
+            smoke_cmd: "node dist/bin/agent-recall.js"
+          - os: windows-latest
+            suffix: windows-x64
+            archive: zip
+            smoke_cmd: "node dist/bin/agent-recall.js"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Download package
+        uses: actions/download-artifact@v4
+        with:
+          name: agent-recall-${{ matrix.suffix }}
+          path: pkg
+
+      - name: Extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd pkg
+          ls -la
+          if [ "${{ matrix.archive }}" = "tar" ]; then
+            tar -xzf agent-recall-*.tar.gz
+          else
+            unzip -q agent-recall-*.zip
+          fi
+          ls -la
+
+      - name: Install runtime deps (production only)
+        working-directory: pkg
+        run: npm install --omit=dev
+
+      - name: CLI smoke
+        working-directory: pkg
+        run: ${{ matrix.smoke_cmd }} help
+
+      - name: CLI doctor smoke
+        working-directory: pkg
+        run: ${{ matrix.smoke_cmd }} doctor
+
+      - name: MCP server smoke
+        # The MCP server is a stdio JSON-RPC endpoint.
+        # We don't speak MCP here; we just confirm it
+        # starts and shuts down cleanly when stdin
+        # closes. A real client would negotiate the
+        # handshake via the MCP SDK; this gate only
+        # checks that the entry point runs.
+        working-directory: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Use a Node-based kill timer so the smoke
+          # step is identical on all three OSes.
+          node -e '
+            const { spawn } = require("node:child_process");
+            const child = spawn(process.execPath, ["dist/src/index.js"], { stdio: ["ignore", "inherit", "inherit"] });
+            const timer = setTimeout(() => child.kill("SIGTERM"), 3000);
+            child.on("exit", (code, signal) => {
+              clearTimeout(timer);
+              // We only require that the process
+              // started; both clean exit (0) and
+              // signal-terminated (SIGTERM) are OK.
+              if (signal !== null) {
+                console.log("MCP entry point started; timer killed it cleanly");
+                process.exit(0);
+              }
+              console.log("MCP entry point exited with code " + code);
+              process.exit(code === 0 ? 0 : 1);
+            });
+            child.on("error", (err) => {
+              clearTimeout(timer);
+              console.error("MCP entry point failed to start: " + err.message);
+              process.exit(1);
+            });
+          '

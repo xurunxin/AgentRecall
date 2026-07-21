@@ -1,5 +1,7 @@
 # AgentRecall
 
+![CI](https://github.com/xurx/agent-recall/actions/workflows/ci.yml/badge.svg)
+
 AgentRecall is a local-first MCP server for coding-agent memory. It gives MCP-compatible clients a governed tool surface for storing, searching, maintaining, and exporting global or project-scoped memories.
 
 SQLite is the source of truth. Markdown files are deterministic exports for review and handoff, not the live database. The server runs over stdio and does not require a hosted database, embedding service, or network model call.

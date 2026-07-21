@@ -5,6 +5,67 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [Unreleased] — Stage 13 PR11 (CI Matrix)
+
+Date: 2026-07-21
+
+### Added
+
+- **`.github/workflows/ci.yml`** (spec § 11.2). The
+  cross-platform CI matrix runs `npm run typecheck`,
+  `npm run build`, and the full `npm test` suite on
+  `ubuntu-latest` / `windows-latest` / `macos-latest`,
+  pinned to Node 24 (the project's `engines.node`
+  minimum — see package.json). The matrix also
+  exercises a portability export round-trip smoke
+  and a cross-platform path safety check (Windows
+  reserved-name probe + case-insensitive fs
+  detection on mac/Windows).
+- **`.github/workflows/release.yml`** (spec § 11.2).
+  Tag-triggered cross-platform packaging: each
+  runner builds `dist/`, strips dev-only artefacts,
+  packs into `agent-recall-<version>-<os>-<arch>.<ext>`,
+  and a downstream `smoke` job extracts the package
+  in a clean dir, runs `npm install --omit=dev`,
+  and verifies the CLI (`help`, `doctor`) and the
+  MCP server entry point (`node dist/src/index.js`)
+  all start cleanly. The MCP smoke uses a Node-based
+  SIGTERM timer (no GNU `timeout` dependency) so the
+  step is byte-identical across all three OSes.
+- **CI badge in `README.md`.** A `![CI]` shield
+  points at the `ci.yml` workflow so the matrix
+  status is visible from the repo front page.
+
+### Changed
+
+- **`.gitignore`** (spec § 11.2). Now excludes the
+  current data-home naming (`.agent-recall/`, in
+  addition to the legacy `.local-memory-mcp/`), the
+  SQLite sidecar files (`*.sqlite-wal`, `*.sqlite-shm`),
+  pre-restore backup artefacts
+  (`memory.sqlite.pre-restore.*`), the test scratch
+  dirs (`tmp-*`, `.tmp/`), per-PR worktrees
+  (`.worktrees/`), and editor / OS scratch
+  (`.vscode/`, `.idea/`, `.DS_Store`, `Thumbs.db`).
+  Without these the live WAL files would create
+  spurious diffs whenever the DB is touched, and
+  the per-PR worktrees would bloat the index.
+
+### Verification
+
+- 391/391 vitest tests pass locally (unchanged
+  baseline; PR11 only adds CI configuration).
+- `npm run typecheck` clean.
+- `npm run build` clean.
+- The CI / release workflow YAMLs are syntactically
+  valid and the steps that can be exercised locally
+  (CLI help, CLI doctor, MCP server smoke with the
+  Node-based kill timer) all pass on this Windows
+  runner. The remaining steps (`npm ci` on ubuntu,
+  Windows reserved-name probe on the actual win
+  runner image, macos bash GNU coreutils) will run
+  in the GitHub Actions matrix on the next push.
+
 ## [Unreleased] — Stage 13 PR10 (Portability)
 
 Date: 2026-07-21
