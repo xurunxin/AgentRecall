@@ -38,8 +38,23 @@ function makeEntry(overrides: Partial<MemoryEntry> = {}): MemoryEntry {
     superseded_by: undefined,
     token_estimate: 10,
     char_count: 60,
+    // Stage 14 PR-B1: the actor filter now reads from
+    // `writer_actor_id` (set by the write service when the
+    // entry is first created). The pre-PR-B1 audit-subquery
+    // path was removed; tests must stamp the column explicitly
+    // because the test helper bypasses the write service.
+    revision: 1,
+    writer_actor_id: "agent:test",
+    content_hash: undefined,
+    pinned: false,
+    trust_level: "agent_observed",
+    sensitivity: "normal",
+    valid_from: undefined,
+    valid_until: undefined,
+    deleted_at: undefined,
+    metadata: {},
     ...overrides
-  };
+  } as MemoryEntry;
 }
 
 function setup() {
@@ -82,24 +97,24 @@ describe("listEntries actor filter (stage 4)", () => {
   });
 
   it("returns only entries whose created audit was by the given actor", () => {
-    store.insertEntry(makeEntry({ id: "mem_a" }));
+    store.insertEntry(makeEntry({ id: "mem_a", writer_actor_id: "agent:claude-code" }));
     store.appendAudit(auditFor("mem_a", "agent:claude-code"));
-    store.insertEntry(makeEntry({ id: "mem_b" }));
+    store.insertEntry(makeEntry({ id: "mem_b", writer_actor_id: "agent:cursor" }));
     store.appendAudit(auditFor("mem_b", "agent:cursor"));
     const claudeOnly = store.listEntries({ scope: "global", actor: "agent:claude-code" });
     expect(claudeOnly.map((e) => e.id)).toEqual(["mem_a"]);
   });
 
   it("returns empty when the actor has written nothing", () => {
-    store.insertEntry(makeEntry({ id: "mem_a" }));
+    store.insertEntry(makeEntry({ id: "mem_a", writer_actor_id: "agent:claude-code" }));
     store.appendAudit(auditFor("mem_a", "agent:claude-code"));
     const empty = store.listEntries({ scope: "global", actor: "agent:nobody" });
     expect(empty).toEqual([]);
   });
 
-  it("skips memories without a created audit row (defensive for pre-v2 data)", () => {
-    store.insertEntry(makeEntry({ id: "mem_orphan" }));
-    // no audit row written
+  it("skips memories without a writer_actor_id match (defensive for pre-v4 data)", () => {
+    store.insertEntry(makeEntry({ id: "mem_orphan", writer_actor_id: "agent:unknown" }));
+    // no writer matching the filter
     const all = store.listEntries({ scope: "global", actor: "agent:claude-code" });
     expect(all).toEqual([]);
   });
@@ -118,16 +133,16 @@ describe("searchEntries actor filter (stage 4)", () => {
   });
 
   it("narrows FTS results by actor", () => {
-    store.insertEntry(makeEntry({ id: "mem_a", body: "uses postgres for primary datastore" }));
+    store.insertEntry(makeEntry({ id: "mem_a", body: "uses postgres for primary datastore", writer_actor_id: "agent:claude-code" }));
     store.appendAudit(auditFor("mem_a", "agent:claude-code"));
-    store.insertEntry(makeEntry({ id: "mem_b", body: "uses postgres for analytics" }));
+    store.insertEntry(makeEntry({ id: "mem_b", body: "uses postgres for analytics", writer_actor_id: "agent:cursor" }));
     store.appendAudit(auditFor("mem_b", "agent:cursor"));
     const claudeOnly = store.searchEntries({ query: "postgres", scope: "global", actor: "agent:claude-code" });
     expect(claudeOnly.map((e) => e.id)).toEqual(["mem_a"]);
   });
 
   it("combines with existing scope filter", () => {
-    store.insertEntry(makeEntry({ id: "mem_a", scope: "global", body: "uses postgres globally" }));
+    store.insertEntry(makeEntry({ id: "mem_a", scope: "global", body: "uses postgres globally", writer_actor_id: "agent:claude-code" }));
     store.appendAudit(auditFor("mem_a", "agent:claude-code"));
     const filtered = store.searchEntries({ query: "postgres", scope: "global", actor: "agent:claude-code" });
     expect(filtered.length).toBe(1);

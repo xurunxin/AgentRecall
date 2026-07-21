@@ -24,25 +24,47 @@
  * Append new codes when introducing new failure modes; do not
  * rename or repurpose existing entries. Clients pin to these
  * strings, so any change is a breaking API change.
+ *
+ * Stage 14 PR-B1 (spec § 8.3): the v1.0 contract adds the
+ * spec-named codes `scope_mismatch`, `project_identity_conflict`,
+ * `unsafe_content`, `db_busy`, `migration_required`,
+ * `backup_failed`, `maintenance_plan_stale`, and `cancelled`.
+ * The pre-v1 aliases `duplicate` / `idempotency_mismatch` /
+ * `plan_invalidated` / `busy` are kept in the registry so
+ * existing client integrations keep working; the new names
+ * are additive.
  */
 export const STABLE_ERROR_CODES = [
   // Schema and validation
   "invalid_schema",
   "invalid_scope",
+  "scope_mismatch",
+  "project_identity_conflict",
   "invalid_state",
   "not_found",
   "secret_detected",
+  "unsafe_content",
   // Capacity and lifecycle
   "capacity_exceeded",
   "duplicate",
-  // Concurrency (Stage 12 PR9 — spec § 5.6)
+  "duplicate_candidate",
+  // Concurrency (spec § 5.6)
   "stale_revision",
   "conflict",
   "busy",
-  // Plan/Apply maintenance (Stage 12 PR9 — spec § 6.2)
-  "plan_invalidated",
-  "plan_not_found",
+  "db_busy",
+  // Idempotency (spec § 5.6)
   "idempotency_mismatch",
+  "idempotency_key_reuse",
+  // Plan/Apply maintenance (spec § 6.2)
+  "plan_invalidated",
+  "maintenance_plan_stale",
+  "plan_not_found",
+  // Migration (spec § 5.4)
+  "migration_required",
+  "backup_failed",
+  // Cancellation (spec § 6.3)
+  "cancelled",
   // Filesystem / I/O
   "io_error",
   "not_writable",
@@ -63,24 +85,34 @@ export type ErrorCategory = "transient" | "permanent";
 
 const TRANSIENT_CODES: ReadonlySet<StableErrorCode> = new Set<StableErrorCode>([
   "busy",
+  "db_busy",
   "io_error",
   "conflict",
   "unavailable",
-  "internal_error"
+  "internal_error",
+  "cancelled",
+  "backup_failed",
+  "stale_revision"
 ]);
 
 const PERMANENT_CODES: ReadonlySet<StableErrorCode> = new Set<StableErrorCode>([
   "invalid_schema",
   "invalid_scope",
+  "scope_mismatch",
+  "project_identity_conflict",
   "invalid_state",
   "not_found",
   "secret_detected",
+  "unsafe_content",
   "capacity_exceeded",
   "duplicate",
-  "stale_revision",
-  "plan_invalidated",
-  "plan_not_found",
+  "duplicate_candidate",
   "idempotency_mismatch",
+  "idempotency_key_reuse",
+  "plan_invalidated",
+  "maintenance_plan_stale",
+  "plan_not_found",
+  "migration_required",
   "not_writable",
   "not_readable",
   "tool_error"

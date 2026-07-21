@@ -18,7 +18,7 @@ import {
   evaluateBudget,
   type BudgetAccepted
 } from "../budget-governor.js";
-import { resolveActor } from "../actor.js";
+import { resolveActor, type ActorId } from "../actor.js";
 import {
   DEFAULT_GLOBAL_BUDGET,
   DEFAULT_PROJECT_BUDGET,
@@ -31,6 +31,8 @@ import {
   type ProjectScope,
   type Result
 } from "../domain.js";
+import type { RequestContext } from "../request-context.js";
+import { traceMetadata } from "../request-context.js";
 
 // Re-export so the sub-services can import the global budget
 // default from this module without reaching into domain.ts.
@@ -230,18 +232,41 @@ export function usageFromActiveEntries(entries: MemoryEntry[]): BudgetUsage {
  * caller is responsible for catching a missing
  * `memory_id` / `project_id` field by spreading
  * conditionally.
+ *
+ * Stage 14 PR-B1 (spec § 5.2 AR-P0-002): the audit `actor`
+ * is decided by the priority chain
+ *   1. `input.actor` (when the service code hard-codes a
+ *      system actor like `system:expiry` / `system:archive` /
+ *      `system:dedup` / `system:export` / `system:backup` /
+ *      `system:maintenance` it is kept verbatim, since the
+ *      caller's intent is "the system did this").
+ *   2. `ctx?.actor_id` (the per-call caller, when the MCP
+ *      handler has provided a RequestContext).
+ *   3. `defaultActor` (the process-wide fallback, used by
+ *      legacy callers and CLI invocations without a ctx).
+ *
+ * The trace fields (request_id, session_id, tool_call_id,
+ * client_name, client_version, project_id) are mixed into
+ * the event's `metadata` whenever a ctx is provided. Caller
+ * metadata wins on collision so service code can override
+ * the trace when it has a more specific value (e.g. the
+ * system actor's `requested_by` is the actual caller).
  */
 export function appendAudit(
   store: SQLiteMemoryStore,
   defaultActor: string,
-  input: Omit<MemoryAuditEvent, "id" | "created_at" | "actor"> & { actor?: string }
+  input: Omit<MemoryAuditEvent, "id" | "created_at" | "actor"> & { actor?: string },
+  ctx?: RequestContext
 ): void {
+  const actorSource: string = input.actor ?? ctx?.actor_id ?? defaultActor;
   const event: MemoryAuditEvent = {
     id: createAuditId(),
     scope: input.scope,
     event: input.event,
-    actor: resolveActor(input.actor ?? defaultActor) as MemoryAuditEvent["actor"],
-    metadata: input.metadata,
+    actor: resolveActor(actorSource) as MemoryAuditEvent["actor"],
+    metadata: ctx === undefined
+      ? input.metadata
+      : { ...traceMetadata(ctx), ...input.metadata },
     created_at: nowIso()
   };
   if (input.memory_id !== undefined) event.memory_id = input.memory_id;
@@ -285,7 +310,8 @@ export function auditRejected(
   defaultActor: string,
   input: unknown,
   error: string,
-  details: Record<string, unknown> | undefined
+  details: Record<string, unknown> | undefined,
+  ctx?: RequestContext
 ): void {
   const project_id = safeProjectIdFromInput(input);
   appendAudit(store, defaultActor, {
@@ -295,7 +321,7 @@ export function auditRejected(
     actor: "system",
     reason: error,
     metadata: rejectionMetadata(error, details)
-  });
+  }, ctx);
 }
 
 export function auditRejectedForEntry(
@@ -303,7 +329,8 @@ export function auditRejectedForEntry(
   defaultActor: string,
   entry: MemoryEntry,
   error: string,
-  details: Record<string, unknown> | undefined
+  details: Record<string, unknown> | undefined,
+  ctx?: RequestContext
 ): void {
   appendAudit(store, defaultActor, {
     memory_id: entry.id,
@@ -313,7 +340,7 @@ export function auditRejectedForEntry(
     actor: "system",
     reason: error,
     metadata: rejectionMetadata(error, details)
-  });
+  }, ctx);
 }
 
 export function auditRejectedForScope(
@@ -322,7 +349,8 @@ export function auditRejectedForScope(
   scope: MemoryScope,
   project_id: string | undefined,
   error: string,
-  details: Record<string, unknown> | undefined
+  details: Record<string, unknown> | undefined,
+  ctx?: RequestContext
 ): void {
   appendAudit(store, defaultActor, {
     scope,
@@ -331,7 +359,7 @@ export function auditRejectedForScope(
     actor: "system",
     reason: error,
     metadata: rejectionMetadata(error, details)
-  });
+  }, ctx);
 }
 
 /**

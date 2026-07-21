@@ -35,6 +35,7 @@ import { MarkdownExporter } from "../markdown-exporter.js";
 import { runBackup, verifyBackup } from "../backup.js";
 import { resolveMemoryScope } from "../scope-resolver.js";
 import { createHash } from "node:crypto";
+import type { RequestContext } from "../request-context.js";
 
 export type MaintenanceAction =
   | "archive_low_value"
@@ -81,7 +82,7 @@ export type MaintenanceContext = {
 export class MemoryMaintenanceService {
   constructor(private readonly ctx: MaintenanceContext) {}
 
-  maintainMemories(input: MaintainMemoriesInput): MaintainMemoriesResult {
+  maintainMemories(input: MaintainMemoriesInput, ctx?: RequestContext): MaintainMemoriesResult {
     if (input.batch_size !== undefined) {
       if (input.batch_size < 50 || input.batch_size > 5000 || !Number.isInteger(input.batch_size)) {
         throw new Error(
@@ -131,15 +132,15 @@ export class MemoryMaintenanceService {
       case "find_duplicates":
         return this.findDuplicatesChunked(scope, input);
       case "merge_duplicates":
-        return this.mergeDuplicates(scope, input);
+        return this.mergeDuplicates(scope, input, ctx);
       case "rebuild_markdown_index":
-        return this.rebuildMarkdownIndex(scope);
+        return this.rebuildMarkdownIndex(scope, ctx);
       case "expire_due":
-        return this.expireDueMemories(scope, input.dry_run === true);
+        return this.expireDueMemories(scope, input.dry_run === true, ctx);
       case "archive_low_value":
-        return this.archiveLowValueMemories(scope, input.dry_run === true);
+        return this.archiveLowValueMemories(scope, input.dry_run === true, ctx);
       case "vacuum_fts":
-        return this.vacuumFts(scope);
+        return this.vacuumFts(scope, ctx);
     }
   }
 
@@ -187,7 +188,8 @@ export class MemoryMaintenanceService {
 
   private mergeDuplicates(
     scope: ResolvedReadScope,
-    input: MaintainMemoriesInput
+    input: MaintainMemoriesInput,
+    ctx?: RequestContext
   ): MaintainMemoriesResult {
     assertProjectScope(scope, "merge_duplicates");
     const strategy: "keep_first" | "keep_newest" = input.strategy ?? "keep_first";
@@ -242,9 +244,9 @@ export class MemoryMaintenanceService {
       const autoCollapse = !dryRun && group.reason === "same_title_and_body" && sameProject;
       if (autoCollapse) {
         if (liveEntries.length > 0) {
-          this.maybeBackup(liveEntries.length);
+          this.maybeBackup(liveEntries.length, ctx);
         }
-        this.applySupersede(keepTarget, supersededIds, "merge_duplicates auto-supersede");
+        this.applySupersede(keepTarget, supersededIds, "merge_duplicates auto-supersede", ctx);
         actuallySuperseded.push(record);
       } else {
         // Plan-only group: surface the proposed action
@@ -273,7 +275,7 @@ export class MemoryMaintenanceService {
     };
   }
 
-  private rebuildMarkdownIndex(scope: ResolvedReadScope): MaintainMemoriesResult {
+  private rebuildMarkdownIndex(scope: ResolvedReadScope, ctx?: RequestContext): MaintainMemoriesResult {
     assertProjectScope(scope, "rebuild_markdown_index");
     const exporter = this.ctx.resolveExporter();
     const staged = exporter.stageScope({
@@ -293,9 +295,9 @@ export class MemoryMaintenanceService {
           ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
           event: "markdown_exported",
           actor: "system:export",
-          metadata: { ...paths, requested_by: this.ctx.defaultActor }
-        });
-        this.appendMaintenanceAudit(scope, "rebuild_markdown_index", changed, paths);
+          metadata: { ...paths, requested_by: ctx?.actor_id ?? this.ctx.defaultActor }
+        }, ctx);
+        this.appendMaintenanceAudit(scope, "rebuild_markdown_index", changed, paths, ctx);
         return {
           action: "rebuild_markdown_index" as const,
           changed,
@@ -303,7 +305,7 @@ export class MemoryMaintenanceService {
         };
       });
       published.complete();
-      this.maybeBackup(changed);
+      this.maybeBackup(changed, ctx);
       return result;
     } catch (error) {
       if (published === undefined) {
@@ -315,7 +317,7 @@ export class MemoryMaintenanceService {
     }
   }
 
-  private expireDueMemories(scope: ResolvedReadScope, dryRun = false): MaintainMemoriesResult {
+  private expireDueMemories(scope: ResolvedReadScope, dryRun = false, ctx?: RequestContext): MaintainMemoriesResult {
     assertProjectScope(scope, "expire_due");
     const now = nowIso();
     const expired = activeEntriesForScope(this.ctx.store, scope)
@@ -337,7 +339,7 @@ export class MemoryMaintenanceService {
       // Throws on failure; the caller sees the
       // `backup_failed` error and the mutation does not
       // run.
-      this.maybeBackup(expired.length);
+      this.maybeBackup(expired.length, ctx);
     }
     return this.ctx.store.transaction(() => {
       const forgotten: Array<{ memory_id: string; expires_at: string }> = [];
@@ -361,18 +363,18 @@ export class MemoryMaintenanceService {
           reason: "expired by maintain_memories",
           metadata: {
             expires_at: entry.expires_at ?? "",
-            requested_by: this.ctx.defaultActor
+            requested_by: ctx?.actor_id ?? this.ctx.defaultActor
           }
-        });
+        }, ctx);
         forgotten.push({ memory_id: entry.id, expires_at: entry.expires_at ?? "" });
       }
       const details = { expired: forgotten };
-      this.appendMaintenanceAudit(scope, "expire_due", forgotten.length, details);
+      this.appendMaintenanceAudit(scope, "expire_due", forgotten.length, details, ctx);
       return { action: "expire_due", changed: forgotten.length, details };
     });
   }
 
-  private archiveLowValueMemories(scope: ResolvedReadScope, dryRun = false): MaintainMemoriesResult {
+  private archiveLowValueMemories(scope: ResolvedReadScope, dryRun = false, ctx?: RequestContext): MaintainMemoriesResult {
     assertProjectScope(scope, "archive_low_value");
     const lowValue = activeEntriesForScope(this.ctx.store, scope)
       .filter((entry) => entry.importance <= 2 && entry.confidence <= 2 && entry.access_count === 0 && entry.source.kind !== "user")
@@ -394,7 +396,7 @@ export class MemoryMaintenanceService {
     if (lowValue.length > 0) {
       // Pre-mutation backup (see expireDueMemories for the
       // rationale on the out-of-transaction placement).
-      this.maybeBackup(lowValue.length);
+      this.maybeBackup(lowValue.length, ctx);
     }
     return this.ctx.store.transaction(() => {
       const archived: Array<{ memory_id: string; reason: string }> = [];
@@ -409,18 +411,18 @@ export class MemoryMaintenanceService {
           reason: "low importance, low confidence, never accessed",
           metadata: {
             reason: "low importance, low confidence, never accessed",
-            requested_by: this.ctx.defaultActor
+            requested_by: ctx?.actor_id ?? this.ctx.defaultActor
           }
-        });
+        }, ctx);
         archived.push({ memory_id: entry.id, reason: "low importance, low confidence, never accessed" });
       }
       const details = { archived };
-      this.appendMaintenanceAudit(scope, "archive_low_value", archived.length, details);
+      this.appendMaintenanceAudit(scope, "archive_low_value", archived.length, details, ctx);
       return { action: "archive_low_value", changed: archived.length, details };
     });
   }
 
-  private vacuumFts(scope: ResolvedReadScope): MaintainMemoriesResult {
+  private vacuumFts(scope: ResolvedReadScope, ctx?: RequestContext): MaintainMemoriesResult {
     const vacuum = (this.ctx.store as SQLiteMemoryStore & { vacuumFts?: () => void }).vacuumFts;
     if (typeof vacuum === "function") {
       vacuum.call(this.ctx.store);
@@ -579,7 +581,7 @@ export class MemoryMaintenanceService {
     return [...entries].sort((a, b) => compareText(a.id, b.id))[0]!;
   }
 
-  private applySupersede(keepTarget: MemoryEntry, supersededIds: string[], reason: string): void {
+  private applySupersede(keepTarget: MemoryEntry, supersededIds: string[], reason: string, ctx?: RequestContext): void {
     this.ctx.store.transaction(() => {
       for (const oldId of supersededIds) {
         this.ctx.store.updateEntry(oldId, {
@@ -596,14 +598,14 @@ export class MemoryMaintenanceService {
           reason,
           metadata: {
             superseded_by: keepTarget.id,
-            requested_by: this.ctx.defaultActor
+            requested_by: ctx?.actor_id ?? this.ctx.defaultActor
           }
-        });
+        }, ctx);
       }
     });
   }
 
-  private maybeBackup(changed: number): void {
+  private maybeBackup(changed: number, ctx?: RequestContext): void {
     if (changed <= 0 || this.ctx.dataHome === undefined) return;
     // Stage 10 PR5: backup failures are now fatal. A
     // destructive maintenance that wants to back up before
@@ -628,16 +630,17 @@ export class MemoryMaintenanceService {
         duration_ms: result.durationMs,
         schema_version: verified.schemaVersion,
         quick_check: verified.quickCheck,
-        requested_by: this.ctx.defaultActor
+        requested_by: ctx?.actor_id ?? this.ctx.defaultActor
       }
-    });
+    }, ctx);
   }
 
   private appendMaintenanceAudit(
     scope: ResolvedReadScope,
     action: MaintenanceAction,
     changed: number,
-    details: Record<string, unknown>
+    details: Record<string, unknown>,
+    ctx?: RequestContext
   ): void {
     appendAudit(this.ctx.store, this.ctx.defaultActor, {
       scope: scope.scope,
@@ -649,9 +652,9 @@ export class MemoryMaintenanceService {
         action,
         changed,
         ...details,
-        requested_by: this.ctx.defaultActor
+        requested_by: ctx?.actor_id ?? this.ctx.defaultActor
       }
-    });
+    }, ctx);
   }
 
   // The private `resolveScope` helper used to live here. It was

@@ -43,6 +43,7 @@ import {
 import { RANKING_VERSION, rankRecall, type RankedItem } from "./recall-ranker.js";
 import { detectRisksInEntry } from "../tools/risk-detector.js";
 import { dataOnlyFramingPreamble } from "../tools/data-only-framing.js";
+import type { RequestContext } from "../request-context.js";
 
 export type ResolvedReadScope = {
   scope: MemoryScope;
@@ -207,7 +208,7 @@ export class MemoryReadService {
     };
   }
 
-  exportMemoryContext(input: ExportMemoryContextInput): string {
+  exportMemoryContext(input: ExportMemoryContextInput, ctx?: RequestContext): string {
     const exporter = this.ctx.resolveExporter();
     const resolved = this.resolveReadScope(input);
     if (!resolved.ok) {
@@ -217,10 +218,11 @@ export class MemoryReadService {
         entries: []
       });
     }
-    const collected = this.collectContextEntries(resolved.value, input);
+    const collected = this.collectContextEntries(resolved.value, input, ctx);
+    const currentActor = ctx?.actor_id ?? this.ctx.defaultActor;
     const entries = collected.map((entry) => ({
       ...entry,
-      trust_boost: computeTrustBoost(entry, this.ctx.defaultActor, (e) =>
+      trust_boost: computeTrustBoost(entry, currentActor, (e) =>
         actorForEntry(this.ctx.store, e)
       ),
       writer: actorForEntry(this.ctx.store, entry)
@@ -301,7 +303,7 @@ export class MemoryReadService {
     return entryFilters;
   }
 
-  private collectContextEntries(scope: ResolvedReadScope, input: ExportMemoryContextInput): MemoryEntry[] {
+  private collectContextEntries(scope: ResolvedReadScope, input: ExportMemoryContextInput, ctx?: RequestContext): MemoryEntry[] {
     const scopes: ResolvedReadScope[] = [
       ...(scope.scope === "project" && input.include_global ? [{ scope: "global" as const }] : []),
       scope
@@ -320,12 +322,13 @@ export class MemoryReadService {
     // markdown exporter then re-sorted by importance + trust,
     // overriding the read-side ranking. With a single ranker
     // the export preserves the ranker order end-to-end.
+    const currentActor = ctx?.actor_id ?? this.ctx.defaultActor;
     const ranked: RankedItem[] = rankRecall({
       candidates: [...byId.values()],
       query: input.query ?? "",
       primaryScope: scope.scope,
       actor: {
-        currentActor: this.ctx.defaultActor,
+        currentActor,
         actorForEntry: (e) => actorForEntry(this.ctx.store, e)
       },
       ...(input.max_items !== undefined ? { topK: input.max_items } : {})

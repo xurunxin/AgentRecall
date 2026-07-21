@@ -38,6 +38,7 @@ import { MemoryWriteService, type RememberResult } from "./services/memory-write
 import type { BudgetUsage, EntryFilters, SearchFilters, SQLiteMemoryStore } from "./sqlite-store.js";
 import { CURRENT_SCHEMA_VERSION } from "./sqlite-store.js";
 import { type RememberInput, type UpdateInput } from "./write-validator.js";
+import type { RequestContext } from "./request-context.js";
 
 // Re-export the public types from the read service so the
 // existing `import { ListResult, ... } from "../memory-service"`
@@ -166,8 +167,8 @@ export class MemoryService {
     return this.read.getMemoryBudget(input);
   }
 
-  exportMemoryContext(input: ExportMemoryContextInput): string {
-    return this.read.exportMemoryContext(input);
+  exportMemoryContext(input: ExportMemoryContextInput, ctx?: RequestContext): string {
+    return this.read.exportMemoryContext(input, ctx);
   }
 
   // ============================================================
@@ -183,23 +184,24 @@ export class MemoryService {
     return this.write.configureProjectBudget(project_id, budget, canonical_path, display_name);
   }
 
-  remember(input: RememberInput): Result<RememberResult, "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate"> {
-    return this.write.remember(input);
+  remember(input: RememberInput, ctx?: RequestContext): Result<RememberResult, "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate"> {
+    return this.write.remember(input, ctx);
   }
 
   updateMemory(
     id: string,
-    input: UpdateInput
+    input: UpdateInput,
+    ctx?: RequestContext
   ): Result<{ memory_id: string }, "not_found" | "invalid_state" | "invalid_schema" | "secret_detected" | "capacity_exceeded" | "stale_revision"> {
-    return this.write.updateMemory(id, input);
+    return this.write.updateMemory(id, input, ctx);
   }
 
   supersedeMemory(input: {
     old_memory_ids: string[];
     replacement: RememberInput;
     reason: string;
-  }): Result<{ memory_id: string }, "not_found" | "invalid_state" | "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate"> {
-    return this.write.supersedeMemory(input);
+  }, ctx?: RequestContext): Result<{ memory_id: string }, "not_found" | "invalid_state" | "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate"> {
+    return this.write.supersedeMemory(input, ctx);
   }
 
   mergeMemories(input: {
@@ -207,23 +209,24 @@ export class MemoryService {
     replacement: RememberInput;
     reason: string;
     strategy?: "keep_first" | "keep_newest";
-  }): Result<{ memory_id: string; merged_from?: string[] }, "not_found" | "invalid_state" | "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate"> {
-    return this.write.mergeMemories(input);
+  }, ctx?: RequestContext): Result<{ memory_id: string; merged_from?: string[] }, "not_found" | "invalid_state" | "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate"> {
+    return this.write.mergeMemories(input, ctx);
   }
 
   forgetMemory(
     id: string,
-    reason: string
+    reason: string,
+    ctx?: RequestContext
   ): Result<{ memory_id: string; released_chars: number }, "not_found"> {
-    return this.write.forgetMemory(id, reason);
+    return this.write.forgetMemory(id, reason, ctx);
   }
 
   // ============================================================
   // Public maintenance methods — delegate to MemoryMaintenanceService
   // ============================================================
 
-  maintainMemories(input: MaintainMemoriesInput): MaintainMemoriesResult {
-    return this.maintenance.maintainMemories(input);
+  maintainMemories(input: MaintainMemoriesInput, ctx?: RequestContext): MaintainMemoriesResult {
+    return this.maintenance.maintainMemories(input, ctx);
   }
 
   // ============================================================

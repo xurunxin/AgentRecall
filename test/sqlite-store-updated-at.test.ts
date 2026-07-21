@@ -33,6 +33,18 @@ function makeEntry(overrides: Partial<MemoryEntry> = {}): MemoryEntry {
     supersedes: [],
     token_estimate: 1,
     char_count: 1,
+    // Stage 14 PR-B1: stamp writer_actor_id explicitly because
+    // the test bypasses the write service.
+    revision: 1,
+    writer_actor_id: "agent:test",
+    content_hash: undefined,
+    pinned: false,
+    trust_level: "agent_observed",
+    sensitivity: "normal",
+    valid_from: undefined,
+    valid_until: undefined,
+    deleted_at: undefined,
+    metadata: {},
     ...overrides
   } as MemoryEntry;
 }
@@ -114,21 +126,24 @@ describe("listEntries updated_at filter (stage 7)", () => {
     store.insertEntry(makeEntry({
       id: "mem_a",
       created_at: "2026-07-10T00:00:00.000Z",
-      updated_at: "2026-07-12T00:00:00.000Z"
+      updated_at: "2026-07-12T00:00:00.000Z",
+      writer_actor_id: "agent:claude-code"
     }));
     store.appendAudit(auditFor("mem_a", "agent:claude-code"));
     // mem_b: created 2026-07-20, updated 2026-07-20
     store.insertEntry(makeEntry({
       id: "mem_b",
       created_at: "2026-07-20T00:00:00.000Z",
-      updated_at: "2026-07-20T00:00:00.000Z"
+      updated_at: "2026-07-20T00:00:00.000Z",
+      writer_actor_id: "agent:claude-code"
     }));
     store.appendAudit(auditFor("mem_b", "agent:claude-code"));
     // mem_c: created 2026-07-20, updated 2026-07-20, but written by cursor
     store.insertEntry(makeEntry({
       id: "mem_c",
       created_at: "2026-07-20T00:00:00.000Z",
-      updated_at: "2026-07-20T00:00:00.000Z"
+      updated_at: "2026-07-20T00:00:00.000Z",
+      writer_actor_id: "agent:cursor"
     }));
     store.appendAudit(auditFor("mem_c", "agent:cursor"));
 

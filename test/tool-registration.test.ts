@@ -331,7 +331,8 @@ describe("createMemoryToolHandlers", () => {
         title: "Expose memory tools",
         tags: [],
         status: "active"
-      })
+      }),
+      expect.objectContaining({ request_id: expect.any(String) })
     );
     expect(textOf(result)).toBe(JSON.stringify({ ok: true, value: { memory_id: "mem_1", status: "active" } }, null, 2));
   });
@@ -367,7 +368,7 @@ describe("createMemoryToolHandlers", () => {
       budget_chars: 8000,
       types: [],
       topics: []
-    });
+    }, expect.objectContaining({ request_id: expect.any(String) }));
     expect(textOf(result)).toContain("# AgentRecall Context");
   });
 
@@ -462,23 +463,27 @@ describe("createMemoryToolHandlers", () => {
     await handlers.get_memory_budget({ scope: "global" });
     await handlers.maintain_memories({ action: "find_duplicates", scope: "global" });
 
-    expect(service.updateMemory).toHaveBeenCalledWith("mem_1", { title: "Updated" });
+    expect(service.updateMemory).toHaveBeenCalledWith("mem_1", { title: "Updated" }, expect.objectContaining({ request_id: expect.any(String) }));
     expect(service.supersedeMemory).toHaveBeenCalledWith(
       expect.objectContaining({
         old_memory_ids: ["mem_1"],
         reason: "merged",
         replacement: expect.objectContaining({ tags: [], status: "active" })
-      })
+      }),
+      expect.objectContaining({ request_id: expect.any(String) })
     );
-    expect(service.forgetMemory).toHaveBeenCalledWith("mem_1", "obsolete");
+    expect(service.forgetMemory).toHaveBeenCalledWith("mem_1", "obsolete", expect.objectContaining({ request_id: expect.any(String) }));
     expect(service.getMemoryBudget).toHaveBeenCalledWith({ scope: "global" });
-    expect(service.maintainMemories).toHaveBeenCalledWith({
-      action: "find_duplicates",
-      scope: "global",
-      batch_size: 500,
-      dry_run: false,
-      strategy: "keep_first"
-    });
+    expect(service.maintainMemories).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "find_duplicates",
+        scope: "global",
+        batch_size: 500,
+        dry_run: false,
+        strategy: "keep_first"
+      }),
+      expect.objectContaining({ request_id: expect.any(String) })
+    );
   });
 });
 

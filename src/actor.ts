@@ -12,6 +12,23 @@ export type ActorKind = "agent" | "user" | "system";
 
 export const ACTOR_KINDS: readonly ActorKind[] = ["agent", "user", "system"];
 
+/**
+ * Stage 14 PR-B1 (spec § 5.2 AR-P0-002): the structured actor
+ * identifier. Either the legacy bare form ("agent" / "user"
+ * / "system") for backwards compatibility with v1 audit rows,
+ * or the canonical `kind:name` form ("agent:claude-code",
+ * "system:expiry", etc.).
+ *
+ * The `name` segment is the only free-form part; the `kind`
+ * prefix is type-checked so audit consumers can dispatch on
+ * `kind` without parsing the suffix.
+ */
+export type ActorId =
+  | `${ActorKind}:${string}`
+  | "agent"
+  | "user"
+  | "system";
+
 export const RECOMMENDED_ACTOR_NAMES: Readonly<Record<ActorKind, readonly string[]>> = {
   agent: [
     "claude-code",
@@ -63,15 +80,15 @@ function isActorKind(value: string): value is ActorKind {
 export function resolveActor(
   override: string | undefined,
   env: NodeJS.ProcessEnv = process.env
-): string {
+): ActorId {
   const candidate = (override ?? env.AGENT_RECALL_ACTOR ?? "").trim();
   if (candidate.length === 0) {
     return DEFAULT_ACTOR;
   }
   if (LEGACY_ACTOR_VALUES.has(candidate)) {
-    return candidate;
+    return candidate as ActorId;
   }
-  return candidate;
+  return candidate as ActorId;
 }
 
 /** Parse a stored actor string into structured form. Used for read-side display. */
@@ -97,5 +114,5 @@ export function isRecommendedActor(value: string): boolean {
   return (RECOMMENDED_ACTOR_NAMES[parsed.kind] as readonly string[]).includes(parsed.name);
 }
 
-export const CLI_ACTOR = "user:cli";
-export const DEFAULT_ACTOR = "agent:unknown";
+export const CLI_ACTOR: ActorId = "user:cli";
+export const DEFAULT_ACTOR: ActorId = "agent:unknown";
