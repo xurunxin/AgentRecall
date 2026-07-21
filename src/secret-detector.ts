@@ -5,6 +5,15 @@ export type SecretFinding = {
   field: string;
 };
 
+/**
+ * Stage 14 PR-C (spec § 9.1): a hand-maintained release
+ * marker the doctor `secret_policy_version` check
+ * compares against the expected version. Bump the
+ * constant when the regex catalogue above changes in a
+ * way that could re-classify previously-accepted text.
+ */
+export const SECRET_POLICY_VERSION = "v1";
+
 const API_KEY_PREFIXES = /\b(sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{20,})\b/;
 const PRIVATE_KEY = /-----BEGIN [A-Z ]*PRIVATE KEY-----/;
 const BEARER_TOKEN = /\bBearer\s+[A-Za-z0-9._~+/=-]{24,}\b/i;

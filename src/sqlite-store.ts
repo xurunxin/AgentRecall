@@ -1524,8 +1524,8 @@ export class SQLiteMemoryStore {
         if (revisionContext !== undefined) {
           this.recordRevisionRow(
             current.id,
-            current.revision,
-            current,
+            next.revision,
+            next,
             revisionContext.changed_by,
             revisionContext.request_id,
             revisionContext.change_reason
@@ -1547,24 +1547,25 @@ export class SQLiteMemoryStore {
   /**
    * Stage 14 PR-B2 (spec § 6.5): append the first
    * `memory_revisions` row for a freshly-created entry. The
-   * snapshot is a `created`-shaped placeholder (just `id` +
-   * `revision: 0`) so the revision chain has a "from nothing"
-   * baseline that the `created` audit event can be joined
-   * against. Called from `MemoryWriteService.commitPreparedRemember`
-   * inside the same transaction as `insertEntry`.
+   * row is keyed on `revision: 1` (the same `revision` the
+   * `memory_entries` row carries post-insert) so the audit
+   * chain is contiguous from the very first mutation. The
+   * snapshot is a `created`-shaped placeholder (the full
+   * entry) so audit consumers can join the revision row
+   * against the `created` audit event. Called from
+   * `MemoryWriteService.commitPreparedRemember` after
+   * `insertEntry`.
    */
   recordRevisionForCreate(
     memoryId: string,
     changedBy: string,
     requestId: string | undefined
   ): void {
+    const created = this.readEntry(memoryId);
     this.recordRevisionRow(
       memoryId,
-      0,
-      {
-        id: memoryId,
-        revision: 0
-      } as unknown as MemoryEntry,
+      1,
+      (created ?? { id: memoryId, revision: 1 }) as unknown as MemoryEntry,
       changedBy,
       requestId,
       "created"

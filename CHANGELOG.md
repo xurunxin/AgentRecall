@@ -280,6 +280,179 @@ Date: 2026-07-21
   (506 distinct ids reported = 506 rows on disk).
 - `npm run typecheck` clean.
 
+## [Unreleased] — Stage 14 PR-C (Doctor Checks)
+
+Date: 2026-07-21
+
+### Added
+
+- **`src/doctor/checks/scope-safety.ts`** (spec § 9.1 #1).
+  Surfaces `memory_entries` rows whose `scope` is
+  `project` but `project_id` is null (orphans — the
+  project-scope filter would silently drop them) and
+  rows whose `project_id` no longer matches any
+  `project_scopes.project_id` (stale project —
+  the entry is invisible under the live scope
+  resolver). Both fail loudly so the operator can
+  either re-link or move the entry out.
+- **`src/doctor/checks/revision-integrity.ts`** (spec
+  § 9.1 #2 / § 6.5). Walks `memory_entries` joined
+  with `memory_revisions` and fails when a memory's
+  revision chain is non-contiguous (e.g. 1, 2, 4 —
+  missing 3), missing the `revision: 1` create
+  baseline, or has a chain desync (the latest
+  `memory_revisions` row is at a different revision
+  than the row's current `revision`). The check
+  enforces the spec § 5.6 / § 6.5 promise that
+  "memory_revisions 保存 memory 完整 snapshot_json，
+  可用于审计回放".
+- **`src/doctor/checks/journal-mode.ts`** (spec § 9.1
+  #3). Reads `PRAGMA journal_mode` and fails when the
+  value is anything other than `wal`. The 8-process
+  stress test from PR-B2 assumes WAL — a
+  `delete` / `truncate` mode connection cannot
+  pipeline concurrent writers despite the busy
+  retry.
+- **`src/doctor/checks/sqlite-runtime.ts`** (spec §
+  9.1 #4). Surfaces the live `sqlite_version()` and
+  `PRAGMA busy_timeout`. Fails when the SQLite
+  version is below 3.45.0 (the cutoff for `STRICT`
+  tables and `json_each` improvements the v4 schema
+  relies on) or when the connection's busy_timeout
+  is below 5,000 ms (the value `runWithBusyRetry`
+  assumes on the way in). Handles the node:sqlite
+  PRAGMA column-name quirk (returns `timeout`
+  rather than `busy_timeout`).
+- **`src/doctor/checks/lock-health.ts`** (spec § 9.1
+  #5). Counts `write_rejected` audit events whose
+  `metadata.error` matches `SQLITE_BUSY` over the
+  last 24 h. Warn at 5+; fail at 25+. A persistent
+  tail of exhausted-retries rejections means
+  contention has outgrown what the defaults can
+  absorb.
+- **`src/doctor/checks/backup-verification.ts`**
+  (spec § 9.1 #6). Pairs with the existing
+  `backup_directory` check: that one counts the
+  files and reports their age; this one opens the
+  most recent backup in a read-only connection and
+  runs `PRAGMA quick_check`. A backup file that has
+  been silently corrupted (filesystem bit-rot, half-
+  written by a crashed process) is worse than no
+  backup at all.
+- **`src/doctor/checks/project-alias-collision.ts`**
+  (spec § 9.1 #7). Groups `project_scopes` by
+  `canonical_path` and fails when two scopes share
+  the same path. The v4 schema does not enforce
+  canonical_path uniqueness (the alias table is the
+  canonical map for project_id lookup), so a
+  duplicate row would silently shadow the first.
+- **`src/doctor/checks/ranking-health.ts`** (spec §
+  9.1 #8). Pins the active `ranking_version` (the
+  build-time constant the recall ranker stamps on
+  every `explain_recall` response) and surfaces it
+  in the doctor report. A mismatch between the
+  pinned version and the running ranker means a
+  silent recall-curve change that no other check
+  would catch.
+- **`src/doctor/checks/export-collision.ts`** (spec
+  § 9.1 #9). Groups active / archived entries by
+  `(scope, project_id, topic)` and surfaces groups
+  with size > 1. The v1 markdown exporter already
+  dedupes topic slugs via `buildTopicFilenameMap`
+  (slug + shortHash on collision), so the check
+  answers a level-up question: are two live memories
+  claiming the same topic file? Warns (not fails)
+  because a shared topic file is still importable.
+- **`src/doctor/checks/audit-revision-gap.ts`**
+  (spec § 9.1 #10). Walks the `created` / `updated`
+  / `superseded` / `forgotten` / `archived` /
+  `merged` audit events and fails when any event
+  is missing `request_id` or `revision` in its
+  metadata. Both fields are required for the
+  per-request audit chain PR-B1 / PR-B2 put in
+  place; a gap means a request reached the server
+  but neither correlation field was recorded.
+- **`src/doctor/checks/secret-policy-version.ts`**
+  (spec § 9.1 #11). Surfaces the active
+  `SECRET_POLICY_VERSION` constant the secret
+  detector exports. The constant is a release
+  marker maintained by hand in `secret-detector.ts`;
+  this check is the consumer that surfaces drift in
+  the doctor report.
+- **`src/doctor/checks/idempotency-integrity.ts`**
+  (spec § 9.1 #12). Walks `mutation_requests` and
+  surfaces four invariant breaks: empty
+  `actor_id`, empty `idempotency_key`, unparseable
+  `result_json`, or `created_at` in the future
+  beyond a 60 s skew tolerance.
+- **`src/doctor/index.ts`** — all 12 new checks
+  wired into `runDoctor` after the existing 12
+  pre-PR-C checks. The check count grew from 12 to
+  24; the existing `test/doctor.test.ts` assertion
+  was updated from `toBe(12)` to `toBe(24)`.
+- **`src/secret-detector.ts`** — exports the
+  `SECRET_POLICY_VERSION` constant the new
+  `secret_policy_version` check reads.
+- **`test/release-gate/p0-doctor-checks.test.ts`**
+  (12 tests). Locks down each of the 12 new
+  checks: positive (healthy store → ok) and
+  negative (manually-degraded store → fail / warn
+  as the spec promises). The degraded fixtures
+  reach into the underlying SQLite handle to
+  inject the precise invariant break the check is
+  supposed to catch (orphan rows for
+  `scope_safety`, deleted `memory_revisions` rows
+  for `revision_integrity`, a non-WAL
+  `journal_mode` switch for `journal_mode`, etc.).
+
+### Changed
+
+- **`src/services/memory-write-service.ts`** — the
+  `created` audit event's metadata now carries
+  `revision: entry.revision` (the post-image
+  revision the entry was inserted at). Pre-PR-C
+  the metadata only carried `topic` / `type` /
+  `importance` / `confidence`, so the
+  `audit_revision_gap` check would warn on every
+  `created` event. The new field is the source
+  the check joins against.
+- **`src/sqlite-store.ts`** — `recordRevisionForCreate`
+  now writes the row at `revision: 1` (the same
+  `revision` the `memory_entries` row carries
+  post-insert) instead of `revision: 0`. The
+  pre-PR-C value of 0 broke the `revision_integrity`
+  check's contiguity invariant (a memory created
+  at revision 1 in the row but revision 0 in the
+  revisions table is non-contiguous). The
+  snapshot is now a real `created`-shaped entry
+  rather than a `{id, revision: 0}` placeholder.
+- **`src/sqlite-store.ts`** —
+  `updateEntryWithRevision` now passes
+  `next.revision` to `recordRevisionRow` (the
+  post-image revision the row is being updated
+  to) rather than `current.revision` (the
+  pre-image). Pre-PR-C the two values were
+  identical in the no-`recordRevisionRow` path
+  but the row-key collision surfaced when
+  `recordRevisionForCreate` was changed to
+  `revision: 1` — the create row + the first
+  update's pre-image both keyed on revision 1.
+- **`test/doctor.test.ts`** — the "returns all-ok
+  for an empty healthy database" test's
+  `report.results.length` assertion was updated
+  from 12 to 24 to match the new check count. No
+  other test expectations change.
+
+### Verification
+
+- 422/422 vitest tests pass (410 baseline after
+  PR-B2 + 12 new in `p0-doctor-checks.test.ts`).
+  54/54 test files, 0 failures.
+- `npm run typecheck` clean.
+- `test/doctor.test.ts` (the existing doctor
+  smoke test) still passes against the 24-check
+  run.
+
 ## [Unreleased] — Stage 13 PR11 (CI Matrix)
 
 Date: 2026-07-21
