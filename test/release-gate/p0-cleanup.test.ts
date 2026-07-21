@@ -107,21 +107,26 @@ describe("release-gate p0-cleanup (Stage 14 PR-D)", () => {
     expect(readme).not.toMatch(/twelve health checks/);
   });
 
-  it("CHANGELOG has a Stage 14 PR-D (Cleanup) block", () => {
+  it("CHANGELOG has a Stage 14 PR-D (Cleanup) sub-section", () => {
     const repoRoot = join(import.meta.dirname, "..", "..");
     const changelog = readFileSync(join(repoRoot, "CHANGELOG.md"), "utf8");
-    expect(changelog).toMatch(/## \[Unreleased\] — Stage 14 PR-D \(Cleanup\)/);
+    // Stage 14 PR-E consolidates the per-PR [Unreleased] blocks
+    // into a single [1.0.0] parent, demoting the per-PR
+    // headings to `### Stage 14 PR-X` sub-sections. The
+    // invariant we still want to guard: the PR-D and PR-C
+    // contributions are still in the file.
+    expect(changelog).toMatch(/### Stage 14 PR-D \(Cleanup\)/);
   });
 
-  it("CHANGELOG has a Stage 14 PR-C (Doctor Checks) block", () => {
+  it("CHANGELOG has a Stage 14 PR-C (Doctor Checks) sub-section", () => {
     const repoRoot = join(import.meta.dirname, "..", "..");
     const changelog = readFileSync(join(repoRoot, "CHANGELOG.md"), "utf8");
-    expect(changelog).toMatch(/## \[Unreleased\] — Stage 14 PR-C \(Doctor Checks\)/);
+    expect(changelog).toMatch(/### Stage 14 PR-C \(Doctor Checks\)/);
   });
 
-  it("package.json version is still 0.1.0 (master plan rule: PR-E bumps to 1.0.0)", () => {
+  it("package.json version is 1.0.0 (master plan rule: PR-E bumps to 1.0.0)", () => {
     const repoRoot = join(import.meta.dirname, "..", "..");
     const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")) as { version: string };
-    expect(pkg.version).toBe("0.1.0");
+    expect(pkg.version).toBe("1.0.0");
   });
 });
