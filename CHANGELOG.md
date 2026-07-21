@@ -5,6 +5,113 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [Unreleased] — Stage 13 PR10 (Portability)
+
+Date: 2026-07-21
+
+### Added
+
+- **Unified portability layer (spec § 6.7).** The three
+  Stage 8 exporters (markdown / json / yaml) collapse
+  into one `CanonicalExporter` that reads a single
+  `CanonicalScope` model and writes it through three
+  pure renderers. The collision-safe filename map
+  (slug + 8-char SHA-256 + Windows-reserved guard) is
+  computed once and reused, so the JSON / YAML
+  renderers no longer fall back to `general` on CJK
+  topics (AR-P1-006).
+- **Collision-safe topic filenames.** `safeTopicBase`
+  + `shortHash` + `buildTopicFilenameMap` produce a
+  stable per-topic filename even when two distinct
+  topics slugify to the same string. CJK characters,
+  diacritics, and Windows reserved basenames (CON,
+  PRN, AUX, ...) are all handled in one place.
+- **`MANIFEST.json` (spec § 6.7).** Every export
+  directory now ships a `MANIFEST.json` with the
+  export + source schema versions, the scope label,
+  the `generated_at` timestamp, the entry / topic
+  counts, and a `{ path, size, sha256 }` record for
+  every emitted file. `readManifest` is strict
+  (version-mismatch throws); `verifyManifest`
+  re-hashes the on-disk files and reports the
+  mismatches; `planImport` can call it via
+  `require_clean_manifest: true` and refuse the
+  import on any drift.
+- **Atomic two-step publisher.** `stageFiles` +
+  `publishStagedFiles` are exposed as separate
+  steps. The previous `MarkdownExporter.stageScope`
+  semantic ("stage only, no publish") is preserved so
+  the `FailingStageExporter` fixture keeps working
+  unchanged. `stageAndPublish` is the convenience
+  wrapper used by `exportScope`.
+- **Import command (spec § 6.7).** `agent-recall
+  import --from <root> --scope [global|project]
+  [--project-id <id>] [--format json|yaml]
+  [--conflict keep|replace|merge|fail] [--dry-run]
+  [--json]`. Round-trips a previous export into a
+  live `MemoryService`. Markdown is intentionally not
+  supported as an import source — the parser throws
+  explicitly so the user knows to use `json` or
+  `yaml`.
+- **Conflict policies.** `keep` skips existing ids,
+  `replace` overwrites with a CAS-revision guard,
+  `merge` unions tags / takes max importance +
+  confidence / keeps the longer body, `fail` aborts
+  on the first conflict without writing anything.
+- **Restore-from-backup command (spec § 6.3).**
+  `agent-recall restore --from <backup>
+  --confirm` runs a 5-step protocol: verify the
+  backup, take a pre-restore backup of the live DB,
+  rename live to `memory.sqlite.pre-restore.<ts>`,
+  copy the backup into place, audit `restore_completed`.
+  The audit chain records both the pre-restore and
+  the restored-from paths.
+- **`MemoryService.insertImportedEntry` /
+  `writeInsertImportedEntry`** (spec § 6.7). The
+  import path bypasses `service.remember` (which
+  mints a fresh id) and writes the entry with its
+  original id, then emits a `created` audit event
+  carrying `imported_from: "export"` and
+  `source_revision: <n>`.
+- **`MemoryService.peekMemoryById`** (spec § 6.7).
+  Importer conflict resolution uses it to compare
+  the existing entry's revision against the imported
+  one without recording an access.
+- **Two new audit event names:** `backup_verified`
+  and `restore_completed`. Both flow through the
+  standard appendAudit pipeline.
+- **33 new portability tests.** `test/portability.test.ts`
+  (26) covers the canonical model, renderers, atomic
+  publisher, manifest round-trip, and the high-level
+  exporter (CJK / collision / deterministic). `test/portability-import.test.ts`
+  (7) covers dry-run, the three conflict policies,
+  manifest hash mismatch, and the empty-plan apply.
+
+### Changed
+
+- **`MarkdownExporter` becomes a thin shell.**
+  `exportScope` / `stageScope` / `publishStagedScope` /
+  `buildContextPack` are preserved on the legacy
+  facade (so the existing `markdown-exporter.test.ts`
+  fixtures keep working) and delegate to the new
+  `CanonicalExporter`.
+- **`format-exporters.ts` becomes a thin wrapper.**
+  The `FormatRouter` forwards to the
+  `CanonicalExporter` so the CLI dispatch path is
+  unchanged.
+
+### Verification
+
+- 391/391 vitest tests pass (was 358 at PR9 baseline
+  + 26 portability + 7 portability-import). Includes
+  the unchanged 17 release-gate tests and the 21 MCP
+  v2 contract tests from PR9.
+- `npm run typecheck` clean.
+- Manual `agent-recall import` round-trip: export a
+  global scope to JSON, drop the live DB, import the
+  export back, confirm `peekMemoryById` returns the
+  restored entry with the original id and revision.
+
 ## [Unreleased] — Stage 12 PR9 (MCP v2 + CAS revision)
 
 Date: 2026-07-21
