@@ -5,10 +5,26 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
-## [Unreleased] — Stage 14 PR-A (Migrate Pre-Backup)
+## [1.0.0] — Stage 14 v1.0 (AgentRecall v1.0)
 
 Date: 2026-07-21
 
+This is the first v1.0 release of AgentRecall. The v1.0
+acceptance bar is the spec § 9.1 P0 exit criteria: doctor
+runs 24 checks, all 5 mutating tools carry idempotency,
+every mutation emits a `memory_revisions` post-image
+snapshot, the multi-process concurrency stress test
+completes with 0 unhandled SQLITE_BUSY / 0 lost writes /
+0 corruption, and the schema is at v4 with WAL +
+busy_timeout + atomic per-actor access tracking.
+
+The release is the consolidation of five serial PRs:
+PR-A (migrate pre-backup), PR-B1 (request context + v1.0
+error codes), PR-B2 (idempotency + memory_revisions +
+atomic access + CAS), PR-C (12 v1.0 doctor checks), and
+PR-D (README / CHANGELOG cleanup + regression locks).
+
+### Stage 14 PR-A (Migrate Pre-Backup)
 ### Changed
 
 - **`agent-recall migrate --yes`** (spec § 5.4 AR-P0-004 / § 14). The CLI
@@ -44,10 +60,7 @@ Date: 2026-07-21
   output still contains "migrated", the JSON shape still exposes `from` and
   `to`, and the no-`--yes` path still refuses.
 
-## [Unreleased] — Stage 14 PR-B1 (Request Context + Error Codes)
-
-Date: 2026-07-21
-
+### Stage 14 PR-B1 (Request Context + Error Codes)
 ### Added
 
 - **`src/request-context.ts`** (new). The `RequestContext` type
@@ -161,10 +174,7 @@ Date: 2026-07-21
   legacy bare values (`agent` / `user` / `system`) for
   backwards compatibility; new writes are structured.
 
-## [Unreleased] — Stage 14 PR-B2 (Mutation Safety)
-
-Date: 2026-07-21
-
+### Stage 14 PR-B2 (Mutation Safety)
 ### Added
 
 - **`src/services/memory-write-service.ts`** (spec § 5.6 AR-P0-006
@@ -280,10 +290,7 @@ Date: 2026-07-21
   (506 distinct ids reported = 506 rows on disk).
 - `npm run typecheck` clean.
 
-## [Unreleased] — Stage 14 PR-C (Doctor Checks)
-
-Date: 2026-07-21
-
+### Stage 14 PR-C (Doctor Checks)
 ### Added
 
 - **`src/doctor/checks/scope-safety.ts`** (spec § 9.1 #1).
@@ -453,10 +460,7 @@ Date: 2026-07-21
   smoke test) still passes against the 24-check
   run.
 
-## [Unreleased] — Stage 14 PR-D (Cleanup)
-
-Date: 2026-07-21
-
+### Stage 14 PR-D (Cleanup)
 ### Changed
 
 - **`README.md`** — the "Doctor" section's check count
