@@ -66,8 +66,17 @@ export type SearchFilters = EntryFilters & {
  * `PRAGMA user_version` tracking. v2 loosened the `audit_events.actor`
  * CHECK constraint to allow structured values like `agent:claude-code`.
  * v3 adds the `last_accessed_by` JSON column to `memory_entries`.
+ * v4 (Stage 11 PR7) adds revision / writer_actor_id / memory_revisions
+ * / memory_accesses / project_aliases / memory_relations.
+ * v5 (Stage 15 PR-M0-1) replaces `mutation_requests` with
+ * `mutation_requests_v2` (PK `(actor_id, tool_name, idempotency_key)`,
+ * transactional reservation).
+ * v6 (Stage 15 PR-M0-4, issue #3) introduces persistent
+ * `maintenance_plans` + `maintenance_plan_items` so plans survive
+ * MCP restart and `apply_maintenance` only mutates planned targets
+ * (no more "broad merge_duplicates" path).
  */
-export const CURRENT_SCHEMA_VERSION = 5;
+export const CURRENT_SCHEMA_VERSION = 6;
 
 /**
  * Stage 12 PR9: thrown by `updateEntryWithRevision` when
@@ -135,6 +144,50 @@ type EntryPatchField =
   | "writer_actor_id";
 
 export type EntryPatch = Partial<Pick<MemoryEntry, EntryPatchField>> & Pick<MemoryEntry, "updated_at">;
+
+/**
+ * Stage 15 PR-M0-4 (issue #3, spec § 6.2): row shape for
+ * the persistent `maintenance_plans` table. The plan is
+ * durable; the items live in a child table keyed on
+ * `(plan_id, target_memory_id)`. The `plan_hash` is
+ * SHA-256 over the canonical JSON of `items` so the
+ * apply step can detect tampering between plan and apply.
+ *
+ * The `state` column is the plan lifecycle:
+ *   - `pending`   -> freshly created, eligible for apply
+ *   - `completed` -> apply succeeded; no further applies
+ *   - `expired`   -> past `expires_at`; apply rejects
+ *   - `rejected`  -> apply refused (stale revision /
+ *                    wrong idempotency_key / hash drift);
+ *                    no further applies
+ */
+export type MaintenancePlanState = "pending" | "completed" | "expired" | "rejected";
+export type MaintenancePlanRisk = "low" | "medium" | "high";
+export type MaintenancePlanActionType = "supersede" | "merge" | "forget" | "update" | "retain";
+
+export type MaintenancePlanItemRow = {
+  target_memory_id: string;
+  expected_revision: number;
+  action_type: MaintenancePlanActionType;
+  /** JSON-encoded `evidence` (the DuplicateGroup that surfaced this candidate). */
+  evidence_json: string;
+  risk: MaintenancePlanRisk;
+};
+
+export type MaintenancePlanRow = {
+  plan_id: string;
+  plan_hash: string;
+  creator_actor_id: string;
+  created_at: string;
+  expires_at: string;
+  state: MaintenancePlanState;
+  /** JSON-encoded `summary: string[]` from the planning step. */
+  summary_json: string;
+  scope: "global" | "project";
+  project_id?: string;
+  risk: MaintenancePlanRisk;
+  items: MaintenancePlanItemRow[];
+};
 
 type Row = Record<string, SQLOutputValue>;
 
@@ -688,6 +741,10 @@ export class SQLiteMemoryStore {
       this.migrate_v4_to_v5();
       return;
     }
+    if (version === 6) {
+      this.migrate_v5_to_v6();
+      return;
+    }
     throw new Error(`No migration registered for schema version ${version}`);
   }
 
@@ -950,6 +1007,68 @@ export class SQLiteMemoryStore {
       // uses the `tool_name='legacy'` namespace to keep
       // its reads working.
       this.db.exec("PRAGMA user_version = 5");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * Stage 15 PR-M0-4 (issue #3, spec § 6.2): v5 -> v6
+   * schema migration. Introduces persistent
+   * `maintenance_plans` and `maintenance_plan_items`
+   * so plans survive MCP restart. Each item carries its
+   * `expected_revision` so `apply_maintenance` can refuse
+   * stale plans; the plan carries a `plan_hash` (SHA256
+   * over the canonical JSON of items) so the apply step
+   * can detect tampering between plan and apply.
+   *
+   * Pre-v6 plans lived in a process-local `Map`; they were
+   * gone the moment the MCP server restarted. With v6, the
+   * plan is durable: an agent can call `plan_maintenance`,
+   * the user can review the plan, and a different MCP
+   * session can call `apply_maintenance` hours later and
+   * still see the same plan.
+   *
+   * Migration is fully transactional. If any step throws,
+   * the user_version stays at 5 and the database is
+   * untouched.
+   */
+  private migrate_v5_to_v6(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS maintenance_plans (
+          plan_id TEXT PRIMARY KEY,
+          plan_hash TEXT NOT NULL,
+          creator_actor_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('pending','completed','expired','rejected')),
+          summary_json TEXT NOT NULL,
+          scope TEXT NOT NULL CHECK (scope IN ('global','project')),
+          project_id TEXT,
+          risk TEXT NOT NULL CHECK (risk IN ('low','medium','high'))
+        ) STRICT;
+
+        CREATE TABLE IF NOT EXISTS maintenance_plan_items (
+          plan_id TEXT NOT NULL,
+          target_memory_id TEXT NOT NULL,
+          expected_revision INTEGER NOT NULL,
+          action_type TEXT NOT NULL CHECK (action_type IN ('supersede','merge','forget','update','retain')),
+          evidence_json TEXT NOT NULL,
+          risk TEXT NOT NULL CHECK (risk IN ('low','medium','high')),
+          PRIMARY KEY (plan_id, target_memory_id),
+          FOREIGN KEY (plan_id) REFERENCES maintenance_plans(plan_id) ON DELETE CASCADE
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS maintenance_plans_state_idx
+          ON maintenance_plans(state, expires_at);
+        CREATE INDEX IF NOT EXISTS maintenance_plan_items_target_idx
+          ON maintenance_plan_items(target_memory_id);
+      `);
+      this.db.exec("PRAGMA user_version = 6");
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -1285,6 +1404,154 @@ export class SQLiteMemoryStore {
       .prepare("SELECT * FROM audit_events WHERE memory_id = ? ORDER BY created_at ASC")
       .all(memoryId)
       .map(decodeAudit);
+  }
+
+  /**
+   * Stage 15 PR-M0-4 (issue #3, spec § 6.2): persistent
+   * maintenance plan CRUD on top of the
+   * `maintenance_plans` + `maintenance_plan_items` tables.
+   * Pre-v6 the plan lived in a process-local Map and was
+   * lost on every MCP restart. With v6 the plan survives
+   * restart so a different session (or even a different
+   * process) can call `apply_maintenance` later.
+   *
+   * The plan_hash is SHA-256 over the canonical JSON of
+   * the items array, so any tampering between plan and
+   * apply is detected by `getPlan`. Expired plans
+   * (state='expired' or expires_at <= now) are
+   * auto-rejected by the read path; explicit
+   * `expireOldPlans` flips `pending` -> `expired` in bulk.
+   */
+  createMaintenancePlan(plan: MaintenancePlanRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO maintenance_plans
+          (plan_id, plan_hash, creator_actor_id, created_at,
+           expires_at, state, summary_json, scope, project_id, risk)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        plan.plan_id,
+        plan.plan_hash,
+        plan.creator_actor_id,
+        plan.created_at,
+        plan.expires_at,
+        plan.state,
+        plan.summary_json,
+        plan.scope,
+        plan.project_id ?? null,
+        plan.risk
+      );
+    const insertItem = this.db.prepare(
+      `INSERT INTO maintenance_plan_items
+        (plan_id, target_memory_id, expected_revision, action_type, evidence_json, risk)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    );
+    for (const item of plan.items) {
+      insertItem.run(
+        plan.plan_id,
+        item.target_memory_id,
+        item.expected_revision,
+        item.action_type,
+        item.evidence_json,
+        item.risk
+      );
+    }
+  }
+
+  getMaintenancePlan(planId: string): MaintenancePlanRow | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM maintenance_plans WHERE plan_id = ?")
+      .get(planId) as
+      | {
+          plan_id: string;
+          plan_hash: string;
+          creator_actor_id: string;
+          created_at: string;
+          expires_at: string;
+          state: string;
+          summary_json: string;
+          scope: string;
+          project_id: string | null;
+          risk: string;
+        }
+      | undefined;
+    if (row === undefined) return undefined;
+    const itemRows = this.db
+      .prepare(
+        "SELECT target_memory_id, expected_revision, action_type, evidence_json, risk FROM maintenance_plan_items WHERE plan_id = ? ORDER BY target_memory_id ASC"
+      )
+      .all(planId) as Array<{
+      target_memory_id: string;
+      expected_revision: number;
+      action_type: string;
+      evidence_json: string;
+      risk: string;
+    }>;
+    const out: MaintenancePlanRow = {
+      plan_id: row.plan_id,
+      plan_hash: row.plan_hash,
+      creator_actor_id: row.creator_actor_id,
+      created_at: row.created_at,
+      expires_at: row.expires_at,
+      state: row.state as MaintenancePlanRow["state"],
+      summary_json: row.summary_json,
+      scope: row.scope as MaintenancePlanRow["scope"],
+      risk: row.risk as MaintenancePlanRow["risk"],
+      items: itemRows.map((r) => ({
+        target_memory_id: r.target_memory_id,
+        expected_revision: r.expected_revision,
+        action_type: r.action_type as MaintenancePlanItemRow["action_type"],
+        evidence_json: r.evidence_json,
+        risk: r.risk as MaintenancePlanItemRow["risk"]
+      }))
+    };
+    if (row.project_id !== null) {
+      out.project_id = row.project_id;
+    }
+    return out;
+  }
+
+  setMaintenancePlanState(planId: string, state: MaintenancePlanRow["state"]): void {
+    this.db
+      .prepare("UPDATE maintenance_plans SET state = ? WHERE plan_id = ?")
+      .run(state, planId);
+  }
+
+  expireOldMaintenancePlans(now: string): number {
+    const result = this.db
+      .prepare(
+        `UPDATE maintenance_plans
+            SET state = 'expired'
+          WHERE state = 'pending' AND expires_at <= ?`
+      )
+      .run(now);
+    return Number(result.changes ?? 0);
+  }
+
+  /** A plan_id is "applied" iff there is an `apply_maintenance`
+   * audit event that names it. We use this to detect a retry
+   * with the same idempotency_key (idempotent no-op) vs a
+   * different idempotency_key (idempotency_mismatch). */
+  getAppliedMaintenanceKeys(planId: string): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT metadata_json FROM audit_events
+          WHERE event = 'apply_maintenance'`
+      )
+      .all() as Array<{ metadata_json: string }>;
+    const keys: string[] = [];
+    for (const row of rows) {
+      try {
+        const meta = JSON.parse(row.metadata_json) as { plan_id?: unknown; idempotency_key?: unknown; ok?: unknown };
+        if (meta.plan_id === planId && typeof meta.idempotency_key === "string" && meta.ok === true) {
+          keys.push(meta.idempotency_key);
+        }
+      } catch {
+        continue;
+      }
+    }
+    return keys;
   }
 
   listAuditEvents(filters: AuditFilters = {}): MemoryAuditEvent[] {

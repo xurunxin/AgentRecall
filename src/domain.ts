@@ -112,7 +112,9 @@ export type AuditEventName =
   | "markdown_exported"
   | "backup_created"
   | "backup_verified"
-  | "restore_completed";
+  | "restore_completed"
+  | "plan_maintenance"
+  | "apply_maintenance";
 
 export type MemoryAuditEvent = {
   id: string;
