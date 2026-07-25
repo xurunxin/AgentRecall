@@ -425,18 +425,60 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
     list_memories: envelopeHandler("list_memories", memoryToolSchemas.list_memories, (input) =>
       service.listMemories(serviceInput<Parameters<MemoryService["listMemories"]>[0]>(input))
     ),
-    update_memory: envelopeHandler("update_memory", memoryToolSchemas.update_memory, (input, _extra, ctx) =>
-      service.updateMemory(memoryIdFromInput(input), patchFromUpdateInput(input), ctx)
-    ),
+    update_memory: envelopeHandler("update_memory", memoryToolSchemas.update_memory, (input, _extra, ctx) => {
+      // Stage 15 PR-M0-2 (issue #2, spec § 5.6): forward
+      // `idempotency_key` and `expected_revision` through
+      // the adapter. `patchFromUpdateInput` only extracts
+      // the patchable fields; the CAS / idempotency fields
+      // must be merged in here so the service's
+      // `checkIdempotency` and CAS guards see them.
+      const patch = patchFromUpdateInput(input);
+      const casFields: { idempotency_key?: string; expected_revision?: number } = {};
+      if (input.idempotency_key !== undefined) casFields.idempotency_key = input.idempotency_key;
+      if (input.expected_revision !== undefined) casFields.expected_revision = input.expected_revision;
+      return service.updateMemory(
+        memoryIdFromInput(input),
+        Object.keys(casFields).length === 0 ? patch : { ...patch, ...casFields },
+        ctx
+      );
+    }),
     supersede_memory: envelopeHandler("supersede_memory", memoryToolSchemas.supersede_memory, (input, _extra, ctx) =>
       service.supersedeMemory(serviceInput<Parameters<MemoryService["supersedeMemory"]>[0]>(input), ctx)
     ),
     merge_memories: envelopeHandler("merge_memories", memoryToolSchemas.merge_memories, (input, _extra, ctx) =>
       service.mergeMemories(serviceInput<Parameters<MemoryService["mergeMemories"]>[0]>(input), ctx)
     ),
-    forget_memory: envelopeHandler("forget_memory", memoryToolSchemas.forget_memory, (input, _extra, ctx) =>
-      service.forgetMemory(memoryIdFromInput(input), input.reason, ctx)
-    ),
+    forget_memory: envelopeHandler("forget_memory", memoryToolSchemas.forget_memory, (input, _extra, ctx) => {
+      // Stage 15 PR-M0-2 (issue #2, spec § 5.6): the
+      // `forget_memory` schema accepts `idempotency_key`
+      // and `expected_revision` (Stage 14 PR-B2), but
+      // the v1 adapter dropped both fields. Forward
+      // them to the service so CAS + idempotency are
+      // usable through MCP, matching the direct service
+      // test behaviour. Only pass the `options` arg
+      // when at least one CAS / idempotency field is
+      // set — the service's signature is
+      // `forgetMemory(id, reason, ctx, options?)` and
+      // a missing-options call must remain 3-arg for
+      // the existing test contract (vi.fn's
+      // `toHaveBeenCalledWith` checks arg count).
+      const casFields: { idempotency_key?: string; expected_revision?: number } = {};
+      if (input.idempotency_key !== undefined) casFields.idempotency_key = input.idempotency_key;
+      if (input.expected_revision !== undefined) casFields.expected_revision = input.expected_revision;
+      if (Object.keys(casFields).length === 0) {
+        return service.forgetMemory(
+          memoryIdFromInput(input),
+          input.reason,
+          ctx
+        );
+      }
+      return service.forgetMemory(
+        memoryIdFromInput(input),
+        input.reason,
+        ctx,
+        casFields
+      );
+    }),
     get_memory_budget: envelopeHandler("get_memory_budget", memoryToolSchemas.get_memory_budget, (input) =>
       service.getMemoryBudget(serviceInput<Parameters<MemoryService["getMemoryBudget"]>[0]>(input))
     ),

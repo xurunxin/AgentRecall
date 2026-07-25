@@ -170,6 +170,80 @@ serial PRs plus the M0-pre fix-test-infra PR below.
   `request_id` / `completed_at` columns so the v4
   read path resumes working. Not in this PR.
 
+### Stage 15 PR-M0-2 (MCP Context Contract)
+### Fixed
+
+- **`src/tools/register-tools.ts`** (issue #2, spec § 5.6).
+  The v1 `update_memory` and `forget_memory` adapters
+  dropped the `idempotency_key` and `expected_revision`
+  fields even though the zod schemas accepted them
+  and the underlying service methods read them. A
+  client calling `update_memory` over MCP with an
+  `idempotency_key` would silently lose the field;
+  the service would run the mutation without the
+  key, so a retry would not replay. The v2 adapter
+  forwards both fields through the call boundary
+  to the service:
+    - `update_memory` — `idempotency_key` and
+      `expected_revision` are merged into the
+      `UpdateInput` object (alongside the patch
+      fields from `patchFromUpdateInput`).
+    - `forget_memory` — the same two fields are
+      passed as the `options` arg to
+      `service.forgetMemory(id, reason, ctx, options)`.
+      When both fields are absent, the adapter calls
+      the legacy 3-arg form so the existing test
+      contract (`toHaveBeenCalledWith` strict-match
+      arg count) keeps passing.
+
+### Changed
+
+- **`src/tools/schemas.ts`** — the
+  `updateMemoryToolSchema` now exposes
+  `expected_revision: z.number().int().nonnegative().optional()`.
+  The `forgetMemoryToolSchema` already had the
+  field (Stage 14 PR-B2); the field was just being
+  dropped in the adapter.
+
+### Added
+
+- **`test/release-gate/p1-mcp-context.test.ts`** (4
+  tests). Locks down the two PR-M0-2 acceptance
+  criteria that aren't already covered by
+  `test/tool-registration.test.ts` (handler arg
+  shape) and `test/release-gate/p0-request-context.test.ts`
+  (audit metadata):
+    1. `update_memory` adapter forwards
+       `idempotency_key` + `expected_revision` to
+       the service.
+    2. `update_memory` adapter keeps the legacy
+       2-input call shape when the client omits
+       both fields.
+    3. `forget_memory` adapter forwards the same
+       two fields via the `options` arg.
+    4. `forget_memory` adapter keeps the legacy
+       3-arg call shape when the client omits
+       both fields.
+
+### Verification
+
+- `npm test` → 0 failed / **450 passed** (was: 446)
+  / 1 unhandled error (the same pre-existing
+  vitest-worker `birpc` `onTaskUpdate` heartbeat
+  issue documented in PR-M0-1's CHANGELOG;
+  0 actual test failures).
+- `npm run typecheck` → 0 error.
+- 4 new p1-mcp-context tests pass.
+- 22 existing `test/tool-registration.test.ts`
+  tests pass unchanged.
+- 7 existing `test/release-gate/p0-mutation-safety.test.ts`
+  tests pass unchanged (the service-level
+  idempotency contract is unchanged; the MCP
+  adapter just stops dropping the fields).
+- 4 existing `test/release-gate/p0-request-context.test.ts`
+  tests pass unchanged (Stage 14 PR-B1 audit
+  metadata contract is preserved).
+
 ## [1.0.0] — Stage 14 v1.0 (AgentRecall v1.0)
 
 Date: 2026-07-21

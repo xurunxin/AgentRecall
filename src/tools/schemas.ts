@@ -187,7 +187,15 @@ export const updateMemoryToolSchema = z
     // key. When set, retries with the same key replay the
     // original mutation; collisions with a different body
     // surface as idempotency_key_reuse.
-    idempotency_key: nonEmptyString.optional()
+    idempotency_key: nonEmptyString.optional(),
+    // Stage 15 PR-M0-2 (issue #2, spec § 5.6): optional
+    // optimistic-concurrency control on update. When set,
+    // the patch is applied only if the row's current
+    // `revision` matches `expected_revision`; otherwise
+    // the service returns `stale_revision`. Surface this
+    // through the MCP contract so a concurrent writer
+    // wins the race and we don't clobber the new state.
+    expected_revision: z.number().int().nonnegative().optional()
   })
   .strict()
   .superRefine((input, context) => {
