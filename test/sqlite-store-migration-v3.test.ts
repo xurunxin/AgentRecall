@@ -33,7 +33,10 @@ describe("SQLiteMemoryStore v2 -> v3 migration", () => {
     // mutation_requests, memory_relations, plus the v4
     // columns on memory_entries). The v3-specific assertions
     // below still cover the v2->v3 step in isolation.
-    expect(CURRENT_SCHEMA_VERSION).toBe(5);
+    // Stage 15 PR-M0-4 bumped the schema to 6
+    // (maintenance_plans); the migration chain still
+    // walks v2->v3->v4->v5->v6.
+    expect(CURRENT_SCHEMA_VERSION).toBe(6);
   });
 
   it("migrates a v2 database to v3, preserving existing rows", () => {

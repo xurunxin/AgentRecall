@@ -81,11 +81,15 @@ export class MemoryService {
   private readonly maintenance: MemoryMaintenanceService;
   private readonly backupFn: () => { path: string; size: number; duration_ms: number } | { error: string };
   private readonly _store: SQLiteMemoryStore;
-  /** Stage 12 PR9 (spec § 6.2): in-memory plan store for the
-   * plan/apply maintenance split. Reset on every server
-   * restart; agents are expected to call plan_maintenance
-   * again after a restart. */
-  private readonly planStore = new MaintenancePlanStore();
+  /** Stage 15 PR-M0-4 (issue #3, spec § 6.2): durable plan
+   * store for the plan/apply maintenance split. Pre-PR-M0-4
+   * the plan lived in a process-local Map and was lost on
+   * every MCP restart; agents had to re-plan after every
+   * reconnect. Post-PR-M0-4 the plan is written to the
+   * `maintenance_plans` table so a different session can
+   * apply it later, and the apply step verifies the
+   * per-item `expected_revision` (CAS) before mutating. */
+  private readonly planStore: MaintenancePlanStore;
 
   constructor(
     store: SQLiteMemoryStore,
@@ -124,6 +128,7 @@ export class MemoryService {
       resolveExporter: resolveExporterFn
     });
     this._store = store;
+    this.planStore = new MaintenancePlanStore(store);
     this.backupFn = () => this.backup();
   }
 
@@ -278,16 +283,26 @@ export class MemoryService {
   // ============================================================
 
   /**
-   * Build a maintenance plan. The plan captures the actions
-   * the maintenance service would take (currently:
-   * merge_duplicates) plus the expected revision of every
-   * entry the plan touches, so apply can refuse if any
-   * entry drifted (spec § 6.2).
+   * Build a maintenance plan. Stage 15 PR-M0-4 (issue
+   * #3, spec § 6.2): the plan is durable (written to
+   * `maintenance_plans`) and each item carries its own
+   * `expected_revision` so apply can refuse stale plans.
+   *
+   * Pre-PR-M0-4 the plan was in-memory and the
+   * `extractDuplicateGroups` helper read fields the
+   * maintenance service never wrote (e.g. `kind`,
+   * `revisions`, `representative_title`) — so
+   * `proposed_actions` was always empty and the plan
+   * applied nothing. Post-PR-M0-4 the helper reads the
+   * actual `DuplicateGroup` shape (`reason`,
+   * `memory_ids`, `titles`, `fingerprint`,
+   * `details.similarity`) and the apply step targets a
+   * single group per call.
    */
   planMaintenance(input: {
     scope: "global" | "project";
     project_id?: string;
-    /** Cap on the number of merge groups in the plan. */
+    /** Cap on the number of duplicate groups in the plan. */
     max_groups?: number;
     /** Optional progress callback for long find_duplicates scans. */
     onProgress?: (processed: number, total: number) => void;
@@ -310,44 +325,167 @@ export class MemoryService {
     const limited = groups.slice(0, max);
 
     const expected_revisions: Record<string, number> = {};
+    // `seenTarget` records the per-target priority so a
+    // target that appears in multiple groups (e.g. a
+    // pair of identical title+body that ALSO shares
+    // title and body separately) gets exactly one
+    // plan item. The first group wins; groups arrive
+    // in `findDuplicatesChunked`'s sort order, which
+    // puts `same_title_and_body` ahead of
+    // `same_title` / `same_body` /
+    // `similar_title_and_body`, so the most specific
+    // group wins.
+    const seenTarget = new Map<string, MaintenancePlan["proposed_actions"][number]>();
     const proposed_actions: MaintenancePlan["proposed_actions"] = [];
     const summary: string[] = [];
 
+    function addItem(item: MaintenancePlan["proposed_actions"][number]): void {
+      const existing = seenTarget.get(item.target_memory_id);
+      if (existing !== undefined) {
+        // Same target in two groups: keep the one
+        // with the higher action priority
+        // (merge > forget > update > retain). If
+        // equal, keep the first (most specific
+        // group reason).
+        if (actionPriority(item.kind) > actionPriority(existing.kind)) {
+          const idx = proposed_actions.indexOf(existing);
+          if (idx >= 0) proposed_actions[idx] = item;
+          seenTarget.set(item.target_memory_id, item);
+        }
+        return;
+      }
+      seenTarget.set(item.target_memory_id, item);
+      proposed_actions.push(item);
+    }
+
     for (const group of limited) {
-      const kind = group.kind;
-      const ids = group.memory_ids;
-      if (ids.length < 2) continue;
-      if (kind === "same_title_and_body") {
-        // Spec § 6.2: only fully identical title+body auto-collapse.
-        proposed_actions.push({ kind: "merge_duplicates", old_memory_ids: ids, reason: "same_title_and_body" });
-        summary.push(`merge ${ids.length} duplicates of "${group.representative_title ?? "untitled"}"`);
-        for (const id of ids) expected_revisions[id] = group.revisions[id] ?? 0;
-      } else if (kind === "same_title" || kind === "same_body") {
-        // Same-title or same-body alone is advisory; surface as a
-        // plan entry but do not auto-merge.
-        summary.push(`flag ${ids.length} entries with ${kind} (advisory only)`);
+      if (group.memory_ids.length < 2) continue;
+      // Read each candidate's current revision straight
+      // from the store. The plan only needs `expected_revision`
+      // for entries the apply step will mutate; advisory
+      // (`retain`) items still record the revision so the
+      // apply step can surface drift in the summary.
+      const revisions = readRevisionsForIds(this.store, group.memory_ids);
+      for (const [id, rev] of Object.entries(revisions)) {
+        expected_revisions[id] = rev;
+      }
+      if (group.reason === "same_title_and_body") {
+        // Spec § 6.2: only fully identical title+body
+        // auto-collapse. Each target is its own item
+        // (action_type='merge', evidence=the group) so
+        // the apply step knows exactly which entries to
+        // mutate.
+        for (const id of group.memory_ids) {
+          addItem({
+            kind: "merge",
+            target_memory_id: id,
+            expected_revision: revisions[id] ?? 0,
+            evidence: {
+              group_reason: group.reason,
+              fingerprint: group.fingerprint,
+              memory_ids: group.memory_ids
+            },
+            risk: "high"
+          });
+        }
+        summary.push(
+          `merge ${group.memory_ids.length} duplicates of "${representativeTitle(group.titles)}"`
+        );
+      } else if (group.reason === "same_title" || group.reason === "same_body") {
+        // Same-title or same-body alone is advisory; surface
+        // a `retain` item with risk=low so the apply step
+        // has a record but does not mutate.
+        for (const id of group.memory_ids) {
+          addItem({
+            kind: "retain",
+            target_memory_id: id,
+            expected_revision: revisions[id] ?? 0,
+            evidence: {
+              group_reason: group.reason,
+              fingerprint: group.fingerprint,
+              memory_ids: group.memory_ids
+            },
+            risk: "low"
+          });
+        }
+        summary.push(
+          `flag ${group.memory_ids.length} entries with ${group.reason} (advisory only)`
+        );
       } else {
-        summary.push(`flag ${ids.length} near-duplicate entries (advisory only)`);
+        // similar_title_and_body: similar but distinct.
+        // Advisory only.
+        for (const id of group.memory_ids) {
+          addItem({
+            kind: "retain",
+            target_memory_id: id,
+            expected_revision: revisions[id] ?? 0,
+            evidence: {
+              group_reason: group.reason,
+              fingerprint: group.fingerprint,
+              memory_ids: group.memory_ids,
+              similarity: group.details?.similarity
+            },
+            risk: "low"
+          });
+        }
+        summary.push(
+          `flag ${group.memory_ids.length} near-duplicate entries (advisory only)`
+        );
       }
     }
 
-    const risk: "low" | "high" = proposed_actions.length === 0 ? "low" : "low";
+    // Destructive items (merge / supersede / forget) make
+    // the plan high-risk. Pure-retain plans (advisory)
+    // are low-risk.
+    const destructiveCount = proposed_actions.filter(
+      (a) => a.kind !== "retain"
+    ).length;
+    const risk: MaintenancePlan["risk"] = destructiveCount > 0 ? "high" : "low";
     const plan = this.planStore.create({
       scope: input.scope,
       ...(input.project_id !== undefined ? { project_id: input.project_id } : {}),
       risk,
+      creator_actor_id: this.defaultActor,
       expected_revisions,
       proposed_actions,
       summary
+    });
+    // Audit the plan creation so the audit log shows
+    // "plan was built at <ts>, with <n> items".
+    appendAudit(this.store, this.defaultActor, {
+      scope: input.scope,
+      ...(input.project_id !== undefined ? { project_id: input.project_id } : {}),
+      event: "plan_maintenance",
+      actor: "system:maintenance",
+      reason: "plan_maintenance",
+      metadata: {
+        plan_id: plan.plan_id,
+        item_count: proposed_actions.length,
+        destructive_count: destructiveCount,
+        advisory_count: proposed_actions.length - destructiveCount,
+        risk,
+        ttl_seconds: 24 * 60 * 60
+      }
     });
     return { ok: true, value: plan };
   }
 
   /**
-   * Apply a previously-built plan. The caller must pass
-   * `confirm: true` and an `idempotency_key`; if any
-   * expected revision drifted, the plan is invalidated
-   * without mutation (spec § 6.2).
+   * Apply a previously-built plan. Stage 15 PR-M0-4:
+   * - load the plan from the durable `maintenance_plans` table;
+   * - re-validate the `plan_hash` (catches tampering);
+   * - re-validate every item's `expected_revision` (CAS);
+   * - for each `merge` group, call the targeted
+   *   `mergePlannedGroup` helper (NOT the broad
+   *   `merge_duplicates` action);
+   * - record per-item `apply_maintenance` audit + revision;
+   * - mark the plan `completed` only when every
+   *   destructive item succeeded.
+   *
+   * If any destructive item fails (stale revision, scope
+   * mismatch, drift), the plan is marked `rejected` and
+   * no further items are attempted. The apply step never
+   * mutates an entry that is not in `proposed_actions`.
    */
   applyMaintenance(input: {
     plan_id: string;
@@ -362,57 +500,219 @@ export class MemoryService {
     }
     const plan = this.planStore.get(input.plan_id);
     if (plan === undefined) {
-      return { ok: true, value: { ok: false, plan_id: input.plan_id, error: "plan_invalidated", details: { reason: "plan_not_found" } } };
+      return {
+        ok: true,
+        value: {
+          ok: false,
+          plan_id: input.plan_id,
+          error: "plan_not_found",
+          details: { reason: "plan_not_found" }
+        }
+      };
     }
 
-    // Capture current revisions for the entries the plan touches.
+    // Capture current revisions for the entries the plan
+    // touches. The plan may have items beyond the
+    // expected_revisions map (e.g. a future plan could
+    // touch a memory without a recorded revision); we
+    // build the snapshot here so the validator can refuse
+    // any "unplanned_target".
     const currentRevisions: Record<string, number> = {};
-    for (const memoryId of Object.keys(plan.expected_revisions)) {
-      const entry = this.store.peekEntry(memoryId);
-      currentRevisions[memoryId] = entry?.revision ?? -1;
+    for (const action of plan.proposed_actions) {
+      const entry = this.store.peekEntry(action.target_memory_id);
+      currentRevisions[action.target_memory_id] = entry?.revision ?? -1;
     }
 
     const validation = this.planStore.validate(input.plan_id, currentRevisions, input.idempotency_key);
     if (!validation.ok) {
-      return { ok: true, value: validation };
-    }
-    if (validation.applied === 0) {
-      // Idempotent retry: nothing to do.
-      return { ok: true, value: validation };
-    }
-
-    let appliedCount = 0;
-    for (const action of plan.proposed_actions) {
-      if (action.kind !== "merge_duplicates") continue;
-      // Spec § 6.2: only fully identical title+body auto-collapse.
-      // The plan already filters; the merge service still re-checks
-      // before mutating.
-      const target = action.old_memory_ids[0];
-      const rest = action.old_memory_ids.slice(1);
-      if (target === undefined || rest.length === 0) continue;
-      const result = this.maintenance.maintainMemories({
-        action: "merge_duplicates",
+      // Stage 15 PR-M0-4: only mark the plan `rejected`
+      // when the refusal is a *correctness* failure
+      // (stale revision, hash drift, plan completed
+      // with a different key). Lifecycle failures
+      // (`plan_expired`, `plan_completed`,
+      // `plan_not_found`) carry their own terminal
+      // state and the `markRejected` call would
+      // overwrite it. The `validate` step has already
+      // flipped `pending` -> `expired` when relevant.
+      if (
+        validation.error === "stale_revision" ||
+        validation.error === "plan_hash_drift" ||
+        validation.error === "unplanned_target"
+      ) {
+        this.planStore.markRejected(input.plan_id);
+      }
+      appendAudit(this.store, this.defaultActor, {
         scope: plan.scope,
         ...(plan.project_id !== undefined ? { project_id: plan.project_id } : {}),
-        batch_size: 100,
-        dry_run: false,
-        strategy: "keep_first"
+        event: "apply_maintenance",
+        actor: "system:maintenance",
+        reason: "plan_rejected",
+        metadata: {
+          plan_id: input.plan_id,
+          ok: false,
+          error: validation.error,
+          details: validation.details ?? {},
+          idempotency_key: input.idempotency_key
+        }
       });
-      // The plain `merge_duplicates` action processes the whole
-      // dataset, so the per-action plan entry is "advisory" once
-      // we are inside apply: we count success at the action level,
-      // not at the per-group level. PR10 will replace this with a
-      // targeted single-group merge helper.
-      if (result.changed > 0) appliedCount += 1;
+      return { ok: true, value: validation };
     }
 
-    this.planStore.markApplied(input.plan_id, input.idempotency_key);
+    // Idempotent retry: same plan + same key = no-op
+    // success. The validator already returned `ok: true`
+    // with the plan; we just emit the audit and return.
+    const destructiveItems = plan.proposed_actions.filter((a) => a.kind !== "retain");
+    if (destructiveItems.length === 0) {
+      this.planStore.markCompleted(input.plan_id, input.idempotency_key);
+      appendAudit(this.store, this.defaultActor, {
+        scope: plan.scope,
+        ...(plan.project_id !== undefined ? { project_id: plan.project_id } : {}),
+        event: "apply_maintenance",
+        actor: "system:maintenance",
+        reason: "plan_no_destructive_items",
+        metadata: {
+          plan_id: input.plan_id,
+          ok: true,
+          applied: 0,
+          rejected: 0,
+          idempotency_key: input.idempotency_key
+        }
+      });
+      return {
+        ok: true,
+        value: {
+          ok: true,
+          plan_id: input.plan_id,
+          applied: 0,
+          rejected: 0,
+          idempotency_key: input.idempotency_key
+        }
+      };
+    }
+
+    // Group the merge items by `evidence.fingerprint` so
+    // each duplicate group is processed as a single
+    // targeted merge call. Items with the same fingerprint
+    // share the same `memory_ids` list (per the plan
+    // construction above), so grouping is unambiguous.
+    const groupsByFingerprint = new Map<string, MaintenancePlan["proposed_actions"]>();
+    for (const action of destructiveItems) {
+      const fingerprint = readFingerprintFromEvidence(action.evidence);
+      if (fingerprint === undefined) {
+        // No fingerprint means the item was hand-crafted
+        // outside the planner. Refuse; we never apply
+        // unstructured items.
+        this.planStore.markRejected(input.plan_id);
+        appendAudit(this.store, this.defaultActor, {
+          scope: plan.scope,
+          ...(plan.project_id !== undefined ? { project_id: plan.project_id } : {}),
+          event: "apply_maintenance",
+          actor: "system:maintenance",
+          reason: "plan_unstructured_item",
+          metadata: {
+            plan_id: input.plan_id,
+            ok: false,
+            error: "unplanned_target",
+            details: { target_memory_id: action.target_memory_id },
+            idempotency_key: input.idempotency_key
+          }
+        });
+        return {
+          ok: true,
+          value: {
+            ok: false,
+            plan_id: input.plan_id,
+            error: "unplanned_target",
+            details: { target_memory_id: action.target_memory_id }
+          }
+        };
+      }
+      const list = groupsByFingerprint.get(fingerprint) ?? [];
+      list.push(action);
+      groupsByFingerprint.set(fingerprint, list);
+    }
+
+    const scope: ResolvedReadScope = {
+      scope: plan.scope,
+      ...(plan.project_id !== undefined ? { project_id: plan.project_id } : {})
+    };
+
+    let applied = 0;
+    let rejected = 0;
+    for (const [, items] of groupsByFingerprint) {
+      const target_ids = items.map((a) => a.target_memory_id);
+      const expected_revisions: Record<string, number> = {};
+      for (const a of items) expected_revisions[a.target_memory_id] = a.expected_revision;
+      const result = this.maintenance.mergePlannedGroup({
+        scope,
+        target_ids,
+        expected_revisions,
+        reason: "apply_maintenance",
+        strategy: "keep_first"
+      });
+      if (result.ok) {
+        applied += result.superseded_ids.length;
+        continue;
+      }
+      rejected += 1;
+      // On the first failed merge, mark the plan
+      // rejected and stop; we do NOT roll back already-
+      // applied groups (they are audited and reversible
+      // via the entry's own `superseded_by` + revision
+      // history). Spec § 6.2 calls for a fail-loud
+      // outcome; partial application is reported in the
+      // return value.
+      this.planStore.markRejected(input.plan_id);
+      appendAudit(this.store, this.defaultActor, {
+        scope: plan.scope,
+        ...(plan.project_id !== undefined ? { project_id: plan.project_id } : {}),
+        event: "apply_maintenance",
+        actor: "system:maintenance",
+        reason: "plan_partial",
+        metadata: {
+          plan_id: input.plan_id,
+          ok: false,
+          error: result.reason,
+          target_ids,
+          applied,
+          rejected: rejected,
+          idempotency_key: input.idempotency_key
+        }
+      });
+      return {
+        ok: true,
+        value: {
+          ok: false,
+          plan_id: input.plan_id,
+          error: "stale_revision",
+          details: { reason: result.reason, target_ids, applied, rejected }
+        }
+      };
+    }
+
+    this.planStore.markCompleted(input.plan_id, input.idempotency_key);
+    appendAudit(this.store, this.defaultActor, {
+      scope: plan.scope,
+      ...(plan.project_id !== undefined ? { project_id: plan.project_id } : {}),
+      event: "apply_maintenance",
+      actor: "system:maintenance",
+      reason: "plan_applied",
+      metadata: {
+        plan_id: input.plan_id,
+        ok: true,
+        applied,
+        rejected: 0,
+        idempotency_key: input.idempotency_key
+      }
+    });
+
     return {
       ok: true,
       value: {
         ok: true,
         plan_id: input.plan_id,
-        applied: appliedCount,
+        applied,
+        rejected: 0,
         idempotency_key: input.idempotency_key
       }
     };
@@ -518,22 +818,81 @@ export class MemoryService {
   }
 }
 
+/**
+ * Stage 15 PR-M0-4 (issue #3, spec § 6.2): extract
+ * `DuplicateGroup` records from a `find_duplicates`
+ * maintenance result. Pre-PR-M0-4 the helper read
+ * `group.kind`, `group.revisions`, and
+ * `group.representative_title` — fields the maintenance
+ * service never wrote — so the planner always saw an
+ * empty `proposed_actions` array. The new shape mirrors
+ * what `MemoryMaintenanceService.findDuplicatesChunked`
+ * actually produces (see `DuplicateGroup` in
+ * `services/memory-maintenance-service.ts`).
+ */
 function extractDuplicateGroups(maintenance: MaintainMemoriesResult): Array<{
-  kind: string;
+  reason: "same_title_and_body" | "same_title" | "same_body" | "similar_title_and_body";
+  fingerprint: string;
   memory_ids: string[];
-  revisions: Record<string, number>;
-  representative_title?: string;
+  titles: string[];
+  details?: { similarity?: number };
 }> {
   if (maintenance.action !== "find_duplicates") return [];
   const details = maintenance.details as { groups?: unknown } | undefined;
   const groups = details?.groups;
   if (!Array.isArray(groups)) return [];
   return groups as Array<{
-    kind: string;
+    reason: "same_title_and_body" | "same_title" | "same_body" | "similar_title_and_body";
+    fingerprint: string;
     memory_ids: string[];
-    revisions: Record<string, number>;
-    representative_title?: string;
+    titles: string[];
+    details?: { similarity?: number };
   }>;
+}
+
+function readRevisionsForIds(
+  store: SQLiteMemoryStore,
+  ids: readonly string[]
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const id of ids) {
+    const entry = store.peekEntry(id);
+    out[id] = entry?.revision ?? 0;
+  }
+  return out;
+}
+
+function readFingerprintFromEvidence(evidence: Record<string, unknown>): string | undefined {
+  const fp = evidence.fingerprint;
+  return typeof fp === "string" ? fp : undefined;
+}
+
+function representativeTitle(titles: readonly string[]): string {
+  for (const t of titles) {
+    if (typeof t === "string" && t.trim().length > 0) return t.trim();
+  }
+  return "untitled";
+}
+
+/**
+ * Action priority used by the planner when a target
+ * memory shows up in more than one duplicate group
+ * (e.g. a pair of identical title+body that also share
+ * their title alone). The higher number wins.
+ */
+function actionPriority(kind: MaintenancePlan["proposed_actions"][number]["kind"]): number {
+  switch (kind) {
+    case "merge":
+      return 4;
+    case "supersede":
+      return 3;
+    case "forget":
+      return 2;
+    case "update":
+      return 1;
+    case "retain":
+      return 0;
+  }
 }
 
 function collectCandidates(

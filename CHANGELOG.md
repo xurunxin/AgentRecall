@@ -352,6 +352,188 @@ serial PRs plus the M0-pre fix-test-infra PR below.
   pass unchanged (the `CanonicalExporter` path is
   untouched).
 
+### Stage 15 PR-M0-4 (Persistent Maintenance Plans + CAS-Protected Apply)
+### Fixed
+
+- **`src/maintenance-plan-store.ts`** (issue #3, spec
+  § 6.2). Four correctness gaps in the maintenance
+  plan/apply workflow:
+
+  1. **Durable plan storage.** Pre-v6 the plan lived
+     in a process-local `Map<string, MaintenancePlan>`
+     and was lost on every MCP restart. The new
+     `MaintenancePlanStore` is a thin wrapper over
+     `SQLiteMemoryStore` that writes plans to the
+     `maintenance_plans` table (and items to
+     `maintenance_plan_items`). The plan now survives
+     MCP restart; a different session can call
+     `apply_maintenance` later and see the same plan.
+
+  2. **Planner reads the actual `DuplicateGroup`
+     shape.** The pre-v6 `extractDuplicateGroups`
+     helper looked for `group.kind`,
+     `group.revisions`, and `group.representative_title`
+     — fields the maintenance service never wrote — so
+     `proposed_actions` was always empty and the plan
+     applied nothing. The new helper reads what
+     `findDuplicatesChunked` actually produces
+     (`reason`, `memory_ids`, `titles`, `fingerprint`,
+     `details.similarity`).
+
+  3. **`risk` no longer always "low".** The planner
+     computes a destructive-vs-advisory split:
+     `same_title_and_body` items carry `kind: "merge"`
+     + `risk: "high"`; advisory items (same title only,
+     same body only, or similar) carry `kind: "retain"`
+     + `risk: "low"`. The plan-level `risk` is `high`
+     iff any item is destructive. This matches the
+     spec's "destructive operations are high risk"
+     intent.
+
+  4. **Apply no longer re-runs the broad
+     `merge_duplicates` action.** Pre-v6 the apply
+     step called `maintainMemories({action:
+     "merge_duplicates"})` which re-scanned the whole
+     scope and re-merged every group — so apply
+     could mutate entries that were not in the plan.
+     The new `MemoryMaintenanceService.mergePlannedGroup`
+     helper takes a fixed `target_ids` list from the
+     plan, re-validates each entry's
+     `expected_revision` (CAS) inside the transaction,
+     refuses on drift, and only mutates the planned
+     targets. A stranger entry (one that is in the
+     scope but not in the plan) is never touched.
+
+  5. **`plan_hash` (SHA-256 over canonical JSON of
+     items) detects tampering.** The apply step
+     re-reads the items from disk, re-computes the
+     hash, and rejects the plan with
+     `plan_hash_drift` if it does not match. A
+     tampered `maintenance_plans` row cannot survive
+     apply.
+
+  6. **Idempotency on the durable plan.** The apply
+     step records `apply_maintenance` audit events
+     with `metadata.idempotency_key`; a retry with a
+     different key surfaces `idempotency_mismatch`.
+     The plan state machine is
+     `pending → completed` (success) or
+     `pending → rejected` (correctness failure: stale
+     revision, hash drift, unplanned target) or
+     `pending → expired` (TTL window passed).
+     Lifecycle failures (`plan_expired`,
+     `plan_completed`, `plan_not_found`) do not
+     overwrite the terminal state with `rejected`.
+
+### Added
+
+- **`src/sqlite-store.ts`** — `CURRENT_SCHEMA_VERSION`
+  bumped 5 → 6. The new `migrate_v5_to_v6` step
+  creates `maintenance_plans` and
+  `maintenance_plan_items` (PRIMARY KEY
+  `(plan_id, target_memory_id)`; foreign key to
+  `maintenance_plans` with `ON DELETE CASCADE`;
+  `state IN ('pending','completed','expired','rejected')`;
+  `risk IN ('low','medium','high')`; `action_type IN
+  ('supersede','merge','forget','update','retain')`).
+  Five new methods on `SQLiteMemoryStore`:
+  `createMaintenancePlan`, `getMaintenancePlan`,
+  `setMaintenancePlanState`,
+  `expireOldMaintenancePlans`,
+  `getAppliedMaintenanceKeys`. The v4 legacy
+  `mutation_requests` table remains read-only for
+  one release cycle (per PR-M0-1 migration policy);
+  the v5 `mutation_requests_v2` table is unaffected.
+- **`src/maintenance-plan-store.ts`** — new public
+  shape: `MaintenancePlanAction` is now per-item
+  (`{ kind, target_memory_id, expected_revision,
+  evidence, risk }`), not a list of "merge group"
+  shapes. `MaintenancePlanStore.create` accepts a
+  `creator_actor_id` and optional `ttl_seconds`
+  (default 24h). The plan is `risk: 'high'`
+  automatically when destructive items are present.
+- **`src/services/memory-maintenance-service.ts`** —
+  two new private helpers: `mergePlannedGroup`
+  (targeted single-group merge with CAS guard) and
+  `forgetPlannedEntries` (targeted forget with CAS
+  guard). The existing public `merge_duplicates`
+  action is unchanged (legacy callers); the new
+  apply path uses the targeted helpers.
+- **`src/memory-service.ts`** — `planMaintenance`
+  reads `find_duplicates` output via the fixed
+  `extractDuplicateGroups` helper, dedupes items by
+  `target_memory_id` (the most specific group
+  reason wins), and writes the audit event
+  `plan_maintenance` so the audit log shows when
+  the plan was built. `applyMaintenance` calls
+  `mergePlannedGroup` per `evidence.fingerprint`
+  (the apply step groups items by their source
+  duplicate group so each merge call is targeted).
+- **`src/domain.ts`** — `AuditEventName` extended
+  with `"plan_maintenance"` and `"apply_maintenance"`.
+- **`test/release-gate/p1-maintenance-plan-v2.test.ts`**
+  (12 tests). Locks down every acceptance criterion
+  from issue #3:
+    1. Plan survives MCP restart (a fresh
+       `MemoryService` against the same store sees
+       the plan).
+    2. Same title+body entries auto-supersede on
+       plan/apply round-trip (one becomes
+       `superseded`, the other stays `active`).
+    3. Stale `expected_revision` is rejected with
+       `stale_revision` and the plan is marked
+       `rejected`. Both target entries stay active.
+    4. Unknown `plan_id` is rejected with
+       `plan_not_found`.
+    5. Apply without `confirm: true` is rejected
+       with `invalid_schema`.
+    6. Apply with empty `idempotency_key` is rejected
+       with `invalid_schema`.
+    7. Expired plans are rejected with
+       `plan_expired` and the state flips to
+       `expired` (not `rejected`).
+    8. Advisory items (same title only) carry
+       `kind: 'retain'` and `risk: 'low'`.
+    9. Apply cannot mutate a memory that is not in
+       the plan (a "stranger" entry stays active
+       while a hand-built plan merges two of three
+       identical entries).
+    10. `expireOldPlans` flips `pending → expired`
+        for plans past `expires_at`.
+    11. `plan_hash` is stable across re-reads of the
+        same plan.
+    12. Project-scope plan refuses to apply to
+        global entries (scope isolation).
+- **`test/sqlite-store-migration.test.ts`**,
+  **`test/sqlite-store-migration-v3.test.ts`**,
+  **`test/cli/migrate.test.ts`**,
+  **`test/release-gate/p0-migration-backup.test.ts`**
+  — bumped expected `CURRENT_SCHEMA_VERSION` /
+  `user_version` from 5 to 6 to match the v5 → v6
+  migration.
+
+### Verification
+
+- `npm test` → 0 failed / **466 passed** (was: 454)
+  / 1 unhandled error (the same pre-existing
+  vitest-worker `birpc` `onTaskUpdate` heartbeat
+  issue documented in PR-M0-1's CHANGELOG;
+  0 actual test failures).
+- `npm run typecheck` → 0 error.
+- 12 new p1-maintenance-plan-v2 tests pass.
+- 60 existing test files pass unchanged.
+- Static check `grep -nE "in-memory.*plan|MaintenancePlan\s*=\s*new Map" src/`
+  returns 0 hits (the only remaining match is a
+  comment in `maintenance-plan-store.ts` documenting
+  the removal of the legacy in-memory API).
+- Static check `grep -nE "mergeDuplicates" src/`
+  returns 3 hits: one in a comment, one as the
+  legacy public `maintainMemories({action:
+  "merge_duplicates"})` switch, and one as the
+  legacy private `mergeDuplicates` method. None of
+  these are called from `apply_maintenance`; the
+  apply path uses the new `mergePlannedGroup` helper.
+
 ## [1.0.0] — Stage 14 v1.0 (AgentRecall v1.0)
 
 Date: 2026-07-21

@@ -148,6 +148,137 @@ export class MemoryMaintenanceService {
   // Per-action implementations
   // ============================================================
 
+  /**
+   * Stage 15 PR-M0-4 (issue #3, spec § 6.2): a targeted
+   * single-group merge used by `apply_maintenance`.
+   * Pre-PR-M0-4 the apply step called `maintainMemories`
+   * with `action: "merge_duplicates"`, which re-scanned
+   * the whole scope and re-merged every group. That was
+   * the "broad merge_duplicates" path the spec called out
+   * — apply would mutate entries that weren't part of the
+   * plan. The new helper takes a fixed `targetIds` list
+   * from the plan and only mutates those. The caller's
+   * apply step has already validated the
+   * `expected_revision` of every target; this method
+   * does a final `peekEntry` check inside the transaction
+   * and refuses on drift (defense in depth).
+   */
+  mergePlannedGroup(
+    input: {
+      scope: ResolvedReadScope;
+      target_ids: string[];
+      expected_revisions: Record<string, number>;
+      reason: string;
+      strategy: "keep_first" | "keep_newest";
+    },
+    ctx?: RequestContext
+  ): { ok: true; keep_id: string; superseded_ids: string[]; changed: number } | { ok: false; reason: "stale_revision" | "target_missing" | "scope_mismatch" | "non_dedup_group" } {
+    assertProjectScope(input.scope, "merge_planned_group");
+    if (input.target_ids.length < 2) {
+      return { ok: false, reason: "non_dedup_group" };
+    }
+    // Pre-mutation backup (see expireDueMemories for
+    // the rationale on the out-of-transaction placement).
+    this.maybeBackup(input.target_ids.length, ctx);
+    return this.ctx.store.transaction(() => {
+      const liveEntries: MemoryEntry[] = [];
+      for (const id of input.target_ids) {
+        const entry = this.ctx.store.peekEntry(id);
+        if (entry === undefined || entry.status !== "active") {
+          return { ok: false as const, reason: "target_missing" as const };
+        }
+        // CAS guard: a different actor's update between
+        // plan and apply must abort the merge.
+        if (input.expected_revisions[id] !== entry.revision) {
+          return { ok: false as const, reason: "stale_revision" as const };
+        }
+        if (entry.scope !== input.scope.scope) {
+          return { ok: false as const, reason: "scope_mismatch" as const };
+        }
+        if (input.scope.project_id !== undefined && entry.project_id !== input.scope.project_id) {
+          return { ok: false as const, reason: "scope_mismatch" as const };
+        }
+        liveEntries.push(entry);
+      }
+      const keepTarget = this.pickKeepTarget(liveEntries, input.strategy);
+      const supersededIds = liveEntries
+        .filter((e) => e.id !== keepTarget.id)
+        .map((e) => e.id)
+        .sort(compareText);
+      this.applySupersede(keepTarget, supersededIds, input.reason, ctx);
+      return {
+        ok: true as const,
+        keep_id: keepTarget.id,
+        superseded_ids: supersededIds,
+        changed: supersededIds.length
+      };
+    });
+  }
+
+  /**
+   * Stage 15 PR-M0-4 (issue #3, spec § 6.2): a targeted
+   * forget used by `apply_maintenance`. Only mutates the
+   * targets in the plan; refuses on drift.
+   */
+  forgetPlannedEntries(
+    input: {
+      scope: ResolvedReadScope;
+      target_ids: string[];
+      expected_revisions: Record<string, number>;
+      reason: string;
+    },
+    ctx?: RequestContext
+  ): { ok: true; forgotten: string[] } | { ok: false; reason: "stale_revision" | "target_missing" | "scope_mismatch" } {
+    if (input.target_ids.length === 0) {
+      return { ok: true, forgotten: [] };
+    }
+    this.maybeBackup(input.target_ids.length, ctx);
+    return this.ctx.store.transaction(() => {
+      const forgotten: string[] = [];
+      for (const id of input.target_ids) {
+        const entry = this.ctx.store.peekEntry(id);
+        if (entry === undefined) {
+          return { ok: false as const, reason: "target_missing" as const };
+        }
+        if (input.expected_revisions[id] !== entry.revision) {
+          return { ok: false as const, reason: "stale_revision" as const };
+        }
+        if (entry.scope !== input.scope.scope) {
+          return { ok: false as const, reason: "scope_mismatch" as const };
+        }
+        if (input.scope.project_id !== undefined && entry.project_id !== input.scope.project_id) {
+          return { ok: false as const, reason: "scope_mismatch" as const };
+        }
+        this.ctx.store.updateEntry(id, {
+          status: "forgotten",
+          body: "",
+          tags: [],
+          char_count: 0,
+          token_estimate: 0,
+          updated_at: nowIso()
+        });
+        appendAudit(this.ctx.store, this.ctx.defaultActor, {
+          memory_id: id,
+          scope: entry.scope,
+          ...(entry.project_id !== undefined ? { project_id: entry.project_id } : {}),
+          event: "forgotten",
+          actor: "system:maintenance",
+          reason: input.reason,
+          metadata: {
+            reason: input.reason,
+            requested_by: ctx?.actor_id ?? this.ctx.defaultActor
+          }
+        }, ctx);
+        forgotten.push(id);
+      }
+      return { ok: true as const, forgotten };
+    });
+  }
+
+  // ============================================================
+  // Per-action implementations
+  // ============================================================
+
   private findDuplicatesChunked(
     scope: ResolvedReadScope,
     input: MaintainMemoriesInput
