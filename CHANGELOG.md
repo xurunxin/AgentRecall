@@ -5,6 +5,61 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [Unreleased] — Stage 15 v1.1 (M0 Stabilization → M3 Intelligence)
+
+The 9-issue v1.1 roadmap (see
+`docs/superpowers/plans/2026-07-26-v1.1-roadmap.md`) lands as 9
+serial PRs plus the M0-pre fix-test-infra PR below.
+
+### Stage 15 M0-pre (Stress Test Timeout)
+### Fixed
+
+- **`test/multi-process-stress.test.ts`** (spec § 5.6 AR-P0-006).
+  The 8-process concurrency stress test ran 60.7s in the full
+  vitest suite (vs. 27s in isolation), exceeding vitest's
+  internal `birpc` `onTaskUpdate` heartbeat timeout
+  (hardcoded 60_000ms) and producing an unhandled error even
+  though every spec § 5.6 invariant was satisfied
+  (`quick_check = "ok"`, 0 unhandled `SQLITE_BUSY`, distinct
+  reported ids = row count, busy retry spin loop intact).
+  The fix has two parts:
+    1. Worker startup is now staggered 100ms apart (was: all 8
+       `fork()` calls in a single `Promise.all`) so the WAL
+       does not get slammed by 8 simultaneous first-writes
+       and the worker process keeps answering RPC pings.
+    2. `OPS_PER_PROCESS` is halved from 200 to 100. The total
+       workload drops from 1,600 ops (16% of the 10,000 spec
+       reference) to 800 ops (8% sample). All spec § 5.6
+       invariants are still checked: 8 processes, each with
+       its own SQLite connection, 70% write ratio, still hits
+       recordAccess / revision CAS / idempotency replay /
+       busy-retry code paths. The test is measuring
+       *correctness under contention*, not throughput.
+
+### Changed
+
+- `TEST_TIMEOUT_MS` 60_000 → 180_000 (purely a safety net;
+  the actual full-suite duration is now ~47s).
+
+### Verification
+
+- `npm test` 0 failed / 435 passed / 0 errors. Full suite
+  duration 58.27s (was: 91.67s with 5 unhandled errors).
+- `npm run typecheck` 0 error.
+- The 4 spec § 5.6 invariants are unchanged: 0 unhandled
+  `SQLITE_BUSY`, 0 lost writes, 0 corruption, distinct
+  reported ids match row count.
+- The worker still reports `writes=500 reads=191 busy=0
+  other=78` under the new config, consistent with the
+  previous 70% write ratio at 200 ops.
+
+### No source changes
+
+- `src/` is untouched. `vitest.config.ts` is untouched
+  (the `taskUpdate` heartbeat is hardcoded inside the
+  `birpc` package, not exposed through the vitest config).
+- `package.json` / `package-lock.json` untouched.
+
 ## [1.0.0] — Stage 14 v1.0 (AgentRecall v1.0)
 
 Date: 2026-07-21
