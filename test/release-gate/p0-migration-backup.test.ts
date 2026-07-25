@@ -138,8 +138,9 @@ describe("release-gate p0-migration-backup (PR-A)", () => {
 
     // Live DB is at the new version. Stage 15 PR-M0-4
     // bumped the schema from 5 -> 6 to introduce
-    // `maintenance_plans` + `maintenance_plan_items`.
-    expect(store.getUserVersion()).toBe(6);
+    // `maintenance_plans` + `maintenance_plan_items`;
+    // PR-M1-1 bumped 6 -> 7 to add `memory_provenance`.
+    expect(store.getUserVersion()).toBe(7);
   });
 
   it("blocks the migration when the pre-mutation backup cannot be written", () => {
@@ -195,7 +196,8 @@ describe("release-gate p0-migration-backup (PR-A)", () => {
     expect(parsed.from).toBe(1);
     // Stage 15 PR-M0-4: schema bumped to 6 with
     // maintenance_plans + maintenance_plan_items.
-    expect(parsed.to).toBe(6);
+    // Stage 15 PR-M1-1: bumped to 7 with memory_provenance.
+    expect(parsed.to).toBe(7);
     expect(parsed.backup.path).toMatch(/memory-.*\.sqlite$/);
     expect(parsed.backup.schema_version).toBe(1);
     expect(parsed.backup.quick_check).toBe("ok");

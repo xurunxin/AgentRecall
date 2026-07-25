@@ -75,8 +75,13 @@ export type SearchFilters = EntryFilters & {
  * `maintenance_plans` + `maintenance_plan_items` so plans survive
  * MCP restart and `apply_maintenance` only mutates planned targets
  * (no more "broad merge_duplicates" path).
+ * v7 (Stage 15 PR-M1-1, issue #6) adds `memory_provenance` for
+ * link chains (issue / PR / commit / tool_call / session / import)
+ * and finalises the v3 `last_accessed_by` JSON column as
+ * read-only-deprecated (the canonical access data lives in
+ * `memory_accesses` from v4 onward).
  */
-export const CURRENT_SCHEMA_VERSION = 6;
+export const CURRENT_SCHEMA_VERSION = 7;
 
 /**
  * Stage 12 PR9: thrown by `updateEntryWithRevision` when
@@ -745,6 +750,10 @@ export class SQLiteMemoryStore {
       this.migrate_v5_to_v6();
       return;
     }
+    if (version === 7) {
+      this.migrate_v6_to_v7();
+      return;
+    }
     throw new Error(`No migration registered for schema version ${version}`);
   }
 
@@ -1076,6 +1085,46 @@ export class SQLiteMemoryStore {
     }
   }
 
+  /**
+   * Stage 15 PR-M1-1 (issue #6, spec § 5.3): v6 -> v7
+   * schema migration. Introduces `memory_provenance`
+   * for the durable link chain (issue URL / PR URL /
+   * commit SHA / tool-call id / session id / mcp
+   * client name / import source). The primary key is
+   * `(memory_id, source_kind, source_ref)` so a
+   * memory can carry multiple provenance links and
+   * the same source ref is idempotent under repeat
+   * ingestion. The v3 `last_accessed_by` JSON
+   * column is now read-only-deprecated; the
+   * canonical access data has lived in
+   * `memory_accesses` since v4, so this migration is
+   * non-destructive (the column is left in place for
+   * one release cycle of read-compat).
+   */
+  private migrate_v6_to_v7(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_provenance (
+          memory_id TEXT NOT NULL,
+          source_kind TEXT NOT NULL CHECK (source_kind IN ('issue','pr','commit','tool_call','session','import')),
+          source_ref TEXT NOT NULL,
+          recorded_by TEXT NOT NULL,
+          recorded_at INTEGER NOT NULL,
+          PRIMARY KEY (memory_id, source_kind, source_ref)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS memory_provenance_kind_idx
+          ON memory_provenance(source_kind, source_ref);
+      `);
+      this.db.exec("PRAGMA user_version = 7");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   private addColumnIfMissing(table: string, column: string, definition: string): void {
     const cols = this.db
       .prepare(`PRAGMA table_info(${table})`)
@@ -1188,7 +1237,7 @@ export class SQLiteMemoryStore {
    * through the `memory_entries.last_accessed_by` JSON column
    * (which is no longer the source of truth).
    */
-  private readAccessMap(memoryId: string): Record<string, string> | undefined {
+  readAccessMap(memoryId: string): Record<string, string> | undefined {
     const rows = this.db
       .prepare(
         "SELECT actor_id, last_accessed_at FROM memory_accesses WHERE memory_id = ? ORDER BY actor_id ASC"
@@ -1527,6 +1576,104 @@ export class SQLiteMemoryStore {
       )
       .run(now);
     return Number(result.changes ?? 0);
+  }
+
+  /**
+   * Stage 15 PR-M1-1 (issue #6, spec § 5.3): write
+   * provenance links for one or more memories. The
+   * primary key `(memory_id, source_kind, source_ref)`
+   * makes the write idempotent under repeat ingestion
+   * (a `recordProvenance` call with the same triple is
+   * a no-op via `INSERT OR IGNORE`). The caller passes
+   * the canonical `recorded_at` (Unix ms) so the
+   * timeline is consistent across cross-process
+   * sources (issue / PR / commit ingest usually knows
+   * the source's own timestamp).
+   */
+  recordProvenance(input: {
+    memory_id: string;
+    source_kind: "issue" | "pr" | "commit" | "tool_call" | "session" | "import";
+    source_ref: string;
+    recorded_by: string;
+    recorded_at: number;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO memory_provenance
+          (memory_id, source_kind, source_ref, recorded_by, recorded_at)
+         VALUES (?, ?, ?, ?, ?)`
+      )
+      .run(
+        input.memory_id,
+        input.source_kind,
+        input.source_ref,
+        input.recorded_by,
+        input.recorded_at
+      );
+  }
+
+  /**
+   * Return the durable provenance link chain for a
+   * memory. The chain is sorted by `source_kind` (so
+   * the explain output is stable across queries with
+   * the same underlying data) and then by
+   * `recorded_at` ascending so the timeline is
+   * chronologically ordered within a kind.
+   */
+  getProvenance(memoryId: string): Array<{
+    source_kind: "issue" | "pr" | "commit" | "tool_call" | "session" | "import";
+    source_ref: string;
+    recorded_by: string;
+    recorded_at: number;
+  }> {
+    return this.db
+      .prepare(
+        `SELECT source_kind, source_ref, recorded_by, recorded_at
+           FROM memory_provenance
+          WHERE memory_id = ?
+          ORDER BY source_kind ASC, recorded_at ASC`
+      )
+      .all(memoryId) as Array<{
+      source_kind: "issue" | "pr" | "commit" | "tool_call" | "session" | "import";
+      source_ref: string;
+      recorded_by: string;
+      recorded_at: number;
+    }>;
+  }
+
+  /**
+   * Per-actor access count for a single memory. Replaces
+   * the legacy `entry.last_accessed_by` JSON map as the
+   * canonical access source. Returns 0 when the actor
+   * has never accessed the memory; the underlying
+   * `memory_accesses` table has `PRIMARY KEY (memory_id,
+   * actor_id)` so the lookup is a single row.
+   */
+  getAccessCountFor(memoryId: string, actorId: string): number {
+    const row = this.db
+      .prepare(
+        "SELECT access_count FROM memory_accesses WHERE memory_id = ? AND actor_id = ?"
+      )
+      .get(memoryId, actorId) as { access_count: number } | undefined;
+    return row?.access_count ?? 0;
+  }
+
+  /**
+   * All per-actor access counts for a memory, keyed by
+   * `actor_id`. Replaces `entry.last_accessed_by` JSON
+   * for callers that need the full access map.
+   */
+  getAllAccessCountsFor(memoryId: string): Record<string, number> {
+    const rows = this.db
+      .prepare(
+        "SELECT actor_id, access_count FROM memory_accesses WHERE memory_id = ?"
+      )
+      .all(memoryId) as Array<{ actor_id: string; access_count: number }>;
+    const out: Record<string, number> = {};
+    for (const row of rows) {
+      out[row.actor_id] = row.access_count;
+    }
+    return out;
   }
 
   /** A plan_id is "applied" iff there is an `apply_maintenance`

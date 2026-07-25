@@ -171,18 +171,37 @@ export function parseEnvFloat(name: string, fallback: number): number {
 // ============================================================
 
 /**
- * Walk the audit log to find the first "created" event for
- * this entry. That event's actor is the canonical writer.
- * Fall back to the legacy kind if no audit row is found.
+ * Stage 15 PR-M1-1 (issue #6, spec § 5.3): the canonical
+ * writer of an entry. Pre-PR-M1-1 this function walked
+ * the audit log to find the first "created" event; that
+ * path is preserved for the rare v1 / v2 case where an
+ * entry exists without a `writer_actor_id` (it should not
+ * happen on a v4+ database because the schema migration
+ * back-fills the column from the audit log). Post-PR-M1-1
+ * the `entry.writer_actor_id` column is the single source
+ * of truth; the audit scan is a defensive fallback only.
+ *
+ * The function does NOT do an N+1 audit scan on the
+ * hot path. Callers that already have the
+ * `writer_actor_id` (e.g. the recall ranker via
+ * `actorForEntryFn`) should pass that directly.
  */
 export function actorForEntry(
-  store: SQLiteMemoryStore,
+  _store: SQLiteMemoryStore,
   entry: MemoryEntry
 ): string {
-  const events = store.getAuditEvents(entry.id);
-  const created = events.find((e) => e.event === "created");
-  if (created !== undefined) return created.actor;
-  return entry.source.kind;
+  if (entry.writer_actor_id !== undefined && entry.writer_actor_id.length > 0) {
+    return entry.writer_actor_id;
+  }
+  // Fallback: legacy entries without a back-filled
+  // writer_actor_id. The audit scan is the only honest
+  // way to recover the original writer; we accept the
+  // cost because this branch should be unreachable on
+  // a v4+ schema.
+  if (entry.source !== undefined && entry.source.kind !== undefined) {
+    return entry.source.kind;
+  }
+  return "agent:unknown";
 }
 
 export function budgetFor(
@@ -404,15 +423,23 @@ export function evaluateEntryBudget(
       ...(result.details !== undefined ? { details: result.details } : {})
     };
   }
-  // Stage 3: enrich each warning with the matching memory's writer
-  // actor (from the audit log) and its last_accessed_by map.
+  // Stage 3 + Stage 15 PR-M1-1: enrich each warning with
+  // the matching memory's writer actor and the canonical
+  // access map. Pre-PR-M1-1 the access count came from
+  // the legacy `last_accessed_by` JSON column;
+  // post-PR-M1-1 the canonical source is
+  // `memory_accesses(memory_id, actor_id, last_accessed_at)`
+  // and we read the full per-actor map via
+  // `readAccessMap` so the warning surfaces real
+  // timestamps (the JSON column is read-only).
   const enrichedWarnings = result.value.warnings.map((w) => {
     const matched = existingEntries.find((e) => e.id === w.memory_id);
     if (matched === undefined) return w;
     const enriched: typeof w = { ...w };
     enriched.actor = actorForEntry(store, matched);
-    if (matched.last_accessed_by !== undefined) {
-      enriched.last_accessed_by = matched.last_accessed_by;
+    const accessMap = store.readAccessMap(matched.id);
+    if (accessMap !== undefined && Object.keys(accessMap).length > 0) {
+      enriched.last_accessed_by = accessMap;
     }
     return enriched;
   });
@@ -432,19 +459,39 @@ export function evaluateEntryBudget(
  * via the AGENT_RECALL_TRUST_STRONG and
  * AGENT_RECALL_TRUST_SOFT env vars.
  */
+/**
+ * Stage 15 PR-M1-1 (issue #6, spec § 5.3): the trust
+ * signal for an entry, given the caller's actor. The
+ * boost is `strong` when the caller's actor matches
+ * the canonical writer (`entry.writer_actor_id`),
+ * `soft` when the caller has previously accessed the
+ * entry (per the `memory_accesses` table), or 0
+ * otherwise.
+ *
+ * Pre-PR-M1-1 the soft check read
+ * `entry.last_accessed_by[currentActor]` from a JSON
+ * column; that column has been read-only-deprecated
+ * since v7. The canonical access data is in
+ * `memory_accesses(memory_id, actor_id, access_count)`
+ * and we look it up via `getAccessCountFor` so the
+ * formula is fully deterministic and explainable.
+ */
 export function computeTrustBoost(
+  store: SQLiteMemoryStore,
   entry: MemoryEntry,
   currentActor: string,
-  actorForEntryFn: (entry: MemoryEntry) => string
+  actorForEntryFn?: (entry: MemoryEntry) => string
 ): number {
   if (currentActor.length === 0) return 0;
   const strong = parseEnvFloat(ENV_TRUST_STRONG, DEFAULT_STRONG_TRUST_BOOST);
   const soft = parseEnvFloat(ENV_TRUST_SOFT, DEFAULT_SOFT_TRUST_BOOST);
-  const writer = actorForEntryFn(entry);
+  const writer =
+    actorForEntryFn !== undefined
+      ? actorForEntryFn(entry)
+      : entry.writer_actor_id;
   if (writer === currentActor) return strong;
-  if (entry.last_accessed_by !== undefined && entry.last_accessed_by[currentActor] !== undefined) {
-    return soft;
-  }
+  const accessCount = store.getAccessCountFor(entry.id, currentActor);
+  if (accessCount > 0) return soft;
   return 0;
 }
 

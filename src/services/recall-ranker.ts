@@ -23,6 +23,7 @@
 // Reference: spec § 5.3 AR-P0-003 "单一召回排序与上下文打包链路".
 
 import type { MemoryEntry } from "../domain.js";
+import type { SQLiteMemoryStore } from "../sqlite-store.js";
 import { computeTrustBoost, contextQueryScore, queryTokens } from "./memory-service-helpers.js";
 
 export const RANKING_VERSION = "coding-default-v1";
@@ -169,6 +170,20 @@ export function rankRecall(input: {
    *  `Infinity` (or undefined) returns the full ranked list. */
   topK?: number;
   now?: Date;
+  /**
+   * Optional SQLite store. When provided, the
+   * `actor_trust` signal uses the canonical
+   * `memory_accesses` table via `computeTrustBoost`;
+   * when absent the soft trust signal is uniformly 0
+   * (the ranker stays a pure function for unit tests
+   * and offline replays).
+   *
+   * Stage 15 PR-M1-1 (issue #6, spec § 5.3) made
+   * this the recommended path. All MCP and CLI
+   * callers pass a store; the legacy no-store path
+   * is preserved for ranker-level unit tests.
+   */
+  store?: SQLiteMemoryStore;
 }): RankedItem[] {
   const now = input.now ?? new Date();
   const tokens = queryTokens(input.query);
@@ -178,7 +193,11 @@ export function rankRecall(input: {
     const lexical = lexicalNorm(contextQueryScore(entry, tokens));
     const scope = scopeAffinity(entry, input.primaryScope);
     const trust = trustNorm(
-      computeTrustBoost(entry, input.actor.currentActor, input.actor.actorForEntry)
+      input.store !== undefined
+        ? computeTrustBoost(input.store, entry, input.actor.currentActor, input.actor.actorForEntry)
+        : input.actor.actorForEntry(entry) === input.actor.currentActor
+          ? 0.3
+          : 0
     );
     const importance = importanceNorm(entry.importance);
     const confidence = confidenceNorm(entry.confidence);
