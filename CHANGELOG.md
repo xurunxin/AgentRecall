@@ -244,6 +244,114 @@ serial PRs plus the M0-pre fix-test-infra PR below.
   tests pass unchanged (Stage 14 PR-B1 audit
   metadata contract is preserved).
 
+### Stage 15 PR-M0-3 (Atomic Import)
+### Fixed
+
+- **`src/portability/importer.ts`** (issue #4, spec § 6.7).
+  Five correctness gaps in the import pipeline:
+
+  1. **Atomic apply.** `applyImport` now wraps the
+     entire apply (inserts + replacements) in a
+     single `service.store.transaction(() => {...})`
+     block. A failure on entry N rolls back entries
+     1..N-1 via the existing `transaction` helper
+     (which opens `BEGIN IMMEDIATE`, runs the work,
+     and rolls back on any throw). The v1 contract
+     silently collected errors into an `errors[]`
+     array and reported partial success; the v2
+     contract is all-or-nothing.
+
+  2. **Throw instead of collect.** Errors are no
+     longer silently collected. The first failure
+     throws, the transaction rolls back, and the
+     caller surfaces the error. The CLI already
+     propagated any throw to a non-zero exit code;
+     the underlying contract now actually throws
+     (it used to return an `errors` array that the
+     CLI discarded).
+
+  3. **`require_clean_manifest` default flipped to
+     `true`.** The v1 contract treated the manifest
+     hash check as opt-in; the v2 contract makes it
+     the default. Callers can still disable it
+     explicitly by passing `require_clean_manifest:
+     false`, but a typo'd or forgotten flag no
+     longer silently accepts a corrupted export.
+
+  4. **YAML removed.** The `ImportFormat` type is
+     now `"json"` (was `"json" | "yaml"`). The
+     hand-rolled YAML emitter has no mirror parser,
+     and the v1 workaround of "convert the yaml
+     export to json first" was a footgun. Passing
+     `--format yaml` to the CLI now exits with a
+     non-zero status and an explicit error. The
+     importer also throws at the top of `planImport`
+     when the caller passes a non-`"json"` format,
+     so a runtime value that escapes the type still
+     fails fast.
+
+  5. **`parseEntries` defensive branch.** The
+     `markdown` and `unknown` format paths both
+     throw with a clear error message ("only
+     'json' is supported"). The v1 contract's
+     markdown error message ("use the json or yaml
+     export") was updated to remove the `yaml`
+     recommendation.
+
+### Changed
+
+- **`src/cli/commands/import.ts`** — the CLI now
+  rejects `--format yaml` with a non-zero exit code
+  and an explicit error message. The `format`
+  parameter is parsed with `if (formatRaw !== "json")`
+  rather than the v1 `if (formatRaw !== "json" &&
+  formatRaw !== "yaml")` check.
+
+### Added
+
+- **`test/release-gate/p1-atomic-import.test.ts`** (4
+  tests). Locks down the five acceptance criteria
+  from the issue body:
+    1. `applyImport` rolls back on revision-drift
+       (any-or-nothing). The test mutates the live
+       row's `revision` between `planImport` and
+       `applyImport` and asserts that the apply
+       throws, the live row's body is unchanged, and
+       the subsequent insert was rolled back.
+    2. `require_clean_manifest` defaults to `true`.
+       The test tampers with one of the topic files
+       in the export directory and asserts the
+       `planImport` throws without the caller
+       passing `require_clean_manifest: true`.
+    3. Round-trip export → import preserves ids,
+       revisions, and scope. Two entries seeded in
+       the source, exported via `CanonicalExporter`,
+       imported into a fresh target via
+       `applyImport` — the restored target's ids,
+       count, and `revision=1` match the source.
+    4. YAML is no longer accepted as an import
+       format. The test passes `"yaml" as never` to
+       the type and asserts the runtime call throws.
+
+### Verification
+
+- `npm test` → 0 failed / **454 passed** (was: 450)
+  / 1 unhandled error (the same pre-existing
+  vitest-worker `birpc` `onTaskUpdate` heartbeat
+  issue documented in PR-M0-1's CHANGELOG;
+  0 actual test failures).
+- `npm run typecheck` → 0 error.
+- 4 new p1-atomic-import tests pass.
+- 18 existing `test/portability-import.test.ts`
+  tests pass unchanged (the importer's public
+  signature is preserved; the v2 behaviour is
+  strictly more strict than v1 — the v1 tests
+  either used `dry_run: true` or did not exercise
+  the new throw paths).
+- 9 existing `test/portability.test.ts` tests
+  pass unchanged (the `CanonicalExporter` path is
+  untouched).
+
 ## [1.0.0] — Stage 14 v1.0 (AgentRecall v1.0)
 
 Date: 2026-07-21

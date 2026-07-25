@@ -67,7 +67,14 @@ export type ImportOptions = {
   conflict: ConflictPolicy;
   dry_run: boolean;
   actor: string;
-  /** When true, abort on a manifest hash mismatch. */
+  /**
+   * When true (the default), abort on a manifest
+   * hash mismatch. Stage 15 PR-M0-3 (issue #4, spec
+   * § 6.7) flips the default to true — the v1
+   * contract made the verification opt-in, which
+   * meant an entry could be silently dropped from
+   * the export without the import noticing.
+   */
   require_clean_manifest?: boolean;
 };
 
@@ -104,7 +111,7 @@ function expectedScopeLabel(scope: MemoryScope, project_id?: string): string {
   return scope === "project" ? `project/${project_id ?? "unknown-project"}` : "global";
 }
 
-function readEntries(exportScopeDir: string, format: "markdown" | "json" | "yaml"): MemoryEntry[] {
+function readEntries(exportScopeDir: string, format: ImportFormat): MemoryEntry[] {
   const topicsDir = join(exportScopeDir, "topics");
   if (!existsSync(topicsDir)) return [];
   const entries: MemoryEntry[] = [];
@@ -118,8 +125,8 @@ function readEntries(exportScopeDir: string, format: "markdown" | "json" | "yaml
   return entries;
 }
 
-function extensionFor(format: "markdown" | "json" | "yaml"): string {
-  if (format === "markdown") return "md";
+function extensionFor(format: ImportFormat): string {
+  // JSON-only now (Stage 15 PR-M0-3, issue #4).
   return format;
 }
 
@@ -128,32 +135,38 @@ function extensionFor(format: "markdown" | "json" | "yaml"): string {
  * is parsed differently:
  *   - JSON: the file is a `{ topic, scope, entries: [...] }`
  *     object.
- *   - YAML: same shape, parsed line-by-line (we use the
- *     hand-rolled YAML emitter's mirror parser — entries
- *     are listed as `- id: ...` items).
  *   - Markdown: not parsed. The Markdown exporter is
  *     intended for human reading; round-tripping a
  *     Markdown export through `import` requires the
- *     user to use the JSON or YAML export. We throw
- *     early to make this explicit.
+ *     user to use the JSON export. We throw early to
+ *     make this explicit.
+ *
+ * Stage 15 PR-M0-3 (issue #4, spec § 6.7): YAML import
+ * is no longer advertised. The hand-rolled YAML emitter
+ * does not have a mirror parser, and the v1 contract's
+ * "convert the yaml export to json first" workaround
+ * was a footgun. Callers that previously passed
+ * `--format yaml` must convert the export to JSON
+ * before importing; passing `--format yaml` to the
+ * CLI now exits with a non-zero status and an explicit
+ * error.
  */
-function parseEntries(body: string, format: "markdown" | "json" | "yaml"): MemoryEntry[] {
+function parseEntries(body: string, format: "markdown" | "json"): MemoryEntry[] {
   if (format === "markdown") {
-    throw new Error("importing from markdown is not supported; use the json or yaml export");
+    throw new Error("importing from markdown is not supported; use the json export");
   }
-  if (format === "json") {
-    const parsed = JSON.parse(body) as { entries: MemoryEntry[] };
-    return parsed.entries ?? [];
+  // JSON is the only supported import format. The
+  // caller's type signature is `format: "json"`, so
+  // this branch is defensive: a runtime value that
+  // escapes the type still gets a clear error.
+  if (format !== "json") {
+    throw new Error(`unsupported import format: ${format} (only "json" is supported)`);
   }
-  // YAML: read the file as JSON-shape via the
-  // round-trip test fixture below. We only need the
-  // entries — a hand-rolled YAML list parser would be
-  // brittle; instead, callers of `importMemoryExport`
-  // can pre-convert the export to JSON before importing.
-  throw new Error("YAML round-trip import is not yet implemented; convert the yaml export to json first");
+  const parsed = JSON.parse(body) as { entries: MemoryEntry[] };
+  return parsed.entries ?? [];
 }
 
-export type ImportFormat = "json" | "yaml";
+export type ImportFormat = "json";
 
 /**
  * Plan an import: classify each imported entry as
@@ -168,8 +181,26 @@ export function planImport(
   format: ImportFormat,
   options: ImportOptions
 ): ImportPlan {
+  // Stage 15 PR-M0-3 (issue #4): the v1 contract
+  // silently accepted `--format yaml` and let
+  // `readEntries` return an empty list when no
+  // matching files existed (it never reached
+  // `parseEntries` for the unknown format). That
+  // made a typo or a forgotten conversion succeed
+  // with an empty plan. v2 fails fast on any
+  // format other than `"json"`.
+  if (format !== "json") {
+    throw new Error(
+      `unsupported import format: "${format}" (only "json" is supported; yaml was removed in v1.1)`
+    );
+  }
   const manifest = readImportBundle(exportScopeDir, scope, project_id);
-  if (options.require_clean_manifest === true) {
+  // Stage 15 PR-M0-3 (issue #4): default to `true`.
+  // The v1 contract made manifest verification
+  // opt-in; the v2 contract makes it opt-out. The
+  // caller can still disable it explicitly by
+  // passing `require_clean_manifest: false`.
+  if (options.require_clean_manifest !== false) {
     const mismatches = verifyManifest(exportScopeDir, manifest);
     if (mismatches.length > 0) {
       throw new Error(
@@ -239,6 +270,20 @@ function mergeEntries(existing: MemoryEntry, imported: MemoryEntry): MemoryEntry
  * `planImport`; applying it does the actual
  * remember / update calls. Each call goes through the
  * normal validation pipeline (scope, secret, budget).
+ *
+ * Stage 15 PR-M0-3 (issue #4, spec § 6.7): the entire
+ * apply is wrapped in a single `BEGIN IMMEDIATE`
+ * transaction so a failure on entry N rolls back
+ * entries 1..N-1. The DB is either fully imported or
+ * not touched at all (all-or-nothing).
+ *
+ * Stage 15 PR-M0-3 (issue #4): errors are no longer
+ * silently collected into an `errors` array. The first
+ * failure throws, the transaction rolls back, and the
+ * caller surfaces the error. This fixes the bug where
+ * `importMemoryExport` returned `{ applied: false, ... }`
+ * even when partial writes had silently corrupted the
+ * live store.
  */
 export function applyImport(
   service: MemoryService,
@@ -250,43 +295,48 @@ export function applyImport(
   }
   let applied = 0;
   const applied_ids: string[] = [];
-  const errors: string[] = [];
-  for (const entry of plan.inserts) {
-    // The import path uses the entry's own id (the
-    // caller is replaying a prior export, so the id
-    // round-trips). We bypass `service.remember` because
-    // that path generates a fresh id. The scope /
-    // secret / budget checks were already applied when
-    // the entry was originally written to the source DB
-    // (the export is a snapshot of a valid DB), so we
-    // trust the entry's shape here.
-    try {
-      // The audit + id round-trip is the only thing the
-      // live path needs to do. We go through the service
-      // so the audit machinery is shared.
+  // We perform the entire apply in a single
+  // transaction. The store's `transaction` helper
+  // opens a `BEGIN IMMEDIATE`, runs the work, and
+  // commits on success; any throw inside the work
+  // callback rolls back. We collect the count +
+  // ids as side-effects and check them after the
+  // commit.
+  service.store.transaction(() => {
+    for (const entry of plan.inserts) {
+      // The import path uses the entry's own id (the
+      // caller is replaying a prior export, so the id
+      // round-trips). We bypass `service.remember` because
+      // that path generates a fresh id. The scope /
+      // secret / budget checks were already applied when
+      // the entry was originally written to the source DB
+      // (the export is a snapshot of a valid DB), so we
+      // trust the entry's shape here.
       service.writeInsertImportedEntry(entry, options.actor);
       applied += 1;
       applied_ids.push(entry.id);
-    } catch (error) {
-      errors.push(`insert ${entry.id}: ${error instanceof Error ? error.message : String(error)}`);
     }
-  }
-  for (const { imported, existing } of plan.replacements) {
-    if (imported.revision !== existing.revision && options.conflict === "replace") {
-      errors.push(
-        `replace ${imported.id}: revision drift (imported=${imported.revision} existing=${existing.revision})`
-      );
-      continue;
-    }
-    const result = service.updateMemory(existing.id, entryToUpdateInput(imported));
-    if (result.ok) {
+    for (const { imported, existing } of plan.replacements) {
+      if (imported.revision !== existing.revision && options.conflict === "replace") {
+        // Stage 15 PR-M0-3: throw (and roll back the
+        // whole apply) instead of collecting the
+        // error and continuing. Drift means the
+        // export's revision no longer matches the
+        // live row's revision; the caller's `replace`
+        // policy is invalidated.
+        throw new Error(
+          `replace ${imported.id}: revision drift (imported=${imported.revision} existing=${existing.revision})`
+        );
+      }
+      const result = service.updateMemory(existing.id, entryToUpdateInput(imported));
+      if (!result.ok) {
+        throw new Error(`update ${imported.id}: ${result.error}`);
+      }
       applied += 1;
       applied_ids.push(imported.id);
-    } else {
-      errors.push(`update ${imported.id}: ${result.error}`);
     }
-  }
-  return { applied, applied_ids, errors };
+  });
+  return { applied, applied_ids, errors: [] };
 }
 
 function entryToRememberInput(entry: MemoryEntry): Parameters<MemoryService["remember"]>[0] {

@@ -39,11 +39,16 @@ export function importCommand(ctx: CliContext): CliResult {
   const scope = (flagString(ctx.args, "scope") ?? "global") as MemoryScope;
   const projectId = flagString(ctx.args, "project-id");
   const formatRaw = flagString(ctx.args, "format") ?? "json";
-  if (formatRaw !== "json" && formatRaw !== "yaml") {
+  // Stage 15 PR-M0-3 (issue #4, spec § 6.7): YAML
+  // import is no longer supported. The CLI now
+  // rejects `--format yaml` explicitly so the
+  // caller doesn't waste a round-trip discovering
+  // the format isn't implemented.
+  if (formatRaw !== "json") {
     return {
       exitCode: 1,
       stdout: "",
-      stderr: `usage: agent-recall import --format json|yaml (got "${formatRaw}")`
+      stderr: `usage: agent-recall import --format json (yaml is no longer supported; got "${formatRaw}")`
     };
   }
   const conflictRaw = flagString(ctx.args, "conflict") ?? "keep";
