@@ -30,7 +30,7 @@ describe("SQLiteMemoryStore migrations", () => {
     // columns on memory_entries). The v1->v2 chain is
     // still exercised by the "migrates a v1 database to
     // current" test below.
-    expect(CURRENT_SCHEMA_VERSION).toBe(4);
+    expect(CURRENT_SCHEMA_VERSION).toBe(5);
   });
 
   it("is a no-op when schema is already at latest version", () => {

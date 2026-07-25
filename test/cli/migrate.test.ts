@@ -40,7 +40,7 @@ describe("migrateCommand", () => {
     // (memory_revisions / memory_accesses / project_aliases
     // / mutation_requests / memory_relations + v4 columns
     // on memory_entries).
-    expect(parsed.to).toBe(4);
+    expect(parsed.to).toBe(5);
     store.close();
   });
 });

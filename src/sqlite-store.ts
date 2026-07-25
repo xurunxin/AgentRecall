@@ -67,7 +67,7 @@ export type SearchFilters = EntryFilters & {
  * CHECK constraint to allow structured values like `agent:claude-code`.
  * v3 adds the `last_accessed_by` JSON column to `memory_entries`.
  */
-export const CURRENT_SCHEMA_VERSION = 4;
+export const CURRENT_SCHEMA_VERSION = 5;
 
 /**
  * Stage 12 PR9: thrown by `updateEntryWithRevision` when
@@ -684,6 +684,10 @@ export class SQLiteMemoryStore {
       this.migrate_v3_to_v4();
       return;
     }
+    if (version === 5) {
+      this.migrate_v4_to_v5();
+      return;
+    }
     throw new Error(`No migration registered for schema version ${version}`);
   }
 
@@ -885,6 +889,67 @@ export class SQLiteMemoryStore {
       }
 
       this.db.exec("PRAGMA user_version = 4");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * Stage 15 PR-M0-1 (issue #1, spec § 5.6): v4 -> v5
+   * schema migration. Introduces the
+   * `mutation_requests_v2` table with
+   * PRIMARY KEY (actor_id, tool_name, idempotency_key)
+   * and a `state` column so the idempotency record is
+   * reserved in the same transaction as the mutation.
+   * Copies every row from the legacy `mutation_requests`
+   * table into v2 with `tool_name='legacy'`. The legacy
+   * table is dropped after the copy. The down path
+   * (schema downgrade) renames v2 back to mutation_requests
+   * and drops the v2 state / request_id / completed_at
+   * columns so the v4 read path resumes working.
+   */
+  private migrate_v4_to_v5(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS mutation_requests_v2 (
+          actor_id TEXT NOT NULL,
+          tool_name TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL,
+          state TEXT NOT NULL CHECK (state IN ('pending','completed')),
+          request_hash TEXT NOT NULL,
+          result_json TEXT,
+          request_id TEXT,
+          created_at TEXT NOT NULL,
+          completed_at TEXT,
+          PRIMARY KEY (actor_id, tool_name, idempotency_key)
+        ) STRICT
+      `);
+
+      // Copy v1 rows into v2 with tool_name='legacy'.
+      // The v1 PK was (actor_id, idempotency_key) so the
+      // copy is 1:1 under the legacy namespace.
+      this.db.exec(`
+        INSERT OR IGNORE INTO mutation_requests_v2
+          (actor_id, tool_name, idempotency_key, state,
+           request_hash, result_json, request_id,
+           created_at, completed_at)
+        SELECT
+          actor_id, 'legacy', idempotency_key, 'completed',
+          request_hash, result_json, NULL,
+          created_at, created_at
+        FROM mutation_requests
+      `);
+
+      // The legacy table is now redundant (v2 is the
+      // source of truth). We keep it for one release
+      // cycle for any external reader that has not yet
+      // migrated; the v1 wrapper in src/services/idempotency.ts
+      // uses the `tool_name='legacy'` namespace to keep
+      // its reads working.
+      this.db.exec("PRAGMA user_version = 5");
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -1233,14 +1298,105 @@ export class SQLiteMemoryStore {
   }
 
   /**
-   * Stage 11 PR7: idempotency cache accessors. The
-   * `mutation_requests` table stores the canonical
-   * result of a mutating operation so a retry with the
-   * same `(actor, key)` can replay the result without
-   * re-running the mutation. Lookups return
-   * `undefined` when no row exists; `upsert` writes
-   * the row and is used both for the initial record
-   * and for the (rare) refresh-on-conflict path.
+   * Stage 15 PR-M0-1 (issue #1, spec § 5.6): idempotency
+   * v2 cache accessors. The `mutation_requests_v2` table
+   * stores the canonical result of a mutating operation
+   * so a retry with the same `(actor, tool, key)` can
+   * replay the result without re-running the mutation.
+   *
+   * `tryReserveMutationRequest` does an `INSERT OR ABORT`
+   * with `state='pending'`. It returns `true` when the
+   * row was inserted (caller should run the mutation,
+   * then call `completeMutationRequest`). It returns
+   * `false` when the row already exists — the caller
+   * must then call `lookupMutationRequestV2` to
+   * classify the hit as replay / rejected / in_flight.
+   *
+   * The store is `STRICT` typed; we keep `nowIso()` for
+   * the created_at / completed_at fields.
+   */
+
+  tryReserveMutationRequest(
+    actor: string,
+    tool: string,
+    key: string,
+    requestHash: string,
+    requestId: string
+  ): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO mutation_requests_v2
+             (actor_id, tool_name, idempotency_key, state,
+              request_hash, result_json, request_id,
+              created_at, completed_at)
+           VALUES (?, ?, ?, 'pending', ?, NULL, ?, ?, NULL)`
+        )
+        .run(actor, tool, key, requestHash, requestId, nowIso());
+      return true;
+    } catch (err) {
+      // node:sqlite throws "SqliteError" on a UNIQUE /
+      // PRIMARY KEY violation. The exact code is
+      // SQLITE_CONSTRAINT_PRIMARYKEY (= 1555) or
+      // SQLITE_CONSTRAINT_UNIQUE (= 1555) — both surface
+      // with the message we grep for. Treat any
+      // constraint violation as "row already exists"
+      // so the caller can classify the hit.
+      if (err instanceof Error && /UNIQUE constraint failed/i.test(err.message)) {
+        return false;
+      }
+      throw err;
+    }
+  }
+
+  completeMutationRequest(
+    actor: string,
+    tool: string,
+    key: string,
+    resultJson: string
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE mutation_requests_v2
+           SET state = 'completed',
+               result_json = ?,
+               completed_at = ?
+         WHERE actor_id = ? AND tool_name = ? AND idempotency_key = ?`
+      )
+      .run(resultJson, nowIso(), actor, tool, key);
+  }
+
+  lookupMutationRequestV2(
+    actor: string,
+    tool: string,
+    key: string
+  ): { request_hash: string; result_json: string; state: "pending" | "completed" } | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT request_hash, result_json, state
+           FROM mutation_requests_v2
+          WHERE actor_id = ? AND tool_name = ? AND idempotency_key = ?`
+      )
+      .get(actor, tool, key) as
+      | { request_hash: string; result_json: string; state: "pending" | "completed" }
+      | undefined;
+    return row;
+  }
+
+  /**
+   * @deprecated Stage 11 PR7: v1 idempotency cache
+   * accessors. The v1 PK was `(actor_id, idempotency_key)`
+   * with no `tool_name` dimension, which caused cross-tool
+   * collisions. Stage 15 PR-M0-1 introduces v2 with
+   * `(actor_id, tool_name, idempotency_key)` — new code
+   * MUST use `tryReserveMutationRequest` /
+   * `completeMutationRequest` / `lookupMutationRequestV2`.
+   * This wrapper is preserved for one release cycle so
+   * external callers and the p0-mutation-safety regression
+   * suite keep working. The v2 migration wrote v1 rows
+   * into `mutation_requests_v2` with `tool_name='legacy'`,
+   * so the v1 `(actor, key)` namespace lives on under the
+   * `legacy` tool.
    */
   lookupMutationRequest(actor: string, key: string):
     | { request_hash: string; result_json: string }

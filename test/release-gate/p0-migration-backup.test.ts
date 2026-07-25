@@ -137,7 +137,7 @@ describe("release-gate p0-migration-backup (PR-A)", () => {
     expect(version?.user_version).toBe(1);
 
     // Live DB is at the new version.
-    expect(store.getUserVersion()).toBe(4);
+    expect(store.getUserVersion()).toBe(5);
   });
 
   it("blocks the migration when the pre-mutation backup cannot be written", () => {
@@ -191,7 +191,7 @@ describe("release-gate p0-migration-backup (PR-A)", () => {
     };
     expect(parsed.ok).toBe(true);
     expect(parsed.from).toBe(1);
-    expect(parsed.to).toBe(4);
+    expect(parsed.to).toBe(5);
     expect(parsed.backup.path).toMatch(/memory-.*\.sqlite$/);
     expect(parsed.backup.schema_version).toBe(1);
     expect(parsed.backup.quick_check).toBe("ok");

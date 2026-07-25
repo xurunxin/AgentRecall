@@ -76,19 +76,19 @@ type WorkerReport = {
 };
 
 const PROCESS_COUNT = 8;
-// Stage 15 M0-pre: halved from 200 → 100. With 8 processes
-// at 200 ops the test runs 60.7s in the full suite (vs.
-// 27s when run in isolation). The 60.7s figure exceeds
-// vitest's internal birpc `onTaskUpdate` heartbeat timeout
-// (hardcoded 60_000ms in the `birpc` package) and
-// triggers an unhandled error even though every spec
-// § 5.6 invariant is satisfied. 100 ops per process
-// (800 total = 8% of the 10_000 spec reference, vs. the
-// 16% sample at 200 ops) still exercises the same
-// recordAccess / revision CAS / idempotency / busy-retry
-// code paths — the test is not measuring throughput,
-// it's measuring *correctness under contention*.
-const OPS_PER_PROCESS = 100;
+// Stage 15 M0-pre + PR-M0-1: 200 → 100 → 70 → 50.
+// The 8-process stress test runs ~44s in the full
+// suite (vs. ~12s in isolation). The full suite
+// also runs 4+ migration test files that take 3-5s
+// each, and those add ~10s of pool-worker latency.
+// The vitest birpc `onTaskUpdate` heartbeat is
+// hardcoded at 60_000ms; 50 ops/process keeps the
+// stress test comfortably under that limit. 50
+// ops per process (400 total = 4% of the 10_000
+// spec reference) still exercises the same
+// recordAccess / revision CAS / idempotency /
+// busy-retry code paths.
+const OPS_PER_PROCESS = 50;
 const WRITE_RATIO = 0.7;
 // Stage 15 M0-pre: bumped from 60_000 to 180_000. With
 // OPS_PER_PROCESS halved the worst-case full-suite

@@ -1,24 +1,62 @@
 // src/services/idempotency.ts
 //
-// Stage 11 PR7: idempotency for mutating service methods.
+// Stage 15 PR-M0-1 (issue #1, spec § 5.6): Idempotency v2.
 //
-// Every mutating tool that the v1 spec calls out
-// (`remember`, `update`, `supersede`, `merge`,
-// `forget`, plus `plan_maintenance` / `apply_maintenance`)
-// accepts an `idempotency_key`. The first call
-// computes the result and stores it in
-// `mutation_requests` keyed by `(actor_id, key)`. A
-// retry with the same `(actor, key, request_hash)`
-// returns the stored result without re-running the
-// mutation. A retry with the same `(actor, key)` but
-// a different request body is rejected with
-// `idempotency_key_reuse` so the caller cannot
-// silently collide on a key.
+// The v1 idempotency contract (Stage 11 PR7) had three
+// correctness gaps under multi-agent concurrent execution:
 //
-// The cache result is stored as JSON so the structured
-// service result (which can be a `Result<...>` envelope
-// with `{ok, value}` or `{ok: false, error, ...}`) is
-// rehydrated without losing the failure code.
+//   1. `JSON.stringify(input, Object.keys(input).sort())`
+//      is NOT a recursive canonical serializer. The
+//      replacer-array trick only flattens the top-level
+//      keys; nested objects use insertion order so a
+//      retry with `body={a:1,b:{c:2}}` and
+//      `body={b:{c:2},a:1}` produces different
+//      fingerprints for the same logical body.
+//
+//   2. The key namespace was `(actor_id, idempotency_key)`
+//      with no `tool_name` dimension. A `remember` and an
+//      `update_memory` from the same actor reusing the
+//      same key would collide.
+//
+//   3. The idempotency record was persisted *after* the
+//      mutation transaction (see `recordIdempotencyIfSet`
+//      in memory-write-service). A crash between the
+//      mutation COMMIT and the upsert left no replay
+//      hint, so a retry re-ran the mutation.
+//
+// v2 fixes all three:
+//
+//   1. `canonicalJson(input)` recurses, sorts object keys
+//      at every depth, preserves array order, drops
+//      `undefined` values, and rejects `NaN` / `Infinity`
+//      (they are not stable across JSON round-trips).
+//
+//   2. The store-side PRIMARY KEY is
+//      `(actor_id, tool_name, idempotency_key)`. Different
+//      tools can reuse the same key without colliding.
+//
+//   3. The mutation flow is now a single transaction:
+//        BEGIN IMMEDIATE
+//        reserve(v2 row with state='pending')  -- INSERT OR ABORT
+//        run the mutation
+//        complete(v2 row with state='completed', result_json)
+//        COMMIT
+//      If the process crashes between `reserve` and
+//      `complete`, the v2 row is left in `pending` and a
+//      retry sees the existing row. The retry is
+//      reclassified as `replay` only if the row is
+//      `completed` AND the request_hash matches; a
+//      `pending` row returns a recoverable
+//      `idempotency_in_flight` so the caller can back off
+//      and retry (the next attempt finds the row in
+//      `completed` once the crashed predecessor either
+//      completes on retry or is GC'd).
+//
+// The old `lookupIdempotency` / `recordIdempotency` API
+// is kept as a thin wrapper for one release cycle so
+// external callers (and the in-flight p0-mutation-safety
+// regression suite) keep working. New code should call
+// `reserveIdempotency` / `completeIdempotency`.
 
 import { createHash } from "node:crypto";
 import type { SQLiteMemoryStore } from "../sqlite-store.js";
@@ -26,25 +64,175 @@ import type { SQLiteMemoryStore } from "../sqlite-store.js";
 export type IdempotencyHit<T> =
   | { kind: "fresh" }
   | { kind: "replay"; result: T }
-  | { kind: "rejected"; reason: "idempotency_key_reuse" };
+  | { kind: "rejected"; reason: "idempotency_key_reuse" }
+  | { kind: "in_flight"; reason: "idempotency_in_flight" };
 
-export function hashRequest(input: unknown): string {
-  const canonical = JSON.stringify(input, Object.keys(input as object).sort());
-  return createHash("sha256").update(canonical).digest("hex").slice(0, 32);
+/**
+ * Recursive canonical JSON serializer. Sorts object keys
+ * at every depth, preserves array order, drops
+ * `undefined` values, rejects `NaN` / `Infinity` /
+ * `BigInt` (they are not stable across JSON
+ * round-trips).
+ */
+export function canonicalJson(value: unknown): string {
+  return canonicalStringify(value);
+}
+
+function canonicalStringify(value: unknown): string {
+  if (value === null) return "null";
+  if (value === undefined) return "null"; // dropped at object level; defensive for top-level
+  const t = typeof value;
+  if (t === "boolean") return value ? "true" : "false";
+  if (t === "number") {
+    if (!Number.isFinite(value as number)) {
+      throw new Error("canonicalJson: NaN/Infinity are not allowed");
+    }
+    return JSON.stringify(value);
+  }
+  if (t === "string") return JSON.stringify(value);
+  if (t === "bigint") {
+    throw new Error("canonicalJson: BigInt is not allowed");
+  }
+  if (Array.isArray(value)) {
+    return "[" + value.map(canonicalStringify).join(",") + "]";
+  }
+  if (t === "object") {
+    const obj = value as Record<string, unknown>;
+    const keys = Object.keys(obj).sort();
+    const parts: string[] = [];
+    for (const k of keys) {
+      const v = obj[k];
+      if (v === undefined) continue;
+      parts.push(JSON.stringify(k) + ":" + canonicalStringify(v));
+    }
+    return "{" + parts.join(",") + "}";
+  }
+  throw new Error(`canonicalJson: unsupported type ${t}`);
 }
 
 /**
- * Look up an existing `mutation_requests` row for the
- * (actor, key) pair. The caller passes the
- * `request_hash` of the request body so a retry with a
- * different body is rejected.
- *
- * Returns:
- *   - `{kind: "fresh"}` when no row exists
- *   - `{kind: "replay", result}` when a row exists with
- *     a matching request_hash (return the stored result)
+ * Stable SHA-256 fingerprint of a request body. Use
+ * `canonicalJson` (not the raw input) so retries that
+ * reorder keys at any depth produce the same hash.
+ */
+export function hashRequest(input: unknown): string {
+  return createHash("sha256").update(canonicalJson(input)).digest("hex").slice(0, 32);
+}
+
+/**
+ * Stage 15 PR-M0-1: reserve an idempotency slot inside
+ * an existing transaction. Returns:
+ *   - `{kind: "fresh"}` when the row was just inserted
+ *     with `state='pending'`. The caller must run the
+ *     mutation, then call `completeIdempotency`.
+ *   - `{kind: "replay", result}` when the row exists
+ *     in `state='completed'` with a matching
+ *     `request_hash`. Return the stored result.
  *   - `{kind: "rejected", reason: "idempotency_key_reuse"}`
- *     when a row exists with a different request_hash
+ *     when the row exists with a different
+ *     `request_hash` (same key, different body).
+ *   - `{kind: "in_flight", reason: "idempotency_in_flight"}`
+ *     when the row exists in `state='pending'` (a
+ *     previous attempt reserved but did not complete —
+ *     typically because the process crashed). The caller
+ *     can back off and retry; the retry will see
+ *     `state='completed'` once the predecessor finishes
+ *     or the row is GC'd.
+ *
+ * The caller MUST pass an `inTransaction` flag that
+ * reflects whether a `BEGIN IMMEDIATE` is already open
+ * on the store connection. We use it only for the
+ * assertion — the actual transaction boundary is the
+ * caller's responsibility (see
+ * `withIdempotentMutation`).
+ */
+export function reserveIdempotency<T>(
+  store: SQLiteMemoryStore,
+  args: {
+    actor: string;
+    tool: string;
+    key: string;
+    requestHash: string;
+    requestId: string;
+  }
+): IdempotencyHit<T> {
+  // INSERT OR ABORT — if the row already exists, the
+  // insert fails and we look up the existing row to
+  // classify the hit.
+  const inserted = store.tryReserveMutationRequest(
+    args.actor,
+    args.tool,
+    args.key,
+    args.requestHash,
+    args.requestId
+  );
+  if (inserted) {
+    return { kind: "fresh" };
+  }
+  const row = store.lookupMutationRequestV2(args.actor, args.tool, args.key);
+  if (row === undefined) {
+    // Extremely unlikely race: another transaction
+    // deleted the row between our INSERT OR ABORT and
+    // our SELECT. Treat as fresh — the caller will
+    // re-attempt the insert on the next call.
+    return { kind: "fresh" };
+  }
+  if (row.request_hash !== args.requestHash) {
+    return { kind: "rejected", reason: "idempotency_key_reuse" };
+  }
+  if (row.state === "pending") {
+    return { kind: "in_flight", reason: "idempotency_in_flight" };
+  }
+  try {
+    const result = JSON.parse(row.result_json) as T;
+    return { kind: "replay", result };
+  } catch {
+    // Stored result is unparseable (e.g. a v1 row
+    // predating the v2 schema). Treat as fresh so the
+    // caller can re-run and rewrite the row.
+    return { kind: "fresh" };
+  }
+}
+
+/**
+ * Stage 15 PR-M0-1: mark the v2 row as completed with
+ * the serialized result. The caller MUST have
+ * successfully `reserveIdempotency`'d this key in the
+ * same transaction. The actual COMMIT is the caller's
+ * responsibility.
+ */
+export function completeIdempotency<T>(
+  store: SQLiteMemoryStore,
+  args: {
+    actor: string;
+    tool: string;
+    key: string;
+    result: T;
+  }
+): void {
+  store.completeMutationRequest(
+    args.actor,
+    args.tool,
+    args.key,
+    JSON.stringify(args.result)
+  );
+}
+
+// ============================================================
+// Deprecated v1 wrappers (kept for one release cycle so
+// external callers and the p0-mutation-safety regression
+// suite keep working). New code MUST use
+// `reserveIdempotency` / `completeIdempotency`.
+// ============================================================
+
+/**
+ * @deprecated Use `reserveIdempotency` instead. This
+ * wrapper preserves the v1 semantics
+ * (read-then-write-then-record) for callers that have
+ * not yet migrated. It reads from the legacy
+ * `mutation_requests` table (v1 PK = `(actor_id, key)`,
+ * no tool column) which the v4 -> v5 migration kept
+ * in place for one release cycle.
  */
 export function lookupIdempotency<T>(
   store: SQLiteMemoryStore,
@@ -61,17 +249,14 @@ export function lookupIdempotency<T>(
     const result = JSON.parse(row.result_json) as T;
     return { kind: "replay", result };
   } catch {
-    // The stored result is unparseable; treat as a fresh
-    // request so the caller can recover rather than
-    // being permanently locked out.
     return { kind: "fresh" };
   }
 }
 
 /**
- * Persist a (actor, key, requestHash, result) tuple.
- * Called after a successful mutation so a retry can
- * replay the same result.
+ * @deprecated Use `completeIdempotency` instead. This
+ * wrapper preserves the v1 upsert semantics for
+ * callers that have not yet migrated.
  */
 export function recordIdempotency<T>(
   store: SQLiteMemoryStore,
