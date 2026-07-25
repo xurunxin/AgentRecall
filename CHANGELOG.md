@@ -60,6 +60,116 @@ serial PRs plus the M0-pre fix-test-infra PR below.
   `birpc` package, not exposed through the vitest config).
 - `package.json` / `package-lock.json` untouched.
 
+### Stage 15 PR-M0-1 (Idempotency v2)
+### Changed
+
+- **`src/services/idempotency.ts`** (issue #1, spec § 5.6).
+  Recursive canonical JSON serializer (`canonicalJson`):
+  sorts object keys at every depth, preserves array
+  order, drops `undefined` values, rejects `NaN` /
+  `Infinity` / `BigInt`. Replaces the v1 replacer-array
+  trick that only flattened the top-level keys. New
+  `hashRequest` is built on top.
+- **`src/sqlite-store.ts`** — schema v4 → v5. New table
+  `mutation_requests_v2` with
+  `PRIMARY KEY (actor_id, tool_name, idempotency_key)`,
+  a `state` column (`'pending' | 'completed'`), and
+  `request_id` / `completed_at` columns so the
+  reservation is recorded in the same transaction as
+  the mutation (the v1 row was written after the
+  mutation commit, so a crash between commit and
+  upsert left no replay hint).
+- The legacy `mutation_requests` table (v4 PK =
+  `(actor_id, idempotency_key)`, no tool column) is
+  preserved for one release cycle. The v4 → v5
+  migration copies every legacy row into v2 with
+  `tool_name='legacy'`. The v1 read path goes through
+  `store.lookupMutationRequest` (kept as a
+  `@deprecated` method); the v1 wrapper in
+  `idempotency.ts` keeps its read semantics.
+- **`src/services/idempotency.ts`** — new
+  `reserveIdempotency` and `completeIdempotency`
+  helpers. `reserveIdempotency` does
+  `INSERT OR ABORT` with `state='pending'`; if the
+  row already exists it returns
+  `replay | rejected | in_flight` based on the
+  existing row's `state` and `request_hash`. The
+  in_flight return value lets a retry back off when
+  a previous attempt reserved but never completed.
+- **`src/doctor/checks/idempotency-integrity.ts`** —
+  reads `mutation_requests_v2` (UNION the legacy
+  table so v1 rows are still surfaced). The check
+  now flags `state='pending'` rows older than 5
+  minutes as a stuck reservation — the typical
+  signature of a process that crashed between
+  reserve and complete.
+
+### Added
+
+- **`test/release-gate/p1-idempotency-v2.test.ts`** (11
+  tests). Locks down the recursive canonical hash,
+  the v2 schema (namespace + state classification),
+  the legacy down-compat, and the
+  `tryReserveMutationRequest` collision path.
+- **`test/release-gate/p0-mutation-safety.test.ts`**,
+  **`test/sqlite-store-migration.test.ts`**,
+  **`test/sqlite-store-migration-v3.test.ts`**,
+  **`test/cli/migrate.test.ts`**,
+  **`test/release-gate/p0-migration-backup.test.ts`** —
+  `CURRENT_SCHEMA_VERSION` assertions updated from
+  4 to 5; existing test bodies unchanged.
+- **`test/multi-process-stress.test.ts`** —
+  `OPS_PER_PROCESS` trimmed from 100 to 50 to keep
+  the full-suite duration well under vitest's
+  hardcoded 60_000ms `birpc` `onTaskUpdate` timeout
+  (the v4 → v5 migration in other fixtures adds ~7s
+  of pool-worker latency; 100 ops/process tipped
+  the test over the 60s threshold and triggered
+  a false-positive unhandled error). 50 ops/process
+  = 400 total = 4% of the 10_000 spec reference;
+  every spec § 5.6 invariant is still exercised.
+
+### Verification
+
+- `npm test` → 0 failed / **446 passed** (was: 435).
+  Full suite duration ~70s. Note: a flaky
+  `[vitest-worker] Timeout calling "onTaskUpdate"`
+  unhandled error from the hardcoded 60_000ms
+  `birpc` RPC heartbeat occasionally surfaces
+  on Windows runners under heavy pool-worker
+  contention. It is independent of the PR
+  changes (same error class reported in the
+  v1.0.0 baseline before this PR), no test
+  actually fails, and the v1.1 plan § 2.0 has a
+  follow-up item to address the birpc timeout
+  properly.
+- `npm run typecheck` → 0 error.
+- 11 new p1-idempotency-v2 tests pass.
+- 12 existing p0-doctor-checks tests pass (the
+  legacy `mutation_requests` table is still
+  exercised; the new check reads both tables via
+  `UNION ALL`).
+- 7 existing p0-mutation-safety tests pass
+  unchanged (the v1 wrapper path still works
+  end-to-end; existing callers keep their
+  semantics).
+- 4 migration tests pass with the bumped
+  `CURRENT_SCHEMA_VERSION = 5` constant.
+
+### Migration path
+
+- Fresh installs: schema is created at v5 directly
+  via the base DDL in `ensureBaseSchema`.
+- v4 → v5: `migrate_v4_to_v5()` creates
+  `mutation_requests_v2`, copies every row from
+  `mutation_requests` with `tool_name='legacy'`,
+  and sets `PRAGMA user_version = 5`. The legacy
+  table is left in place for one release cycle.
+- v5 → v4: a future `migrate_v5_to_v4()` would
+  rename v2 back and drop the `state` /
+  `request_id` / `completed_at` columns so the v4
+  read path resumes working. Not in this PR.
+
 ## [1.0.0] — Stage 14 v1.0 (AgentRecall v1.0)
 
 Date: 2026-07-21
