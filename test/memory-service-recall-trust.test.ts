@@ -71,47 +71,58 @@ const baseRemember = (overrides: Record<string, unknown> = {}) => ({
 });
 
 describe("computeTrustBoost", () => {
+  // Stage 15 PR-M1-1 (issue #6, spec § 5.3): the
+  // soft trust signal now reads from the canonical
+  // `memory_accesses` table; the legacy
+  // `last_accessed_by` JSON column is read-only-
+  // deprecated. The helper accepts the store as
+  // its first argument so the soft check can call
+  // `getAccessCountFor(memory_id, actor_id)`.
   it("returns strong boost (0.3) when the writer matches the current actor", () => {
-    const entry = makeEntry();
-    const result = computeTrustBoost(entry, "agent:claude-code", () => "agent:claude-code");
+    const { store } = setup("agent:claude-code");
+    const entry = makeEntry({ writer_actor_id: "agent:claude-code" });
+    const result = computeTrustBoost(store, entry, "agent:claude-code");
     expect(result).toBe(0.3);
   });
 
-  it("returns soft boost (0.1) when the current actor appears in last_accessed_by", () => {
-    const entry = makeEntry({
-      last_accessed_by: { "agent:claude-code": "2026-07-20T00:00:00.000Z" }
-    });
-    const result = computeTrustBoost(entry, "agent:claude-code", () => "agent:other");
+  it("returns soft boost (0.1) when the current actor has accessed the memory (memory_accesses)", () => {
+    const { store } = setup("agent:claude-code");
+    const entry = makeEntry({ writer_actor_id: "agent:other" });
+    // Stage 15 PR-M1-1: the soft signal comes from
+    // `memory_accesses`, not the legacy
+    // `last_accessed_by` JSON. Write one access
+    // row to seed the soft signal.
+    store.recordAccess(entry.id, "agent:claude-code", "2026-07-20T00:00:00.000Z");
+    const result = computeTrustBoost(store, entry, "agent:claude-code");
     expect(result).toBe(0.1);
   });
 
   it("returns 0 when there is no relationship", () => {
-    const entry = makeEntry({
-      last_accessed_by: { "agent:other": "2026-07-20T00:00:00.000Z" }
-    });
-    const result = computeTrustBoost(entry, "agent:claude-code", () => "agent:other");
+    const { store } = setup("agent:claude-code");
+    const entry = makeEntry({ writer_actor_id: "agent:other" });
+    const result = computeTrustBoost(store, entry, "agent:claude-code");
     expect(result).toBe(0);
   });
 
   it("returns 0 when the current actor is empty (legacy callers)", () => {
-    const entry = makeEntry({
-      last_accessed_by: { "agent:claude-code": "2026-07-20T00:00:00.000Z" }
-    });
-    const result = computeTrustBoost(entry, "", () => "agent:claude-code");
+    const { store } = setup("agent:claude-code");
+    const entry = makeEntry({ writer_actor_id: "agent:claude-code" });
+    const result = computeTrustBoost(store, entry, "");
     expect(result).toBe(0);
   });
 
   it("strong boost takes precedence over soft boost when both apply", () => {
-    const entry = makeEntry({
-      last_accessed_by: { "agent:claude-code": "2026-07-20T00:00:00.000Z" }
-    });
-    const result = computeTrustBoost(entry, "agent:claude-code", () => "agent:claude-code");
+    const { store } = setup("agent:claude-code");
+    const entry = makeEntry({ writer_actor_id: "agent:claude-code" });
+    store.recordAccess(entry.id, "agent:claude-code", "2026-07-20T00:00:00.000Z");
+    const result = computeTrustBoost(store, entry, "agent:claude-code");
     expect(result).toBe(0.3);
   });
 
-  it("soft boost does not fire for an empty last_accessed_by map", () => {
-    const entry = makeEntry();
-    const result = computeTrustBoost(entry, "agent:claude-code", () => "agent:other");
+  it("soft boost does not fire for an empty access table", () => {
+    const { store } = setup("agent:claude-code");
+    const entry = makeEntry({ writer_actor_id: "agent:other" });
+    const result = computeTrustBoost(store, entry, "agent:claude-code");
     expect(result).toBe(0);
   });
 });

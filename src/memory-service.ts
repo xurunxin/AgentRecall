@@ -757,7 +757,7 @@ export class MemoryService {
           score: item.score,
           components: item.components,
           title: item.entry.title,
-          trust_boost: computeTrustBoost(item.entry, this.defaultActor, (e) => e.writer_actor_id)
+          trust_boost: computeTrustBoost(this._store, item.entry, this.defaultActor, (e) => e.writer_actor_id)
         }))
       }
     };

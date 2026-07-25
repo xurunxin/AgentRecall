@@ -534,6 +534,155 @@ serial PRs plus the M0-pre fix-test-infra PR below.
   these are called from `apply_maintenance`; the
   apply path uses the new `mergePlannedGroup` helper.
 
+### Stage 15 PR-M1-1 (Trust + Provenance Unification)
+### Fixed
+
+- **`src/services/memory-service-helpers.ts`** (issue
+  #6, spec § 5.3). Four gaps in the trust + access
+  signal model:
+
+  1. **`memory_accesses` is now the only access
+     source of truth.** The legacy
+     `last_accessed_by` JSON column is read-only-
+     deprecated. `computeTrustBoost` now reads the
+     soft signal from `store.getAccessCountFor(memory_id,
+     actor_id)` instead of
+     `entry.last_accessed_by[actor]`. The
+     `evaluateEntryBudget` warning enrichment
+     surfaces the per-actor access map via
+     `store.readAccessMap(memory_id)`, which reads
+     the canonical `memory_accesses` table and
+     returns `Record<string, string>` (actor ->
+     ISO timestamp).
+
+  2. **`writer_actor_id` is the only writer source.**
+     `actorForEntry` no longer walks the audit log
+     to find the first "created" event. It returns
+     `entry.writer_actor_id` directly (with a
+     defensive fallback for legacy entries that
+     pre-date the v4 back-fill). The hot path
+     performs zero audit scans.
+
+  3. **Trust formula is deterministic and
+     explainable.** The new `computeTrustBoost(store,
+     entry, currentActor, actorFn?)` signature
+     makes the data dependency explicit. The
+     formula: `strong` (writer match, default 0.3)
+     > `soft` (accessor per `memory_accesses`,
+     default 0.1) > 0. Two recall calls with
+     identical inputs produce byte-identical
+     explanations.
+
+  4. **`computeTrustBoost` is the single entry
+     point** for trust evaluation. The ranker now
+     takes an optional `store` parameter; when
+     present, the trust signal is derived from the
+     real `memory_accesses` data; when absent (for
+     ranker-level unit tests), the soft signal is
+     uniformly 0 and the ranker stays a pure
+     function.
+
+### Added
+
+- **`src/sqlite-store.ts`** —
+  `CURRENT_SCHEMA_VERSION` bumped 6 → 7. The new
+  `migrate_v6_to_v7` step creates the
+  `memory_provenance` table (PRIMARY KEY
+  `(memory_id, source_kind, source_ref)`; CHECK on
+  `source_kind IN ('issue','pr','commit','tool_call',
+  'session','import')`; `recorded_at INTEGER NOT NULL`)
+  with an index on `(source_kind, source_ref)`. Four
+  new methods on `SQLiteMemoryStore`:
+  - `recordProvenance({memory_id, source_kind,
+    source_ref, recorded_by, recorded_at})` — uses
+    `INSERT OR IGNORE` so repeat ingestion is
+    idempotent under `(memory_id, source_kind,
+    source_ref)`.
+  - `getProvenance(memory_id)` — returns the
+    durable link chain, sorted by `source_kind` ASC
+    then `recorded_at` ASC.
+  - `getAccessCountFor(memory_id, actor_id)` —
+    per-actor access count from
+    `memory_accesses`; replaces the legacy
+    `last_accessed_by[actor]` lookup.
+  - `getAllAccessCountsFor(memory_id)` — full
+    per-actor access map.
+  - `readAccessMap(memory_id)` is now public
+    (was private); returns
+    `Record<actor_id, last_accessed_at>` from the
+    canonical `memory_accesses` table.
+- **`src/services/provenance.ts`** — new module
+  with two functions:
+  - `recordProvenance(store, input)` — validates
+    `memory_id`, `source_kind`, `source_ref` (trimmed,
+    non-empty), and `recorded_by`; returns
+    `{ ok: true, link }` or `{ ok: false, error:
+    "invalid_input" }`. The validation catches
+    runtime values that escape the
+    `source_kind` literal type at runtime.
+  - `explainProvenance(store, memory_id)` —
+    returns `{ memory_id, links, summary }` with
+    a stable `summary[]` (one line per link, format:
+    `<source_kind>: <source_ref> (recorded_by=<actor>,
+    at=<iso>)`).
+- **`test/release-gate/p2-trust-provenance.test.ts`**
+  (6 tests). Locks down every acceptance criterion
+  from issue #6:
+    1. Two recall calls with identical inputs
+       produce byte-identical explanations
+       (deterministic).
+    2. `writer_actor_id` is the canonical writer
+       source — no audit scan on the hot path.
+    3. `explain_recall` exposes `trust_boost`,
+       the real `access_count` from
+       `memory_accesses`, and the per-actor access
+       map via the store accessor.
+    4. `recordProvenance` + `explainProvenance`
+       round-trip: chain is sorted by
+       `source_kind` ASC then `recorded_at` ASC;
+       repeat ingestion with the same
+       `(memory_id, source_kind, source_ref)` is
+       idempotent (no duplicate row).
+    5. Invalid `recordProvenance` input (empty
+       `source_ref`, unknown `source_kind`, empty
+       `memory_id`, empty `recorded_by`) returns
+       `invalid_input` without writing a row.
+    6. Trust formula invariant:
+       `strong > soft > 0` for three
+       representative entries (writer match,
+       accessor, no relationship).
+- **`test/memory-service-recall-trust.test.ts`**,
+  **`test/trust-boost-config.test.ts`** — updated
+  to the new `computeTrustBoost(store, entry, ...)`
+  signature and the `memory_accesses`-based soft
+  signal. The `last_accessed_by` JSON column is
+  no longer the source of trust; the tests now
+  seed the soft signal via `store.recordAccess`.
+
+### Verification
+
+- `npm test` → 0 failed / **472 passed** (was: 466)
+  / 1 unhandled error (the same pre-existing
+  vitest-worker `birpc` `onTaskUpdate` heartbeat
+  issue documented in PR-M0-1's CHANGELOG;
+  0 actual test failures).
+- `npm run typecheck` → 0 error.
+- 6 new p2-trust-provenance tests pass.
+- 61 existing test files pass unchanged.
+- Static check `grep -nE "last_accessed_by.*JSON"
+  src/services/memory-read-service.ts` returns 0
+  hits. The legacy JSON column is no longer
+  consulted on the read path; the canonical
+  source is `memory_accesses`.
+- Static check `grep -nE "SELECT.*FROM
+  audit_events" src/services/` returns 0 hits
+  (the read / write / maintenance / helpers
+  services perform no audit scans on the hot
+  path; the only audit scans live in
+  `src/sqlite-store.ts` for the v4 back-fill of
+  `writer_actor_id` and the v1 `audit_events_v2`
+  rebuild).
+
 ## [1.0.0] — Stage 14 v1.0 (AgentRecall v1.0)
 
 Date: 2026-07-21

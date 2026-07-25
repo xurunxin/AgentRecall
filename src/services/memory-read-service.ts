@@ -222,7 +222,7 @@ export class MemoryReadService {
     const currentActor = ctx?.actor_id ?? this.ctx.defaultActor;
     const entries = collected.map((entry) => ({
       ...entry,
-      trust_boost: computeTrustBoost(entry, currentActor, (e) =>
+      trust_boost: computeTrustBoost(this.ctx.store, entry, currentActor, (e) =>
         actorForEntry(this.ctx.store, e)
       ),
       writer: actorForEntry(this.ctx.store, entry)

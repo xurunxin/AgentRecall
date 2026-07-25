@@ -1,0 +1,84 @@
+feat(provenance): trust + access unified on memory_accesses + writer_actor_id
+
+Stage 15 PR-M1-1 (issue #6, spec § 5.3).
+
+Pre-PR-M1-1 had four correctness gaps in the trust
++ access signal model:
+
+  1. The `last_accessed_by` JSON column on
+     `memory_entries` was the soft-trust source;
+     `memory_accesses` (canonical since v4) was
+     a side-table.
+  2. `actorForEntry` walked the audit log on
+     every call to recover the writer, even
+     though `writer_actor_id` (v4 column) was
+     already populated.
+  3. Trust formula combined writer + JSON-map
+     lookups; the call site did not know which
+     source was consulted.
+  4. No durable provenance link chain (issue /
+     PR / commit / tool_call / session / import).
+
+This PR fixes all four:
+
+  - **Schema v6 → v7**: `memory_provenance`
+    table (PRIMARY KEY `(memory_id, source_kind,
+    source_ref)`, CHECK on `source_kind`).
+  - **`memory_accesses` is the only access
+    source of truth.** `computeTrustBoost`
+    reads the soft signal from
+    `store.getAccessCountFor(memory_id,
+    actor_id)`. The legacy
+    `last_accessed_by` JSON column is
+    read-only-deprecated.
+  - **`writer_actor_id` is the only writer
+    source.** `actorForEntry` returns the
+    column directly with a defensive fallback
+    for legacy v1/v2 entries. The hot path
+    performs zero audit scans.
+  - **Trust formula deterministic and
+    explainable.** New signature
+    `computeTrustBoost(store, entry,
+    currentActor, actorFn?)` makes the data
+    dependency explicit. The ranker accepts an
+    optional `store` parameter; when present,
+    the trust signal uses the real
+    `memory_accesses` data; when absent, the
+    ranker stays a pure function.
+  - **`src/services/provenance.ts`** — new
+    module with `recordProvenance` and
+    `explainProvenance`. The `recordProvenance`
+    input is validated (memory_id, source_kind,
+    source_ref trimmed + non-empty,
+    recorded_by non-empty); the function
+    returns `{ ok: false, error: "invalid_input"
+    }` for runtime values that escape the
+    `source_kind` literal type. The
+    `explainProvenance` summary is stable:
+    `source_kind` ASC then `recorded_at` ASC.
+
+CHANGELOG: PR-M1-1 section added; 4 schema-version
+tests updated to expect `CURRENT_SCHEMA_VERSION = 7`
+/ `user_version = 7`.
+
+6 new tests in `test/release-gate/p2-trust-provenance.test.ts`
+cover every acceptance criterion from issue #6:
+deterministic explanations; `writer_actor_id` as the
+canonical writer (no audit scan on the hot path);
+`explain_recall` exposes `trust_boost` + real
+`access_count`; provenance round-trip preserves
+order and content; invalid input is rejected
+without writing a row; trust formula invariant
+`strong > soft > 0`.
+
+`test/memory-service-recall-trust.test.ts` and
+`test/trust-boost-config.test.ts` updated to the
+new signature and the `memory_accesses`-based
+soft signal.
+
+Test count: 472 (was 466; +6).
+Typecheck: 0 error.
+Static checks: no `last_accessed_by.*JSON` in
+`src/services/memory-read-service.ts`; no
+`SELECT.*FROM audit_events` in `src/services/`
+outside of the audit/CLI surface.

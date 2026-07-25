@@ -43,7 +43,8 @@ describe("migrateCommand", () => {
     // Stage 15 PR-M0-1: bumped to 5 (mutation_requests_v2).
     // Stage 15 PR-M0-4: bumped to 6 (maintenance_plans +
     // maintenance_plan_items).
-    expect(parsed.to).toBe(6);
+    // Stage 15 PR-M1-1: bumped to 7 (memory_provenance).
+    expect(parsed.to).toBe(7);
     store.close();
   });
 });
