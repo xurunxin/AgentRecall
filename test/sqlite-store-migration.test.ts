@@ -34,8 +34,10 @@ describe("SQLiteMemoryStore migrations", () => {
     // to 7 (memory_provenance); PR-M1-2 bumped to 8
     // (project_identities + project_aliases_new);
     // PR-M1-3 bumped to 9 (memory_feedback +
-    // memory_recall_signals).
-    expect(CURRENT_SCHEMA_VERSION).toBe(9);
+    // memory_recall_signals); PR-M3-1 bumped to 10
+    // (memory hierarchy: tier, valid_from/until,
+    // memory_episodes).
+    expect(CURRENT_SCHEMA_VERSION).toBe(10);
   });
 
   it("is a no-op when schema is already at latest version", () => {

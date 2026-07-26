@@ -538,6 +538,10 @@ export function buildEntry(
     pinned: false,
     trust_level: "agent_observed",
     sensitivity: "normal",
+    // Stage 15 PR-M3-1 (issue #9, spec § 6.5): the
+    // memory tier. Default `'working'`. Callers can
+    // override via the v1.1 `tier` input field.
+    tier: (input as { tier?: MemoryEntry["tier"] }).tier ?? "working",
     metadata: {}
   };
 }
