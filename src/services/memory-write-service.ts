@@ -20,6 +20,7 @@
 // (process-wide `defaultActor`) is preserved so pre-PR-B1
 // callers and tests keep working.
 
+import { randomUUID } from "node:crypto";
 import { nowIso, err, ok, type MemoryEntry, type MemoryBudget, type MemoryScope, type ProjectScope, type Result } from "../domain.js";
 import type { SQLiteMemoryStore } from "../sqlite-store.js";
 import {
@@ -32,7 +33,11 @@ import {
 import { resolveMemoryScope, type ProjectIdentityResolver } from "../scope-resolver.js";
 import { computeEntrySize, createMemoryId } from "../domain.js";
 import type { RequestContext } from "../request-context.js";
-import { hashRequest, lookupIdempotency, recordIdempotency } from "./idempotency.js";
+import {
+  hashRequest,
+  runWithIdempotentMutation,
+  tryReplayOnly
+} from "./idempotency.js";
 import {
   activeEntriesFor,
   appendAudit,
@@ -47,10 +52,11 @@ import {
   matchesReplacementScope
 } from "./memory-service-helpers.js";
 
-type RememberError = "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate" | "idempotency_mismatch";
-type UpdateError = "not_found" | "invalid_state" | "invalid_schema" | "secret_detected" | "capacity_exceeded" | "stale_revision" | "idempotency_mismatch";
+type RememberError = "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate" | "idempotency_mismatch" | "idempotency_in_flight";
+type UpdateError = "not_found" | "invalid_state" | "invalid_schema" | "secret_detected" | "capacity_exceeded" | "stale_revision" | "idempotency_mismatch" | "idempotency_in_flight";
 type SupersedeError = RememberError | "not_found" | "invalid_state";
-type ForgetError = "not_found" | "idempotency_mismatch";
+type MergeError = RememberError | "not_found" | "invalid_state";
+type ForgetError = "not_found" | "idempotency_mismatch" | "idempotency_in_flight";
 
 type PreparedRemember = {
   entry: MemoryEntry;
@@ -148,23 +154,46 @@ export class MemoryWriteService {
   }
 
   remember(input: RememberInput, ctx?: RequestContext): Result<RememberResult, RememberError> {
-    // Stage 14 PR-B2 (spec § 5.6): when the caller provides
-    // an idempotency_key, check the mutation_requests table
-    // for a prior result. Same key + same body replays the
-    // original outcome (the agent's retried request after a
-    // network blip). Same key + different body surfaces
-    // idempotency_mismatch so the caller can detect a
-    // client-side bug.
-    const idempotency = this.checkIdempotency<RememberResult>(
-      input,
-      "remember",
-      ctx
-    );
-    if (idempotency.kind === "replay") return ok(idempotency.result);
-    if (idempotency.kind === "rejected") {
-      return err("idempotency_mismatch", "idempotency_key was reused with a different request body", {
-        key: input.idempotency_key
-      });
+    // Stage 16 v1.1.1 PR-3 (#10): the v2 reservation
+    // happens FIRST, before any business work. A
+    // `replay` short-circuits before `prepareRemember`
+    // (no budget check, no duplicate scan, no DB
+    // reads); a `rejected` short-circuits with
+    // `idempotency_mismatch` before any other
+    // validation. The fresh path runs the full
+    // validation + commit inside the same
+    // transaction as the v2 row.
+    if (input.idempotency_key !== undefined) {
+      // Stage 16 v1.1.1 PR-3 (#10): canonical operation
+      // payload is the `RememberInput` minus the
+      // idempotency key itself.
+      const { idempotency_key: _key, ...body } = input;
+      const requestHash = hashRequest(body);
+      const actor = ctx?.actor_id ?? this.ctx.defaultActor;
+      const requestId = ctx?.request_id ?? randomUUID();
+      const earlyReplay = tryReplayOnly<Result<RememberResult, RememberError>>(
+        this.ctx.store,
+        { actor, tool: "remember", key: input.idempotency_key, requestHash, requestId }
+      );
+      if (earlyReplay.kind === "replay") {
+        return earlyReplay.result;
+      }
+      if (earlyReplay.kind === "rejected") {
+        return err(
+          "idempotency_mismatch",
+          "idempotency_key was reused with a different request body",
+          { key: input.idempotency_key }
+        );
+      }
+      if (earlyReplay.kind === "in_flight") {
+        return err(
+          "idempotency_in_flight",
+          "a previous attempt reserved this key but did not complete; retry shortly",
+          { key: input.idempotency_key }
+        );
+      }
+      // `fresh` — fall through to the v2-in-transaction
+      // helper below.
     }
     const prepared = this.prepareRemember(input, true, ctx);
     if (!prepared.ok) {
@@ -191,11 +220,49 @@ export class MemoryWriteService {
       }
     }
     const suppressed = input.confirm_write === true ? [] : prepared.value.budget.warnings;
-    const result = this.ctx.store.transaction(() =>
-      this.commitPreparedRemember(prepared.value, suppressed, ctx)
+    if (input.idempotency_key === undefined) {
+      return ok(
+        this.ctx.store.transaction(() =>
+          this.commitPreparedRemember(prepared.value, suppressed, ctx)
+        )
+      );
+    }
+    // Fresh path: reserve + work + complete, all in one
+    // transaction.
+    const { idempotency_key: _key, ...body } = input;
+    const requestHash = hashRequest(body);
+    const actor = ctx?.actor_id ?? this.ctx.defaultActor;
+    const requestId = ctx?.request_id ?? randomUUID();
+    return runWithIdempotentMutation<Result<RememberResult, RememberError>>(
+      this.ctx.store,
+      {
+        actor,
+        tool: "remember",
+        key: input.idempotency_key,
+        requestHash,
+        requestId
+      },
+      (hit) => {
+        if (hit.kind === "replay") {
+          return hit.result;
+        }
+        if (hit.kind === "rejected") {
+          return err(
+            "idempotency_mismatch",
+            "idempotency_key was reused with a different request body",
+            { key: input.idempotency_key }
+          );
+        }
+        if (hit.kind === "in_flight") {
+          return err(
+            "idempotency_in_flight",
+            "a previous attempt reserved this key but did not complete; retry shortly",
+            { key: input.idempotency_key }
+          );
+        }
+        return ok(this.commitPreparedRemember(prepared.value, suppressed, ctx));
+      }
     );
-    this.recordIdempotencyIfSet(input, result, ctx);
-    return ok(result);
   }
 
   updateMemory(
@@ -203,21 +270,16 @@ export class MemoryWriteService {
     input: UpdateInput,
     ctx?: RequestContext
   ): Result<{ memory_id: string }, UpdateError> {
-    // Stage 14 PR-B2 (spec § 5.6): idempotency replay /
-    // mismatch check before any state change. Same key + same
-    // body replays the prior outcome; same key + different
-    // body surfaces idempotency_mismatch.
-    const idempotency = this.checkIdempotency<{ memory_id: string }>(
-      input,
-      "update_memory",
-      ctx
-    );
-    if (idempotency.kind === "replay") return ok(idempotency.result);
-    if (idempotency.kind === "rejected") {
-      return err("idempotency_mismatch", "idempotency_key was reused with a different request body", {
-        key: input.idempotency_key
-      });
-    }
+    // Stage 16 v1.1.1 PR-3 (#10): every public mutation
+    // uses the v2 reservation in the same transaction
+    // as the business write. The v2 namespace is
+    // `(actor_id, tool_name, idempotency_key)`; same
+    // key across different tools does not collide.
+    //
+    // The canonical operation payload is
+    // `{ memory_id, patch, expected_revision }`. The
+    // patch is the post-validation patch (after
+    // schema, status, and budget checks).
     // Stage 9: peek the current entry first so every rejection
     // path (invalid_state, secret_detected, invalid_schema) can
     // attach a write_rejected audit to the memory_id. This
@@ -275,47 +337,47 @@ export class MemoryWriteService {
       ...(requestId !== undefined ? { request_id: requestId } : {}),
       change_reason: event
     };
-    // Stage 12 PR9: optimistic-concurrency control. When
-    // the caller passes `expected_revision`, route the
-    // write through `updateEntryWithRevision` so a
-    // concurrent writer wins the race and we surface
-    // `stale_revision` instead of silently overwriting.
-    if (validated.value.expected_revision !== undefined) {
-      const expected = validated.value.expected_revision;
-      const applied = this.ctx.store.updateEntryWithRevision(
-        id,
-        patch as Parameters<SQLiteMemoryStore["updateEntry"]>[1],
-        expected,
-        revisionContext
-      );
-      if (!applied) {
-        const currentRevision = this.ctx.store.peekEntry(id)?.revision;
-        auditRejectedForEntry(
-          this.ctx.store,
-          this.ctx.defaultActor,
-          current,
-          "stale_revision",
-          { memory_id: id, expected_revision: expected, current_revision: currentRevision },
-          ctx
+
+    // Run the actual update inside the v2 transaction.
+    const runUpdate = (): Result<{ memory_id: string }, UpdateError> => {
+      // Stage 12 PR9: optimistic-concurrency control. When
+      // the caller passes `expected_revision`, route the
+      // write through `updateEntryWithRevision` so a
+      // concurrent writer wins the race and we surface
+      // `stale_revision` instead of silently overwriting.
+      if (validated.value.expected_revision !== undefined) {
+        const expected = validated.value.expected_revision;
+        const applied = this.ctx.store.updateEntryWithRevision(
+          id,
+          patch as Parameters<SQLiteMemoryStore["updateEntry"]>[1],
+          expected,
+          revisionContext
         );
-        return err("stale_revision", "memory revision has changed; re-read and retry", {
+        if (!applied) {
+          const currentRevision = this.ctx.store.peekEntry(id)?.revision;
+          auditRejectedForEntry(
+            this.ctx.store,
+            this.ctx.defaultActor,
+            current,
+            "stale_revision",
+            { memory_id: id, expected_revision: expected, current_revision: currentRevision },
+            ctx
+          );
+          return err("stale_revision", "memory revision has changed; re-read and retry", {
+            memory_id: id,
+            expected_revision: expected,
+            current_revision: currentRevision
+          });
+        }
+        appendAudit(this.ctx.store, this.ctx.defaultActor, {
           memory_id: id,
-          expected_revision: expected,
-          current_revision: currentRevision
-        });
+          scope: current.scope,
+          ...(current.project_id !== undefined ? { project_id: current.project_id } : {}),
+          event,
+          metadata: { fields: Object.keys(validated.value).sort() }
+        }, ctx);
+        return ok({ memory_id: id });
       }
-      appendAudit(this.ctx.store, this.ctx.defaultActor, {
-        memory_id: id,
-        scope: current.scope,
-        ...(current.project_id !== undefined ? { project_id: current.project_id } : {}),
-        event,
-        metadata: { fields: Object.keys(validated.value).sort() }
-      }, ctx);
-      const result = { memory_id: id };
-      this.recordIdempotencyIfSet(input, result, ctx);
-      return ok(result);
-    }
-    const result = this.ctx.store.transaction(() => {
       this.ctx.store.updateEntry(id, patch as Parameters<SQLiteMemoryStore["updateEntry"]>[1], revisionContext);
       appendAudit(this.ctx.store, this.ctx.defaultActor, {
         memory_id: id,
@@ -324,10 +386,51 @@ export class MemoryWriteService {
         event,
         metadata: { fields: Object.keys(validated.value).sort() }
       }, ctx);
-      return { memory_id: id };
-    });
-    this.recordIdempotencyIfSet(input, result, ctx);
-    return ok(result);
+      return ok({ memory_id: id });
+    };
+
+    if (input.idempotency_key === undefined) {
+      return this.ctx.store.transaction(runUpdate);
+    }
+    // Stage 16 v1.1.1 PR-3 (#10): canonical operation
+    // payload for `update_memory` is
+    // `{ memory_id, patch, expected_revision }`. The
+    // `idempotency_key` itself is excluded from the
+    // hash.
+    const { idempotency_key: _key, ...rest } = input as { idempotency_key?: string } & Record<string, unknown>;
+    const payload = {
+      memory_id: id,
+      patch: validated.value,
+      ...(validated.value.expected_revision !== undefined ? { expected_revision: validated.value.expected_revision } : {})
+    };
+    const requestHash = hashRequest(payload);
+    return runWithIdempotentMutation<Result<{ memory_id: string }, UpdateError>>(
+      this.ctx.store,
+      {
+        actor,
+        tool: "update_memory",
+        key: input.idempotency_key,
+        requestHash,
+        requestId: requestId ?? randomUUID()
+      },
+      (hit) => {
+        if (hit.kind === "replay") return hit.result;
+        if (hit.kind === "rejected") {
+          return err("idempotency_mismatch", "idempotency_key was reused with a different request body", {
+            key: input.idempotency_key
+          });
+        }
+        if (hit.kind === "in_flight") {
+          return err(
+            "idempotency_in_flight",
+            "a previous attempt reserved this key but did not complete; retry shortly",
+            { key: input.idempotency_key }
+          );
+        }
+        return runUpdate();
+      }
+    );
+    void rest;
   }
 
   supersedeMemory(input: {
@@ -336,25 +439,46 @@ export class MemoryWriteService {
     reason: string;
     idempotency_key?: string;
   }, ctx?: RequestContext): Result<{ memory_id: string }, SupersedeError> {
-    // Stage 14 PR-B2 (spec § 5.6): top-level idempotency check
-    // on the supersede operation as a whole. The replacement's
-    // own `idempotency_key` is the per-row key inside the
-    // `mutation_requests` cache; the top-level key guards
-    // against a network retry re-running the whole multi-row
-    // transaction (which would otherwise create a second
+    // Stage 16 v1.1.1 PR-3 (#10): v2 reservation in the
+    // same transaction as the multi-row supersede
+    // apply. The top-level key guards against a network
+    // retry re-running the whole multi-row transaction
+    // (which would otherwise create a second
     // replacement entry).
-    const idempotency = this.checkIdempotency<{ memory_id: string }>(
-      input as { idempotency_key?: string },
-      "supersede",
-      ctx
-    );
-    if (idempotency.kind === "replay") return ok(idempotency.result);
-    if (idempotency.kind === "rejected") {
-      return err("idempotency_mismatch", "idempotency_key was reused with a different request body", {
-        key: input.idempotency_key
-      });
-    }
+    //
+    // The early probe MUST run before any business
+    // check (status / scope / budget). Otherwise a
+    // retry that lands after the first apply has
+    // already superseded the old row would be
+    // short-circuited with `invalid_state` instead
+    // of replaying the original `ok` result.
     const oldIds = [...new Set(input.old_memory_ids)];
+    if (input.idempotency_key !== undefined) {
+      const probePayload = {
+        old_ids: oldIds,
+        replacement: input.replacement,
+        reason: input.reason
+      };
+      const requestHash = hashRequest(probePayload);
+      const actor = ctx?.actor_id ?? this.ctx.defaultActor;
+      const requestId = ctx?.request_id ?? randomUUID();
+      const earlyReplay = tryReplayOnly<Result<{ memory_id: string }, SupersedeError>>(
+        this.ctx.store,
+        { actor, tool: "supersede_memory", key: input.idempotency_key, requestHash, requestId }
+      );
+      if (earlyReplay.kind === "replay") return earlyReplay.result;
+      if (earlyReplay.kind === "rejected") {
+        return err("idempotency_mismatch", "idempotency_key was reused with a different request body", {
+          key: input.idempotency_key
+        });
+      }
+      if (earlyReplay.kind === "in_flight") {
+        return err("idempotency_in_flight", "a previous attempt reserved this key but did not complete; retry shortly", {
+          key: input.idempotency_key
+        });
+      }
+      // `fresh` — fall through.
+    }
     if (oldIds.length === 0 || oldIds.some((id) => id.trim().length === 0)) {
       auditRejected(this.ctx.store, this.ctx.defaultActor, input.replacement, "invalid_schema", {
         old_memory_ids_count: oldIds.length
@@ -457,7 +581,7 @@ export class MemoryWriteService {
 
     const actor = ctx?.actor_id ?? this.ctx.defaultActor;
     const requestId = ctx?.request_id;
-    const result = this.ctx.store.transaction(() => {
+    const runApply = (): Result<{ memory_id: string }, SupersedeError> => {
       const created = this.commitPreparedRemember(prepared, undefined, ctx);
       for (const old of oldEntries) {
         this.ctx.store.updateEntry(old.id, {
@@ -480,10 +604,48 @@ export class MemoryWriteService {
           }
         }, ctx);
       }
-      return { memory_id: created.memory_id };
-    });
-    this.recordIdempotencyIfSet(input as { idempotency_key?: string }, result, ctx);
-    return ok(result);
+      return ok({ memory_id: created.memory_id });
+    };
+
+    if (input.idempotency_key === undefined) {
+      return this.ctx.store.transaction(runApply);
+    }
+    // Stage 16 v1.1.1 PR-3 (#10): canonical payload for
+    // `supersede_memory` is
+    // `{ old_ids, replacement, reason }`. The
+    // `idempotency_key` is excluded from the hash.
+    const payload = {
+      old_ids: oldIds,
+      replacement: input.replacement,
+      reason: input.reason
+    };
+    const requestHash = hashRequest(payload);
+    return runWithIdempotentMutation<Result<{ memory_id: string }, SupersedeError>>(
+      this.ctx.store,
+      {
+        actor,
+        tool: "supersede_memory",
+        key: input.idempotency_key,
+        requestHash,
+        requestId: requestId ?? randomUUID()
+      },
+      (hit) => {
+        if (hit.kind === "replay") return hit.result;
+        if (hit.kind === "rejected") {
+          return err("idempotency_mismatch", "idempotency_key was reused with a different request body", {
+            key: input.idempotency_key
+          });
+        }
+        if (hit.kind === "in_flight") {
+          return err(
+            "idempotency_in_flight",
+            "a previous attempt reserved this key but did not complete; retry shortly",
+            { key: input.idempotency_key }
+          );
+        }
+        return runApply();
+      }
+    );
   }
 
   mergeMemories(input: {
@@ -492,21 +654,44 @@ export class MemoryWriteService {
     reason: string;
     strategy?: "keep_first" | "keep_newest";
     idempotency_key?: string;
-  }, ctx?: RequestContext): Result<{ memory_id: string; merged_from?: string[] }, SupersedeError> {
-    // Stage 14 PR-B2 (spec § 5.6): top-level idempotency on
-    // the merge op. See `supersedeMemory` for the rationale.
-    const idempotency = this.checkIdempotency<{ memory_id: string; merged_from?: string[] }>(
-      input as { idempotency_key?: string },
-      "merge",
-      ctx
-    );
-    if (idempotency.kind === "replay") return ok(idempotency.result);
-    if (idempotency.kind === "rejected") {
-      return err("idempotency_mismatch", "idempotency_key was reused with a different request body", {
-        key: input.idempotency_key
-      });
-    }
+  }, ctx?: RequestContext): Result<{ memory_id: string; merged_from?: string[] }, MergeError> {
+    // Stage 16 v1.1.1 PR-3 (#10): v2 reservation in the
+    // same transaction as the multi-row merge apply.
+    //
+    // Early-probe before any business check (count,
+    // scope, status, budget). Otherwise a retry that
+    // lands after the first apply has already merged
+    // the old rows would be short-circuited with
+    // `invalid_state` instead of replaying the
+    // original `ok` result.
     const oldIds = [...new Set(input.old_memory_ids)];
+    if (input.idempotency_key !== undefined) {
+      const probePayload = {
+        old_ids: oldIds,
+        replacement: input.replacement,
+        reason: input.reason,
+        ...(input.strategy !== undefined ? { strategy: input.strategy } : {})
+      };
+      const requestHash = hashRequest(probePayload);
+      const actor = ctx?.actor_id ?? this.ctx.defaultActor;
+      const requestId = ctx?.request_id ?? randomUUID();
+      const earlyReplay = tryReplayOnly<Result<{ memory_id: string; merged_from?: string[] }, MergeError>>(
+        this.ctx.store,
+        { actor, tool: "merge_memories", key: input.idempotency_key, requestHash, requestId }
+      );
+      if (earlyReplay.kind === "replay") return earlyReplay.result;
+      if (earlyReplay.kind === "rejected") {
+        return err("idempotency_mismatch", "idempotency_key was reused with a different request body", {
+          key: input.idempotency_key
+        });
+      }
+      if (earlyReplay.kind === "in_flight") {
+        return err("idempotency_in_flight", "a previous attempt reserved this key but did not complete; retry shortly", {
+          key: input.idempotency_key
+        });
+      }
+      // `fresh` — fall through.
+    }
     if (oldIds.length < 2) {
       auditRejected(this.ctx.store, this.ctx.defaultActor, input.replacement, "invalid_schema", {
         old_memory_ids_count: oldIds.length
@@ -603,7 +788,7 @@ export class MemoryWriteService {
 
     const actor = ctx?.actor_id ?? this.ctx.defaultActor;
     const requestId = ctx?.request_id;
-    const result = this.ctx.store.transaction(() => {
+    const runApply = (): Result<{ memory_id: string; merged_from?: string[] }, MergeError> => {
       const created = this.commitPreparedRemember(prepared, undefined, ctx);
       for (const old of oldEntries) {
         this.ctx.store.updateEntry(old.id, {
@@ -628,13 +813,51 @@ export class MemoryWriteService {
           }
         }, ctx);
       }
-      return {
+      return ok({
         memory_id: created.memory_id,
         merged_from: oldEntries.map((e) => e.id).sort()
-      };
-    });
-    this.recordIdempotencyIfSet(input as { idempotency_key?: string }, result, ctx);
-    return ok(result);
+      });
+    };
+
+    if (input.idempotency_key === undefined) {
+      return this.ctx.store.transaction(runApply);
+    }
+    // Stage 16 v1.1.1 PR-3 (#10): canonical payload for
+    // `merge_memories` is
+    // `{ old_ids, replacement, reason, strategy }`.
+    const payload = {
+      old_ids: oldIds,
+      replacement: input.replacement,
+      reason: input.reason,
+      ...(input.strategy !== undefined ? { strategy: input.strategy } : {})
+    };
+    const requestHash = hashRequest(payload);
+    return runWithIdempotentMutation<Result<{ memory_id: string; merged_from?: string[] }, MergeError>>(
+      this.ctx.store,
+      {
+        actor,
+        tool: "merge_memories",
+        key: input.idempotency_key,
+        requestHash,
+        requestId: requestId ?? randomUUID()
+      },
+      (hit) => {
+        if (hit.kind === "replay") return hit.result;
+        if (hit.kind === "rejected") {
+          return err("idempotency_mismatch", "idempotency_key was reused with a different request body", {
+            key: input.idempotency_key
+          });
+        }
+        if (hit.kind === "in_flight") {
+          return err(
+            "idempotency_in_flight",
+            "a previous attempt reserved this key but did not complete; retry shortly",
+            { key: input.idempotency_key }
+          );
+        }
+        return runApply();
+      }
+    );
   }
 
   forgetMemory(
@@ -643,28 +866,46 @@ export class MemoryWriteService {
     ctx?: RequestContext,
     options?: { idempotency_key?: string; expected_revision?: number }
   ): Result<{ memory_id: string; released_chars: number }, ForgetError> {
-    // Stage 14 PR-B2 (spec § 5.6): top-level idempotency on
-    // forget. CAS (expected_revision) is supported via the
-    // store's `updateEntryWithRevision` so two agents
-    // simultaneously forgetting the same entry see one win
-    // and the other get `not_found` (the row's status is
-    // already `forgotten` by the time the second writer
-    // peeks, so the re-peeked entry is filtered out by the
-    // CAS guard in the store).
-    const idempotencyInput: { idempotency_key?: string } =
-      options?.idempotency_key !== undefined
-        ? { idempotency_key: options.idempotency_key }
-        : {};
-    const idempotency = this.checkIdempotency<{ memory_id: string; released_chars: number }>(
-      idempotencyInput,
-      "forget",
-      ctx
-    );
-    if (idempotency.kind === "replay") return ok(idempotency.result);
-    if (idempotency.kind === "rejected") {
-      return err("idempotency_mismatch", "idempotency_key was reused with a different request body", {
-        key: options?.idempotency_key
-      });
+    // Stage 16 v1.1.1 PR-3 (#10): v2 reservation in the
+    // same transaction as the forget apply. The
+    // canonical operation payload for `forget_memory`
+    // is `{ memory_id, reason, expected_revision }` —
+    // all three are part of the request hash so
+    // re-using a key with a different memory_id,
+    // reason, or expected_revision is rejected as
+    // `idempotency_key_reuse` (`rejected`).
+    //
+    // Early-probe before any business check
+    // (peekEntry, expected_revision CAS). A retry
+    // that lands after the first apply has already
+    // forgotten the row would otherwise be
+    // short-circuited with `not_found` instead of
+    // replaying the original `ok` result.
+    if (options?.idempotency_key !== undefined) {
+      const probePayload = {
+        memory_id: id,
+        reason,
+        ...(options?.expected_revision !== undefined ? { expected_revision: options.expected_revision } : {})
+      };
+      const requestHash = hashRequest(probePayload);
+      const actor = ctx?.actor_id ?? this.ctx.defaultActor;
+      const requestId = ctx?.request_id ?? randomUUID();
+      const earlyReplay = tryReplayOnly<Result<{ memory_id: string; released_chars: number }, ForgetError>>(
+        this.ctx.store,
+        { actor, tool: "forget_memory", key: options.idempotency_key, requestHash, requestId }
+      );
+      if (earlyReplay.kind === "replay") return earlyReplay.result;
+      if (earlyReplay.kind === "rejected") {
+        return err("idempotency_mismatch", "idempotency_key was reused with a different request body", {
+          key: options.idempotency_key
+        });
+      }
+      if (earlyReplay.kind === "in_flight") {
+        return err("idempotency_in_flight", "a previous attempt reserved this key but did not complete; retry shortly", {
+          key: options.idempotency_key
+        });
+      }
+      // `fresh` — fall through.
     }
     const current = this.ctx.store.peekEntry(id);
     if (current === undefined) {
@@ -722,22 +963,72 @@ export class MemoryWriteService {
       }, ctx);
       return { memory_id: id, released_chars };
     };
-    const txnResult = this.ctx.store.transaction(apply);
-    if (casMissed) {
-      return err("not_found", "memory not found", {
-        memory_id: id,
-        expected_revision: options?.expected_revision
-      });
+
+    if (options?.idempotency_key === undefined) {
+      const txnResult = this.ctx.store.transaction(apply);
+      if (casMissed) {
+        return err("not_found", "memory not found", {
+          memory_id: id,
+          expected_revision: options?.expected_revision
+        });
+      }
+      if (txnResult === undefined) {
+        return err("not_found", "memory not found", { memory_id: id });
+      }
+      return ok(txnResult);
     }
-    if (txnResult === undefined) {
-      // Unreachable in practice — `apply` only returns
-      // undefined when CAS misses, which sets
-      // `casMissed` and returns early above. The guard
-      // keeps TypeScript happy.
-      return err("not_found", "memory not found", { memory_id: id });
-    }
-    this.recordIdempotencyIfSet(idempotencyInput, txnResult, ctx);
-    return ok(txnResult);
+
+    // Stage 16 v1.1.1 PR-3 (#10): canonical payload for
+    // `forget_memory` is
+    // `{ memory_id, reason, expected_revision }`. The
+    // `idempotency_key` is excluded.
+    const payload = {
+      memory_id: id,
+      reason,
+      ...(options?.expected_revision !== undefined ? { expected_revision: options.expected_revision } : {})
+    };
+    const requestHash = hashRequest(payload);
+    const runApply = (): Result<{ memory_id: string; released_chars: number }, ForgetError> => {
+      const txnResult = this.ctx.store.transaction(apply);
+      if (casMissed) {
+        return err("not_found", "memory not found", {
+          memory_id: id,
+          expected_revision: options?.expected_revision
+        });
+      }
+      if (txnResult === undefined) {
+        return err("not_found", "memory not found", { memory_id: id });
+      }
+      return ok(txnResult);
+    };
+    return runWithIdempotentMutation<Result<{ memory_id: string; released_chars: number }, ForgetError>>(
+      this.ctx.store,
+      {
+        actor,
+        tool: "forget_memory",
+        key: options.idempotency_key,
+        requestHash,
+        requestId: requestId ?? randomUUID()
+      },
+      (hit) => {
+        if (hit.kind === "replay") return hit.result;
+        if (hit.kind === "rejected") {
+          return err(
+            "idempotency_mismatch",
+            "idempotency_key was reused with a different request body",
+            { key: options.idempotency_key }
+          );
+        }
+        if (hit.kind === "in_flight") {
+          return err(
+            "idempotency_in_flight",
+            "a previous attempt reserved this key but did not complete; retry shortly",
+            { key: options.idempotency_key }
+          );
+        }
+        return runApply();
+      }
+    );
   }
 
   // ============================================================
@@ -873,62 +1164,5 @@ export class MemoryWriteService {
       budget_after: usage,
       warnings: warnings ?? prepared.budget.warnings
     };
-  }
-
-  /**
-   * Stage 14 PR-B2 (spec § 5.6): idempotency check for a
-   * mutating method. Returns a discriminated union:
-   *   - `{ kind: "fresh" }` — no prior result, the caller
-   *     should run the mutation and call
-   *     `recordIdempotencyIfSet` on success.
-   *   - `{ kind: "replay", result }` — same key + same body
-   *     was seen before, return the stored result without
-   *     re-running the mutation.
-   *   - `{ kind: "rejected" }` — same key with a different
-   *     body, surface as `idempotency_mismatch`.
-   */
-  private checkIdempotency<T>(
-    input: { idempotency_key?: string },
-    toolName: string,
-    ctx?: RequestContext
-  ): { kind: "fresh" } | { kind: "replay"; result: T } | { kind: "rejected" } {
-    const key = input.idempotency_key;
-    if (key === undefined) {
-      return { kind: "fresh" };
-    }
-    const actor = ctx?.actor_id ?? this.ctx.defaultActor;
-    // Hash the body WITHOUT the idempotency_key itself so a
-    // retry with the same body but a different key (or no
-    // key) still produces a consistent fingerprint.
-    const { idempotency_key: _ignored, ...body } = input as { idempotency_key?: string } & Record<string, unknown>;
-    const hash = hashRequest(body);
-    const hit = lookupIdempotency<T>(this.ctx.store, actor, key, hash);
-    if (hit.kind === "replay") {
-      return { kind: "replay", result: hit.result };
-    }
-    if (hit.kind === "rejected") {
-      return { kind: "rejected" };
-    }
-    return { kind: "fresh" };
-  }
-
-  /**
-   * Stage 14 PR-B2: persist the mutation result under the
-   * caller's idempotency key. No-op when the caller did not
-   * supply a key. The hash is recomputed from the body so
-   * the stored row matches what the lookup would compare
-   * against on the next retry.
-   */
-  private recordIdempotencyIfSet(
-    input: { idempotency_key?: string },
-    result: unknown,
-    ctx?: RequestContext
-  ): void {
-    const key = input.idempotency_key;
-    if (key === undefined) return;
-    const actor = ctx?.actor_id ?? this.ctx.defaultActor;
-    const { idempotency_key: _ignored, ...body } = input as { idempotency_key?: string } & Record<string, unknown>;
-    const hash = hashRequest(body);
-    recordIdempotency(this.ctx.store, actor, key, hash, result);
   }
 }

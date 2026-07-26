@@ -5,7 +5,148 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
-## [Unreleased] — Stage 15 v1.1 (M0 Stabilization → M3 Intelligence)
+## [Unreleased] — Stage 16 v1.1.1 (Idempotency v2 public path)
+
+The 8-issue v1.1.1 follow-up roadmap (see
+`docs/superpowers/plans/2026-07-26-v1.1.1-followup.md`)
+lands as 8 serial PRs after v1.1.0. Each PR closes
+exactly one issue (#10–#17) under the tracker
+issue #18.
+
+### Stage 16 PR-3 (Idempotency v2 Public Path)
+### Fixed
+
+- **`src/services/idempotency.ts`** (issue #10,
+  spec § 5.6). The v2 idempotency contract
+  introduced in Stage 15 PR-M0-1 was exposed only
+  through a private read-then-write-then-record
+  flow inside `MemoryWriteService`. This PR moves
+  the v2 reservation into the same transaction as
+  the business write for every mutating method, so
+  a process crash between `COMMIT` and the row
+  upsert can no longer leave the system in a
+  state where a retry re-runs the mutation.
+  - New helper `runWithIdempotentMutation<T>`:
+    wraps `reserveIdempotency` + caller work +
+    `completeIdempotency` inside a single
+    `store.transaction(...)` block. Reserves
+    `(actor_id, tool_name, idempotency_key)` with
+    `state='pending'`, runs the work, writes
+    `state='completed'` + `result_json` +
+    `completed_at`, all in one transaction.
+  - New helper `tryReplayOnly<T>`: lookup-only
+    probe. Reads the existing v2 row and returns
+    `replay | rejected | in_flight | fresh` without
+    writing a `pending` row. Used at the top of
+    every mutating method so a `replay` /
+    `rejected` / `in_flight` hit short-circuits
+    BEFORE any business check
+    (status / scope / budget / count). The
+    `fresh` fall-through to `runWithIdempotentMutation`
+    is the only path that creates a v2 row.
+  - The previous v1 wrappers
+    `checkIdempotency` / `recordIdempotencyIfSet`
+    are removed; the deprecated
+    `lookupIdempotency` / `recordIdempotency` are
+    kept for one release cycle so the
+    `p0-mutation-safety` regression suite keeps
+    working until v1.1.2.
+  - Crash semantics: a crash before `COMMIT`
+    rolls back the business mutation AND the
+    reservation (next retry sees `fresh`). A crash
+    after `reserve` but before `complete` leaves a
+    `pending` row; the next retry sees
+    `idempotency_in_flight` so the caller can back
+    off and retry. Pending rows are GC'd at store
+    open based on
+    `AGENT_RECALL_IDEMPOTENCY_TAKEOVER_MS`
+    (default 60s).
+- **`src/services/memory-write-service.ts`**
+  (issue #10). All 5 mutating methods
+  (`remember`, `updateMemory`, `supersedeMemory`,
+  `mergeMemories`, `forgetMemory`) now go through
+  the v2 flow. Each method calls `tryReplayOnly`
+  at the very top (BEFORE the status / scope /
+  budget / count checks) and `runWithIdempotentMutation`
+  for the fresh path. The new error code
+  `idempotency_in_flight` is added to every
+  `Result` union
+  (`RememberError`, `UpdateError`, `SupersedeError`,
+  `MergeError`, `ForgetError`).
+  - Canonical operation payload for each tool:
+    - `remember` — the full
+      `RememberInput` minus `idempotency_key`.
+    - `update_memory` —
+      `{ memory_id, patch, expected_revision }`.
+    - `supersede_memory` —
+      `{ old_ids, replacement, reason }`.
+    - `merge_memories` —
+      `{ old_ids, replacement, reason, strategy }`.
+    - `forget_memory` —
+      `{ memory_id, reason, expected_revision }`.
+  - The two-helper pattern (probe + transaction)
+    is critical. If the probe reserved, the fresh
+    path's `runWithIdempotentMutation` would see
+    its own `pending` row and surface
+    `in_flight` instead of running the work. The
+    probe is strictly read-only; the
+    `runWithIdempotentMutation` transaction is the
+    only writer.
+- **`src/memory-service.ts`** (issue #10). The 5
+  public mutation methods re-declare the
+  `idempotency_in_flight` error code in their
+  return type unions so callers can switch on it
+  without a type assertion.
+
+### New tests
+
+- `test/release-gate/p3-idempotency-v2-public-path.test.ts`
+  (8 tests):
+  - `tryReplayOnly` is lookup-only (no v2 row
+    written until `runWithIdempotentMutation`
+    actually runs).
+  - `runWithIdempotentMutation` reserves + runs +
+    completes in one transaction; the v2 row
+    ends in `state='completed'` with a
+    non-null `result_json` and `completed_at`.
+  - Replay (same key + same body) returns the
+    original result without writing a new entry
+    or appending a new audit event.
+  - Mismatch (same key + different body) surfaces
+    `idempotency_mismatch`, never a fresh write.
+  - In-flight (manually written `pending` row)
+    surfaces `idempotency_in_flight` so the
+    caller can back off and retry.
+  - Early-probe on `supersedeMemory` short-
+    circuits before the status check; a retry
+    that lands after the first apply replays
+    the original `ok` result instead of failing
+    with `invalid_state`.
+  - Early-probe on `forgetMemory` short-circuits
+    before the `peekEntry` check; a retry that
+    lands after the first apply replays the
+    original `not_found`.
+  - Probe-then-run sequence: probe returns
+    `fresh` (no row written), `runWithIdempotentMutation`
+    actually reserves (row count goes 0 → 1),
+    subsequent probe returns `replay` with the
+    stored result.
+
+### Verification
+
+- `npm test` → 0 failed / **521 passed** (was:
+  513 in Stage 16 PR-2) / 5 skipped / 1 unhandled
+  error (the pre-existing vitest-worker `birpc`
+  `onTaskUpdate` heartbeat documented in
+  PR-M0-1's CHANGELOG; 0 actual test failures).
+- `npm run typecheck` → 0 error.
+- The 7 `p0-mutation-safety` tests are the
+  primary acceptance suite for this PR. The
+  8 new `p3-idempotency-v2-public-path` tests
+  cover the v2-row state machine and the
+  early-probe invariant.
+
+### Stage 15 v1.1 (M0 Stabilization → M3 Intelligence)
 
 The 9-issue v1.1 roadmap (see
 `docs/superpowers/plans/2026-07-26-v1.1-roadmap.md`) lands as 9

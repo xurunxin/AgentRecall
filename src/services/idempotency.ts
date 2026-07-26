@@ -218,6 +218,141 @@ export function completeIdempotency<T>(
   );
 }
 
+/**
+ * Stage 16 v1.1.1 PR-3 (#10): reserve a v2 idempotency
+ * slot, run the mutation, and complete the slot — all
+ * inside a single store transaction. The work callback
+ * receives the reserve result so it can short-circuit on
+ * `replay` or `rejected` before any business mutation.
+ *
+ * The v2 reservation is keyed on
+ * `(actor_id, tool_name, idempotency_key)` and the
+ * canonical `requestHash` (sha256 of the canonical
+ * payload JSON). Two distinct actors can re-use the
+ * same key without collision; two distinct tools can
+ * re-use the same key; two distinct bodies on the
+ * same `(actor, tool, key)` triple surface
+ * `idempotency_key_reuse`.
+ *
+ * Crash semantics: a process crash before `COMMIT`
+ * rolls back the business mutation AND the
+ * reservation. The next retry sees `fresh` (the v2
+ * row never landed). A process crash after `reserve`
+ * but before `complete` leaves a `pending` row; the
+ * next retry sees `in_flight` and surfaces
+ * `idempotency_in_flight` so the caller can back off
+ * and retry. Pending rows are GC'd at store open
+ * based on the takeover window
+ * (`AGENT_RECALL_IDEMPOTENCY_TAKEOVER_MS`,
+ * default 60s).
+ *
+ * The work callback's return type is the public
+ * result type (e.g. `Result<RememberResult, ...>`).
+ * For `replay`, the callback returns the stored
+ * result; for `fresh`, the callback returns the
+ * newly-computed result. The helper serialises the
+ * `fresh` result into the v2 row inside the same
+ * transaction so a retry returns the byte-identical
+ * payload.
+ */
+export function runWithIdempotentMutation<T>(
+  store: SQLiteMemoryStore,
+  args: {
+    actor: string;
+    tool: string;
+    key: string;
+    requestHash: string;
+    requestId: string;
+  },
+  work: (
+    reserve:
+      | { kind: "fresh" }
+      | { kind: "replay"; result: T }
+      | { kind: "rejected" }
+      | { kind: "in_flight" }
+  ) => T
+): T {
+  return store.transaction(() => {
+    const reserve = reserveIdempotency<T>(store, args);
+    const result = work(reserve);
+    if (reserve.kind === "fresh") {
+      completeIdempotency<T>(store, {
+        actor: args.actor,
+        tool: args.tool,
+        key: args.key,
+        result
+      });
+    }
+    return result;
+  });
+}
+
+/**
+ * Stage 16 v1.1.1 PR-3 (#10): early-replay probe.
+ *
+ * Lookup-only. Does NOT write a v2 row. Reads the
+ * existing `(actor, tool, key)` row and classifies
+ * the hit so a `replay` / `rejected` / `in_flight`
+ * short-circuit before any business work runs (no
+ * `prepareRemember`, no budget check, no duplicate
+ * scan, no DB writes).
+ *
+ * Why lookup-only and not `reserveIdempotency`? If
+ * the probe reserved, the row would land in
+ * `state='pending'`. The fresh path then falls
+ * through to `runWithIdempotentMutation` which
+ * tries to reserve the same `(actor, tool, key)`
+ * again — the second `INSERT OR ABORT` fails
+ * because the row already exists, the row is in
+ * `state='pending'`, and the helper returns
+ * `in_flight`. The fresh path would never run.
+ *
+ * `tryReplayOnly` therefore reads only. The fresh
+ * path falls through to `runWithIdempotentMutation`
+ * which reserves AND completes the row inside the
+ * same transaction as the business write.
+ *
+ * Race window: between this lookup and the
+ * subsequent `runWithIdempotentMutation` reserve,
+ * another caller may insert a row with the same
+ * key. `runWithIdempotentMutation` will then
+ * surface `replay` / `rejected` / `in_flight`
+ * based on that concurrent row, exactly as if the
+ * caller had hit the cache on a retry. The contract
+ * holds.
+ */
+export function tryReplayOnly<T>(
+  store: SQLiteMemoryStore,
+  args: {
+    actor: string;
+    tool: string;
+    key: string;
+    requestHash: string;
+    requestId: string;
+  }
+): IdempotencyHit<T> {
+  const row = store.lookupMutationRequestV2(args.actor, args.tool, args.key);
+  if (row === undefined) {
+    return { kind: "fresh" };
+  }
+  if (row.request_hash !== args.requestHash) {
+    return { kind: "rejected", reason: "idempotency_key_reuse" };
+  }
+  if (row.state === "pending") {
+    return { kind: "in_flight", reason: "idempotency_in_flight" };
+  }
+  try {
+    const result = JSON.parse(row.result_json) as T;
+    return { kind: "replay", result };
+  } catch {
+    // Stored result is unparseable (e.g. a v1 row
+    // predating the v2 schema, or a hand-corrupted
+    // `result_json`). Treat as fresh so the caller
+    // can re-run and rewrite the row.
+    return { kind: "fresh" };
+  }
+}
+
 // ============================================================
 // Deprecated v1 wrappers (kept for one release cycle so
 // external callers and the p0-mutation-safety regression
