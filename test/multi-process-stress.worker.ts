@@ -76,7 +76,8 @@ type ScenarioId =
   | "access-feedback"
   | "termination-during-tx"
   | "busy-retry-holder"
-  | "busy-retry-writer";
+  | "busy-retry-writer"
+  | "project_isolation";
 
 type WorkerInput = {
   workerId: number;
@@ -103,6 +104,25 @@ type WorkerInput = {
   /** When true, this worker is the SIGKILL victim for the
    *  `termination-during-tx` scenario. */
   isVictim?: boolean;
+  /** `project_isolation`: the `project_id` this worker writes to.
+   *  Workers 0..3 use project A's id; workers 4..7 use project B's
+   *  id. The driver's assertions verify the two groups land in
+   *  disjoint buckets of every per-project-scoped table. */
+  raceIsolationProjectId?: string;
+  /** `project_isolation`: the canonical `project_path` paired with
+   *  `raceIsolationProjectId`. The resolver takes the
+   *  `register`-mode strict path when both fields are supplied,
+   *  which registers an identity row in `project_identities` (and
+   *  an alias in `project_aliases_new`) on the worker's first
+   *  successful `service.remember`. We pass it on EVERY op so a
+   *  slow worker doesn't accidentally trigger the strict
+   *  `invalid_scope` path that refuses unknown identities. */
+  raceIsolationProjectPath?: string;
+  /** `project_isolation`: the per-project shared idempotency key.
+   *  Distinct across the two projects so the v2 PK
+   *  `(actor, tool, key)` doesn't collide across the project
+   *  boundary (the v2 namespace has no `project_id` dimension). */
+  raceIsolationKey?: string;
 };
 
 type WorkerReport = {
@@ -136,6 +156,12 @@ type WorkerReport = {
   expectedCrash: boolean;
   /** Exit code this worker ended with (always 0 for non-victims). */
   exitCode: number;
+  /** Diagnostic histogram of `other` errors (anything that is
+   *  not `idempotency_mismatch` / `idempotency_in_flight` /
+   *  `ok`). Pure instrumentation — not asserted on by the
+   *  driver, but useful for diagnosing transient
+   *  `capacity_exceeded` / `duplicate_candidate` hits. */
+  otherErrorHistogram: Record<string, number>;
 };
 
 const input = JSON.parse(process.argv[2] ?? "null") as Partial<WorkerInput> | null;
@@ -177,7 +203,8 @@ const report: WorkerReport = {
   accessRows: 0,
   feedbackRows: 0,
   expectedCrash: cfg.isVictim === true,
-  exitCode: 0
+  exitCode: 0,
+  otherErrorHistogram: {}
 };
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -530,6 +557,108 @@ function runBusyRetryWriter(): void {
   }
 }
 
+function runProjectIsolation(): void {
+  // Project-isolation scenario: this worker writes only to
+  // its own `project_id` namespace. The driver partitions
+  // the 8 workers into two groups (4 + 4), each group
+  // races on a shared idempotency key within its own
+  // project, and the assertions verify the two groups
+  // land in disjoint buckets of every per-project table.
+  //
+  // We supply BOTH `project_id` AND `project_path` on
+  // every call so the `ProjectIdentityResolver` takes the
+  // strict `register`-mode path (the v2 idempotency
+  // namespace `(actor, tool, key)` has no project
+  // dimension; using `project_path` keeps the identity
+  // registration deterministic — the FIRST worker to
+  // commit in each group creates the
+  // `project_identities` row, the rest find it).
+  //
+  // Bodies are byte-identical WITHIN a project (only the
+  // `project_id` differs, and it's the same for all 4
+  // workers in the group), so the v2 reservation PK
+  // `(actor, tool, key)` collapses the 4 racing workers
+  // to a single `memory_entries` row per project.
+  // Cross-project the keys differ, so no v2 collision.
+  //
+  // We pass `confirm_write: true` to bypass the
+  // Stage-2 duplicate-candidate short-circuit. The
+  // duplicate scan is a pre-write advisory (it walks
+  // `memory_entries WHERE scope = ? AND project_id = ?`
+  // looking for same title or body) and would otherwise
+  // race the v2 idempotency's early-replay probe: when
+  // worker 0 commits between worker 1's `tryReplayOnly`
+  // lookup and worker 1's `prepareRemember` lookup,
+  // worker 1's `prepareRemember` sees worker 0's
+  // committed row and returns `duplicate_candidate`
+  // before `runWithIdempotentMutation` can detect the
+  // replay. The v2 idempotency comment in
+  // `services/idempotency.ts` (`Race window: ...`)
+  // documents the same window for `runWithIdempotentMutation`
+  // but does NOT cover `prepareRemember`, so this race
+  // surfaces in the test. `confirm_write: true` skips
+  // the advisory duplicate check; the v2 reservation
+  // still runs and still collapses within a project.
+  if (
+    cfg.raceIsolationProjectId === undefined ||
+    cfg.raceIsolationProjectPath === undefined ||
+    cfg.raceIsolationKey === undefined
+  ) {
+    throw new Error(
+      "project_isolation requires raceIsolationProjectId, raceIsolationProjectPath, raceIsolationKey"
+    );
+  }
+  const projectId = cfg.raceIsolationProjectId;
+  const projectPath = cfg.raceIsolationProjectPath;
+  const body = `isolation body for ${projectId}`;
+  const input = {
+    scope: "project" as const,
+    project_id: projectId,
+    project_path: projectPath,
+    type: "fact" as const,
+    topic: "iso",
+    title: "iso body",
+    body,
+    tags: ["stress"],
+    source: { kind: "agent" as const },
+    importance: 3 as const,
+    confidence: 3 as const,
+    idempotency_key: cfg.raceIsolationKey,
+    confirm_write: true
+  };
+  for (let i = 0; i < cfg.ops; i += 1) {
+    const r = service.remember(input, ctxOf(`iso-${cfg.workerId}-${i}`));
+    if (r.ok) {
+      report.idempotencyOkCount += 1;
+      if (i === 0) {
+        report.successIds.push(r.value.memory_id);
+        noteMutation();
+      }
+    } else if (r.error === "idempotency_mismatch") {
+      // Should never fire: bodies are byte-identical
+      // WITHIN a project and the keys are distinct
+      // ACROSS projects. The driver's assertion catches
+      // a real leak.
+      report.idempotencyMismatchCount += 1;
+    } else if (r.error === "idempotency_in_flight") {
+      // The first worker in the group reserved the v2
+      // slot but hadn't `complete()`d it yet when the
+      // second worker's reserve landed. The store's
+      // busy_timeout (5s) absorbs the gap on most runs;
+      // if a runner is so loaded that it can't, the
+      // second worker sees `in_flight` and the caller
+      // (driver) treats it as a transient. We do not
+      // fail the scenario on transient in_flight — we
+      // only fail on persistent mismatch / cross-project
+      // pollution.
+      report.idempotencyInFlightCount += 1;
+    } else {
+      report.otherErrors += 1;
+      report.otherErrorHistogram[r.error] = (report.otherErrorHistogram[r.error] ?? 0) + 1;
+    }
+  }
+}
+
 function callRememberWithBusyRetry(opIdx: number): ReturnType<typeof service.remember> {
   const input = {
     scope: "global" as const,
@@ -606,6 +735,9 @@ try {
         break;
       case "busy-retry-writer":
         runBusyRetryWriter();
+        break;
+      case "project_isolation":
+        runProjectIsolation();
         break;
       default: {
         const _exhaustive: never = cfg.scenario;

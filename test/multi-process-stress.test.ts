@@ -67,7 +67,8 @@ type ScenarioId =
   | "access-feedback"
   | "termination-during-tx"
   | "busy-retry-holder"
-  | "busy-retry-writer";
+  | "busy-retry-writer"
+  | "project_isolation";
 
 type WorkerInput = {
   workerId: number;
@@ -83,6 +84,17 @@ type WorkerInput = {
   raceBusyHoldMs?: number;
   raceBusyExpectedWorkers?: number;
   isVictim?: boolean;
+  /** Project-scoped scenario: the `project_id` the worker writes to. */
+  raceIsolationProjectId?: string;
+  /** Project-scoped scenario: the canonical `project_path` that
+   *  drives `ProjectIdentityResolver` to register an identity row
+   *  in `project_identities` (real, not mocked). */
+  raceIsolationProjectPath?: string;
+  /** Project-scoped scenario: the shared (per-project) idempotency
+   *  key the v2 reservation collapses on. Distinct across the two
+   *  projects so the v2 PK `(actor, tool, key)` doesn't collide
+   *  across project namespaces. */
+  raceIsolationKey?: string;
 };
 
 type WorkerReport = {
@@ -111,6 +123,8 @@ type WorkerReport = {
   feedbackRows: number;
   expectedCrash: boolean;
   exitCode: number;
+  /** Diagnostic histogram of `other` errors per worker. */
+  otherErrorHistogram: Record<string, number>;
 };
 
 const PROCESS_COUNT = 8;
@@ -206,7 +220,7 @@ const WINDOWS_TERMINATE_EXIT_CODE = 1; // TerminateProcess default on Windows
 
 function forkWorker(
   input: WorkerInput
-): { child: ChildProcess; promise: Promise<WorkerReport> } {
+): { child: ChildProcess; promise: Promise<WorkerReport>; stderr: () => string } {
   const workerPath = fileURLToPath(new URL("./multi-process-stress.worker.ts", import.meta.url));
   const child: ChildProcess = fork(workerPath, [JSON.stringify(input)], {
     stdio: ["ignore", "pipe", "pipe", "ipc"],
@@ -281,7 +295,8 @@ function forkWorker(
             accessRows: 0,
             feedbackRows: 0,
             expectedCrash: true,
-            exitCode: code ?? 0
+            exitCode: code ?? 0,
+            otherErrorHistogram: {}
           };
           resolve(synthetic);
           return;
@@ -294,7 +309,7 @@ function forkWorker(
       }
     });
   });
-  return { child, promise };
+  return { child, promise, stderr: () => stderrBuf };
 }
 
 // ============================================================
@@ -325,7 +340,7 @@ async function runScenario(input: {
    *  specific workers (e.g. wait for their mid-tx
    *  marker, then kill). */
   afterRelease?: (barrierDir: string, tasks: Array<{ child: ChildProcess; workerId: number }>) => Promise<void>;
-}): Promise<WorkerReport[]> {
+}): Promise<{ reports: WorkerReport[]; tasks: Array<{ child: ChildProcess; promise: Promise<WorkerReport>; workerId: number; stderr: () => string }> }> {
   const dbPath = input.dbPath;
   const barrierDir = makeBarrierDir();
   // Make sure the DB is freshly created so every worker
@@ -342,6 +357,7 @@ async function runScenario(input: {
     child: ChildProcess;
     promise: Promise<WorkerReport>;
     workerId: number;
+    stderr: () => string;
   }> = [];
   for (let i = 0; i < input.workerCount; i += 1) {
     const partial = input.buildInput(i);
@@ -350,9 +366,9 @@ async function runScenario(input: {
       workerId: i,
       barrierDir
     };
-    const { child, promise } = forkWorker(fullInput);
+    const { child, promise, stderr } = forkWorker(fullInput);
     input.onSpawn?.(i, child.pid ?? -1, child);
-    tasks.push({ child, promise, workerId: i });
+    tasks.push({ child, promise, workerId: i, stderr });
   }
 
   let reports: WorkerReport[];
@@ -415,7 +431,7 @@ async function runScenario(input: {
     }
   }
 
-  return reports;
+  return { reports, tasks };
 }
 
 // ============================================================
@@ -494,6 +510,91 @@ function getMemoryRevision(dbPath: string, id: string): number {
 }
 
 /**
+ * Count FTS5 hits for a token, scoped to a single `project_id`.
+ * Mirrors `SQLiteMemoryStore.searchEntries` (which joins
+ * `memory_fts` on `memory_entries` and applies
+ * `buildEntryWhere({scope: 'project', project_id})`). The token
+ * is canonicalised the same way the store does (split on Unicode
+ * letters/digits, wrap each token in double quotes, OR them
+ * together); we don't reuse `store.searchEntries` because the
+ * driver opens a verify handle without the migration + resolver
+ * overhead.
+ */
+function ftsHitsByProject(dbPath: string, projectId: string, query: string): number {
+  const handle = openVerifyHandle(dbPath);
+  try {
+    const tokens = (query.match(/[\p{L}\p{N}_]+/gu) ?? []).map((t) => `"${t.replaceAll('"', '""')}"`);
+    const ftsTerm = tokens.join(" OR ");
+    if (ftsTerm.length === 0) return 0;
+    const row = handle
+      .prepare(
+        `SELECT COUNT(*) AS n
+           FROM memory_fts
+           JOIN memory_entries m ON m.id = memory_fts.id
+          WHERE memory_fts MATCH ?
+            AND m.scope = 'project'
+            AND m.project_id = ?`
+      )
+      .get(ftsTerm, projectId) as { n: number };
+    return row.n;
+  } finally {
+    try {
+      handle.close();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/**
+ * Count active entries per project scope. Mirrors
+ * `SQLiteMemoryStore.getBudgetUsage({scope: 'project', project_id})`
+ * which is the spec § 5.6 per-project budget probe.
+ */
+function budgetActiveByProject(dbPath: string, projectId: string): number {
+  const handle = openVerifyHandle(dbPath);
+  try {
+    const row = handle
+      .prepare(
+        `SELECT COUNT(*) AS n
+           FROM memory_entries
+          WHERE scope = 'project'
+            AND status = 'active'
+            AND project_id = ?`
+      )
+      .get(projectId) as { n: number };
+    return row.n;
+  } finally {
+    try {
+      handle.close();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/** Collect the distinct `project_id` of every `created` audit row. */
+function distinctAuditProjectIds(dbPath: string): string[] {
+  const handle = openVerifyHandle(dbPath);
+  try {
+    const rows = handle
+      .prepare(
+        `SELECT DISTINCT project_id AS pid
+           FROM audit_events
+          WHERE event = 'created'`
+      )
+      .all() as Array<{ pid: string | null }>;
+    return rows.map((r) => r.pid ?? "").filter((s) => s.length > 0);
+  } finally {
+    try {
+      handle.close();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/**
  * Prove worker lifetime overlap. We require at least half of
  * the worker pairs to have overlapping intervals (started_at <
  * finished_at_other). On the release profile with 8 workers
@@ -557,7 +658,7 @@ describe(`multi-process concurrency stress (spec § 5.6 AR-P0-006, profile=${PRO
     async () => {
       const dbPath = join(dataHome, "mixed.sqlite");
       const startedAt = Date.now();
-      const reports = await runScenario({
+      const { reports, tasks } = await runScenario({
         dbPath,
         barrierTimeoutMs: BARRIER_TIMEOUT_MS,
         scenario: "mixed",
@@ -610,7 +711,7 @@ describe(`multi-process concurrency stress (spec § 5.6 AR-P0-006, profile=${PRO
     async () => {
       const dbPath = join(dataHome, "idem.sqlite");
       const raceKey = `idem-race-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const reports = await runScenario({
+      const { reports, tasks } = await runScenario({
         dbPath,
         barrierTimeoutMs: BARRIER_TIMEOUT_MS,
         scenario: "idempotency-race",
@@ -706,7 +807,7 @@ describe(`multi-process concurrency stress (spec § 5.6 AR-P0-006, profile=${PRO
         /* ignore */
       }
 
-      const reports = await runScenario({
+      const { reports, tasks } = await runScenario({
         dbPath,
         barrierTimeoutMs: BARRIER_TIMEOUT_MS,
         scenario: "cas-race",
@@ -789,7 +890,7 @@ describe(`multi-process concurrency stress (spec § 5.6 AR-P0-006, profile=${PRO
         /* ignore */
       }
 
-      const reports = await runScenario({
+      const { reports, tasks } = await runScenario({
         dbPath,
         barrierTimeoutMs: BARRIER_TIMEOUT_MS,
         scenario: "access-feedback",
@@ -839,7 +940,7 @@ describe(`multi-process concurrency stress (spec § 5.6 AR-P0-006, profile=${PRO
       // announces it's mid-tx.
       const victimPidRef: { pid?: number } = {};
       const victimChildRef: { child?: ChildProcess } = {};
-      const reports = await runScenario({
+      const { reports, tasks } = await runScenario({
         dbPath,
         barrierTimeoutMs: BARRIER_TIMEOUT_MS,
         scenario: "termination-during-tx",
@@ -1062,6 +1163,323 @@ it(
           /* ignore */
         }
       }
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  it(
+    `${PROCESS_COUNT} processes split across two project namespaces isolate rows, audits, FTS hits, and budget usage under contention`,
+    async () => {
+      const dbPath = join(dataHome, "isolation.sqlite");
+      // Spec § 5.6 invariant (the one Task 1 did NOT prove):
+      // "0 个跨项目 mutation" — i.e. a multi-process write burst
+      // against two project namespaces must NOT collapse rows
+      // across projects and must NOT pollute each project's audit
+      // chain, FTS index, or budget usage.
+      //
+      // The 8 workers are split 4 + 4 across two projects. Within
+      // each project the workers race on a shared (actor, tool,
+      // idempotency_key) triple, so the v2 reservation collapses
+      // each group's writes to exactly one row. The two groups
+      // use DISTINCT idempotency keys (the v2 PK is
+      // (actor, tool, key) with no project dimension, so a shared
+      // key would either v2-mismatch or replay-collapse across
+      // projects — neither is what we want to assert). The
+      // cross-project keys are the trick that lets us prove
+      // cross-project isolation: each group gets its own row, and
+      // we can then assert the two rows live in disjoint buckets
+      // of `memory_entries`, `audit_events`, `memory_fts`, and
+      // `memory_entries` (budget).
+      const projectAId = "project-iso-A";
+      const projectAPath = join(dataHome, "lm-stress-project-A");
+      const projectBId = "project-iso-B";
+      const projectBPath = join(dataHome, "lm-stress-project-B");
+      // Per-project idempotency keys. Random suffixes keep two
+      // runs of the same scenario from sharing a v2 row.
+      const projectAKey = `iso-key-A-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const projectBKey = `iso-key-B-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const projectIds = [projectAId, projectBId];
+      const projectPaths = [projectAPath, projectBPath];
+      const projectKeys = [projectAKey, projectBKey];
+
+      // Bootstrap the DB so the migration runs before any worker
+      // opens a writer connection, then register both projects
+      // via `configureProjectBudget` (creates `project_scopes`
+      // rows with the spec § 5.6 default budget). The actual
+      // `project_identities` rows are created by the workers'
+      // first `service.remember` call (the resolver takes the
+      // `register`-mode strict path because we pass both
+      // `project_id` AND `project_path`).
+      if (!existsSync(dbPath)) {
+        const boot = new DatabaseSync(dbPath);
+        boot.close();
+      }
+      {
+        const { SQLiteMemoryStore } = await import("../src/sqlite-store.js");
+        const { MemoryService } = await import("../src/memory-service.js");
+        const { DEFAULT_PROJECT_BUDGET } = await import("../src/domain.js");
+        const bootstrapStore = new SQLiteMemoryStore(dbPath);
+        const bootstrapService = new MemoryService(bootstrapStore);
+        for (let i = 0; i < projectIds.length; i += 1) {
+          bootstrapService.configureProjectBudget(
+            projectIds[i]!,
+            DEFAULT_PROJECT_BUDGET,
+            projectPaths[i]!,
+            `Project ${i === 0 ? "A" : "B"}`
+          );
+        }
+        try {
+          bootstrapStore.close();
+        } catch {
+          /* ignore */
+        }
+      }
+
+      // Workers 0..3 → projectA, workers 4..7 → projectB. Each
+      // group races on its own idempotency key inside its own
+      // project. The same actor (`agent:project-iso`) is used by
+      // every worker — the v2 PK is (actor, tool, key) so the
+      // key is the only dimension that keeps the two groups
+      // isolated at the v2 layer.
+      const { reports, tasks } = await runScenario({
+        dbPath,
+        barrierTimeoutMs: BARRIER_TIMEOUT_MS,
+        scenario: "project_isolation",
+        workerCount: PROCESS_COUNT,
+        buildInput: (workerId) => {
+          const inA = workerId < PROCESS_COUNT / 2;
+          return {
+            actor: "agent:project-iso",
+            dbPath,
+            ops: 5,
+            scenario: "project_isolation",
+            raceIsolationProjectId: inA ? projectAId : projectBId,
+            raceIsolationProjectPath: inA ? projectAPath : projectBPath,
+            raceIsolationKey: inA ? projectAKey : projectBKey
+          };
+        }
+      });
+
+      const totalOk = reports.reduce((a, r) => a + r.idempotencyOkCount, 0);
+      const totalMismatch = reports.reduce((a, r) => a + r.idempotencyMismatchCount, 0);
+      const totalInFlight = reports.reduce((a, r) => a + r.idempotencyInFlightCount, 0);
+      const totalOther = reports.reduce((a, r) => a + r.otherErrors, 0);
+      const otherTypes: Record<string, number> = {};
+      for (const r of reports) {
+        for (const [k, v] of Object.entries(r.otherErrorHistogram)) {
+          otherTypes[k] = (otherTypes[k] ?? 0) + v;
+        }
+      }
+      // eslint-disable-next-line no-console
+      console.log(
+        `[stress:isolation] ok=${totalOk} mismatch=${totalMismatch} inflight=${totalInFlight} other=${totalOther} types=${JSON.stringify(otherTypes)}`
+      );
+
+      // Capture worker stderr for any non-ok op so a future
+      // regression doesn't disappear silently.
+      const stderrLines: string[] = [];
+      for (const t of tasks) {
+        const s = t.stderr();
+        if (s.length > 0) stderrLines.push(s.trim());
+      }
+      if (stderrLines.length > 0) {
+        // eslint-disable-next-line no-console
+        console.log(`[stress:isolation-stderr] ${stderrLines.join(" | ")}`);
+      }
+
+      // ---- Invariant: DB integrity.
+      expect(quickCheck(dbPath)).toBe("ok");
+
+      // ---- Invariant: each worker reported at least one ok
+      // result (the first call returns fresh; the rest are
+      // replays of the same (actor, tool, key) within their
+      // own project). The fresh path is `ok=true`; replay is
+      // also `ok=true` (the stored result is replayed). No
+      // worker should see `idempotency_mismatch` because the
+      // bodies are byte-identical WITHIN each project, and the
+      // two projects use distinct keys so the v2 PKs don't
+      // collide across projects.
+      for (const r of reports) {
+        expect(r.busyErrors, `worker ${r.workerId} reported unhandled SQLITE_BUSY`).toBe(0);
+        expect(
+          r.idempotencyOkCount,
+          `worker ${r.workerId} must have at least one ok (fresh or replay) result`
+        ).toBeGreaterThan(0);
+      }
+      // No cross-project mismatch: each project's group shares
+      // a single key, so the requestHash is identical within
+      // the group. Mismatch would mean a worker saw a stale
+      // hash from a previous run, which would indicate a v2
+      // cache leak across scenarios (we use a unique key
+      // suffix to dodge that, but the assertion guards
+      // against future regressions).
+      expect(
+        totalMismatch,
+        "no cross-project idempotency_mismatch (each project's workers share one key)"
+      ).toBe(0);
+
+      // ---- Invariant: `memory_entries` is partitioned per
+      // project — exactly 1 row per project, 2 rows total.
+      // Within each project the v2 reservation collapsed the 4
+      // racing workers to a single row; the two groups must
+      // land in disjoint buckets, not be collapsed into one.
+      const totalRows = countRows(dbPath, "memory_entries");
+      expect(totalRows, "exactly 2 rows in memory_entries (one per project)").toBe(2);
+      const rowsA = countRowsWhere(
+        dbPath,
+        "memory_entries",
+        "scope = 'project' AND project_id = ?",
+        projectAId
+      );
+      const rowsB = countRowsWhere(
+        dbPath,
+        "memory_entries",
+        "scope = 'project' AND project_id = ?",
+        projectBId
+      );
+      expect(rowsA, "exactly 1 row in projectA").toBe(1);
+      expect(rowsB, "exactly 1 row in projectB").toBe(1);
+
+      // ---- Invariant: the v2 reservation collapsed each
+      // group's writes to exactly one `memory_id`. Across
+      // the two projects we expect exactly two distinct
+      // ids, each one reported by all 4 workers in its
+      // project (fresh by one worker, replay by the
+      // other three). The total reported-id count is 8
+      // (one per worker), the distinct count is 2.
+      const allSuccessIds = reports.flatMap((r) => r.successIds);
+      const distinctIds = new Set(allSuccessIds);
+      expect(distinctIds.size, "exactly 2 distinct ids across the two projects").toBe(2);
+      expect(allSuccessIds.length, "every worker reported exactly 1 fresh-or-replay id").toBe(8);
+      // Every reported id lives in memory_entries and only in
+      // its own project — no cross-project leak.
+      for (const id of distinctIds) {
+        const projectIdOfRow = countRowsWhere(
+          dbPath,
+          "memory_entries",
+          "id = ?",
+          id
+        );
+        expect(projectIdOfRow, `id ${id} must exist in memory_entries`).toBe(1);
+      }
+
+      // ---- Invariant: the audit log records exactly one
+      // `created` event per project, and no other project's
+      // audit row is associated with a different project's
+      // memory_id. Each `created` row carries its own
+      // `project_id` so cross-project pollution would surface
+      // as an audit row whose `project_id` doesn't match the
+      // row's `memory_entries.project_id`.
+      const auditsByProject = countRowsWhere(
+        dbPath,
+        "audit_events",
+        "event = 'created' AND project_id = ?",
+        projectAId
+      );
+      expect(auditsByProject, "exactly 1 'created' audit row for projectA").toBe(1);
+      const auditsByProjectB = countRowsWhere(
+        dbPath,
+        "audit_events",
+        "event = 'created' AND project_id = ?",
+        projectBId
+      );
+      expect(auditsByProjectB, "exactly 1 'created' audit row for projectB").toBe(1);
+      const auditProjects = distinctAuditProjectIds(dbPath);
+      // The two distinct audit project_ids must be exactly the
+      // two we registered — no cross-project `created` event
+      // ever escapes into the other bucket.
+      expect(new Set(auditProjects), "audit 'created' rows project_ids match the registered set").toEqual(
+        new Set([projectAId, projectBId])
+      );
+
+      // ---- Invariant: the project identity model actually
+      // engaged. Both projects must appear in
+      // `project_identities` (created via
+      // `ProjectIdentityResolver` in the worker's first
+      // `service.remember` call, which supplied both
+      // `project_id` and `project_path`).
+      const identityRows = countRows(dbPath, "project_identities");
+      expect(identityRows, "project_identities has 2 rows (one per project)").toBe(2);
+      const identityA = countRowsWhere(
+        dbPath,
+        "project_identities",
+        "project_id = ?",
+        projectAId
+      );
+      expect(identityA, "project_identities row for projectA").toBe(1);
+      const identityB = countRowsWhere(
+        dbPath,
+        "project_identities",
+        "project_id = ?",
+        projectBId
+      );
+      expect(identityB, "project_identities row for projectB").toBe(1);
+
+      // ---- Invariant: project_scopes was configured by the
+      // bootstrap `configureProjectBudget` calls.
+      const scopeRows = countRows(dbPath, "project_scopes");
+      expect(scopeRows, "project_scopes has 2 rows").toBe(2);
+
+      // ---- Invariant: per-project budget usage is exactly 1
+      // active entry (the row the v2 reservation landed).
+      // The spec § 5.6 budget probe (`getBudgetUsage`) walks
+      // `memory_entries WHERE scope = ? AND project_id = ? AND
+      // status = 'active'` — we mirror it with a direct SQL
+      // probe to avoid service bootstrap in the driver.
+      const budgetA = budgetActiveByProject(dbPath, projectAId);
+      const budgetB = budgetActiveByProject(dbPath, projectBId);
+      expect(budgetA, "budget-active entries in projectA = 1").toBe(1);
+      expect(budgetB, "budget-active entries in projectB = 1").toBe(1);
+
+      // ---- Invariant: FTS hits are partitioned per project.
+      // Searching for the body token with `project_id = projectA`
+      // returns ONLY projectA's row; the same search with
+      // `project_id = projectB` returns ONLY projectB's row.
+      // No cross-project leak through the FTS index.
+      const ftsHitsA = ftsHitsByProject(dbPath, projectAId, "isolation");
+      expect(ftsHitsA, "FTS query scoped to projectA hits 1 row").toBe(1);
+      const ftsHitsB = ftsHitsByProject(dbPath, projectBId, "isolation");
+      expect(ftsHitsB, "FTS query scoped to projectB hits 1 row").toBe(1);
+      // Cross-check: the FTS rows that match the body token
+      // globally (no project filter) must equal the sum of the
+      // per-project hits — no row leaked into a third bucket
+      // and no row missing from its own bucket.
+      const ftsHitsGlobal = ftsHitsByProject(dbPath, "", "isolation");
+      void ftsHitsGlobal; // see note below — we only assert the per-project invariant.
+      const handle = openVerifyHandle(dbPath);
+      try {
+        const tokens = ("isolation".match(/[\p{L}\p{N}_]+/gu) ?? []).map(
+          (t) => `"${t.replaceAll('"', '""')}"`
+        );
+        const ftsTerm = tokens.join(" OR ");
+        const row = handle
+          .prepare(
+            `SELECT COUNT(*) AS n
+               FROM memory_fts
+               JOIN memory_entries m ON m.id = memory_fts.id
+              WHERE memory_fts MATCH ?`
+          )
+          .get(ftsTerm) as { n: number };
+        expect(
+          row.n,
+          "global FTS hits for the isolation token = sum of per-project hits"
+        ).toBe(ftsHitsA + ftsHitsB);
+      } finally {
+        try {
+          handle.close();
+        } catch {
+          /* ignore */
+        }
+      }
+
+      // ---- Invariant: the v2 reservation persisted exactly
+      // two `mutation_requests_v2` rows — one per project —
+      // with distinct idempotency_keys. No third key leaked in.
+      const v2Rows = countRows(dbPath, "mutation_requests_v2");
+      expect(v2Rows, "mutation_requests_v2 has 2 rows (one per project)").toBe(2);
+
+      // ---- Overlap proof: max(started_at) < min(finished_at).
+      assertOverlappingLifetimes(reports);
     },
     TEST_TIMEOUT_MS
   );
