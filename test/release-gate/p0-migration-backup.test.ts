@@ -141,8 +141,10 @@ describe("release-gate p0-migration-backup (PR-A)", () => {
     // `maintenance_plans` + `maintenance_plan_items`;
     // PR-M1-1 bumped 6 -> 7 to add `memory_provenance`;
     // PR-M1-2 bumped 7 -> 8 to add
-    // `project_identities` + `project_aliases_new`.
-    expect(store.getUserVersion()).toBe(8);
+    // `project_identities` + `project_aliases_new`;
+    // PR-M1-3 bumped 8 -> 9 to add `memory_feedback` +
+    // `memory_recall_signals`.
+    expect(store.getUserVersion()).toBe(9);
   });
 
   it("blocks the migration when the pre-mutation backup cannot be written", () => {
@@ -201,7 +203,9 @@ describe("release-gate p0-migration-backup (PR-A)", () => {
     // Stage 15 PR-M1-1: bumped to 7 with memory_provenance.
     // Stage 15 PR-M1-2: bumped to 8 with project_identities
     // + project_aliases_new.
-    expect(parsed.to).toBe(8);
+    // Stage 15 PR-M1-3: bumped to 9 with memory_feedback
+    // + memory_recall_signals.
+    expect(parsed.to).toBe(9);
     expect(parsed.backup.path).toMatch(/memory-.*\.sqlite$/);
     expect(parsed.backup.schema_version).toBe(1);
     expect(parsed.backup.quick_check).toBe("ok");

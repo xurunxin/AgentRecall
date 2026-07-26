@@ -32,8 +32,10 @@ describe("SQLiteMemoryStore migrations", () => {
     // current" test below. Stage 15 PR-M0-4 bumped
     // schema to 6 (maintenance_plans); PR-M1-1 bumped
     // to 7 (memory_provenance); PR-M1-2 bumped to 8
-    // (project_identities + project_aliases_new).
-    expect(CURRENT_SCHEMA_VERSION).toBe(8);
+    // (project_identities + project_aliases_new);
+    // PR-M1-3 bumped to 9 (memory_feedback +
+    // memory_recall_signals).
+    expect(CURRENT_SCHEMA_VERSION).toBe(9);
   });
 
   it("is a no-op when schema is already at latest version", () => {

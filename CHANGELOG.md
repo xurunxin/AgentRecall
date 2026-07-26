@@ -803,6 +803,106 @@ serial PRs plus the M0-pre fix-test-infra PR below.
   forwards the resolver's `ok: false` so the MCP
   envelope surfaces the conflict code.
 
+### Stage 15 PR-M1-3 (Hybrid Recall: RRF + Real Signals)
+### Fixed
+
+- **`src/services/recall-ranker.ts`** (issue #5,
+  spec § 5.3). Three gaps in the ranker:
+
+  1. **Real `feedback_signal`**: the pre-PR-M1-3
+     ranker had a placeholder `feedback_signal: 0`
+     (no feedback table). Post-PR-M1-3 the signal
+     is computed from the new `memory_feedback`
+     table: per-memory counts of `up` vs `down`
+     mapped to `[-1, 1]` (saturate at 5). `pin` /
+     `hide` are not scored here; they affect recall
+     inclusion upstream.
+
+  2. **Real `access_signal` from
+     `memory_accesses`**: the pre-PR-M1-3 ranker
+     read the legacy `memory_entries.access_count`
+     column. Post-PR-M1-3 the signal is computed
+     from the canonical `memory_accesses` table
+     (per-actor counts, summed).
+
+  3. **`scope_priority` boost**: a project memory
+     in a project query gets `priority = 1.0`; a
+     global memory in a project query gets
+     `priority = 0.1` (it can still compete on
+     relevance, but at the same lexical rank a
+     project memory wins). The constant
+     `SCOPE_PRIORITY_PROJECT_BOOST = 0.5` controls
+     the magnitude; the boost surfaces as a
+     separate `scope_priority` component in the
+     explain output.
+
+  4. **RRF pre-sort**: candidates are pre-sorted
+     by lexical score; the `lexical_relevance`
+     component is now `1 / (60 + rank_lex)` so the
+     ranker behaves like a reciprocal-rank-fused
+     hybrid (per the spec, the `score = sum(1 /
+     (60 + rank_i))` form).
+
+### Added
+
+- **`src/sqlite-store.ts`** —
+  `CURRENT_SCHEMA_VERSION` bumped 8 → 9. The new
+  `migrate_v8_to_v9` step creates two tables:
+  - `memory_feedback(memory_id, actor_id, kind,
+    created_at)` with `kind IN
+    ('up','down','pin','hide')` and PRIMARY KEY
+    `(memory_id, actor_id, kind)` (so a single
+    actor can change their mind).
+  - `memory_recall_signals(memory_id PK,
+    recall_count, last_recalled_at,
+    last_recall_rank, last_recall_query)` for
+    cached per-memory recall stats.
+  Four new methods on `SQLiteMemoryStore`:
+  `recordMemoryFeedback`, `getMemoryFeedback`,
+  `getMemoryFeedbackCounts`, `recordRecallSignal`,
+  `getRecallSignal`.
+- **`src/memory-service.ts`** — new
+  `recordFeedback({memory_id, kind, actor_id?})`
+  method on `MemoryService` (validates the memory
+  exists; returns `{ok: true}` or
+  `{ok: false, error: "not_found"}`).
+- **`test/release-gate/p2-hybrid-recall.test.ts`**
+  (7 tests). Locks down every acceptance criterion
+  from issue #5:
+    1. Project memory ranks above unrelated global
+       memory at the same lexical match.
+    2. Real `feedback_signal`: a 👍 on a memory
+       lifts it past a 👎 on another.
+    3. Real `access_signal`: per-actor accesses
+       via `memory_accesses`.
+    4. `explain_recall` exposes real computed
+       signals (no placeholder 0 for trust,
+       feedback, access).
+    5. `recordFeedback` rejects unknown memory_id
+       with `not_found`.
+    6. `recordFeedback` is idempotent under
+       `(memory_id, actor_id, kind)`.
+    7. `recordRecallSignal` + `getRecallSignal`
+       round-trip.
+
+### Verification
+
+- `npm test` → 0 failed / **488 passed** (was: 481)
+  / 1 unhandled error (the same pre-existing
+  vitest-worker `birpc` `onTaskUpdate` heartbeat
+  issue documented in PR-M0-1's CHANGELOG;
+  0 actual test failures).
+- `npm run typecheck` → 0 error.
+- 7 new p2-hybrid-recall tests pass.
+- 63 existing test files pass unchanged.
+- Static check `grep -nE "trust_boost: 0|feedback.*=.*0\\b" src/services/recall-ranker.ts`
+  returns 0 hits.
+- The `OFF` path (no embedding, no feedback) is
+  covered by the ranker-level unit tests: when
+  the store is omitted, `feedback_signal` is 0,
+  `access_signal` is 0, and the ranker still
+  returns a deterministic output.
+
 ## [1.0.0] — Stage 14 v1.0 (AgentRecall v1.0)
 
 Date: 2026-07-21

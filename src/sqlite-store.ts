@@ -88,8 +88,13 @@ export type SearchFilters = EntryFilters & {
  * consults both: an alias path that maps to a different
  * `project_id` than the caller's input surfaces
  * `project_identity_conflict`.
+ * v9 (Stage 15 PR-M1-3, issue #5) adds `memory_feedback`
+ * (per-actor explicit 👍/👎 signals) and
+ * `memory_recall_signals` (cached per-memory recall stats
+ * for the ranker). The RRF fusion in the ranker uses both
+ * to replace the placeholder feedback / access signals.
  */
-export const CURRENT_SCHEMA_VERSION = 8;
+export const CURRENT_SCHEMA_VERSION = 9;
 
 /**
  * Stage 12 PR9: thrown by `updateEntryWithRevision` when
@@ -766,6 +771,10 @@ export class SQLiteMemoryStore {
       this.migrate_v7_to_v8();
       return;
     }
+    if (version === 9) {
+      this.migrate_v8_to_v9();
+      return;
+    }
     throw new Error(`No migration registered for schema version ${version}`);
   }
 
@@ -1195,6 +1204,64 @@ export class SQLiteMemoryStore {
           ON project_aliases_new(project_id);
       `);
       this.db.exec("PRAGMA user_version = 8");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * Stage 15 PR-M1-3 (issue #5, spec § 5.3): v8 -> v9
+   * schema migration. Introduces two new tables that
+   * feed the ranker with real signals (replacing
+   * the placeholder feedback / access signals):
+   *
+   *   - `memory_feedback(memory_id, actor_id, kind,
+   *     created_at)` — explicit per-actor feedback.
+   *     `kind IN ('up','down','pin','hide')`. PRIMARY
+   *     KEY `(memory_id, actor_id, kind)` so a single
+   *     actor can change their mind and the latest
+   *     intent wins.
+   *   - `memory_recall_signals(memory_id, recall_count,
+   *     last_recalled_at, last_recall_rank)` — cached
+   *     per-memory recall stats. The ranker reads
+   *     `last_recall_rank` to compute a `recall_signal`
+   *     component; this is the spec-named "feedback
+   *     signal" replacement that no longer needs to
+   *     be 0.
+   *
+   * Both tables are STRICT (typed columns). The
+   * migration is non-destructive: existing rows are
+   * untouched, the new tables start empty.
+   */
+  private migrate_v8_to_v9(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_feedback (
+          memory_id TEXT NOT NULL,
+          actor_id TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK (kind IN ('up','down','pin','hide')),
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (memory_id, actor_id, kind)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS memory_feedback_actor_idx
+          ON memory_feedback(actor_id, created_at);
+
+        CREATE TABLE IF NOT EXISTS memory_recall_signals (
+          memory_id TEXT PRIMARY KEY,
+          recall_count INTEGER NOT NULL DEFAULT 0,
+          last_recalled_at TEXT,
+          last_recall_rank REAL,
+          last_recall_query TEXT
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS memory_recall_signals_recency_idx
+          ON memory_recall_signals(last_recalled_at);
+      `);
+      this.db.exec("PRAGMA user_version = 9");
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -1856,6 +1923,124 @@ export class SQLiteMemoryStore {
       recorded_by: string;
       recorded_at: number;
     }>;
+  }
+
+  /**
+   * Stage 15 PR-M1-3 (issue #5, spec § 5.3): record
+   * explicit per-actor feedback for a memory. The
+   * `kind` enum is `up` (👍), `down` (👎), `pin`
+   * (always surface), `hide` (always suppress).
+   * `INSERT OR REPLACE` lets a single actor change
+   * their mind and the latest intent wins.
+   */
+  recordMemoryFeedback(input: {
+    memory_id: string;
+    actor_id: string;
+    kind: "up" | "down" | "pin" | "hide";
+    created_at: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO memory_feedback
+          (memory_id, actor_id, kind, created_at)
+         VALUES (?, ?, ?, ?)`
+      )
+      .run(input.memory_id, input.actor_id, input.kind, input.created_at);
+  }
+
+  /**
+   * Per-actor feedback map for a memory. The
+   * `up`/`down`/`pin`/`hide` keys are mutually
+   * independent; a single actor may have up to four
+   * feedback rows.
+   */
+  getMemoryFeedback(memoryId: string): Array<{
+    actor_id: string;
+    kind: "up" | "down" | "pin" | "hide";
+    created_at: string;
+  }> {
+    return this.db
+      .prepare(
+        "SELECT actor_id, kind, created_at FROM memory_feedback WHERE memory_id = ? ORDER BY created_at ASC"
+      )
+      .all(memoryId) as Array<{
+      actor_id: string;
+      kind: "up" | "down" | "pin" | "hide";
+      created_at: string;
+    }>;
+  }
+
+  /**
+   * Aggregate feedback per `kind` for a memory. Used
+   * by the ranker to compute the `feedback_signal`
+   * component without round-tripping the per-actor
+   * rows.
+   */
+  getMemoryFeedbackCounts(memoryId: string): {
+    up: number;
+    down: number;
+    pin: number;
+    hide: number;
+  } {
+    const rows = this.db
+      .prepare("SELECT kind, COUNT(*) AS c FROM memory_feedback WHERE memory_id = ? GROUP BY kind")
+      .all(memoryId) as Array<{ kind: string; c: number }>;
+    const out = { up: 0, down: 0, pin: 0, hide: 0 };
+    for (const row of rows) {
+      if (row.kind === "up") out.up = row.c;
+      else if (row.kind === "down") out.down = row.c;
+      else if (row.kind === "pin") out.pin = row.c;
+      else if (row.kind === "hide") out.hide = row.c;
+    }
+    return out;
+  }
+
+  /**
+   * Stage 15 PR-M1-3: cache the per-memory recall
+   * stats so the ranker's `recall_signal` component
+   * is real (not a placeholder 0). The cache is
+   * updated after every `rankRecall`; reads are
+   * point lookups.
+   */
+  recordRecallSignal(input: {
+    memory_id: string;
+    rank: number;
+    query: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO memory_recall_signals
+          (memory_id, recall_count, last_recalled_at, last_recall_rank, last_recall_query)
+         VALUES (?, 1, ?, ?, ?)
+         ON CONFLICT(memory_id) DO UPDATE SET
+           recall_count = recall_count + 1,
+           last_recalled_at = excluded.last_recalled_at,
+           last_recall_rank = excluded.last_recall_rank,
+           last_recall_query = excluded.last_recall_query`
+      )
+      .run(input.memory_id, nowIso(), input.rank, input.query);
+  }
+
+  getRecallSignal(memoryId: string): {
+    memory_id: string;
+    recall_count: number;
+    last_recalled_at: string | null;
+    last_recall_rank: number | null;
+    last_recall_query: string | null;
+  } | undefined {
+    return this.db
+      .prepare(
+        "SELECT memory_id, recall_count, last_recalled_at, last_recall_rank, last_recall_query FROM memory_recall_signals WHERE memory_id = ?"
+      )
+      .get(memoryId) as
+      | {
+          memory_id: string;
+          recall_count: number;
+          last_recalled_at: string | null;
+          last_recall_rank: number | null;
+          last_recall_query: string | null;
+        }
+      | undefined;
   }
 
   /**
