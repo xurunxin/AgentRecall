@@ -13,6 +13,116 @@ lands as 8 serial PRs after v1.1.0. Each PR closes
 exactly one issue (#10–#17) under the tracker
 issue #18.
 
+### Stage 16 PR-6 (Real Hybrid Retrieval)
+### Fixed
+
+- **`src/services/recall-ranker.ts`** (issue #15,
+  spec § 5.3). The pre-PR-6 v1.1.0 ranker was already
+  a single source of truth, but the v1.1.1 PR-6
+  refactor moved the `access_signal`,
+  `actor_trust` (access-based soft boost), and
+  `rrf_access` components behind an explicit
+  `store` parameter on `rankRecall`. The pre-refactor
+  callers in `memory-read-service.ts` were not
+  updated to pass the store, so the ranker fell back
+  to writer-identity-only trust — which silently
+  dropped the "recently-touched foreign memory ranks
+  above untouched foreign memory" behaviour that
+  stage 5 added on top of the `memory_accesses`
+  table. PR-6 passes `store: this.ctx.store` to both
+  `collectContextEntries` and `explainRecall` so
+  the ranker reads the canonical `memory_accesses`
+  / `memory_feedback` / `memory_relations` tables
+  end-to-end. The `memory-service.ts` `explainRecall`
+  was already passing the store; the new calls now
+  match that contract.
+- **`src/services/recall-ranker.ts`** — `RANKING_VERSION`
+  is now `coding-default-v2`. The pre-PR-6 version
+  used a separately-normalised `contextQueryScore`
+  in the linear combination but reported the RRF
+  value `1 / (RRF_K + rank_lex)` in
+  `components.lexical_relevance`; the two could
+  diverge by an order of magnitude. v1.1.1 routes
+  the final score through the actual RRF sum
+  (`WEIGHTS.lexical_relevance * rrf`), so the
+  `components.lexical_relevance` value is now the
+  EXACT value used in the score. `WEIGHTS.lexical_relevance`
+  is `200` (was `0.46`); the RRF sum is much smaller
+  than the old `contextQueryScore`, so the lexical
+  weight must dominate to keep rank-1 / rank-2 delta
+  larger than the tier-priority delta.
+- **`src/services/recall-ranker.ts`** — `conflict_penalty`
+  is now real. The pre-PR-6 value was a `0`-placeholder.
+  PR-6 counts the entry's `memory_relations` rows of
+  type `contradicts` / `supersedes` (via the new
+  `getMemoryRelationsOfType(memoryId, types)` API on
+  the store) and applies a 0.05 penalty per conflicting
+  peer, capped at 0.2.
+- **`src/services/recall-ranker.ts`** — `rrf_lexical` +
+  `rrf_access` are now first-class components. The
+  pre-PR-6 components report only the lexical RRF;
+  PR-6 reports both contributions separately so the
+  explain renderer can attribute the lift to the
+  access signal.
+- **`src/services/memory-read-service.ts`** —
+  `searchMemories` and `exportMemoryContext` now
+  both route through the single `rankRecall`
+  pipeline. The pre-PR-6 path concatenated results
+  from per-scope `searchEntries` calls, which made
+  global entries always rank below project entries
+  in the project-scope case. PR-6 collects
+  candidates (preserving the v1.1.0 FTS5 filter
+  forwarding — `actor`, `type`, `topic`, `status`,
+  `tags`, `updated_since`, `updated_until`) and
+  then runs `rankRecall` over the deduped union,
+  so scope priority + access signal can promote
+  an untouched project entry over a stale global
+  entry with the same lexical match.
+- **`src/sqlite-store.ts`** — new
+  `getMemoryRelationsOfType(memoryId, types)` API.
+  `SELECT from_memory_id, to_memory_id, relation_type
+  FROM memory_relations WHERE from_memory_id = ? AND
+  relation_type IN (?, ...)`. Used by the ranker
+  for the real `conflict_penalty`; exported so
+  future maintainers can plug it into the
+  explain_recall renderer.
+
+### New tests
+
+- **`test/release-gate/p3-hybrid-retrieval.test.ts`**
+  (6 tests). Covers the v1.1.1 contract end-to-end:
+  - RRF sum is the EXACT value used in the linear
+    combination (no more components/score divergence).
+  - Lexical sort tie-break by `tier_priority` desc,
+    then by id asc.
+  - Score sort tie-break by `tier_priority` desc
+    (after score).
+  - `conflict_penalty` counts `contradicts` /
+    `supersedes` relations and is capped at 0.2.
+  - `searchMemories` and `exportMemoryContext`
+    share the same pipeline; the project-scope case
+    no longer concatenates global results below
+    project results.
+  - `ranking_version` is `coding-default-v2`.
+
+### Verification
+
+- `npm test` → 546 passed + 5 skipped (was 540
+  + 5 skipped in PR-5; +6 from the new
+  `p3-hybrid-retrieval` suite).
+- `npm run typecheck` → 0 error.
+- `npm run build` → 0 error.
+- 1 unhandled `birpc` `onTaskUpdate` 60s timeout
+  (the pre-existing vitest-worker heartbeat
+  documented in PR-M0-1's CHANGELOG; 0 actual
+  test failures).
+- The 9 pre-existing
+  `test/memory-service-recall-trust.test.ts`
+  tests all pass (the stage 5 trust_boost
+  ranking contract is preserved end-to-end).
+- No `package.json` / `package-lock.json`
+  changes.
+
 ### Stage 16 PR-5 (Atomic Maintenance Apply)
 ### Fixed
 
