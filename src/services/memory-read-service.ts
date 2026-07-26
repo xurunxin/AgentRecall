@@ -169,51 +169,91 @@ export class MemoryReadService {
     if (!resolved.ok) {
       return resolved;
     }
-    // Stage 9: pull `include_global` out before forwarding filters
-    // to the store (the store has no native global-merge concept).
-    // When a project search is asked to also surface global hits,
-    // run a second searchEntries against the global scope and
-    // prepend the global items, then slice to the limit. This
-    // matches the pre-split MemoryService.searchMemories behavior.
+    // Stage 16 v1.1.1 PR-6 (issue #15, spec § 5.3):
+    // the v1.1.0 contract used FTS5 + a flat
+    // `[...globalItems, ...projectItems].slice(0, limit)`
+    // concatenation. v1.1.1 routes both
+    // `search_memories` and `recall_context`
+    // through the same candidate-collection +
+    // ranker pipeline. The candidate collection
+    // still uses the store's FTS5 query to bound
+    // the candidate set (preserves the v1.1.0
+    // `actor` / `type` / `topic` / `tags` /
+    // `updated_at` filter forwarding); the ranker
+    // then fuses the lexical RRF with the access
+    // RRF over the candidate set so the project
+    // scope priority survives the joint ranking.
     const { include_global: includeGlobal, ...storeFilters } = filters;
-    const resolvedFilters = this.entryFiltersForRead(storeFilters, resolved.value);
-    const limit = filters.limit ?? 10;
     const status = filters.status ?? "active";
-    const projectItems = this.ctx.store.searchEntries({
-      ...resolvedFilters,
-      query: filters.query,
-      status,
-      limit
-    });
-    const globalItems =
-      resolved.value.scope === "project" && includeGlobal
+    const limit = filters.limit ?? 10;
+    const query = filters.query;
+    const resolvedFilters = this.entryFiltersForRead(storeFilters, resolved.value);
+    const projectFtsItems =
+      resolved.value.scope === "project"
         ? this.ctx.store.searchEntries({
-            query: filters.query,
+            ...resolvedFilters,
+            query,
+            status,
+            limit: 10_000
+          })
+        : [];
+    const globalFtsItems =
+      resolved.value.scope === "global" || (resolved.value.scope === "project" && includeGlobal)
+        ? this.ctx.store.searchEntries({
+            query,
             scope: "global",
             ...(filters.type !== undefined ? { type: filters.type } : {}),
             ...(filters.topic !== undefined ? { topic: filters.topic } : {}),
             status,
             ...(filters.tags !== undefined ? { tags: filters.tags } : {}),
-            limit
+            ...(storeFilters.actor !== undefined ? { actor: storeFilters.actor } : {}),
+            ...(storeFilters.updated_since !== undefined
+              ? { updated_since: storeFilters.updated_since }
+              : {}),
+            ...(storeFilters.updated_until !== undefined
+              ? { updated_until: storeFilters.updated_until }
+              : {}),
+            limit: 10_000
           })
         : [];
-    const items = [...globalItems, ...projectItems].slice(0, limit);
+    // Dedup (FTS may return the same id in both
+    // lists when `include_global` is on; the
+    // ranker is pure so duplicates are deduped by
+    // id before ranking).
+    const seen = new Set<string>();
+    const candidates: MemoryEntry[] = [];
+    for (const item of [...globalFtsItems, ...projectFtsItems]) {
+      if (seen.has(item.id)) continue;
+      seen.add(item.id);
+      candidates.push(item);
+    }
+    const ranked = rankRecall({
+      candidates,
+      query,
+      primaryScope: resolved.value.scope,
+      actor: {
+        currentActor: this.ctx.defaultActor,
+        actorForEntry: (entry) => entry.writer_actor_id
+      },
+      store: this.ctx.store,
+      topK: limit
+    });
     return {
-      items: items.map((entry) => {
-        const item: SearchMemoryItem = {
-          id: entry.id,
-          scope: entry.scope,
-          type: entry.type,
-          topic: entry.topic,
-          title: entry.title,
-          tags: entry.tags,
-          source: entry.source,
-          updated_at: entry.updated_at,
-          status: entry.status,
-          match_reason: "SQLite FTS matched query text against title, body, topic, or tags"
+      items: ranked.map((item) => {
+        const r: SearchMemoryItem = {
+          id: item.entry.id,
+          scope: item.entry.scope,
+          type: item.entry.type,
+          topic: item.entry.topic,
+          title: item.entry.title,
+          tags: item.entry.tags,
+          source: item.entry.source,
+          updated_at: item.entry.updated_at,
+          status: item.entry.status,
+          match_reason: "Shared pipeline: lexical RRF + access RRF + scope priority + signals"
         };
-        if (entry.project_id !== undefined) item.project_id = entry.project_id;
-        return item;
+        if (item.entry.project_id !== undefined) r.project_id = item.entry.project_id;
+        return r;
       })
     };
   }
@@ -373,6 +413,15 @@ export class MemoryReadService {
     // markdown exporter then re-sorted by importance + trust,
     // overriding the read-side ranking. With a single ranker
     // the export preserves the ranker order end-to-end.
+    // Stage 16 v1.1.1 PR-6 (issue #15): pass the store so
+    // the ranker can read `memory_accesses`,
+    // `memory_feedback`, and `memory_relations` for real
+    // (non-placeholder) signals. Without the store, the
+    // ranker falls back to writer-identity-only trust, and
+    // access-based trust / access signal / rrf_access all
+    // collapse to 0 — which would lose the
+    // "recently-touched foreign memory ranks above
+    // untouched foreign memory" behaviour from stage 5.
     const currentActor = ctx?.actor_id ?? this.ctx.defaultActor;
     const ranked: RankedItem[] = rankRecall({
       candidates: [...byId.values()],
@@ -382,6 +431,7 @@ export class MemoryReadService {
         currentActor,
         actorForEntry: (e) => actorForEntry(this.ctx.store, e)
       },
+      store: this.ctx.store,
       ...(input.max_items !== undefined ? { topK: input.max_items } : {})
     });
     return ranked.map((r) => r.entry);
@@ -429,6 +479,15 @@ export class MemoryReadService {
         currentActor: this.ctx.defaultActor,
         actorForEntry: (e) => actorForEntry(this.ctx.store, e)
       },
+      // Stage 16 v1.1.1 PR-6 (issue #15): pass the store
+      // so the ranker reads the canonical `memory_accesses`
+      // / `memory_feedback` / `memory_relations` tables for
+      // real (non-placeholder) signals. Mirrors the
+      // `collectContextEntries` call above; the two
+      // ranking paths must stay in lockstep so the
+      // explain breakdown matches what the markdown
+      // exporter actually ordered.
+      store: this.ctx.store,
       ...(input.max_items !== undefined ? { topK: input.max_items } : {})
     });
     return {

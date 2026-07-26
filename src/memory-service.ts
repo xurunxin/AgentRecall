@@ -908,7 +908,7 @@ export class MemoryService {
     return {
       ok: true,
       value: {
-        ranking_version: "coding-default-v1",
+        ranking_version: "coding-default-v2",
         items: limited.map((item) => ({
           memory_id: item.entry.id,
           score: item.score,

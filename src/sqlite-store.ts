@@ -2331,7 +2331,6 @@ export class SQLiteMemoryStore {
       .get(memoryId, actorId) as { access_count: number } | undefined;
     return row?.access_count ?? 0;
   }
-
   /**
    * All per-actor access counts for a memory, keyed by
    * `actor_id`. Replaces `entry.last_accessed_by` JSON
@@ -2373,6 +2372,32 @@ export class SQLiteMemoryStore {
       }
     }
     return keys;
+  }
+
+
+  /**
+   * Stage 16 v1.1.1 PR-6 (issue #15, spec § 5.3):
+   * real conflict penalty. Returns the
+   * `memory_relations` rows for an entry whose
+   * `relation_type` is in the supplied set. The
+   * ranker uses this to count the entry's
+   * `contradicts` / `supersedes` peers and
+   * penalise each conflicting peer by 0.05 (up
+   * to 0.2 total).
+   */
+  getMemoryRelationsOfType(
+    memoryId: string,
+    types: string[]
+  ): Array<{ from_memory_id: string; to_memory_id: string; relation_type: string }> {
+    if (types.length === 0) return [];
+    const placeholders = types.map(() => "?").join(",");
+    return this.db
+      .prepare(
+        `SELECT from_memory_id, to_memory_id, relation_type
+           FROM memory_relations
+          WHERE from_memory_id = ? AND relation_type IN (${placeholders})`
+      )
+      .all(memoryId, ...types) as Array<{ from_memory_id: string; to_memory_id: string; relation_type: string }>;
   }
 
   listAuditEvents(filters: AuditFilters = {}): MemoryAuditEvent[] {
