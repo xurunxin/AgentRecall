@@ -265,11 +265,32 @@ export class MemoryReadService {
     if (input.scope === "project" && input.project_id === undefined) {
       return err("invalid_scope", "project budget requires project_id");
     }
-    const budget = budgetFor(this.ctx.store, { scope: input.scope, project_id: input.project_id });
+    // v1.1.2 (issue #21): route the read through the
+    // strict resolver so an unknown `project_id` is
+    // rejected with `invalid_scope` before any budget
+    // query runs. Pre-v1.1.2 the read fell through to
+    // `budgetFor` (which returned `DEFAULT_PROJECT_BUDGET`
+    // for an unknown id and silently leaked the default
+    // budget for an unbound namespace).
+    const resolved = this.resolveReadScope(input);
+    if (!resolved.ok) {
+      // The strict resolver surfaces both
+      // `invalid_scope` and `project_identity_conflict`;
+      // the public `getMemoryBudget` contract only
+      // promises `invalid_scope`, so we collapse the
+      // conflict code to `invalid_scope` here. The
+      // conflict metadata is preserved on `details`.
+      if (resolved.error === "project_identity_conflict") {
+        return err("invalid_scope", resolved.message, resolved.details);
+      }
+      return err("invalid_scope", resolved.message, resolved.details);
+    }
+    const resolvedProjectId = resolved.value.project_id;
+    const budget = budgetFor(this.ctx.store, { scope: input.scope, project_id: resolvedProjectId });
     const usage = this.ctx.store.getBudgetUsage(input);
     const activeEntries = this.ctx.store.listEntries({
       scope: input.scope,
-      ...(input.project_id !== undefined ? { project_id: input.project_id } : {}),
+      ...(resolvedProjectId !== undefined ? { project_id: resolvedProjectId } : {}),
       status: "active",
       limit: 10_000
     });

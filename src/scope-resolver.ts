@@ -73,15 +73,47 @@ export type ScopeInput = {
   project_path?: string;
 };
 
+export type IdentityStatus = "bound" | "unbound";
+
 export type ResolvedScope = {
   scope: MemoryScope;
   project_id?: string;
   project_path?: string;
   display_name?: string;
   budget?: MemoryBudget;
+  /**
+   * v1.1.2 (issue #21): explicit binding status. `bound`
+   * (default) means a row in `project_identities` pins the
+   * id to a canonical path; the resolver consulted the
+   * store and found the row. `unbound` means the legacy
+   * escape hatch was used
+   * (`AGENT_RECALL_ALLOW_UNBOUND_PROJECT_ID=1`); the
+   * caller should be aware that strict isolation is
+   * disabled while the resolver is in unbound mode.
+   * Omitted on `global` scope and on the legacy
+   * store-less `resolveMemoryScope` return value.
+   */
+  identity_status?: IdentityStatus;
 };
 
 export type ResolveError = "invalid_scope" | "project_identity_conflict" | "invalid_alias";
+
+/**
+ * v1.1.2 (issue #21): default-off legacy escape hatch.
+ * When set to `"1"`, a `project_id`-only call without
+ * a registered identity row is allowed to proceed in
+ * "unbound" mode (the resolver still returns `ok`, but
+ * `identity_status: "unbound"` is surfaced so callers
+ * can branch on it). The default-off policy is
+ * `strict-by-default`: unknown ids are refused at the
+ * service boundary before any project scope, alias,
+ * memory, audit, or budget row is created.
+ */
+export const ENV_ALLOW_UNBOUND_PROJECT_ID = "AGENT_RECALL_ALLOW_UNBOUND_PROJECT_ID";
+
+export function isUnboundProjectIdAllowed(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[ENV_ALLOW_UNBOUND_PROJECT_ID] === "1";
+}
 
 function sanitizeProjectId(value: string): string {
   return value.trim().replace(/[^A-Za-z0-9_.-]/g, "-").replace(/-+/g, "-").slice(0, 96);
@@ -223,8 +255,29 @@ export type IdentityResolutionMode = "lookup" | "register" | "strict_existing";
 export class ProjectIdentityResolver {
   constructor(
     private readonly store: SQLiteMemoryStore,
-    private readonly recordedBy: string
+    private readonly recordedBy: string,
+    /**
+     * v1.1.2 (issue #21): default-off legacy escape
+     * hatch. When `true`, a `project_id`-only call
+     * without a registered identity row is allowed
+     * to proceed in "unbound" mode (the resolver
+     * returns `ok` with `identity_status: "unbound"`).
+     * Production callers default this to
+     * `isUnboundProjectIdAllowed()`; tests inject
+     * `true` to exercise the legacy behaviour.
+     */
+    private readonly allowUnbound: boolean = isUnboundProjectIdAllowed()
   ) {}
+
+  /**
+   * v1.1.2 (issue #21): expose the constructor's
+   * `allowUnbound` flag so the CLI / resource health
+   * payload can declare "strict isolation is
+   * disabled" without re-reading the env var.
+   */
+  isAllowUnbound(): boolean {
+    return this.allowUnbound;
+  }
 
   resolve(
     input: ScopeInput,
@@ -248,22 +301,40 @@ export class ProjectIdentityResolver {
       return resolveMemoryScopeWithStore(input, this.store, this.recordedBy);
     }
     if (input.project_id !== undefined) {
-      // Stage 16 v1.1.1 PR-2 (#14): back-compat for
-      // `project_id`-only inputs. A `project_id`-only
-      // call does not supply a `project_path`, so we
-      // cannot create or consult an identity row. The
-      // call falls through to the store-less path that
-      // v1.1.0 used, which returned
-      // `ok({scope, project_id})` without an identity
-      // check. A `project_path` input continues to
-      // flow through the strict path (any mode +
-      // `project_path` consults the store and may
-      // create an identity in `register` mode).
-      // The strict "no implicit identity from an id
-      // alone" rule is reserved for v1.1.2 once the
-      // public callers have been updated to supply
-      // an explicit `project_path`.
-      return resolveMemoryScopeWithStore(input, undefined, this.recordedBy);
+      // v1.1.2 (issue #21): strict-by-default. A
+      // `project_id`-only call must resolve to a
+      // registered identity. The store-backed lookup
+      // finds it; if missing, the legacy escape hatch
+      // (env var) returns an explicit
+      // `identity_status: "unbound"`; otherwise we
+      // refuse with `invalid_scope`. The previous
+      // v1.1.1 PR-2 (#14) back-compat branch fell
+      // through to the store-less path, which silently
+      // created new project namespaces on first use
+      // — that is the default-unbound fallback this
+      // task closes.
+      const identity = this.store.getProjectIdentity(input.project_id);
+      if (identity !== undefined) {
+        return ok({
+          scope: "project",
+          project_id: input.project_id,
+          project_path: identity.canonical_path,
+          display_name: basename(identity.canonical_path),
+          identity_status: "bound"
+        });
+      }
+      if (this.allowUnbound) {
+        return ok({
+          scope: "project",
+          project_id: input.project_id,
+          identity_status: "unbound"
+        });
+      }
+      return err(
+        "invalid_scope",
+        `project_id=${input.project_id} is not registered; supply project_path to create the identity, or set ${ENV_ALLOW_UNBOUND_PROJECT_ID}=1 to allow the legacy unbound mode`,
+        { project_id: input.project_id }
+      );
     }
     return err("invalid_scope", "project scope requires project_id or project_path");
   }
@@ -358,10 +429,17 @@ export function resolveMemoryScopeWithStore(
       if (identity === undefined) {
         return err(
           "invalid_scope",
-          `project_id=${project_id} is not registered; supply project_path to create the identity`,
+          `project_id=${project_id} is not registered; supply project_path to create the identity, or set ${ENV_ALLOW_UNBOUND_PROJECT_ID}=1 to allow the legacy unbound mode`,
           { project_id }
         );
       }
+      return ok({
+        scope: "project",
+        project_id,
+        project_path: identity.canonical_path,
+        display_name: basename(identity.canonical_path),
+        identity_status: "bound"
+      });
     }
     return ok({
       scope: "project",

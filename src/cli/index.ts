@@ -6,6 +6,7 @@
 
 import { resolveDataHome } from "../index.js";
 import { SQLiteMemoryStore } from "../sqlite-store.js";
+import { ProjectIdentityResolver } from "../scope-resolver.js";
 import { auditCommand } from "./commands/audit.js";
 import { backupCommand, restoreCommand } from "./commands/backup.js";
 import { doctorCommand } from "./commands/doctor.js";
@@ -23,6 +24,17 @@ export type CliContext = {
   dataHome: string;
   args: ParsedArgs;
   store: SQLiteMemoryStore;
+  /**
+   * v1.1.2 (issue #21): the per-CLI project identity
+   * resolver. Constructed once in `runCli` and shared
+   * with the project-scope commands (`export` in
+   * particular). A `project_id`-only call without a
+   * registered identity is rejected at the resolver
+   * before any store query runs. The legacy escape
+   * hatch (`AGENT_RECALL_ALLOW_UNBOUND_PROJECT_ID=1`)
+   * is read by the resolver constructor.
+   */
+  identityResolver: ProjectIdentityResolver;
   /**
    * Stage 14 PR-B1 (spec § 5.2 AR-P0-002): a per-invocation
    * RequestContext. The actor defaults to the
@@ -87,6 +99,20 @@ export async function runCli(
   const dataHomeOverride = typeof args.flags["data-home"] === "string" ? args.flags["data-home"] : undefined;
   const dataHome = dataHomeOverride ?? resolveDataHome(env);
   const store = new SQLiteMemoryStore(`${dataHome}/memory.sqlite`);
+  // v1.1.2 (issue #21): construct one identity resolver
+  // per CLI invocation. The recordedBy is `user:cli` so
+  // any auto-registered identity row carries the
+  // canonical CLI actor. The allowUnbound flag is read
+  // from the `AGENT_RECALL_ALLOW_UNBOUND_PROJECT_ID`
+  // env var at construction time; the resolver reads
+  // from the supplied env so a programmatic CLI test
+  // (e.g. `runCli(argv, env)`) can flip the flag
+  // without mutating `process.env`.
+  const identityResolver = new ProjectIdentityResolver(
+    store,
+    "user:cli",
+    env["AGENT_RECALL_ALLOW_UNBOUND_PROJECT_ID"] === "1"
+  );
   const ctx: RequestContext = buildRequestContext({
     actor_override: "user:cli",
     client_name: "agent-recall-cli",
@@ -105,7 +131,7 @@ export async function runCli(
     };
   }
   try {
-    const result = await handler({ dataHome, args, store, ctx });
+    const result = await handler({ dataHome, args, store, identityResolver, ctx });
     store.close();
     return result;
   } catch (error) {

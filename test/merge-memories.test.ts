@@ -104,7 +104,10 @@ describe("merge_memories", () => {
 
   it("rejects when an old id is in a different scope (project vs global)", () => {
     const g = service.remember(baseInput({ scope: "global" }));
-    const p = service.remember(baseInput({ scope: "project", project_id: "p1" }));
+    // v1.1.2 (issue #21): a project-scoped `remember`
+    // must carry a `project_path` so the strict
+    // resolver can register the identity.
+    const p = service.remember(baseInput({ scope: "project", project_id: "p1", project_path: "/tmp/p1" }));
     if (!g.ok || !p.ok) throw new Error("setup");
     const result = service.mergeMemories({
       old_memory_ids: [g.value.memory_id, p.value.memory_id],

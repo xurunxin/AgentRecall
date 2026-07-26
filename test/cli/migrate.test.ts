@@ -48,9 +48,13 @@ describe("migrateCommand", () => {
     // + project_aliases_new).
     // Stage 15 PR-M1-3: bumped to 9 (memory_feedback +
     // memory_recall_signals).
-    // Stage 15 PR-M3-1: bumped to 10 (memory hierarchy:
-    // tier, valid_from/until, memory_episodes).
-    expect(parsed.to).toBe(11);
+    // Stage 16 v1.1.1 PR-5: bumped to 11 (atomic
+    // maintenance apply: applying state,
+    // applied_result_json, idempotency_key_used).
+    // v1.1.2 (issue #21): bumped to 12 to add the
+    // v11 -> v12 backfill of `project_identities`
+    // from pre-existing `project_scopes` rows.
+    expect(parsed.to).toBe(12);
     store.close();
   });
 });

@@ -20,6 +20,7 @@ import { describe, expect, it } from "vitest";
 import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMemoryToolHandlers, registerMemoryTools } from "../src/tools/register-tools.js";
 import { registerMemoryResources } from "../src/mcp/resources.js";
+import { ProjectIdentityResolver } from "../src/scope-resolver.js";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -383,10 +384,12 @@ describe("MCP resources (spec § 6.3)", () => {
 
   it("registers all 5 resources", () => {
     const { server, calls } = captureServer();
+    const service = makeService();
     registerMemoryResources(server as unknown as Parameters<typeof registerMemoryResources>[0], {
-      store: makeService().store,
+      store: service.store,
       dataHome: "/tmp/foo",
-      defaultActor: "agent:test"
+      defaultActor: "agent:test",
+      identityResolver: new ProjectIdentityResolver(service.store, "agent:test")
     });
     expect(calls.map((c) => c.name)).toEqual([
       "memory_projects",
@@ -408,17 +411,31 @@ describe("MCP resources (spec § 6.3)", () => {
     registerMemoryResources(server as unknown as Parameters<typeof registerMemoryResources>[0], {
       store: service.store,
       dataHome: "/tmp/foo",
-      defaultActor: "agent:test"
+      defaultActor: "agent:test",
+      identityResolver: new ProjectIdentityResolver(service.store, "agent:test")
     });
     const health = calls.find((c) => c.name === "memory_health");
     if (health === undefined) throw new Error("memory_health not registered");
     const out = await health.cb(new URL("memory://health"), {}, undefined);
     const contents = (out as { contents: Array<{ mimeType: string; text: string }> }).contents;
     expect(contents[0]?.mimeType).toBe("application/json");
-    const payload = JSON.parse(contents[0]!.text) as { status: string; server_version: string; schema_version: number; data_home: string };
+    const payload = JSON.parse(contents[0]!.text) as {
+      status: string;
+      server_version: string;
+      schema_version: number;
+      data_home: string;
+      strict_isolation: boolean;
+      identity_status: string;
+      allow_unbound_project_id: boolean;
+    };
     expect(payload.status).toBe("ok");
     expect(payload.server_version).toEqual(expect.any(String));
     expect(payload.schema_version).toEqual(expect.any(Number));
     expect(payload.data_home).toBe("/tmp/foo");
+    // v1.1.2 (issue #21): the health resource
+    // surfaces the strict-isolation contract.
+    expect(payload.strict_isolation).toBe(true);
+    expect(payload.identity_status).toBe("bound");
+    expect(payload.allow_unbound_project_id).toBe(false);
   });
 });

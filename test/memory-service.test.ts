@@ -35,9 +35,16 @@ class FailingStageExporter extends MarkdownExporter {
 describe("MemoryService", () => {
   it("remembers, searches, and reads project memory", () => {
     const { store, memory } = service();
+    // v1.1.2 (issue #21): a project-scoped `remember`
+    // must carry a `project_path` (or a pre-registered
+    // identity) so the strict resolver can pin the
+    // canonical binding. The `project_path` is
+    // platform-resolved by `realpathSync` and the
+    // identity is recorded on the first register.
     const result = memory.remember({
       scope: "project",
       project_id: "repo-123",
+      project_path: "/tmp/repo-123",
       type: "debugging",
       topic: "database",
       title: "Postgres tests need local database",
@@ -330,6 +337,7 @@ describe("MemoryService", () => {
     const projectOld = memory.remember({
       scope: "project",
       project_id: "repo-a",
+      project_path: "/tmp/repo-a",
       type: "lesson",
       topic: "supersede",
       title: "Project old entry",
@@ -378,13 +386,37 @@ describe("MemoryService", () => {
 
     expect(crossScope).toMatchObject({ ok: false, error: "invalid_scope" });
     expect(crossProject).toMatchObject({ ok: false, error: "invalid_scope" });
+    // v1.1.2 (issue #21): the cross-project supersede
+    // surfaces `invalid_scope` at the strict resolver
+    // because `project_id: "repo-b"` has no registered
+    // identity. The replacement was never written so a
+    // search for the title would normally return an
+    // empty result; the new contract rejects the read
+    // up-front with `invalid_scope` (no namespace
+    // leakage). The "repo-a" search is fine because
+    // the identity was registered by `projectOld`'s
+    // `remember` call.
     expect(memory.searchMemories({ scope: "project", project_id: "repo-a", query: "replacement-cross-scope" }).items).toEqual([]);
-    expect(memory.searchMemories({ scope: "project", project_id: "repo-b", query: "replacement-cross-project" }).items).toEqual([]);
-    // listAuditEvents orders by (created_at, id); the two rejections
-    // share a millisecond so the tiebreak on the random id is
-    // order-dependent. Use an order-insensitive assertion: each
-    // expected event must appear, in any position.
-    expect(store.listAuditEvents({ event: "write_rejected" })).toEqual(
+    const repoBSearch = memory.searchMemories({ scope: "project", project_id: "repo-b", query: "replacement-cross-project" });
+    expect(repoBSearch.ok).toBe(false);
+    if (repoBSearch.ok) return;
+    expect(repoBSearch.error).toBe("invalid_scope");
+    // listAuditEvents orders by (created_at, id); the
+    // two rejections share a millisecond so the tiebreak
+    // on the random id is order-dependent. Use an
+    // order-insensitive assertion: each expected event
+    // must appear, in any position. v1.1.2 (issue #21):
+    // the cross-project supersede is rejected at the
+    // strict resolver (the replacement's `project_id:
+    // "repo-b"` has no registered identity) so the
+    // audit event surfaces `project_id: "repo-b"`
+    // rather than the v1.1.0 cross-scope metadata
+    // (`replacement_scope` / `replacement_project_id`).
+    // The cross-scope rejection is unchanged and still
+    // emits the old-shape audit.
+    const rejectedAudits = store.listAuditEvents({ event: "write_rejected" });
+    expect(rejectedAudits.length).toBeGreaterThanOrEqual(1);
+    expect(rejectedAudits).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
           memory_id: globalOld.value.memory_id,
@@ -396,17 +428,21 @@ describe("MemoryService", () => {
             replacement_scope: "project",
             replacement_project_id: "repo-a"
           })
-        }),
+        })
+      ])
+    );
+    // The cross-project supersede is now caught at the
+    // strict resolver. The audit event's shape is the
+    // resolver rejection (no `memory_id`, project_id
+    // is the unbound `repo-b`).
+    expect(rejectedAudits).toEqual(
+      expect.arrayContaining([
         expect.objectContaining({
-          memory_id: projectOld.value.memory_id,
           scope: "project",
-          project_id: "repo-a",
+          project_id: "repo-b",
           reason: "invalid_scope",
           metadata: expect.objectContaining({
-            error: "invalid_scope",
-            memory_id: projectOld.value.memory_id,
-            replacement_scope: "project",
-            replacement_project_id: "repo-b"
+            error: "invalid_scope"
           })
         })
       ])
@@ -449,20 +485,36 @@ describe("MemoryService", () => {
 
     expect(rejected).toMatchObject({ ok: false, error: "invalid_scope" });
     expect(store.getProjectScope("repo-created-by-preflight")).toBeUndefined();
-    expect(memory.searchMemories({ scope: "project", project_id: "repo-created-by-preflight", query: "replacement-should-not-create-scope" }).items).toEqual([]);
-    expect(store.listAuditEvents({ event: "write_rejected" })).toEqual([
+    // v1.1.2 (issue #21): the unbound `project_id` is
+    // rejected at the resolver; the search returns
+    // `invalid_scope` instead of an empty result. The
+    // pre-v1.1.2 contract leaked the registered
+    // namespace as a silent empty result, which is
+    // the exact v1.1.2 default-unbound fallback that
+    // task #21 closes. The single `write_rejected`
+    // audit is the resolver rejection (no `memory_id`
+    // because the rejection happens at the input
+    // layer, before any entry is constructed).
+    const search = memory.searchMemories({
+      scope: "project",
+      project_id: "repo-created-by-preflight",
+      query: "replacement-should-not-create-scope"
+    });
+    expect(search.ok).toBe(false);
+    if (search.ok) return;
+    expect(search.error).toBe("invalid_scope");
+    const rejectedAudits = store.listAuditEvents({ event: "write_rejected" });
+    expect(rejectedAudits).toHaveLength(1);
+    expect(rejectedAudits[0]).toEqual(
       expect.objectContaining({
-        memory_id: old.value.memory_id,
-        scope: "global",
+        scope: "project",
+        project_id: "repo-created-by-preflight",
         reason: "invalid_scope",
         metadata: expect.objectContaining({
-          error: "invalid_scope",
-          memory_id: old.value.memory_id,
-          replacement_scope: "project",
-          replacement_project_id: "repo-created-by-preflight"
+          error: "invalid_scope"
         })
       })
-    ]);
+    );
     store.close();
   });
 
@@ -477,6 +529,7 @@ describe("MemoryService", () => {
     const old = memory.remember({
       scope: "project",
       project_id: "repo-a",
+      project_path: "/tmp/repo-a",
       type: "lesson",
       topic: "supersede",
       title: "Repo A old memory",
@@ -583,6 +636,7 @@ describe("MemoryService", () => {
     const project = memory.remember({
       scope: "project",
       project_id: "repo-123",
+      project_path: "/tmp/repo-123",
       type: "debugging",
       topic: "database",
       title: "Repo postgres setup",
@@ -823,6 +877,7 @@ describe("MemoryService", () => {
     const first = memory.remember({
       scope: "project",
       project_id: "repo-123",
+      project_path: "/tmp/repo-123",
       type: "lesson",
       topic: "updates",
       title: "Original title",
@@ -954,6 +1009,7 @@ describe("MemoryService", () => {
     expect(memory.remember({
       scope: "project",
       project_id: "repo-a",
+      project_path: "/tmp/repo-a",
       type: "lesson",
       topic: "budget",
       title: "Repo A",
@@ -966,6 +1022,7 @@ describe("MemoryService", () => {
     expect(memory.remember({
       scope: "project",
       project_id: "repo-b",
+      project_path: "/tmp/repo-b",
       type: "lesson",
       topic: "budget",
       title: "Repo B",
@@ -1008,6 +1065,7 @@ describe("MemoryService", () => {
     const project = memory.remember({
       scope: "project",
       project_id: "repo-a",
+      project_path: "/tmp/repo-a",
       type: "debugging",
       topic: "shell",
       title: "Repo A rtk wrapper",
@@ -1020,6 +1078,7 @@ describe("MemoryService", () => {
     const otherProject = memory.remember({
       scope: "project",
       project_id: "repo-b",
+      project_path: "/tmp/repo-b",
       type: "debugging",
       topic: "shell",
       title: "Repo B rtk wrapper",
@@ -1032,6 +1091,7 @@ describe("MemoryService", () => {
     const forgotten = memory.remember({
       scope: "project",
       project_id: "repo-a",
+      project_path: "/tmp/repo-a",
       type: "lesson",
       topic: "shell",
       title: "Forgotten rtk note",
@@ -1423,6 +1483,7 @@ describe("MemoryService", () => {
     const low = memory.remember({
       scope: "project",
       project_id: "repo-a",
+      project_path: "/tmp/repo-a",
       type: "lesson",
       topic: "cleanup",
       title: "Low value cleanup note",
@@ -1435,6 +1496,7 @@ describe("MemoryService", () => {
     const protectedEntry = memory.remember({
       scope: "project",
       project_id: "repo-a",
+      project_path: "/tmp/repo-a",
       type: "lesson",
       topic: "cleanup",
       title: "User cleanup note",

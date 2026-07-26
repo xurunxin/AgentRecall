@@ -2,6 +2,8 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
 import { nowIso } from "./domain.js";
+
+const IS_WINDOWS = process.platform === "win32";
 import type {
   AuditEventName,
   MemoryAuditEvent,
@@ -107,7 +109,7 @@ export type SearchFilters = EntryFilters & {
  * (entries past their `valid_until` decay, entries
  * not yet at `valid_from` are excluded from recall).
  */
-export const CURRENT_SCHEMA_VERSION = 11;
+export const CURRENT_SCHEMA_VERSION = 12;
 
 /**
  * Stage 12 PR9: thrown by `updateEntryWithRevision` when
@@ -853,6 +855,10 @@ export class SQLiteMemoryStore {
       this.migrate_v10_to_v11();
       return;
     }
+    if (version === 12) {
+      this.migrate_v11_to_v12();
+      return;
+    }
     throw new Error(`No migration registered for schema version ${version}`);
   }
 
@@ -1463,6 +1469,123 @@ export class SQLiteMemoryStore {
           ON maintenance_plans(state, expires_at);
       `);
       this.db.exec("PRAGMA user_version = 11");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * v1.1.2 (issue #21): v11 -> v12 schema migration.
+   * Backfills `project_identities` from the pre-existing
+   * `project_scopes` rows so a v1.1.1 database that never
+   * had a `project_identities` row (because every
+   * registration went through `configureProjectBudget`
+   * and only wrote the v1.0 `project_scopes` table) gains
+   * a corresponding identity row under the strict
+   * v1.1.2 contract.
+   *
+   * The backfill refuses ambiguous mappings: a single
+   * canonical path bound to two distinct `project_id`s,
+   * or two distinct canonical paths bound to a single
+   * `project_id`, fails the migration. The operator must
+   * resolve the conflict by hand (drop the duplicate
+   * `project_scopes` row, or move one of the directories
+   * under a different name) and re-run `migrate --yes`.
+   * The backfill never guesses.
+   *
+   * Windows: the path-to-id map is case-folded so the
+   * same case-insensitive path shared by two projects
+   * (e.g. one registered as `C:\Repos\Phoenix` and a
+   * later one as `c:\repos\phoenix`) is detected as an
+   * ambiguity on both POSIX and Windows.
+   */
+  private migrate_v11_to_v12(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      // No-op short-circuit when the v8 tables are
+      // missing — the database was created at v1.0
+      // and never had identities to backfill. The
+      // migration just advances the user_version
+      // marker so the next migration can run.
+      const hasIdentities = this.db
+        .prepare(
+          "SELECT 1 AS n FROM sqlite_master WHERE type = 'table' AND name = 'project_identities'"
+        )
+        .get() as { n: number } | undefined;
+      if (hasIdentities === undefined) {
+        this.db.exec("PRAGMA user_version = 12");
+        this.db.exec("COMMIT");
+        return;
+      }
+      const scopeRows = this.db
+        .prepare(
+          "SELECT project_id, canonical_path, created_at FROM project_scopes"
+        )
+        .all() as Array<{ project_id: string; canonical_path: string; created_at: string }>;
+      // Path -> ids (Windows case-folded).
+      const pathToIds = new Map<string, string[]>();
+      // project_id -> paths.
+      const idToPaths = new Map<string, string[]>();
+      for (const row of scopeRows) {
+        const key = IS_WINDOWS ? row.canonical_path.toLowerCase() : row.canonical_path;
+        const pathList = pathToIds.get(key) ?? [];
+        pathList.push(row.project_id);
+        pathToIds.set(key, pathList);
+        const idList = idToPaths.get(row.project_id) ?? [];
+        idList.push(row.canonical_path);
+        idToPaths.set(row.project_id, idList);
+      }
+      // Refuse ambiguous mappings. A path bound to two
+      // project_ids is a hard conflict; a project_id
+      // bound to two distinct canonical paths is also a
+      // hard conflict (a v1.0 scope row was updated to
+      // a new path without an explicit identity reset).
+      const pathConflicts: string[] = [];
+      for (const [path, ids] of pathToIds.entries()) {
+        if (ids.length > 1) pathConflicts.push(`${path} -> [${ids.join(", ")}]`);
+      }
+      if (pathConflicts.length > 0) {
+        throw new Error(
+          `v1.1.2 backfill: ambiguous canonical paths in project_scopes. ` +
+            `Resolve manually before re-running migrate:\n  ${pathConflicts.join("\n  ")}`
+        );
+      }
+      const idConflicts: string[] = [];
+      for (const [id, paths] of idToPaths.entries()) {
+        if (paths.length > 1) {
+          const distinct = IS_WINDOWS
+            ? [...new Set(paths.map((p) => p.toLowerCase()))]
+            : [...new Set(paths)];
+          if (distinct.length > 1) {
+            idConflicts.push(`${id} -> [${distinct.join(", ")}]`);
+          }
+        }
+      }
+      if (idConflicts.length > 0) {
+        throw new Error(
+          `v1.1.2 backfill: ambiguous project_ids in project_scopes. ` +
+            `Resolve manually before re-running migrate:\n  ${idConflicts.join("\n  ")}`
+        );
+      }
+      // Create one identity per scope row. `INSERT OR
+      // IGNORE` is idempotent so a manual re-run of the
+      // migration does not double-write.
+      for (const row of scopeRows) {
+        this.createProjectIdentity({
+          project_id: row.project_id,
+          canonical_path: row.canonical_path,
+          // The recorded_by is the system backfill
+          // agent (the v1.1.2 contract surfaces this
+          // on the identity row so an operator can
+          // see which identities were auto-promoted
+          // from a v1.1.1 scope row).
+          created_by: "system:backfill",
+          created_at: row.created_at
+        });
+      }
+      this.db.exec("PRAGMA user_version = 12");
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");

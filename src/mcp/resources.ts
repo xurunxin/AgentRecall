@@ -32,11 +32,24 @@ import { CURRENT_SCHEMA_VERSION } from "../sqlite-store.js";
 import { serverVersion } from "../server-version.js";
 import { listBackups } from "../backup.js";
 import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { ProjectIdentityResolver } from "../scope-resolver.js";
 
 export interface MemoryServerContext {
   readonly store: SQLiteMemoryStore;
   readonly dataHome?: string;
   readonly defaultActor: string;
+  /**
+   * v1.1.2 (issue #21): the per-server project identity
+   * resolver. The per-project resources
+   * (`memory://project/{id}/summary` /
+   * `memory://project/{id}/memory/{mid}`) route through
+   * `strict_existing` so a request for an unknown id
+   * is rejected at the resolver before any store
+   * query. The health resource surfaces the resolver's
+   * `allowUnbound` flag and the current
+   * `identity_status` for the active configuration.
+   */
+  readonly identityResolver: ProjectIdentityResolver;
 }
 
 type Variables = Record<string, string | string[] | undefined>;
@@ -173,6 +186,22 @@ export function registerMemoryResources(server: MemoryResourceServer, ctx: Memor
       if (projectId === undefined || projectId.length === 0) {
         return jsonResource(uri, { ok: false, error: "not_found", message: "missing project_id" });
       }
+      // v1.1.2 (issue #21): route through the strict
+      // resolver. An unknown `project_id` is rejected
+      // here with `identity_status: "unbound"` (or
+      // `invalid_scope` when strict isolation is on).
+      const resolved = ctx.identityResolver.resolve(
+        { scope: "project", project_id: projectId },
+        "strict_existing"
+      );
+      if (!resolved.ok) {
+        return jsonResource(uri, {
+          ok: false,
+          error: "not_found",
+          message: `project ${projectId} not registered`,
+          identity_status: ctx.identityResolver.isAllowUnbound() ? "unbound" : "strict"
+        });
+      }
       const scope = ctx.store.getProjectScope(projectId);
       if (scope === undefined) {
         return jsonResource(uri, { ok: false, error: "not_found", message: `project ${projectId} not found` });
@@ -182,6 +211,7 @@ export function registerMemoryResources(server: MemoryResourceServer, ctx: Memor
       return jsonResource(uri, {
         project_id: projectId,
         display_name: scope.display_name,
+        identity_status: resolved.value.identity_status,
         budget: scope.budget,
         usage: { active_entries: budget.active_entries, active_chars: budget.active_chars },
         status_counts: countByStatus(entries),
@@ -204,12 +234,25 @@ export function registerMemoryResources(server: MemoryResourceServer, ctx: Memor
       if (projectId === undefined || memoryId === undefined) {
         return jsonResource(uri, { ok: false, error: "not_found", message: "missing project_id or memory_id" });
       }
+      // v1.1.2 (issue #21): strict resolver check.
+      const resolved = ctx.identityResolver.resolve(
+        { scope: "project", project_id: projectId },
+        "strict_existing"
+      );
+      if (!resolved.ok) {
+        return jsonResource(uri, {
+          ok: false,
+          error: "not_found",
+          message: `project ${projectId} not registered`,
+          identity_status: ctx.identityResolver.isAllowUnbound() ? "unbound" : "strict"
+        });
+      }
       const entry = ctx.store.peekEntry(memoryId);
       if (entry === undefined || entry.scope !== "project" || entry.project_id !== projectId) {
         return jsonResource(uri, { ok: false, error: "not_found", message: `memory ${memoryId} not in project ${projectId}` });
       }
       const audit: MemoryAuditEvent[] = ctx.store.listAuditEvents({ memory_id: memoryId });
-      return jsonResource(uri, { entry, audit });
+      return jsonResource(uri, { entry, audit, identity_status: resolved.value.identity_status });
     }
   );
 
@@ -245,12 +288,29 @@ export function registerMemoryResources(server: MemoryResourceServer, ctx: Memor
       const dataHome = ctx.dataHome;
       const backupDir = dataHome === undefined ? undefined : `${dataHome}/backups`;
       const backupEntries = backupDir === undefined ? [] : listBackups(backupDir);
+      // v1.1.2 (issue #21): surface the strict
+      // isolation contract on the health resource.
+      // `strict_isolation: true` is the documented
+      // v1.1.2 default; the operator opts into the
+      // legacy unbound mode via
+      // `AGENT_RECALL_ALLOW_UNBOUND_PROJECT_ID=1`.
+      const allowUnbound = ctx.identityResolver.isAllowUnbound();
       return jsonResource(uri, {
         status: "ok",
         server_version: serverVersion(),
         schema_version: CURRENT_SCHEMA_VERSION,
         default_actor: ctx.defaultActor,
         data_home: dataHome,
+        strict_isolation: !allowUnbound,
+        // v1.1.2 (issue #21): `identity_status` is
+        // `bound` when strict isolation is on (the
+        // default) and `unbound` when the legacy
+        // escape hatch is enabled. The CLI / MCP
+        // client surfaces this in the response so
+        // an operator can verify the runtime mode
+        // without re-reading the env var.
+        identity_status: allowUnbound ? "unbound" : "bound",
+        allow_unbound_project_id: allowUnbound,
         backup: {
           dir: backupDir,
           entry_count: backupEntries.length,

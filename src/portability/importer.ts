@@ -79,6 +79,7 @@ import { err, ok } from "../domain.js";
 import { detectSecrets } from "../secret-detector.js";
 import { validateRememberInput } from "../write-validator.js";
 import type { MemoryService } from "../memory-service.js";
+import { ProjectIdentityResolver } from "../scope-resolver.js";
 import { readManifest, verifyManifest, MANIFEST_FILENAME, type Manifest } from "./manifest.js";
 import {
   computeBundleHash,
@@ -314,6 +315,20 @@ export function preflightImport(
   // identity is rejected at the preflight stage
   // (rather than silently creating a new identity
   // from the bundle).
+  // v1.1.2 (issue #21): the preflight constructs a
+  // strict resolver from the target store and
+  // runs it for every project-scoped entry. The
+  // resolver surfaces `identity_status: "bound"`
+  // when a `project_identities` row exists and
+  // `invalid_scope` when the bundle tries to
+  // import into an unknown / unbound namespace.
+  // Path-supplied entries are still allowed to
+  // register an identity (the strict resolver's
+  // path branch routes through
+  // `resolveMemoryScopeWithStore(this.store, ...)`)
+  // so a v1 export that carries the original
+  // `project_path` per entry is honoured.
+  const identityResolver = new ProjectIdentityResolver(service.store, options.actor);
   for (const entry of bundle.entries) {
     // 1. schema / enum / secret. The validator may
     // reject the entry with `invalid_schema` OR
@@ -349,21 +364,45 @@ export function preflightImport(
         { entry_id: entry.id }
       );
     }
-    // 4. project identity. We require that a
-    //    project entry carries a `project_id`
-    //    (or a `project_path` that the apply
-    //    phase can resolve). The apply phase
-    //    uses the strict_existing resolver, so a
-    //    `project_id` that has not been
-    //    registered will fail at apply time.
-    //    Here we just enforce the field shape.
+    // 4. project identity. v1.1.2 (issue #21): the
+    //    preflight now runs the strict resolver on
+    //    every project-scoped entry. A `project_id`
+    //    that has not been registered on the target
+    //    store surfaces `identity_conflict` so the
+    //    bundle is rejected at preflight (the apply
+    //    phase used to be the only gate, and the
+    //    preflight's "we'll just enforce the field
+    //    shape" comment was wrong — apply does not
+    //    run the resolver on inserts, so an
+    //    unbound `project_id` would silently
+    //    create a new namespace).
     if (entry.scope === "project") {
       const projectId = entry.project_id;
-      if (projectId === undefined && entry.project_path === undefined) {
+      const projectPath = entry.project_path;
+      if (projectId === undefined && projectPath === undefined) {
         return err(
           "invalid_schema",
           `entry ${entry.id} has project scope but no project_id / project_path`,
           { entry_id: entry.id }
+        );
+      }
+      const identityResolved = identityResolver.resolve(
+        {
+          scope: "project",
+          ...(projectId !== undefined ? { project_id: projectId } : {}),
+          ...(projectPath !== undefined ? { project_path: projectPath } : {})
+        },
+        "strict_existing"
+      );
+      if (!identityResolved.ok) {
+        return err(
+          "identity_conflict",
+          `entry ${entry.id} targets an unbound / conflicting project: ${identityResolved.message}`,
+          {
+            entry_id: entry.id,
+            ...(projectId !== undefined ? { project_id: projectId } : {}),
+            ...(projectPath !== undefined ? { project_path: projectPath } : {})
+          }
         );
       }
     }

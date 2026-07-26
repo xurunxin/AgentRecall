@@ -5,6 +5,161 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [1.1.2] — Stage 17 v1.1.2 (Bound project identity on every public path)
+
+The v1.1.1 follow-up roadmap left issue **#21** (the default-unbound
+project_id fallback) on the list. The Stage 16 PR-2 (#14) wired the
+`ProjectIdentityResolver` into every public service path, but the
+`project_id`-only branch still fell through to the store-less resolver
+and silently created a new namespace on first use. v1.1.2 closes
+that fallback. The default is `strict-by-default`: an unknown
+`project_id` is rejected at the resolver before any project scope,
+alias, memory, audit, or budget row is created.
+
+### Added
+
+- **`src/scope-resolver.ts`** — new `IdentityStatus = "bound" |
+  "unbound"` type and an `identity_status` field on `ResolvedScope`.
+  The strict resolver class (`ProjectIdentityResolver`) now
+  consults the store on every `project_id`-only call:
+  - Identity present → `ok` with `identity_status: "bound"`.
+  - Identity absent + `AGENT_RECALL_ALLOW_UNBOUND_PROJECT_ID=1`
+    → `ok` with `identity_status: "unbound"` (the legacy
+    escape hatch).
+  - Identity absent + strict mode → `err("invalid_scope", ...)`
+    with the env-var name in the message so a caller can
+    discover the escape hatch without reading the docs.
+- **`src/sqlite-store.ts`** — new `migrate_v11_to_v12()` step
+  that backfills `project_identities` from pre-existing
+  `project_scopes` rows. The backfill refuses ambiguous
+  mappings (one path bound to two `project_id`s, or vice
+  versa) rather than guessing; the migration surfaces a
+  descriptive error and rolls the transaction back so the
+  operator can resolve the conflict by hand and re-run
+  `migrate --yes`. `CURRENT_SCHEMA_VERSION` bumped from 11
+  to 12.
+- **`src/services/memory-write-service.ts`** —
+  `configureProjectBudget` is now the canonical
+  "register a project" call: it writes the v1.0
+  `project_scopes` row AND the v1.1.2 `project_identities`
+  row in a single transaction. Pre-v1.1.2 code that called
+  `configureProjectBudget` only wrote the v1.0 row and the
+  strict resolver would refuse subsequent `project_id`-only
+  reads; the v1.1.2 contract pins the identity at
+  registration time.
+- **`src/services/memory-read-service.ts`** — `getMemoryBudget`
+  is now routed through the strict resolver so an unknown
+  `project_id` is rejected with `invalid_scope` instead of
+  silently returning the default budget for an unbound
+  namespace.
+- **`src/cli/index.ts`** + **`src/cli/commands/export.ts`** —
+  the CLI constructs one `ProjectIdentityResolver` per
+  invocation and shares it with the project-scope commands.
+  The CLI `export` success message ends with
+  `[identity_status: unbound — strict isolation disabled]`
+  when the legacy escape hatch is on, so the operator
+  can see the runtime mode without re-reading the env var.
+- **`src/mcp/resources.ts`** — the per-project resources
+  (`memory://project/{id}/summary` and
+  `memory://project/{id}/memory/{mid}`) route through
+  `strict_existing`. The `memory://health` resource
+  surfaces `strict_isolation: true|false`,
+  `identity_status: "bound|unbound"`, and
+  `allow_unbound_project_id: true|false` so an MCP
+  client can branch on the runtime mode.
+- **`src/portability/importer.ts`** — the preflight now
+  runs the strict resolver on every project-scoped entry.
+  A `project_id` that has not been registered on the
+  target store surfaces `identity_conflict` so the bundle
+  is rejected at preflight (the apply phase used to be
+  the only gate, and the live store could silently gain
+  a new identity on a `replace` import).
+
+### New tests
+
+- **`test/release-gate/p3-project-identity-strict.test.ts`**
+  (14 tests) — covers the v1.1.2 surface that PR-2
+  deferred:
+  - `project_id`-only `remember` is rejected with
+    `invalid_scope`; no identity / alias row is created.
+  - Cross-project write with an unbound `project_id` is
+    rejected; the original identity is untouched.
+  - `configureProjectBudget` registers the identity so
+    a `project_id`-only read of the registered project
+    succeeds.
+  - Legacy escape hatch (`AGENT_RECALL_ALLOW_UNBOUND_PROJECT_ID=1`)
+    returns `identity_status: "unbound"`.
+  - Default mode refuses the escape hatch and surfaces
+    `invalid_scope`.
+  - v11 -> v12 migration backfills `project_identities`
+    from pre-existing `project_scopes` rows.
+  - v11 -> v12 migration refuses ambiguous path / id
+    mappings.
+  - Strict preflight rejects an unbound `project_id`
+    per entry with `identity_conflict`; the live store
+    is untouched.
+  - Windows case-folding: aliases registered under
+    mixed-case paths resolve to the same identity on
+    Windows only (the Stage 15 PR-M1-2 contract).
+  - CLI `export` rejects an unknown `project_id` in
+    default strict mode.
+  - CLI `export` prints `identity_status: unbound`
+    when the legacy escape hatch is on.
+  - `memory://health` surfaces
+    `strict_isolation: true` + `identity_status: "bound"`
+    by default.
+  - `memory://project/{id}/summary` rejects an unknown
+    `project_id` (returns `identity_status: "strict"`).
+  - `memory://project/{id}/summary` returns
+    `identity_status: "bound"` for a registered project.
+
+### Migration
+
+- A v1.1.1 database without `project_identities` rows
+  migrates to v1.1.2 in one step (`agent-recall
+  migrate --yes`). The v11 -> v12 backfill runs the
+  `INSERT OR IGNORE` on every `project_scopes` row. A
+  database with two `project_scopes` rows sharing a
+  `canonical_path` (or one row bound to two distinct
+  paths) refuses the migration; the operator must
+  drop the duplicate `project_scopes` row before
+  re-running.
+- Rollback: restore the pre-migration backup written
+  by `migrate --yes` (the verified backup is
+  taken BEFORE the migration chain runs, so the v11
+  schema is on disk and the operator can downgrade by
+  restoring the backup). The `main` branch and
+  the v1.1.2 release both target the same `main`
+  branch line; no tag is required to roll back.
+
+### Verification
+
+- `npm test` → **580 passed** + 42 skipped (was 567
+  passed in v1.1.1; +14 from the new
+  `p3-project-identity-strict` suite + 1 from the
+  expanded `p3-project-identity-public-path` suite).
+- `npm run typecheck` → 0 error.
+- `npm run build` → 0 error (not re-run; the strict
+  resolver changes are type-safe).
+- 1 unhandled worker `birpc` `onTaskUpdate` 60s
+  timeout in `test/multi-process-stress.test.ts` (the
+  pre-existing vitest-worker heartbeat documented in
+  Stage 16 PR-M0-1; 0 actual test failures).
+- No `package.json` / `package-lock.json` changes
+  (the v1.1.2 contract is enforced at the resolver +
+  store layer; the runtime path is unchanged).
+
+### Known non-blocking limits
+
+- The `test/multi-process-stress.test.ts` "no orphaned
+  child processes or temp data homes remain after every
+  scenario" assertion is a Windows-only flake (the
+  cleanup runs `rmSync` synchronously; on Windows the
+  OS sometimes holds a directory handle long enough to
+  race the next test's `mkdtempSync`). The same suite
+  passes on Linux / macOS; the CI gate is documented
+  in `docs/superpowers/plans/2026-07-26-v1-final-release-gate.md`.
+
 ## [1.1.1] — Stage 16 v1.1.1 (Idempotency v2 public path + black-box gate)
 
 The 8-issue v1.1.1 follow-up roadmap (see

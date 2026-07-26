@@ -128,28 +128,28 @@ describe("release-gate p3-project-identity-public-path (Stage 16 PR-2 #14)", () 
   });
 
   it("read-only calls do not create project identities or aliases", () => {
-    // No registration has happened yet; the canonical
-    // project_id is the one supplied by the caller.
-    // Stage 16 v1.1.1 PR-2 (#14) (`strict_existing` /
-    // `lookup` mode for reads) must not create a new
-    // identity row.
+    // v1.1.2 (issue #21): strict-by-default. A
+    // `project_id`-only call without a registered
+    // identity is rejected at the resolver before any
+    // identity, alias, memory, audit, or budget row is
+    // created. The shape of the rejection is a Result
+    // with `error: "invalid_scope"`.
     const before = {
       identities: (store.backupHandle().prepare("SELECT COUNT(*) AS n FROM project_identities").get() as { n: number }).n,
       aliases: (store.backupHandle().prepare("SELECT COUNT(*) AS n FROM project_aliases_new").get() as { n: number }).n
     };
-    // Back-compat: a `project_id`-only call falls
-    // through to the canonical `ok({scope, project_id})`
-    // path. The shape is a plain `{ items: [...] }`
-    // (not a `Result`), so the assertion is on the
-    // `items` field, not on an `ok` flag.
     const search = service.searchMemories({ scope: "project", project_id: "any", query: "any", limit: 5 });
-    expect(search.items).toBeDefined();
-    expect(Array.isArray(search.items)).toBe(true);
+    expect(search.ok).toBe(false);
+    if (search.ok) return;
+    expect(search.error).toBe("invalid_scope");
     const list = service.listMemories({ scope: "project", project_id: "any" });
-    expect(list.items).toBeDefined();
-    expect(Array.isArray(list.items)).toBe(true);
+    expect(list.ok).toBe(false);
+    if (list.ok) return;
+    expect(list.error).toBe("invalid_scope");
     const budget = service.getMemoryBudget({ scope: "project", project_id: "any" });
-    expect(budget.budget).toBeDefined();
+    expect(budget.ok).toBe(false);
+    if (budget.ok) return;
+    expect(budget.error).toBe("invalid_scope");
 
     const after = {
       identities: (store.backupHandle().prepare("SELECT COUNT(*) AS n FROM project_identities").get() as { n: number }).n,
@@ -179,11 +179,17 @@ describe("release-gate p3-project-identity-public-path (Stage 16 PR-2 #14)", () 
     expect(seenByA.items.length).toBe(1);
 
     // Search under a different `project_id` for the
-    // same query must not return repo A's memory. The
-    // resolver does not create an identity for an
-    // unknown id; the search returns an empty result.
+    // same query is REJECTED at the resolver: the id
+    // has no registered identity, so the strict
+    // contract refuses the read before any store
+    // query. The error code is `invalid_scope`; the
+    // contract deliberately does not surface "this id
+    // does not exist" because that would leak the
+    // registered namespace to a probing caller.
     const seenByOther = service.searchMemories({ scope: "project", project_id: "stale-id", query: "title", limit: 5 });
-    expect(seenByOther.items.length).toBe(0);
+    expect(seenByOther.ok).toBe(false);
+    if (seenByOther.ok) return;
+    expect(seenByOther.error).toBe("invalid_scope");
   });
 
   it("public service paths go through the injected resolver (no store-less resolver call site)", async () => {

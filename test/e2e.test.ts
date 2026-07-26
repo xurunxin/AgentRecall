@@ -52,6 +52,7 @@ describe("AgentRecall e2e", () => {
       const remembered = service.remember({
         scope: "project",
         project_id: "repo-e2e",
+        project_path: "/tmp/repo-e2e",
         type: "lesson",
         topic: "sqlite",
         title: "Project memory stays scoped",

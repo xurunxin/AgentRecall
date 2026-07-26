@@ -10,6 +10,7 @@ import { SQLiteMemoryStore } from "./sqlite-store.js";
 import { registerMemoryTools } from "./tools/register-tools.js";
 import { registerMemoryResources } from "./mcp/resources.js";
 import { resolveActor } from "./actor.js";
+import { ProjectIdentityResolver } from "./scope-resolver.js";
 import { serverVersion } from "./server-version.js";
 
 export function serverName(): string {
@@ -50,6 +51,15 @@ export async function main(): Promise<void> {
   const dataHome = resolveDataHome();
   const service = createService(dataHome);
   const defaultActor = resolveActor(undefined);
+  // v1.1.2 (issue #21): construct one identity
+  // resolver per MCP process and share it with the
+  // resource layer so the per-project templates and
+  // the health resource surface the strict isolation
+  // contract. The resolver reads the
+  // `AGENT_RECALL_ALLOW_UNBOUND_PROJECT_ID` env var
+  // at construction time; the recordedBy is the
+  // server's default actor.
+  const identityResolver = new ProjectIdentityResolver(service.store, defaultActor);
   const server = new McpServer({
     name: serverName(),
     version: serverVersion()
@@ -58,7 +68,8 @@ export async function main(): Promise<void> {
   registerMemoryResources(server, {
     store: service.store,
     dataHome,
-    defaultActor
+    defaultActor,
+    identityResolver
   });
 
   const transport = new StdioServerTransport();

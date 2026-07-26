@@ -120,6 +120,28 @@ export class MemoryWriteService {
       created_at: existing?.created_at ?? now,
       updated_at: now
     };
+    // v1.1.2 (issue #21): `configureProjectBudget` is
+    // the canonical "register a project" call. It MUST
+    // also create the corresponding `project_identities`
+    // row so the strict resolver (`strict_existing` /
+    // `register` mode) finds the identity and refuses
+    // cross-project writes. Pre-v1.1.2 the v1.0
+    // `project_scopes` table was the only place a
+    // project was registered; the v1.1.2 contract
+    // promotes `project_identities` to the source of
+    // truth for the `(project_id, canonical_path)`
+    // binding. `createProjectIdentity` is `INSERT OR
+    // IGNORE` on `(project_id)`, so a re-register with
+    // the same triple is a no-op; a re-register with a
+    // different `canonical_path` is left untouched (the
+    // existing row is the canonical binding; a path
+    // change is a new alias, not a re-registration).
+    this.ctx.store.createProjectIdentity({
+      project_id,
+      canonical_path,
+      created_by: this.ctx.defaultActor,
+      created_at: existing !== undefined ? existing.created_at : now
+    });
     this.ctx.store.upsertProjectScope(scope);
     return scope;
   }

@@ -35,9 +35,11 @@ describe("SQLiteMemoryStore migrations", () => {
     // (project_identities + project_aliases_new);
     // PR-M1-3 bumped to 9 (memory_feedback +
     // memory_recall_signals); PR-M3-1 bumped to 10
-    // (memory hierarchy: tier, valid_from/until,
-    // memory_episodes).
-    expect(CURRENT_SCHEMA_VERSION).toBe(11);
+    // v1.1.2 (issue #21): bumped to 12 to add the
+    // v11 -> v12 backfill of `project_identities` from
+    // pre-existing `project_scopes` rows. Pre-1.1.2 the
+    // canonical version was 11.
+    expect(CURRENT_SCHEMA_VERSION).toBe(12);
   });
 
   it("is a no-op when schema is already at latest version", () => {

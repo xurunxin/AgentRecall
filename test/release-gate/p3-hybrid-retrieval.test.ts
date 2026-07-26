@@ -171,6 +171,7 @@ describe("release-gate p3-hybrid-retrieval (Stage 16 PR-6 #15)", () => {
       baseInput({
         scope: "project",
         project_id: "repo-1",
+        project_path: "/tmp/repo-1",
         topic: "scope",
         title: "project scope priority",
         body: "this entry lives in repo-1"
