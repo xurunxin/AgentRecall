@@ -51,15 +51,16 @@ function gitTagExists(tag: string): boolean {
 }
 
 describe("release-gate p0-release-v1 (Stage 14 PR-E)", () => {
-  it("DoD #3: package.json version is 1.1.0 (Stage 15 v1.1 release)", () => {
-    // Stage 15 v1.1.0: the 8-PR v1.1 roadmap is
-    // released. The v1.0 release-gate was originally
-    // a 1.0.0 lock; we keep the gate but move the
-    // expected version to 1.1.0. The `name` lock is
-    // unchanged.
+  it("DoD #3: package.json version is 1.1.1 (Stage 16 v1.1.1 release)", () => {
+    // Stage 16 v1.1.1: the 8-PR v1.1.1 follow-up
+    // (PR-1..PR-8) is released. The v1.0 release-gate
+    // was originally a 1.0.0 lock; we keep the gate
+    // but move the expected version to 1.1.1 (a
+    // patch bump over v1.1.0; no API break). The
+    // `name` lock is unchanged.
     const pkg = readPackage();
     expect(pkg.name).toBe("agent-recall");
-    expect(pkg.version).toBe("1.1.0");
+    expect(pkg.version).toBe("1.1.1");
   });
 
   it("DoD #5: CHANGELOG has a [1.0.0] block that mentions Stage 14 v1.0", () => {

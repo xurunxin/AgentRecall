@@ -5,6 +5,400 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [1.1.1] — Stage 16 v1.1.1 (Idempotency v2 public path + black-box gate)
+
+The 8-issue v1.1.1 follow-up roadmap (see
+`docs/superpowers/plans/2026-07-26-v1.1.1-followup.md`)
+lands as 8 serial PRs after v1.1.0. Each PR closes
+exactly one issue (#10–#17) under the tracker
+issue #18. The v1.1.1 release is a patch bump over
+v1.1.0: the public API is unchanged; the changes
+are public-path correctness (the v1.1 primitives
+wired into the MCP / service / SQLite boundary)
+plus a real black-box gate.
+
+### Stage 16 PR-1 (MCP trusted context) — #11
+### Fixed
+
+- **`src/tools/register-tools.ts`** (issue #11,
+  spec § 5.6). The SDK `extra` argument is now
+  forwarded end-to-end so the inner handler
+  receives the real JSON-RPC `requestId` /
+  `sessionId` / cancellation / progress context
+  the client sent. The pre-PR-1 wrapper dropped
+  `extra`, forcing the inner handler to rely on
+  process-wide defaults and the audit `actor`
+  field to fall back to the env-resolved value
+  even when the SDK could supply a more
+  specific one.
+- **`src/tools/register-tools.ts`** —
+  `buildToolRequestContext` no longer fabricates
+  a `tool_call_id` from `Date.now()` +
+  `Math.random()`; it pulls the real
+  `extra.requestId` (the JSON-RPC id) when
+  available and falls back to a fresh
+  `randomUUID()` only in-process (direct handler
+  tests, unit tests without a transport).
+- **`src/services/memory-read-service.ts`** —
+  `getMemory` no longer takes an `accessedBy`
+  parameter; the service is now a pure read
+  with no side effects.
+- **`src/sqlite-store.ts`** — new `peekEntry(id)`
+  API returns the entry without recording
+  access. The `getEntry` helper either
+  delegates to `peekEntry` + explicit
+  `recordAccess` (when the caller wants to
+  record access) or becomes pure. The MCP
+  `get_memory` path uses `peekEntry`; the
+  recall paths that legitimately need to
+  record access (e.g. `recall_context`
+  selecting a memory) call `recordMemoryAccess`
+  explicitly.
+- **`src/tools/schemas.ts`** — `accessed_by`
+  is removed from the `get_memory` schema
+  (kept as a deprecated alias for one release
+  cycle).
+- **`src/memory-service.ts`** — `getMemory(id)`
+  drops the second `accessedBy` argument in
+  the public signature.
+
+### Annotation audit (mandatory for #11 acceptance)
+
+- `get_memory` is now `readOnlyHint: true`,
+  `destructiveHint: false`, `idempotentHint: true`.
+- `remember` / `update_memory` /
+  `supersede_memory` / `merge_memories` /
+  `forget_memory` are `idempotentHint: true`
+  only when the call carries an
+  `idempotency_key` (PR-3 enforces the v2
+  reservation; PR-1 only fixes the annotation
+  truth table).
+- The mutating administrative tools
+  (`plan_maintenance`, `apply_maintenance`,
+  `maintain_memories`, `export_memory_context`,
+  `create_backup`, `migrate`) are audited for
+  `destructiveHint: true` where they actually
+  mutate. `openWorldHint` is left at the SDK
+  default (we are a local service).
+- `list_memories` / `search_memories` /
+  `explain_recall` / `get_memory_budget` /
+  `list_backups` are `readOnlyHint: true`.
+
+The annotation audit ships an executable test
+in `test/release-gate/p3-mcp-tool-annotations.test.ts`
+that walks every tool registration and
+verifies the annotation matches the actual
+behaviour (via mocked service spies that
+record side effects per call).
+
+### Stage 16 PR-2 (Project identity public path) — #14
+### Fixed
+
+- **`src/scope-resolver.ts`** — new
+  `ProjectIdentityResolver` class with three
+  resolution modes:
+  - `lookup` — read-only; never creates an
+    identity or alias.
+  - `register` — may create a new identity
+    from a trusted write path. Default for
+    `remember` from MCP.
+  - `strict_existing` — requires a registered
+    identity; refuses unknown ids / paths.
+    Default for `search_memories` /
+    `list_memories` / `recall_context` /
+    `export_memory_context`.
+- **`src/memory-service.ts`** — the
+  `ProjectIdentityResolver` is constructed
+  once in the service factory and injected
+  into the read / write / maintenance
+  sub-services.
+- **`src/services/memory-write-service.ts`** —
+  `resolveRememberInput` uses the injected
+  resolver in `register` mode (was: store-less
+  `resolveMemoryScope`).
+- **`src/services/memory-read-service.ts`** —
+  `listMemories` / `searchMemories` /
+  `exportMemoryContext` / `getMemoryBudget` use
+  the injected resolver in `strict_existing`
+  mode (was: store-less `resolveMemoryScope`).
+- **`src/services/memory-maintenance-service.ts`** —
+  the plan / apply paths use the injected
+  resolver in `register` mode.
+- **`src/portability/importer.ts`** — the
+  pre-flight uses the injected resolver in
+  `strict_existing` mode.
+- **`src/mcp/resources.ts`** — the resource
+  handlers use the injected resolver in
+  `strict_existing` mode.
+
+### Stage 16 PR-3 (Idempotency v2 in every public mutation path) — #10
+### Fixed
+
+- **`src/services/idempotency.ts`** — new
+  `runWithIdempotentMutation<T>(store, args,
+  work)` helper that combines the reservation,
+  the work, and the completion in one
+  transaction. Deprecated `lookupIdempotency` /
+  `recordIdempotency` wrappers are kept for
+  one more release cycle; every production
+  path now uses `runWithIdempotentMutation`.
+- **`src/services/memory-write-service.ts`** —
+  all 5 mutation methods (remember,
+  updateMemory, supersedeMemory,
+  mergeMemories, forgetMemory) are rewritten
+  to use the v2 reservation. The canonical
+  operation payload excludes the
+  `idempotency_key` itself so a retry with
+  a different body under the same key
+  surfaces `idempotency_key_reuse` (the v1.1.0
+  fix only fingerprinted the key, which is
+  the bug #10 highlights).
+
+### Stage 16 PR-4 (Strict import) — #13
+### Fixed
+
+- **`src/portability/importer.ts`** — explicit
+  preflight phase: schema + enum, project
+  identity + scope binding (via
+  `ProjectIdentityResolver` from PR-2 in
+  `strict_existing` mode), secret + unsafe-
+  content policy, sensitivity / export
+  policy, id / revision conflict policy,
+  aggregate batch budget impact. Reject the
+  entire plan before any mutation if any
+  entry fails.
+- **`src/portability/exporter.ts`** — versioned
+  portability contract: `snapshot` mode
+  preserves current entry fields, writer,
+  source revision, trust / sensitivity / tier,
+  and import provenance. `full_history` mode
+  additionally exports `memory_revisions`,
+  relevant audit events, relations, and
+  access-independent provenance.
+- **`src/portability/manifest.ts`** — stable
+  import batch id (UUID) and bundle hash
+  (sha256). Imported data is marked
+  `trust_level: imported` unless a stronger
+  trust decision is explicitly and safely
+  restored from a signed / trusted bundle.
+- **`src/portability/migration-adapter.ts`**
+  (NEW) — recognises `v0_raw` (no manifest),
+  `v1_canonical` (Stage 13 PR10), and
+  `v2_history` (Stage 16 PR-4) bundles.
+  Synthesises a v1 manifest for v0 bundles and
+  forces `trust_level: imported` on entries
+  lacking the field.
+
+### Stage 16 PR-5 (Atomic maintenance apply) — #12
+### Fixed
+
+- **`src/sqlite-store.ts`** — schema v10 →
+  v11: `maintenance_plans` adds three new
+  columns (`completed_at`,
+  `applied_result_json`, `idempotency_key_used`)
+  + an `applying` state value. The migration
+  rebuilds the table to add the new state
+  value to the CHECK constraint.
+- **`src/maintenance-plan-store.ts`** —
+  `validate()` distinguishes a `completed`
+  plan with a matching key from a `completed`
+  plan with a different key. The
+  matching-key case returns
+  `{ ok: true, plan, replay }` so the apply
+  layer can return the stored result
+  verbatim.
+- **`src/memory-service.ts`** — `applyMaintenance`
+  wraps the entire apply in a single
+  `store.transaction(...)` and writes the
+  pre-mutation backup outside the
+  transaction (VACUUM INTO cannot run in a
+  transaction). New `markApplying` /
+  `markCompleted(plan_id, key, resultJson)`
+  methods on the plan store.
+
+### Stage 16 PR-6 (Real hybrid retrieval) — #15
+### Fixed
+
+- **`src/services/recall-ranker.ts`** —
+  `RANKING_VERSION = "coding-default-v2"`
+  (was v1). The pre-PR-6 v1.1.0 ranker reported
+  a `lexical_relevance` RRF value in the
+  explain output but the final `score` still
+  used a separately-normalised
+  `contextQueryScore`, so the two could
+  diverge. v1.1.1 routes the final score
+  through the actual RRF sum.
+- **`src/services/recall-ranker.ts`** —
+  `WEIGHTS.lexical_relevance = 200` (was 0.46).
+  RRF sum is much smaller than
+  `contextQueryScore`; 200 makes the rank-1 /
+  rank-2 RRF delta dominate the tier-priority
+  delta.
+- **`src/services/recall-ranker.ts`** — new
+  `rrf_lexical` + `rrf_access` components
+  (multi-source RRF over `fts_lexical` +
+  `access`). Lexical sort tie-break by
+  `tier_priority` desc, then by id asc. Score
+  sort tie-break by `tier_priority` desc.
+- **`src/services/recall-ranker.ts`** — real
+  `conflict_penalty` via the new
+  `store.getMemoryRelationsOfType(memoryId,
+  types)` API. Counts `contradicts` /
+  `supersedes` relations, 0.05 per peer,
+  capped at 0.2.
+- **`src/services/memory-read-service.ts`** —
+  `searchMemories` and `exportMemoryContext`
+  both route through the shared pipeline
+  (still uses `store.searchEntries` for
+  candidate collection, then dedup +
+  `rankRecall` for joint ranking). Preserves
+  v1.1.0 filter behaviour while fixing the
+  global-first concatenation bug.
+
+### Stage 16 PR-7 (Memory semantics MCP) — #17
+### Fixed
+
+- **`src/write-validator.ts`** — `RememberInput`
+  / `UpdateInput` accept the controlled fields
+  `tier`, `pinned`, `valid_from`, `valid_until`,
+  `sensitivity`, `trust_level`, and the
+  trusted-user confirmation flag
+  `user_confirmed`. The validator applies
+  canonical defaults so existing callers
+  keep working. The trust-level authorization
+  policy is enforced: a patch that raises the
+  trust tier to `user_confirmed` MUST also pass
+  `user_confirmed: true`, otherwise the
+  validator returns `unauthorized`. The
+  temporal-window sanity check rejects
+  `valid_from > valid_until` as `invalid_state`.
+- **`src/sqlite-store.ts`** — `EntryPatch` and
+  `ENTRY_PATCH_FIELDS` include the six new
+  controlled fields (pre-PR-7 the sanitizer
+  silently dropped them).
+- **`src/services/recall-ranker.ts`** —
+  temporal-window policy enforced at the
+  ranker entry point: candidates whose
+  `valid_from` is in the future OR whose
+  `valid_until` is in the past are excluded
+  from the lexical and access RRF source
+  lists, so they never appear in
+  `search_memories` / `recall_context` results.
+- **`src/memory-service.ts`** — three new
+  public service methods: `recordProvenance`,
+  `explainProvenance`, `confirmMemoryTrust`.
+  The actor identity comes from the trusted
+  `RequestContext` (per PR-1 #11).
+- **`src/tools/schemas.ts`** + `descriptions.ts`
+  + `register-tools.ts` — four new MCP tools:
+  `record_memory_feedback`,
+  `record_memory_provenance`,
+  `explain_memory_provenance`,
+  `confirm_memory_trust`. The
+  `remember` / `update_memory` MCP schemas
+  expose the six new controlled fields plus
+  the `user_confirmed` confirmation flag.
+  The `superRefine` blocks reject backward
+  temporal windows and unauthorized trust /
+  sensitivity escalations at the tool
+  boundary.
+- **`src/tools/register-tools.ts`** — auto-
+  capture provenance: every successful
+  `remember` writes a `tool_call` provenance
+  link with the SDK's `requestId`.
+- **`src/tools/register-tools.ts`** — tool
+  profile split: a `core` profile (10 tools,
+  what normal coding agents should see) and
+  an `extended` profile (the administrative
+  tools plus the four memory-semantics
+  tools). The CLI's `--profile=extended` flag
+  is the runtime entry point.
+
+### Stage 16 PR-8 (Packaged MCP black-box + cross-platform gate) — #16
+### Fixed
+
+- **`src/tools/register-tools.ts`** — flattened
+  `outputSchema` from a `z.union` to a single
+  `z.object`. The MCP SDK's `validateToolOutput`
+  calls `normalizeObjectSchema` on the
+  registered schema; a union is not an object
+  and returns `undefined`, so the SDK then
+  attempted `safeParseAsync(undefined, ...)`
+  which throws `Cannot read properties of
+  undefined (reading '_zod')` on every tool
+  dispatch. PR-8 flattens the envelope to a
+  single object schema.
+- **`src/index.ts`** — the `agent-recall
+  connected on stdio` status hint is now
+  gated behind `AGENT_RECALL_VERBOSE_STDIO=1`
+  so the black-box test can assert "no stderr
+  leak over the full lifecycle" without false
+  positives.
+- **`.github/workflows/release.yml`** — the
+  `Upload artefact` step now matches both
+  `agent-recall-*.tar.gz` AND
+  `agent-recall-*.zip`, so the Windows ZIP
+  artefact is no longer dropped at upload time.
+- **`.github/workflows/ci.yml`** — the
+  `Export round-trip smoke` step no longer
+  suppresses export failures with `|| true`.
+
+### Added
+
+- **`scripts/verify-artifact-globs.mjs`**
+  (NEW) — dependency-free local check that
+  asserts the release workflow's globs /
+  entry points / engines are consistent. Wired
+  into `npm run verify:artifacts`.
+- **`test/blackbox/mcp-client-e2e.test.ts`**
+  (expanded) — covers the full documented
+  mutation lifecycle end-to-end: remember
+  with idempotency / replay / key-reuse
+  rejection / update with CAS / stale CAS
+  rejection / explain_recall /
+  record_memory_feedback / forget with
+  idempotency / stderr-leak guard.
+
+### New tests
+
+- `test/release-gate/p3-mcp-trusted-context.test.ts`
+- `test/release-gate/p3-mcp-tool-annotations.test.ts`
+- `test/release-gate/p3-project-identity-public-path.test.ts`
+- `test/release-gate/p3-idempotency-v2-public-path.test.ts`
+- `test/release-gate/p3-strict-import.test.ts`
+- `test/release-gate/p3-atomic-maintenance-apply.test.ts`
+- `test/release-gate/p3-hybrid-retrieval.test.ts`
+- `test/release-gate/p3-memory-semantics-mcp.test.ts`
+
+### Verification
+
+- `npm test` → 569 passed + 5 skipped (was 499
+  + 5 in v1.1.0; +70 from the v1.1.1 public-path
+  + black-box suites).
+- `npm run typecheck` → 0 error.
+- `npm run build` → 0 error.
+- `npm run verify:artifacts` → every
+  release-gate assertion passes locally.
+- 2 unhandled `birpc` `onTaskUpdate` 60s
+  timeouts (the pre-existing vitest-worker
+  heartbeat documented in PR-M0-1's
+  CHANGELOG; 0 actual test failures).
+- The pre-existing `p0-release-v1.test.ts` and
+  `p0-cleanup.test.ts` suites pass with the
+  version lock moved from 1.1.0 to 1.1.1.
+
+### Migration
+
+- `package.json` `version` 1.1.0 → 1.1.1.
+  No API break; no dependency bump.
+- The flattened `outputSchema` is a superset
+  of the v1.1.0 union schema. Existing MCP
+  clients that validate the response against
+  the v1.1.0 JSON-Schema continue to work.
+- The `AGENT_RECALL_VERBOSE_STDIO` env var is
+  opt-in; the default behaviour is the
+  quieter v1.1.1 mode.
+
 ## [Unreleased] — Stage 16 v1.1.1 (Idempotency v2 public path)
 
 The 8-issue v1.1.1 follow-up roadmap (see
