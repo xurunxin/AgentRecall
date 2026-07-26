@@ -50,7 +50,8 @@ describe("migrateCommand", () => {
     // memory_recall_signals).
     // Stage 15 PR-M3-1: bumped to 10 (memory hierarchy:
     // tier, valid_from/until, memory_episodes).
-    expect(parsed.to).toBe(10);
+    expect(parsed.to).toBe(11);
     store.close();
   });
 });
+

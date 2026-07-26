@@ -180,6 +180,18 @@ export class MemoryMaintenanceService {
       expected_revisions: Record<string, number>;
       reason: string;
       strategy: "keep_first" | "keep_newest";
+      /**
+       * Stage 16 v1.1.1 PR-5 (issue #12). When
+       * `true`, the caller has already opened a
+       * `store.transaction` that wraps the entire
+       * apply. The helper skips the inner
+       * `store.transaction` (it's a no-op when the
+       * depth is > 0 anyway) and skips the
+       * pre-mutation backup (which would fail with
+       * `VACUUM INTO cannot run inside a
+       * transaction`).
+       */
+      inTransaction?: boolean;
     },
     ctx?: RequestContext
   ): { ok: true; keep_id: string; superseded_ids: string[]; changed: number } | { ok: false; reason: "stale_revision" | "target_missing" | "scope_mismatch" | "non_dedup_group" } {
@@ -187,10 +199,12 @@ export class MemoryMaintenanceService {
     if (input.target_ids.length < 2) {
       return { ok: false, reason: "non_dedup_group" };
     }
-    // Pre-mutation backup (see expireDueMemories for
-    // the rationale on the out-of-transaction placement).
-    this.maybeBackup(input.target_ids.length, ctx);
-    return this.ctx.store.transaction(() => {
+    if (input.inTransaction !== true) {
+      // Pre-mutation backup (see expireDueMemories for
+      // the rationale on the out-of-transaction placement).
+      this.maybeBackup(input.target_ids.length, ctx);
+    }
+    const runMerge = (): { ok: true; keep_id: string; superseded_ids: string[]; changed: number } | { ok: false; reason: "stale_revision" | "target_missing" | "scope_mismatch" | "non_dedup_group" } => {
       const liveEntries: MemoryEntry[] = [];
       for (const id of input.target_ids) {
         const entry = this.ctx.store.peekEntry(id);
@@ -222,7 +236,11 @@ export class MemoryMaintenanceService {
         superseded_ids: supersededIds,
         changed: supersededIds.length
       };
-    });
+    };
+    if (input.inTransaction === true) {
+      return runMerge();
+    }
+    return this.ctx.store.transaction(runMerge);
   }
 
   /**
@@ -744,6 +762,36 @@ export class MemoryMaintenanceService {
         }, ctx);
       }
     });
+  }
+
+  /**
+   * Stage 16 v1.1.1 PR-5 (issue #12): the apply
+   * entry point. Runs the entire plan in one
+   * transaction. The caller is responsible for the
+   * pre-mutation backup (which must run OUTSIDE the
+   * transaction because `VACUUM INTO` cannot run
+   * against a connection holding an open
+   * transaction).
+   */
+  applyPlannedGroupInTransaction(input: {
+    scope: ResolvedReadScope;
+    target_ids: string[];
+    expected_revisions: Record<string, number>;
+    reason: string;
+    strategy: "keep_first" | "keep_newest";
+  }, ctx?: RequestContext): { ok: true; keep_id: string; superseded_ids: string[]; changed: number } | { ok: false; reason: "stale_revision" | "target_missing" | "scope_mismatch" | "non_dedup_group" } {
+    return this.mergePlannedGroup({ ...input, inTransaction: true }, ctx);
+  }
+
+  /**
+   * Stage 16 v1.1.1 PR-5 (issue #12): the apply
+   * entry point for a one-shot pre-mutation backup.
+   * The apply layer calls this BEFORE the
+   * transaction opens so the `VACUUM INTO` runs
+   * against a connection with no open transaction.
+   */
+  applyPlannedPreBackup(changed: number): void {
+    this.maybeBackup(changed);
   }
 
   private maybeBackup(changed: number, ctx?: RequestContext): void {

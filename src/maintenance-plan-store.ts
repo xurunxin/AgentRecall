@@ -202,7 +202,7 @@ export class MaintenancePlanStore {
     plan_id: string,
     currentRevisions: Record<string, number>,
     idempotency_key: string
-  ): { ok: true; plan: MaintenancePlan } | PlanApplyResult {
+  ): { ok: true; plan: MaintenancePlan; replay?: { applied: number; rejected: number } } | Extract<PlanApplyResult, { ok: false }> {
     const row = this.store.getMaintenancePlan(plan_id);
     if (row === undefined) {
       return { ok: false, plan_id, error: "plan_not_found" };
@@ -216,16 +216,41 @@ export class MaintenancePlanStore {
       return { ok: false, plan_id, error: "plan_expired", details: { expires_at: row.expires_at } };
     }
     if (row.state === "completed") {
-      const appliedKeys = this.store.getAppliedMaintenanceKeys(plan_id);
-      if (appliedKeys.includes(idempotency_key)) {
+      // Stage 16 v1.1.1 PR-5 (issue #12): the
+      // completed-plan replay / mismatch contract
+      // is now symmetric on the `idempotency_key`.
+      // Same key + same plan -> replay the original
+      // success result (the caller sees the same
+      // `ok: true, applied, rejected, plan_id`
+      // shape it saw on the first apply). Different
+      // key -> `idempotency_mismatch` as before.
+      const stored = this.store.getMaintenancePlanAppliedResult(plan_id, idempotency_key);
+      if (stored !== undefined) {
         return {
-          ok: false,
-          plan_id,
-          error: "idempotency_mismatch",
-          details: { reason: "plan_already_completed_with_different_key", applied_keys: appliedKeys }
+          ok: true,
+          plan: planFromRow(row),
+          replay: stored.result as { applied: number; rejected: number }
         };
       }
-      return { ok: false, plan_id, error: "plan_completed" };
+      const appliedKeys = this.store.getAppliedMaintenanceKeys(plan_id);
+      return {
+        ok: false,
+        plan_id,
+        error: "idempotency_mismatch",
+        details: { reason: "plan_already_completed_with_different_key", applied_keys: appliedKeys }
+      };
+    }
+    if (row.state === "applying") {
+      // Stage 16 v1.1.1 PR-5 (issue #12): a plan
+      // stuck in `applying` is an interrupted
+      // apply. Refuse with a dedicated error so the
+      // caller can wait or mark the plan expired.
+      return {
+        ok: false,
+        plan_id,
+        error: "plan_expired",
+        details: { reason: "plan_in_applying_state", current_state: "applying" }
+      };
     }
     if (row.state === "rejected") {
       return { ok: false, plan_id, error: "plan_hash_drift", details: { reason: "plan_in_rejected_state" } };
@@ -283,8 +308,25 @@ export class MaintenancePlanStore {
     return { ok: true, plan: planFromRow(row) };
   }
 
-  markCompleted(plan_id: string, _idempotency_key: string): void {
-    this.store.setMaintenancePlanState(plan_id, "completed");
+  markCompleted(plan_id: string, idempotency_key: string, appliedResult: { applied: number; rejected: number }): void {
+    this.store.markMaintenancePlanCompleted(
+      plan_id,
+      idempotency_key,
+      JSON.stringify(appliedResult),
+      nowIso()
+    );
+  }
+
+  /**
+   * Stage 16 v1.1.1 PR-5 (issue #12): flip a plan
+   * from `pending` to `applying`. Returns `true` if
+   * the transition succeeded. The apply phase
+   * calls this BEFORE any mutation runs; the
+   * `markCompleted` call later transitions to
+   * `completed` and persists the canonical result.
+   */
+  markApplying(plan_id: string): boolean {
+    return this.store.markMaintenancePlanApplying(plan_id);
   }
 
   markRejected(plan_id: string): void {

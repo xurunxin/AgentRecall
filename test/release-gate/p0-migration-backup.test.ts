@@ -146,7 +146,7 @@ describe("release-gate p0-migration-backup (PR-A)", () => {
     // `memory_recall_signals`; PR-M3-1 bumped 9 -> 10
     // to add the memory hierarchy (tier,
     // valid_from/until, memory_episodes).
-    expect(store.getUserVersion()).toBe(10);
+    expect(store.getUserVersion()).toBe(11);
   });
 
   it("blocks the migration when the pre-mutation backup cannot be written", () => {
@@ -209,7 +209,7 @@ describe("release-gate p0-migration-backup (PR-A)", () => {
     // + memory_recall_signals.
     // Stage 15 PR-M3-1: bumped to 10 with memory
     // hierarchy (tier, valid_from/until, memory_episodes).
-    expect(parsed.to).toBe(10);
+    expect(parsed.to).toBe(11);
     expect(parsed.backup.path).toMatch(/memory-.*\.sqlite$/);
     expect(parsed.backup.schema_version).toBe(1);
     expect(parsed.backup.quick_check).toBe("ok");
@@ -257,3 +257,4 @@ describe("release-gate p0-migration-backup (PR-A)", () => {
     expect(listBackups(join(dataHome, "backups")).length).toBe(0);
   });
 });
+

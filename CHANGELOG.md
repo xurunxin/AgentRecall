@@ -13,6 +13,156 @@ lands as 8 serial PRs after v1.1.0. Each PR closes
 exactly one issue (#10–#17) under the tracker
 issue #18.
 
+### Stage 16 PR-5 (Atomic Maintenance Apply)
+### Fixed
+
+- **`src/sqlite-store.ts`** (issue #12, spec § 6.2).
+  Schema v10 → v11: `maintenance_plans` adds three
+  new columns + an `applying` state value:
+  - `completed_at` — the apply timestamp.
+  - `applied_result_json` — the canonical apply
+    result. A replay with the same `idempotency_key`
+    returns this verbatim instead of
+    `idempotency_mismatch`.
+  - `idempotency_key_used` — the key the plan was
+    last applied with. Replaces the v1.1.0
+    audit-log-walking `getAppliedMaintenanceKeys`
+    helper.
+  - `applying` — the apply-phase transition state.
+    The plan moves through `pending → applying →
+    completed | rejected`; a `pending → applying`
+    transition is part of the apply transaction so
+    a crash between `markApplying` and
+    `markCompleted` leaves the plan in `pending`,
+    not in `applying`. The migration rebuilds the
+    table to add the new state value to the
+    `CHECK` constraint (SQLite does not support
+    `ALTER TABLE ... DROP CONSTRAINT`).
+- **`src/maintenance-plan-store.ts`** (issue #12).
+  - `validate()` now distinguishes a `completed`
+    plan with a matching key from a `completed`
+    plan with a different key. The matching-key
+    case returns `{ ok: true, plan, replay }` so
+    the apply layer can return the stored result
+    verbatim. The different-key case still
+    surfaces `idempotency_mismatch` as before.
+  - `validate()` also surfaces a dedicated
+    `plan_expired` error (with `current_state:
+    "applying"`) when the plan is stuck in
+    `applying` past the takeover window.
+  - `markCompleted(plan_id, idempotency_key,
+    appliedResult)` now persists the canonical
+    result + the idempotency key + the
+    `completed_at` timestamp in a single
+    `UPDATE`.
+  - New `markApplying(plan_id)` flips a `pending`
+    plan to `applying`. Returns `true` if the
+    transition succeeded.
+- **`src/memory-service.ts`** (issue #12). The
+  entire `applyMaintenance` flow now runs inside
+  a single `store.transaction(...)`:
+  1. Pre-mutation backup (OUTSIDE the transaction;
+     `VACUUM INTO` cannot run against a connection
+     holding an open transaction).
+  2. `BEGIN IMMEDIATE`.
+  3. `markApplying(plan_id)` — `pending → applying`.
+  4. Each `mergePlannedGroup` runs in
+     `inTransaction: true` mode (skips the inner
+     `store.transaction` and the per-group
+     `maybeBackup`).
+  5. `markCompleted(plan_id, idempotency_key,
+     appliedResult)` — `applying → completed` with
+     the canonical result + the key + the
+     `completed_at` timestamp.
+  6. `COMMIT`.
+  A throw anywhere in steps 3–5 rolls back every
+  mutation AND the state transition.
+- **`src/services/memory-maintenance-service.ts`**
+  (issue #12). `mergePlannedGroup` and
+  `forgetPlannedEntries` accept an `inTransaction`
+  flag; when `true` they skip the inner
+  `store.transaction` (it would be a no-op anyway)
+  and the per-group pre-mutation backup. Two new
+  public helpers — `applyPlannedPreBackup` and
+  `applyPlannedGroupInTransaction` — expose the
+  in-transaction path to the apply layer.
+
+### Crash semantics
+
+- Crash before `BEGIN IMMEDIATE` (i.e. before
+  `markApplying`): the plan stays `pending`. A
+  retry can apply.
+- Crash after `markApplying` but before
+  `markCompleted` (the most likely window): the
+  `BEGIN IMMEDIATE` transaction has not yet
+  committed, so the `applying` state is rolled
+  back. The plan stays `pending`. A retry can
+  apply.
+- Crash after `markCompleted` (the transaction
+  has committed): the plan is `completed` with
+  the canonical result. A retry with the same
+  key replays; a retry with a different key
+  surfaces `idempotency_mismatch`.
+- A truly committed `applying` row (i.e. the
+  `markApplying` update committed but the
+  transaction was killed before
+  `markCompleted`): the plan is `applying`. The
+  next apply call surfaces `plan_expired` with
+  `current_state: "applying"`. The operator can
+  wait for the takeover window (default 24h,
+  same as the plan TTL) or mark the plan
+  expired manually.
+
+### New tests
+
+- `test/release-gate/p3-atomic-maintenance-apply.test.ts`
+  (7 tests):
+  - Plan with two duplicate groups applies both
+    or applies none (single transaction).
+  - Same plan + same idempotency_key replays the
+    original result (no new `plan_applied`
+    audits).
+  - Same plan + different idempotency_key is
+    rejected with `idempotency_mismatch`.
+  - Stale revision in the second group rolls
+    back the first group (single transaction).
+  - Apply never touches an unplanned memory.
+  - Expired plan mutates nothing and stays
+    `expired` after the apply call.
+  - Plan state transitions through `applying`
+    (visible via the `completed_at` timestamp
+    on the `completed` row).
+
+### Verification
+
+- `npm test` → 0 failed / **540 passed** (was:
+  533 in Stage 16 PR-4) / 5 skipped / 1 unhandled
+  error (the pre-existing vitest-worker `birpc`
+  `onTaskUpdate` heartbeat documented in
+  PR-M0-1's CHANGELOG; 0 actual test failures).
+- `npm run typecheck` → 0 error.
+- The 12 pre-existing
+  `test/release-gate/p1-maintenance-plan-v2.test.ts`
+  tests all pass.
+- Four migration tests
+  (`test/sqlite-store-migration.test.ts`,
+  `test/sqlite-store-migration-v3.test.ts`,
+  `test/cli/migrate.test.ts`,
+  `test/release-gate/p0-migration-backup.test.ts`)
+  bumped from 10 to 11 to track the new
+  `CURRENT_SCHEMA_VERSION`.
+- No source changes to non-maintenance code
+  paths. No `package.json` /
+  `package-lock.json` changes.
+
+### Stage 15 v1.1 (M0 Stabilization → M3 Intelligence)
+
+The 8-issue v1.1.1 follow-up roadmap (see
+`docs/superpowers/plans/2026-07-26-v1.1.1-followup.md`)
+lands as 8 serial PRs after v1.1.0. Each PR closes
+exactly one issue (#10–#17) under the tracker
+issue #18.
+
 ### Stage 16 PR-4 (Strict Import)
 ### Fixed
 
