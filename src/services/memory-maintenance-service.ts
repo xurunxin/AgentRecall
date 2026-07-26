@@ -33,7 +33,7 @@ import type { BudgetUsage, SQLiteMemoryStore } from "../sqlite-store.js";
 import { nowIso, type MemoryAuditEvent, type MemoryEntry, type MemoryScope } from "../domain.js";
 import { MarkdownExporter } from "../markdown-exporter.js";
 import { runBackup, verifyBackup } from "../backup.js";
-import { resolveMemoryScope } from "../scope-resolver.js";
+import { resolveMemoryScope, type ProjectIdentityResolver } from "../scope-resolver.js";
 import { createHash } from "node:crypto";
 import type { RequestContext } from "../request-context.js";
 
@@ -73,6 +73,13 @@ export type MaintainMemoriesResult = {
 export type MaintenanceContext = {
   store: SQLiteMemoryStore;
   defaultActor: string;
+  /**
+   * Stage 16 v1.1.1 PR-2 (#14): the project identity
+   * resolver. Maintenance paths use `register` mode
+   * (a `project_path` may create an identity on the
+   * first ever maintenance call for that repo).
+   */
+  identityResolver: ProjectIdentityResolver;
   dataHome?: string;
   exporter?: MarkdownExporter;
   /** Returns a MarkdownExporter (shared with read side via a factory). */
@@ -96,11 +103,14 @@ export class MemoryMaintenanceService {
     // only `project_id` and silently dropped `project_path`,
     // causing project_path-only inputs to fall through to a
     // cross-project "scope=project" filter.
-    const resolved = resolveMemoryScope({
-      scope: input.scope,
-      ...(input.project_id !== undefined ? { project_id: input.project_id } : {}),
-      ...(input.project_path !== undefined ? { project_path: input.project_path } : {})
-    });
+    const resolved = this.ctx.identityResolver.resolve(
+      {
+        scope: input.scope,
+        ...(input.project_id !== undefined ? { project_id: input.project_id } : {}),
+        ...(input.project_path !== undefined ? { project_path: input.project_path } : {})
+      },
+      "register"
+    );
     if (!resolved.ok) {
       return {
         action: input.action,

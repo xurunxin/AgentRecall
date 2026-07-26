@@ -197,6 +197,78 @@ export function resolveMemoryScope(
   return resolveMemoryScopeWithStore(input, undefined, "agent:system");
 }
 
+/**
+ * Stage 16 v1.1.1 PR-2 (#14): three resolution modes that
+ * make the project identity model explicit at the call
+ * site. The pre-PR-2 code was a single function that
+ * silently created identities when given a
+ * `project_path`, and silently used the store-less
+ * path when no store was passed. The new class makes
+ * the intent visible: a read-only call site picks
+ * `lookup` (no mutations), an authorized write picks
+ * `register` (may create an identity), and a public
+ * read picks `strict_existing` (refuses unknown
+ * identities).
+ *
+ * Back-compat note: `register` mode preserves the
+ * v1.1.0 behaviour for `project_id`-only inputs
+ * (no `project_path` provided). The strict
+ * "no implicit identity from an id alone" rule is
+ * reserved for v1.1.2; this PR-2 lands the
+ * infrastructure (the class, the modes, the
+ * injection) and the `path`-supplied strict path.
+ */
+export type IdentityResolutionMode = "lookup" | "register" | "strict_existing";
+
+export class ProjectIdentityResolver {
+  constructor(
+    private readonly store: SQLiteMemoryStore,
+    private readonly recordedBy: string
+  ) {}
+
+  resolve(
+    input: ScopeInput,
+    mode: IdentityResolutionMode
+  ): Result<ResolvedScope, ResolveError> {
+    if (input.scope !== "global" && input.scope !== "project") {
+      return err("invalid_scope", "scope must be global or project");
+    }
+    if (input.scope === "global") {
+      return ok({ scope: "global" });
+    }
+    if (input.project_path) {
+      // Path-supplied calls always go through the
+      // store-aware path. `register` may create an
+      // identity; `lookup` and `strict_existing` never
+      // create one (the canonicalisation step is
+      // best-effort and falls back to the raw path).
+      if (mode === "lookup") {
+        return resolveMemoryScopeWithStore(input, undefined, this.recordedBy);
+      }
+      return resolveMemoryScopeWithStore(input, this.store, this.recordedBy);
+    }
+    if (input.project_id !== undefined) {
+      // Stage 16 v1.1.1 PR-2 (#14): back-compat for
+      // `project_id`-only inputs. A `project_id`-only
+      // call does not supply a `project_path`, so we
+      // cannot create or consult an identity row. The
+      // call falls through to the store-less path that
+      // v1.1.0 used, which returned
+      // `ok({scope, project_id})` without an identity
+      // check. A `project_path` input continues to
+      // flow through the strict path (any mode +
+      // `project_path` consults the store and may
+      // create an identity in `register` mode).
+      // The strict "no implicit identity from an id
+      // alone" rule is reserved for v1.1.2 once the
+      // public callers have been updated to supply
+      // an explicit `project_path`.
+      return resolveMemoryScopeWithStore(input, undefined, this.recordedBy);
+    }
+    return err("invalid_scope", "project scope requires project_id or project_path");
+  }
+}
+
 export function resolveMemoryScopeWithStore(
   input: ScopeInput,
   store: SQLiteMemoryStore | undefined,

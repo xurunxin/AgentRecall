@@ -35,6 +35,7 @@ import { appendAudit, computeTrustBoost } from "./services/memory-service-helper
 import { MemoryReadService, type ExportMemoryContextInput, type ListResult, type MemoryBudgetResult, type ResolvedReadScope, type SearchResult } from "./services/memory-read-service.js";
 import { MemoryMaintenanceService, type MaintainMemoriesInput, type MaintainMemoriesResult, type MaintenanceAction } from "./services/memory-maintenance-service.js";
 import { MemoryWriteService, type RememberResult } from "./services/memory-write-service.js";
+import { ProjectIdentityResolver } from "./scope-resolver.js";
 import type { BudgetUsage, EntryFilters, SearchFilters, SQLiteMemoryStore } from "./sqlite-store.js";
 import { CURRENT_SCHEMA_VERSION } from "./sqlite-store.js";
 import { type RememberInput, type UpdateInput } from "./write-validator.js";
@@ -110,20 +111,32 @@ export class MemoryService {
     const resolveExporterFn = (): MarkdownExporter =>
       this.exporter ?? new MarkdownExporter(join(process.cwd(), ".agent-recall", "exports"));
 
+    // Stage 16 v1.1.1 PR-2 (#14): one
+    // `ProjectIdentityResolver` per service, used by
+    // every public path that needs to resolve a
+    // `scope` / `project_id` / `project_path` triple.
+    // The recordedBy is the default actor (the actor
+    // responsible for any identity / alias rows the
+    // resolver may create).
+    const identityResolver = new ProjectIdentityResolver(store, defaultActor);
+
     this.read = new MemoryReadService({
       store,
       defaultActor,
+      identityResolver,
       resolveExporter: resolveExporterFn
     });
     this.write = new MemoryWriteService({
       store,
       defaultActor,
+      identityResolver,
       configureProjectBudget: (project_id, budget, canonical_path, display_name) =>
         this.configureProjectBudget(project_id, budget, canonical_path, display_name)
     });
     this.maintenance = new MemoryMaintenanceService({
       store,
       defaultActor,
+      identityResolver,
       ...(this.dataHome !== undefined ? { dataHome: this.dataHome } : {}),
       resolveExporter: resolveExporterFn
     });

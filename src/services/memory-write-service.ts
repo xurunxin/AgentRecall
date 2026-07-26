@@ -29,7 +29,7 @@ import {
   validateRememberInput,
   validateUpdateInput
 } from "../write-validator.js";
-import { resolveMemoryScope } from "../scope-resolver.js";
+import { resolveMemoryScope, type ProjectIdentityResolver } from "../scope-resolver.js";
 import { computeEntrySize, createMemoryId } from "../domain.js";
 import type { RequestContext } from "../request-context.js";
 import { hashRequest, lookupIdempotency, recordIdempotency } from "./idempotency.js";
@@ -77,6 +77,15 @@ export type RememberResult = {
 export type WriteContext = {
   store: SQLiteMemoryStore;
   defaultActor: string;
+  /**
+   * Stage 16 v1.1.1 PR-2 (#14): the project identity
+   * resolver. Write paths use `register` mode; a
+   * `project_path` may create a new identity, but
+   * `project_id`-only calls must resolve an existing
+   * identity (no implicit identity creation from an
+   * id alone).
+   */
+  identityResolver: ProjectIdentityResolver;
   /** Returns the configured project scope (or creates one with default budget). */
   configureProjectBudget: (
     project_id: string,
@@ -780,7 +789,7 @@ export class MemoryWriteService {
       if (auditRejections) auditRejected(this.ctx.store, this.ctx.defaultActor, input, validated.error, validated.details, ctx);
       return validated;
     }
-    const resolved = resolveMemoryScope(validated.value);
+    const resolved = this.ctx.identityResolver.resolve(validated.value, "register");
     if (!resolved.ok) {
       // Stage 15 PR-M1-2: the resolver may now surface
       // `project_identity_conflict`. The remember

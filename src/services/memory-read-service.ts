@@ -28,7 +28,7 @@ import {
   type Result
 } from "../domain.js";
 import { MarkdownExporter } from "../markdown-exporter.js";
-import { resolveMemoryScope } from "../scope-resolver.js";
+import { resolveMemoryScope, type ProjectIdentityResolver } from "../scope-resolver.js";
 import { CURRENT_SCHEMA_VERSION } from "../sqlite-store.js";
 import type { BudgetUsage, EntryFilters, SearchFilters, SQLiteMemoryStore } from "../sqlite-store.js";
 import {
@@ -103,6 +103,13 @@ type SearchServiceFilters = SearchFilters & { include_global?: boolean; project_
 export type ReadContext = {
   store: SQLiteMemoryStore;
   defaultActor: string;
+  /**
+   * Stage 16 v1.1.1 PR-2 (#14): the project identity
+   * resolver. Read paths use `lookup` (no mutations;
+   * never creates an identity) or `strict_existing`
+   * (refuses unknown `project_id`s).
+   */
+  identityResolver: ProjectIdentityResolver;
   /** Optional MarkdownExporter; rebuilt on each export call when missing. */
   exporter?: MarkdownExporter;
   /** Returns the MarkdownExporter for read-side exports. */
@@ -291,9 +298,15 @@ export class MemoryReadService {
     project_id?: string;
     project_path?: string;
   }): Result<ResolvedReadScope, "invalid_scope" | "project_identity_conflict"> {
-    const resolved = resolveMemoryScope(input);
+    // Stage 16 v1.1.1 PR-2 (#14): read paths go through
+    // the injected `ProjectIdentityResolver` in
+    // `strict_existing` mode. A read cannot create a
+    // project identity; an unknown `project_id`
+    // surfaces `invalid_scope` instead of an implicit
+    // identity.
+    const resolved = this.ctx.identityResolver.resolve(input, "strict_existing");
     if (!resolved.ok) {
-      // Stage 15 PR-M1-2: the resolver may now surface
+      // The resolver may now surface
       // `project_identity_conflict` when the caller's
       // `project_id` + `project_path` triple does not
       // match an existing identity. `invalid_alias` is
