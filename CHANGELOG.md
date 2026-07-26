@@ -1048,6 +1048,128 @@ serial PRs plus the M0-pre fix-test-infra PR below.
   the new `memory_episodes` table starts empty.
   Legacy v9 databases migrate cleanly.
 
+## [1.1.0] — Stage 15 v1.1 (M0 Stabilization → M3 Intelligence)
+
+Date: 2026-07-26
+
+This is the second release of AgentRecall. The v1.1
+roadmap (see `docs/superpowers/plans/2026-07-26-v1.1-roadmap.md`)
+lands as 8 serial PRs plus the M0-pre fix-test-infra
+PR, addressing the 9 P0/P1/P2 issues from
+`xurunxin/AgentRecall` issues #1–#9.
+
+### M0 Stabilization (4 PRs)
+
+- **PR-M0-pre** — fixed a vitest `birpc` `onTaskUpdate`
+  60s hardcoded heartbeat that surfaced as an
+  unhandled error in the 8-process concurrency
+  stress test. Staggered worker startup by 100ms
+  and trimmed `OPS_PER_PROCESS` to 50; the
+  invariant (0 unhandled SQLITE_BUSY, 0 lost
+  writes, 0 corruption) still holds.
+- **PR-M0-1 (#1)** — Idempotency v2: schema v4→v5,
+  recursive `canonicalJson`, `(actor, tool, key)`
+  PK namespace, transactional reservation.
+- **PR-M0-2 (#2)** — MCP Context Contract:
+  `idempotency_key` + `expected_revision` flow
+  through `update_memory` and `forget_memory`
+  MCP adapters.
+- **PR-M0-3 (#4)** — Atomic Import: `applyImport`
+  wrapped in a single `service.store.transaction()`;
+  throw instead of collect errors; manifest
+  `require_clean_manifest` default `true`;
+  `ImportFormat = "json"` only.
+- **PR-M0-4 (#3)** — Maintenance Plan v2: schema
+  v5→v6, persistent `maintenance_plans` +
+  `maintenance_plan_items` (plans survive MCP
+  restart); `applyMaintenance` reads items
+  from the durable store and only mutates
+  planned targets; `plan_hash` (SHA-256) detects
+  tampering; `risk` is no longer always "low".
+
+### M1 Retrieval Upgrade (3 PRs)
+
+- **PR-M1-1 (#6)** — Trust + Provenance Unification:
+  `memory_accesses` is the only access source of
+  truth; `writer_actor_id` is the only writer
+  source; trust formula deterministic and
+  explainable; new `memory_provenance` table
+  (issue / PR / commit / tool_call / session /
+  import). Schema v6→v7.
+- **PR-M1-2 (#7)** — Project Identity Conflict
+  Protection: strict `project_identities` table;
+  `project_aliases_new` with FK to identity; the
+  resolver surfaces `project_identity_conflict`
+  when an alias path maps to a different
+  `project_id`. Symlink / worktree / Windows
+  case-insensitive handling. Schema v7→v8.
+- **PR-M1-3 (#5)** — Hybrid Recall: RRF fusion,
+  scope priority (project × 1.5), real
+  `access_signal` from `memory_accesses`,
+  real `feedback_signal` from `memory_feedback`,
+  `scope_priority` boost, `MemoryService.recordFeedback`
+  API. Schema v8→v9.
+
+### M2 Production Hardening (1 PR)
+
+- **PR-M2-1 (#8)** — CI Black-box Gate + Packaging:
+  `package.json` `files` field restricts the
+  published tarball to `dist/`, `README.md`,
+  `LICENSE`, `CHANGELOG.md`. New
+  `test/blackbox/mcp-client-e2e.test.ts`
+  spawns the **built** MCP server via the SDK's
+  `StdioClientTransport` and exercises
+  `initialize` / `listTools` / `listResources`
+  / `list_memories` against a real MCP
+  transport. CI matrix: ubuntu / windows /
+  macos × Node 24.
+
+### M3 Intelligence Layer (1 PR)
+
+- **PR-M3-1 (#9)** — Memory Hierarchy +
+  Benchmark: `memory_entries.tier` column
+  (`'core' | 'working' | 'archival'`, default
+  `'working'`); ranker weights `tier`
+  (core × 1.3, working × 1.0, archival × 0.7);
+  `valid_from` / `valid_until` columns for
+  temporal validity; `memory_episodes` table
+  for episode-shaped memories; benchmark
+  fixture proves the ranker weights the
+  hierarchy correctly. Schema v9→v10.
+
+### Migration
+
+The v9→v10 migration is non-destructive: the
+new columns default to NULL / `'working'`,
+the new `memory_episodes` table starts empty.
+A user upgrading from v1.0.0 (schema v4)
+walks the chain v4→v5→v6→v7→v8→v9→v10.
+Every step is fully transactional; the
+migrations are idempotent under `IF NOT EXISTS`.
+
+### Verification
+
+- `npm test` → 0 failed / **494 passed** (was:
+  435 in v1.0.0) / 5 black-box skipped in dev
+  (no `dist/`) / 1 unhandled error (the same
+  pre-existing vitest-worker `birpc`
+  `onTaskUpdate` heartbeat issue documented
+  in PR-M0-1's CHANGELOG; 0 actual test
+  failures).
+- `npm run typecheck` → 0 error.
+- 9 issues closed (#1, #2, #3, #4, #5, #6, #7,
+  #8, #9) via 8 serial PRs (PR-M0-pre is infra).
+- New tests across 8 new test files:
+  - `p1-idempotency-v2.test.ts` (11)
+  - `p1-mcp-context.test.ts` (4)
+  - `p1-atomic-import.test.ts` (4)
+  - `p1-maintenance-plan-v2.test.ts` (12)
+  - `p2-trust-provenance.test.ts` (6)
+  - `p2-project-identity.test.ts` (9)
+  - `p2-hybrid-recall.test.ts` (7)
+  - `p2-memory-hierarchy.test.ts` (6)
+  - `test/blackbox/mcp-client-e2e.test.ts` (5)
+
 ## [1.0.0] — Stage 14 v1.0 (AgentRecall v1.0)
 
 Date: 2026-07-21
