@@ -27,7 +27,8 @@
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "pack:dry": "npm pack --dry-run",
-    "smoke:blackbox": "tsx test/blackbox/mcp-client-e2e.test.ts"
+    "smoke:blackbox": "tsx test/blackbox/mcp-client-e2e.test.ts",
+    "verify:artifacts": "node scripts/verify-artifact-globs.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",

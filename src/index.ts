@@ -63,7 +63,16 @@ export async function main(): Promise<void> {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error(`${serverName()} connected on stdio`);
+  // Stage 16 v1.1.1 PR-8 (issue #16, spec § 11.2):
+  // the connected-on-stdio status hint is gated
+  // behind `AGENT_RECALL_VERBOSE_STDIO` so the
+  // black-box test can assert "no stderr leak
+  // over the lifecycle" without false positives.
+  // Operators who want the old behaviour opt
+  // in via the env var.
+  if (process.env.AGENT_RECALL_VERBOSE_STDIO === "1") {
+    console.error(`${serverName()} connected on stdio`);
+  }
 }
 
 function isDirectExecution(): boolean {

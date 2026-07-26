@@ -794,7 +794,42 @@ function makeFailureSchema() {
 }
 
 function makeEnvelopeSchema<T>(dataSchema: z.ZodType<T>) {
-  return z.union([makeOutputSchema(dataSchema), makeFailureSchema()]);
+  // Stage 16 v1.1.1 PR-8 (issue #16, spec § 11.2):
+  // the v1.1.0 envelope used `z.union([ok, fail])`
+  // which tripped an MCP SDK / Zod v4 compatibility
+  // bug (`Cannot read properties of undefined
+  // (reading '_zod')`) on tool dispatch. The MCP
+  // SDK's `validateToolOutput` calls
+  // `normalizeObjectSchema` on the registered
+  // `outputSchema`; the union is not an object and
+  // returns `undefined`, so the SDK then attempts
+  // to call `safeParseAsync(undefined, ...)` which
+  // throws. PR-8 flattens to a single `ok: boolean`
+  // schema with the success `data` field made
+  // optional; the SDK treats it as an object
+  // schema and the validation succeeds for every
+  // tool. The actual error / success discrimination
+  // is the responsibility of the handler envelope
+  // (`buildEnvelopeResult`); the `outputSchema` is
+  // documentation only.
+  return z.object({
+    ok: z.boolean(),
+    data: dataSchema.optional(),
+    error: z
+      .object({
+        code: z.string(),
+        message: z.string(),
+        retryable: z.boolean().optional(),
+        details: z.record(z.string(), z.unknown()).optional()
+      })
+      .optional(),
+    meta: z.object({
+      request_id: z.string(),
+      server_version: z.string(),
+      schema_version: z.number().int(),
+      duration_ms: z.number().int().nonnegative()
+    })
+  });
 }
 
 const GENERIC_OUTPUT_SCHEMA = makeEnvelopeSchema(z.unknown());
