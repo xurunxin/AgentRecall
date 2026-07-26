@@ -79,6 +79,20 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Multi-process release stress (spec § 5.6)
+        # Phase A Task 1 (#20): run the multi-process
+        # stress test at the spec § 5.6 release profile
+        # (8 workers × 1,250 ops = 10,000 total
+        # operations) before packaging. The CI profile
+        # (1,600 ops) runs on every push via ci.yml;
+        # the release profile is opt-in here so the
+        # candidate artefacts are exercised against
+        # the full spec gate.
+        env:
+          TMPDIR: ${{ runner.temp }}
+          STRESS_PROFILE: release
+        run: npx vitest run test/multi-process-stress.test.ts
+
       - name: Strip dev-only artefacts
         shell: bash
         # The tarball/zip ships only what the user

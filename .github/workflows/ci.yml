@@ -78,6 +78,13 @@ jobs:
           # fine, on linux the runner image ships a
           # fast tmpfs at /tmp.
           TMPDIR: ${{ runner.temp }}
+          # Phase A Task 1 (#20): the CI profile keeps
+          # the multi-process stress test at the spec
+          # § 5.6 CI sample of 8 workers × 200 ops =
+          # 1,600 total operations. The release profile
+          # (8 × 1,250 = 10,000) is opt-in via the
+          # release workflow.
+          STRESS_PROFILE: ci
 
       - name: MCP black-box E2E
         # Stage 15 PR-M2-1 (issue #8, spec § 11.2):
