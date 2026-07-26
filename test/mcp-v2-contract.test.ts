@@ -186,16 +186,24 @@ describe("Tool annotations (spec § 6.3)", () => {
     registerMemoryTools(server as unknown as Parameters<typeof registerMemoryTools>[0], fakeService());
     const byName = Object.fromEntries(registered.map((r) => [r.name, r.config.annotations]));
     expect(byName.recall_context).toEqual({ readOnlyHint: true, destructiveHint: false, idempotentHint: true });
-    expect(byName.remember).toEqual({ readOnlyHint: false, destructiveHint: false, idempotentHint: true });
-    expect(byName.update_memory).toEqual({ readOnlyHint: false, destructiveHint: true, idempotentHint: true });
-    expect(byName.supersede_memory).toEqual({ readOnlyHint: false, destructiveHint: true, idempotentHint: true });
-    expect(byName.merge_memories).toEqual({ readOnlyHint: false, destructiveHint: true, idempotentHint: true });
-    expect(byName.forget_memory).toEqual({ readOnlyHint: false, destructiveHint: true, idempotentHint: true });
+    // Stage 16 v1.1.1 PR-1 (#11): mutating tools are
+    // `idempotentHint: false` because the static
+    // annotation must reflect the call site without an
+    // `idempotency_key`. Clients that want true
+    // idempotency pass `idempotency_key`; the v2
+    // reservation (PR-3) enforces the no-side-effect
+    // replay for those calls. `remember` is not
+    // destructive (it is an additive write).
+    expect(byName.remember).toEqual({ readOnlyHint: false, destructiveHint: false, idempotentHint: false });
+    expect(byName.update_memory).toEqual({ readOnlyHint: false, destructiveHint: true, idempotentHint: false });
+    expect(byName.supersede_memory).toEqual({ readOnlyHint: false, destructiveHint: true, idempotentHint: false });
+    expect(byName.merge_memories).toEqual({ readOnlyHint: false, destructiveHint: true, idempotentHint: false });
+    expect(byName.forget_memory).toEqual({ readOnlyHint: false, destructiveHint: true, idempotentHint: false });
     expect(byName.get_memory_budget).toEqual({ readOnlyHint: true, destructiveHint: false, idempotentHint: true });
-    expect(byName.maintain_memories).toEqual({ readOnlyHint: false, destructiveHint: true, idempotentHint: true });
+    expect(byName.maintain_memories).toEqual({ readOnlyHint: false, destructiveHint: true, idempotentHint: false });
     expect(byName.export_memory_context).toEqual({ readOnlyHint: true, destructiveHint: false, idempotentHint: true });
     expect(byName.plan_maintenance).toEqual({ readOnlyHint: true, destructiveHint: false, idempotentHint: true });
-    expect(byName.apply_maintenance).toEqual({ readOnlyHint: false, destructiveHint: true, idempotentHint: true });
+    expect(byName.apply_maintenance).toEqual({ readOnlyHint: false, destructiveHint: true, idempotentHint: false });
     expect(byName.explain_recall).toEqual({ readOnlyHint: true, destructiveHint: false, idempotentHint: true });
     expect(byName.list_backups).toEqual({ readOnlyHint: true, destructiveHint: false, idempotentHint: true });
   });

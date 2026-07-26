@@ -150,7 +150,19 @@ export const getMemoryToolSchema = z
   .object({
     id: nonEmptyString.optional(),
     memory_id: nonEmptyString.optional(),
-    accessed_by: nonEmptyString.optional()
+    // Stage 16 v1.1.1 PR-1 (#11): `accessed_by` is a
+    // no-op for one release cycle so existing clients
+    // keep parsing. Access identity must come from the
+    // trusted `RequestContext` actor; client input can no
+    // longer impersonate another actor. The field is
+    // accepted here only so the schema does not reject
+    // pre-v1.1.1 client payloads. The handler drops the
+    // value on the floor.
+    accessed_by: nonEmptyString
+      .optional()
+      .describe(
+        "Deprecated in v1.1.1. The handler no longer uses this field; access identity comes from the trusted RequestContext actor. Pass undefined."
+      )
   })
   .strict()
   .superRefine(requireConsistentMemoryId);

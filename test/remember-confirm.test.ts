@@ -233,8 +233,13 @@ describe("remember near-duplicate detection (stage 3)", () => {
 
     const first = claude.remember(baseInput({ title: "p1" }));
     if (!first.ok) throw new Error("setup");
-    // claude reads its own memory (populates last_accessed_by)
-    claude.getMemory(first.value.memory_id, "agent:claude-code");
+    // Stage 16 v1.1.1 PR-1 (#11): `getMemory` is a pure
+    // read. The near-duplicate warning reads the matching
+    // memory's `last_accessed_by` from the canonical
+    // `memory_accesses` table directly, so we have to seed
+    // an explicit `recordAccess` here for the warning to
+    // surface the entry.
+    sharedStore.recordAccess(first.value.memory_id, "agent:claude-code", new Date().toISOString());
     // cursor writes a similar memory
     const result = cursor.remember(baseInput({ title: "p2", body: "primary datastore is postgres for the api" }));
     expect(result.ok).toBe(true);

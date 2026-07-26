@@ -201,6 +201,18 @@ function isResultSuccess(value: unknown): value is { ok: true; value: unknown } 
 type HandlerExtra = {
   signal: AbortSignal;
   sendNotification: (notification: ServerNotification) => Promise<void>;
+  /**
+   * The MCP transport session id (stable across the
+   * connection). The SDK pins one per transport.
+   */
+  sessionId?: string;
+  /**
+   * The JSON-RPC id of the request. Stage 16 v1.1.1 PR-1
+   * (#11) reads this as the trusted `tool_call_id` in the
+   * resulting `RequestContext` so audit metadata is
+   * correlatable to the original request.
+   */
+  requestId?: string | number;
   _meta?: { progressToken?: string | number };
 };
 
@@ -234,23 +246,35 @@ function adaptProgress(
  * audit trail unless the client explicitly re-uses the same
  * JSON-RPC id (in which case the SDK forwards the same id and
  * `buildRequestContext` preserves it).
+ *
+ * Stage 16 v1.1.1 PR-1 (#11): prefer the SDK's real
+ * `extra.requestId` (the JSON-RPC id) as the `tool_call_id`
+ * whenever the SDK exposes it. The pre-PR-1 implementation
+ * synthesised a fake `${Date.now()}-${Math.random()...}` id,
+ * which made audit trails unlinkable to the original MCP
+ * request. Falls back to the existing `randomUUID()` default
+ * in `buildRequestContext` when the SDK exposes no id (direct
+ * handler tests, in-process unit tests).
+ *
+ * Stage 16 v1.1.1 PR-1 (#11): the legacy `_meta.clientName` /
+ * `_meta.clientVersion` extraction is removed — `clientInfo`
+ * arrives once at the `initialize` handshake and is not part
+ * of the per-call `extra` envelope (it is server-session
+ * state, not request metadata). Callers that need the
+ * client name / version should resolve them at the server
+ * level (`server.getClientVersion()`) before forwarding the
+ * per-call context.
  */
 function buildToolRequestContext(
   extra: HandlerExtra | undefined,
-  override: { actor?: string; project_id?: string } = {}
+  override: { actor?: string; project_id?: string; client_name?: string; client_version?: string } = {}
 ): RequestContext {
-  const meta = (extra?._meta ?? {}) as {
-    clientName?: string;
-    clientVersion?: string;
-    sessionId?: string;
-    progressToken?: string | number;
-  };
   return buildRequestContext({
     ...(override.actor !== undefined ? { actor_override: override.actor } : {}),
-    ...(meta.clientName !== undefined ? { client_name: meta.clientName } : {}),
-    ...(meta.clientVersion !== undefined ? { client_version: meta.clientVersion } : {}),
-    ...(meta.sessionId !== undefined ? { session_id: meta.sessionId } : {}),
-    ...(extra !== undefined ? { tool_call_id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}` } : {}),
+    ...(override.client_name !== undefined ? { client_name: override.client_name } : {}),
+    ...(override.client_version !== undefined ? { client_version: override.client_version } : {}),
+    ...(extra?.sessionId !== undefined ? { session_id: extra.sessionId } : {}),
+    ...(extra?.requestId !== undefined ? { tool_call_id: String(extra.requestId) } : {}),
     ...(override.project_id !== undefined ? { project_id: override.project_id } : {})
   });
 }
@@ -262,6 +286,27 @@ function envelopeHandler<T>(
 ): (input: unknown, extra?: HandlerExtra) => Promise<CallToolResult> {
   return async (input: unknown, extra?: HandlerExtra) => {
     const started = Date.now();
+    // Stage 16 v1.1.1 PR-1 (#11): if the client has
+    // already aborted the request before we even started
+    // parsing, surface a stable `cancelled` error code
+    // instead of running the work and risking a partial
+    // mutation. The MCP SDK forwards the
+    // `AbortSignal` via `extra.signal`; clients cancel
+    // by flipping it to aborted.
+    if (Boolean(extra?.signal?.aborted)) {
+      return buildEnvelopeResult({
+        legacyContent: jsonResult({
+          ok: false,
+          error: "cancelled",
+          message: `Request for ${toolName} was cancelled before it started.`
+        }).content,
+        failure: {
+          code: "cancelled",
+          message: `Request for ${toolName} was cancelled before it started.`
+        },
+        durationMs: Date.now() - started
+      });
+    }
     const parsed = schema.safeParse(input);
     if (!parsed.success) {
       const legacy: CallToolResult = jsonResult({
@@ -321,7 +366,16 @@ function envelopeHandler<T>(
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const code = error instanceof Error && error.name === "AbortError" ? "tool_error" : "tool_error";
+      // Stage 16 v1.1.1 PR-1 (#11): an `AbortError` (or any
+      // error raised while the AbortSignal is already
+      // aborted) is a stable `cancelled` failure, not a
+      // generic `tool_error`. Clients key off the code to
+      // distinguish "user cancelled" from "server
+      // exploded".
+      const wasAborted =
+        (error instanceof Error && error.name === "AbortError") ||
+        Boolean(extra?.signal?.aborted);
+      const code = wasAborted ? "cancelled" : "tool_error";
       return buildEnvelopeResult({
         legacyContent: jsonResult({ ok: false, error: code, message }).content,
         failure: { code, message },
@@ -343,6 +397,24 @@ function textEnvelopeHandler<T>(
 ): (input: unknown, extra?: HandlerExtra) => Promise<CallToolResult> {
   return async (input: unknown, extra?: HandlerExtra) => {
     const started = Date.now();
+    // Stage 16 v1.1.1 PR-1 (#11): early-exit on already-
+    // aborted signals so we never run the work and risk a
+    // partial mutation. The SDK forwards the AbortSignal
+    // via `extra.signal`.
+    if (Boolean(extra?.signal?.aborted)) {
+      return buildEnvelopeResult({
+        legacyContent: jsonResult({
+          ok: false,
+          error: "cancelled",
+          message: `Request for ${toolName} was cancelled before it started.`
+        }).content,
+        failure: {
+          code: "cancelled",
+          message: `Request for ${toolName} was cancelled before it started.`
+        },
+        durationMs: Date.now() - started
+      });
+    }
     const parsed = schema.safeParse(input);
     if (!parsed.success) {
       const legacy: CallToolResult = jsonResult({
@@ -386,9 +458,16 @@ function textEnvelopeHandler<T>(
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      // Stage 16 v1.1.1 PR-1 (#11): stable `cancelled`
+      // failure for `AbortError` or any error raised while
+      // the signal is already aborted.
+      const wasAborted =
+        (error instanceof Error && error.name === "AbortError") ||
+        Boolean(extra?.signal?.aborted);
+      const code = wasAborted ? "cancelled" : "tool_error";
       return buildEnvelopeResult({
-        legacyContent: jsonResult({ ok: false, error: "tool_error", message }).content,
-        failure: { code: "tool_error", message },
+        legacyContent: jsonResult({ ok: false, error: code, message }).content,
+        failure: { code, message },
         durationMs: Date.now() - started
       });
     }
@@ -419,8 +498,18 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
     ),
     get_memory: envelopeHandler("get_memory", memoryToolSchemas.get_memory, (input) => {
       const memoryId = memoryIdFromInput(input);
-      const accessedBy = input.accessed_by;
-      return service.getMemory(memoryId, accessedBy) ?? asNotFoundMemoryResult(memoryId);
+      // Stage 16 v1.1.1 PR-1 (#11): `get_memory` is now a
+      // pure read. Client-supplied `accessed_by` is ignored;
+      // access identity comes from the trusted
+      // `RequestContext` actor. If a caller wants to record
+      // access (e.g. `recall_context` selection), they must
+      // do it explicitly through the `record_memory_feedback`
+      // tool (PR-7) or the `recordAccess` store API. The
+      // schema keeps `accessed_by` as a deprecated alias for
+      // one release cycle so existing clients keep parsing
+      // without errors; the value is dropped here.
+      void input.accessed_by;
+      return service.getMemory(memoryId) ?? asNotFoundMemoryResult(memoryId);
     }),
     list_memories: envelopeHandler("list_memories", memoryToolSchemas.list_memories, (input) =>
       service.listMemories(serviceInput<Parameters<MemoryService["listMemories"]>[0]>(input))
@@ -516,21 +605,46 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
 // Tool annotations (spec § 6.3) and output schemas.
 // ============================================================
 
+/**
+ * Stage 16 v1.1.1 PR-1 (#11) — annotation truth table.
+ *
+ * The pre-PR-1 matrix marked every mutating tool as
+ * `idempotentHint: true`, but that is only true when the
+ * caller supplies an `idempotency_key`. Without the key,
+ * two `remember` calls with the same body create two
+ * memories; two `forget_memory` calls with the same id
+ * return the second one as a no-op only because the entry
+ * is already gone (not because the call is genuinely
+ * idempotent at the protocol level).
+ *
+ * The honest static annotation is therefore
+ * `idempotentHint: false` for every tool that mutates
+ * unless it is the call site that has to opt in. The
+ * exception is `get_memory` (now genuinely read-only
+ * post-PR-1) and the read-only helpers
+ * (`search_memories`, `list_memories`, `get_memory_budget`,
+ * `explain_recall`, `list_backups`, `recall_context`,
+ * `export_memory_context`, `plan_maintenance`).
+ *
+ * Clients that want true idempotency pass an
+ * `idempotency_key`; the v2 reservation in PR-3 enforces
+ * the no-side-effect replay for those calls.
+ */
 const ANNOTATIONS: Record<MemoryToolName, { readOnlyHint: boolean; destructiveHint: boolean; idempotentHint: boolean }> = {
   recall_context: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
-  remember: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+  remember: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
   search_memories: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   get_memory: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   list_memories: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
-  update_memory: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
-  supersede_memory: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
-  merge_memories: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
-  forget_memory: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+  update_memory: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+  supersede_memory: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+  merge_memories: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
+  forget_memory: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
   get_memory_budget: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
-  maintain_memories: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+  maintain_memories: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
   export_memory_context: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   plan_maintenance: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
-  apply_maintenance: { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
+  apply_maintenance: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
   explain_recall: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   list_backups: { readOnlyHint: true, destructiveHint: false, idempotentHint: true }
 };
@@ -588,7 +702,14 @@ type MemoryToolServer = {
       outputSchema?: ZodType;
       annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean; idempotentHint?: boolean };
     },
-    cb: (input: unknown) => Promise<CallToolResult>
+    // Stage 16 v1.1.1 PR-1 (#11): the SDK's `registerTool`
+    // callback receives `(input, extra)`. The `extra` is
+    // forwarded to the inner handler so the trusted
+    // `RequestContext` (session id, JSON-RPC request id,
+    // cancellation signal) survives the registration hop.
+    // Pre-PR-1 the wrapper dropped `extra` here, which forced
+    // the inner handler to rely on process-wide defaults.
+    cb: (input: unknown, extra: unknown) => Promise<CallToolResult>
   ): unknown;
 };
 
@@ -604,7 +725,16 @@ export function registerMemoryTools(server: MemoryToolServer, service: MemorySer
         outputSchema: GENERIC_OUTPUT_SCHEMA,
         annotations: ANNOTATIONS[name]
       },
-      async (input: unknown) => handlers[name](input)
+      // Stage 16 v1.1.1 PR-1 (#11): forward the SDK `extra`
+      // argument end-to-end so the registered callback receives
+      // the real client / session / cancellation / progress
+      // context that the inner handler can use to build a
+      // trusted `RequestContext`. Pre-PR-1 the wrapper dropped
+      // `extra` here, which made the inner handler rely on
+      // process-wide defaults and forced the
+      // `buildToolRequestContext` to fabricate a `tool_call_id`
+      // from `Date.now()` + `Math.random()`.
+      async (input: unknown, extra: unknown) => handlers[name](input, extra as HandlerExtra | undefined)
     );
   }
 }

@@ -1472,6 +1472,23 @@ export class SQLiteMemoryStore {
     return map;
   }
 
+  /**
+   * Stage 16 v1.1.1 PR-1 (#11): pure read of a memory entry.
+   * No side effects on `memory_accesses` or
+   * `memory_entries.access_count`. Use this from
+   * `get_memory` (read-only tool) and from any path that
+   * must not change canonical access state.
+   *
+   * For paths that legitimately need to record access
+   * (e.g. `recall_context` selecting a memory), call
+   * `getEntry` with an `accessedBy` actor, or call
+   * `recordMemoryAccess(memoryId, actorId)` explicitly after
+   * the read.
+   */
+  peekEntry(id: string): MemoryEntry | undefined {
+    return this.readEntry(id);
+  }
+
   getEntry(id: string, accessedBy?: string): MemoryEntry | undefined {
     const entry = this.readEntry(id);
     if (entry === undefined) return undefined;
@@ -1522,10 +1539,6 @@ export class SQLiteMemoryStore {
       last_accessed_at: lastAccessedAt,
       ...(nextMap !== undefined ? { last_accessed_by: nextMap } : {})
     };
-  }
-
-  peekEntry(id: string): MemoryEntry | undefined {
-    return this.readEntry(id);
   }
 
   listEntries(filters: EntryFilters): MemoryEntry[] {
@@ -2399,7 +2412,31 @@ export class SQLiteMemoryStore {
 
   private readEntry(id: string): MemoryEntry | undefined {
     const row = this.db.prepare("SELECT * FROM memory_entries WHERE id = ?").get(id);
-    return row === undefined ? undefined : decodeEntry(row);
+    if (row === undefined) return undefined;
+    const entry = decodeEntry(row);
+    // Stage 16 v1.1.1 PR-1 (#11): the canonical access
+    // source of truth is `memory_accesses` (v4 schema). The
+    // `last_accessed_by` JSON column on `memory_entries` is
+    // a derived cache that pre-PR-1 callers (e.g. `getEntry`
+    // with an `accessedBy` argument) maintained as a side
+    // effect of reading. Now that reads are pure (no side
+    // effects), the cache may be stale or null even when
+    // `memory_accesses` has rows. Re-derive the per-actor
+    // last-access map from the canonical table when the
+    // cache is empty.
+    if (entry.last_accessed_by === undefined || Object.keys(entry.last_accessed_by).length === 0) {
+      const accessRows = this.db
+        .prepare(
+          "SELECT actor_id, last_accessed_at FROM memory_accesses WHERE memory_id = ? ORDER BY actor_id ASC"
+        )
+        .all(id) as Array<{ actor_id: string; last_accessed_at: string }>;
+      if (accessRows.length > 0) {
+        const derived: Record<string, string> = {};
+        for (const r of accessRows) derived[r.actor_id] = r.last_accessed_at;
+        entry.last_accessed_by = derived;
+      }
+    }
+    return entry;
   }
 
   private entryParams(entry: MemoryEntry): SQLInputValue[] {

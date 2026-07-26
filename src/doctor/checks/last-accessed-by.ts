@@ -1,45 +1,44 @@
 // src/doctor/checks/last-accessed-by.ts
 //
-// Surfaces a snapshot of the per-agent access map. The map is stored as
-// JSON on each `memory_entries.last_accessed_by` cell, so we aggregate by
-// walking every row once. Cheap on healthy databases; bounded by
-// `memory_entries` size.
+// Surfaces a snapshot of the per-agent access map.
+//
+// Stage 16 v1.1.1 PR-1 (#11): the canonical access source
+// of truth is `memory_accesses` (schema v4). The
+// `last_accessed_by` JSON column on `memory_entries` is a
+// derived cache; reads are now pure (no side effects) so
+// the cache can be stale or null even when the canonical
+// table has rows. This check now aggregates directly from
+// `memory_accesses` (the per-actor, per-memory rows) and
+// reports one entry per `memory_id` that has at least one
+// access row.
 
 import type { CheckContext, CheckResult } from "../types.js";
 
 type AgentCount = { agent: string; last_accessed_at: string };
 
-function parseMap(raw: unknown): Record<string, string> {
-  if (typeof raw !== "string" || raw.length === 0) return {};
-  try {
-    const parsed = JSON.parse(raw) as unknown;
-    if (parsed === null || typeof parsed !== "object") return {};
-    const out: Record<string, string> = {};
-    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-      if (typeof v === "string") out[k] = v;
-    }
-    return out;
-  } catch {
-    return {};
-  }
-}
-
 export function checkLastAccessedBy(ctx: CheckContext): CheckResult {
   const handle = ctx.store.backupHandle();
+  // Aggregate the canonical per-actor access rows. The
+  // `memory_id` count is "distinct memories with at least
+  // one access row"; the per-agent `last_accessed_at` is
+  // the maximum timestamp we have ever seen for that actor
+  // across the whole database.
   const rows = handle
-    .prepare("SELECT last_accessed_by FROM memory_entries")
-    .all() as Array<{ last_accessed_by: string | null }>;
+    .prepare(
+      `SELECT memory_id, actor_id, MAX(last_accessed_at) AS last_accessed_at
+         FROM memory_accesses
+        GROUP BY memory_id, actor_id
+        ORDER BY actor_id ASC`
+    )
+    .all() as Array<{ memory_id: string; actor_id: string; last_accessed_at: string }>;
 
   const agents = new Map<string, string>();
-  let entries = 0;
+  const distinctMemoryIds = new Set<string>();
   for (const row of rows) {
-    const map = parseMap(row.last_accessed_by);
-    const keys = Object.keys(map);
-    if (keys.length === 0) continue;
-    entries += 1;
-    for (const [agent, ts] of Object.entries(map)) {
-      const prev = agents.get(agent);
-      if (prev === undefined || ts > prev) agents.set(agent, ts);
+    distinctMemoryIds.add(row.memory_id);
+    const prev = agents.get(row.actor_id);
+    if (prev === undefined || row.last_accessed_at > prev) {
+      agents.set(row.actor_id, row.last_accessed_at);
     }
   }
 
@@ -50,7 +49,7 @@ export function checkLastAccessedBy(ctx: CheckContext): CheckResult {
   return {
     name: "last_accessed_by",
     status: "ok",
-    message: `${entries} entries, ${distribution.length} agents seen`,
-    details: { entries, agents: distribution }
+    message: `${distinctMemoryIds.size} entries, ${distribution.length} agents seen`,
+    details: { entries: distinctMemoryIds.size, agents: distribution }
   };
 }

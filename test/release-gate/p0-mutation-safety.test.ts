@@ -249,7 +249,7 @@ describe("release-gate p0-mutation-safety (AR-P0-006)", () => {
     expect(got?.entry.revision).toBe(2);
   });
 
-  it("recordAccess atomic UPSERT: two sibling reads from different actors each land their own row in memory_accesses", () => {
+  it("recordAccess atomic UPSERT: two sibling records from different actors each land their own row in memory_accesses", () => {
     const create = service.remember(
       {
         scope: "global" as const,
@@ -268,13 +268,15 @@ describe("release-gate p0-mutation-safety (AR-P0-006)", () => {
     if (!create.ok) return;
     const id = create.value.memory_id;
 
-    // Two distinct actors read the same memory. Each
-    // UPSERT must land (the table is keyed on
-    // (memory_id, actor_id)).
-    const a1 = service.getMemory(id, "agent:alpha");
-    const b1 = service.getMemory(id, "agent:beta");
-    expect(a1).toBeDefined();
-    expect(b1).toBeDefined();
+    // Stage 16 v1.1.1 PR-1 (#11): `getMemory` is now a
+    // pure read. Callers that need to record access (e.g.
+    // `recall_context` selection) call `store.recordAccess`
+    // explicitly. The atomic UPSERT contract - the table
+    // is keyed on `(memory_id, actor_id)`, so two distinct
+    // actors each land their own row - is unchanged.
+    const now = new Date().toISOString();
+    store.recordAccess(id, "agent:alpha", now);
+    store.recordAccess(id, "agent:beta", now);
 
     // Verify both rows are present in memory_accesses.
     const handle = store.backupHandle();
@@ -289,15 +291,15 @@ describe("release-gate p0-mutation-safety (AR-P0-006)", () => {
     expect(alpha?.access_count).toBe(1);
     expect(beta?.access_count).toBe(1);
 
-    // Reading again from the same actor bumps the
+    // Recording again from the same actor bumps the
     // per-actor access_count, not the entry count.
-    const a2 = service.getMemory(id, "agent:alpha");
-    expect(a2).toBeDefined();
+    store.recordAccess(id, "agent:alpha", now);
     const rowsAfter = handle
       .prepare(
         "SELECT actor_id, access_count FROM memory_accesses WHERE memory_id = ? ORDER BY actor_id ASC"
       )
       .all(id) as Array<{ actor_id: string; access_count: number }>;
+    expect(rowsAfter.length).toBe(2);
     const alphaAfter = rowsAfter.find((r) => r.actor_id === "agent:alpha");
     expect(alphaAfter?.access_count).toBe(2);
   });

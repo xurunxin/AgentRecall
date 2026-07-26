@@ -287,8 +287,13 @@ describe("memory tool schemas", () => {
     });
   });
 
-  it("get_memory accepts an accessed_by string and the handler forwards it", async () => {
-    // Schema accepts and validates the field.
+  it("get_memory is a pure read and ignores client-supplied accessed_by", async () => {
+    // Schema still accepts `accessed_by` for one release
+    // cycle so existing clients keep parsing. Stage 16
+    // v1.1.1 PR-1 (#11) marks the field deprecated and the
+    // handler drops it on the floor — access identity comes
+    // from the trusted `RequestContext` actor, not from
+    // client input.
     expect(memoryToolSchemas.get_memory.parse({
       memory_id: "mem_1",
       accessed_by: "agent:claude-code"
@@ -297,16 +302,19 @@ describe("memory tool schemas", () => {
       accessed_by: "agent:claude-code"
     });
 
-    // Handler forwards the value through to MemoryService.getMemory.
+    // Handler does NOT forward the client-supplied
+    // accessed_by to the service; the service is called
+    // with just the memory id.
     const service = fakeService();
     service.getMemory.mockReturnValue({ entry: { id: "mem_1" }, audit: [] });
     const handlers = createMemoryToolHandlers(service);
     await handlers.get_memory({ memory_id: "mem_1", accessed_by: "agent:claude-code" });
-    expect(service.getMemory).toHaveBeenCalledWith("mem_1", "agent:claude-code");
+    expect(service.getMemory).toHaveBeenCalledWith("mem_1");
 
-    // And omits the second arg when accessed_by is absent.
+    // And still calls with just the memory id when
+    // accessed_by is absent.
     await handlers.get_memory({ memory_id: "mem_2" });
-    expect(service.getMemory).toHaveBeenLastCalledWith("mem_2", undefined);
+    expect(service.getMemory).toHaveBeenLastCalledWith("mem_2");
   });
 });
 

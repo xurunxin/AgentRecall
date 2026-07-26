@@ -114,9 +114,25 @@ export class MemoryReadService {
 
   getMemory(
     id: string,
+    /**
+     * Stage 16 v1.1.1 PR-1 (#11): the `accessedBy` parameter is
+     * accepted for backward compatibility with the v1.1.0
+     * service contract, but it is no longer used to mutate
+     * access state from a read. `getMemory` is now a pure
+     * read — the `memory_accesses` row, the per-actor last-
+     * access map, and `memory_entries.access_count` are no
+     * longer touched from a read. If a caller legitimately
+     * needs to record access (e.g. `recall_context` selecting
+     * a memory for the context budget), call
+     * `store.recordMemoryAccess(memoryId, actorId)` explicitly
+     * after the read.
+     *
+     * @deprecated Pass `undefined`; this parameter is a no-op
+     * and will be removed in v1.2.
+     */
     accessedBy?: string
   ): { entry: MemoryEntry; audit: MemoryAuditEvent[] } | undefined {
-    const entry = this.ctx.store.getEntry(id, accessedBy);
+    const entry = this.ctx.store.peekEntry(id);
     return entry === undefined ? undefined : { entry, audit: this.ctx.store.getAuditEvents(id) };
   }
 

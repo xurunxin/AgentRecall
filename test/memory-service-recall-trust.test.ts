@@ -193,8 +193,12 @@ describe("exportMemoryContext trust_boost ranking (stage 5)", () => {
       body: "primary datastore postgres notes also from a foreign agent"
     }));
     if (!r2.ok) throw new Error("setup2");
-    // claude-code reads r2 — populates last_accessed_by
-    service.getMemory(r2.value.memory_id, "agent:claude-code");
+    // Stage 16 v1.1.1 PR-1 (#11): `getMemory` is a pure
+    // read; the canonical access source of truth is
+    // `memory_accesses`. Callers that need to record
+    // access (here, to feed the trust-boost signal) call
+    // `store.recordAccess` explicitly.
+    store.recordAccess(r2.value.memory_id, "agent:claude-code", new Date().toISOString());
 
     const result = service.exportMemoryContext({
       scope: "global",

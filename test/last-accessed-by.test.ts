@@ -43,24 +43,47 @@ describe("last_accessed_by", () => {
     }
   });
 
-  it("records the agent on getEntry reads", () => {
+  it("getMemory is a pure read and does not record access", () => {
+    // Stage 16 v1.1.1 PR-1 (#11): `getMemory` is now
+    // read-only. The pre-PR-1 `getMemory(id, accessedBy)`
+    // signature was a side-effecting read; the new path
+    // calls `store.peekEntry` and never touches
+    // `memory_accesses` or `memory_entries.access_count`.
     const r = service.remember(baseInput());
     if (!r.ok) throw new Error("setup");
-    const accessed = service.getMemory(r.value.memory_id, "agent:claude-code");
+    // Calling getMemory with an actor (or without) must not
+    // populate `last_accessed_by`. The legacy `accessedBy`
+    // parameter is accepted but ignored (deprecated).
+    service.getMemory(r.value.memory_id, "agent:claude-code");
+    const after = service.getMemory(r.value.memory_id);
+    expect(after?.entry.last_accessed_by).toBeUndefined();
+  });
+
+  it("explicit store.recordAccess still updates last_accessed_by", () => {
+    // Stage 16 v1.1.1 PR-1 (#11): callers that legitimately
+    // need to record access (e.g. `recall_context`
+    // selection) call `store.recordAccess` explicitly
+    // instead of relying on the read side effect.
+    const r = service.remember(baseInput());
+    if (!r.ok) throw new Error("setup");
+    store.recordAccess(r.value.memory_id, "agent:claude-code", new Date().toISOString());
+    const accessed = service.getMemory(r.value.memory_id);
     expect(accessed?.entry.last_accessed_by?.["agent:claude-code"]).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
-  it("accumulates multiple agent names", () => {
+  it("accumulates multiple agent names via explicit recordAccess", () => {
     const r = service.remember(baseInput());
     if (!r.ok) throw new Error("setup");
-    service.getMemory(r.value.memory_id, "agent:claude-code");
-    service.getMemory(r.value.memory_id, "agent:cursor");
-    const final = service.getMemory(r.value.memory_id, "agent:codex");
+    const iso = new Date().toISOString();
+    store.recordAccess(r.value.memory_id, "agent:claude-code", iso);
+    store.recordAccess(r.value.memory_id, "agent:cursor", iso);
+    store.recordAccess(r.value.memory_id, "agent:codex", iso);
+    const final = service.getMemory(r.value.memory_id);
     const map = final?.entry.last_accessed_by ?? {};
     expect(Object.keys(map).sort()).toEqual(["agent:claude-code", "agent:codex", "agent:cursor"]);
   });
 
-  it("does not record when accessedBy is omitted", () => {
+  it("does not record when no actor is ever recorded", () => {
     const r = service.remember(baseInput());
     if (!r.ok) throw new Error("setup");
     const accessed = service.getMemory(r.value.memory_id);
@@ -70,7 +93,7 @@ describe("last_accessed_by", () => {
   it("surfaces in the doctor report (one of the checks)", () => {
     const r = service.remember(baseInput());
     if (!r.ok) throw new Error("setup");
-    service.getMemory(r.value.memory_id, "agent:claude-code");
+    store.recordAccess(r.value.memory_id, "agent:claude-code", new Date().toISOString());
     const ctx: CheckContext = {
       dataHome,
       store,
@@ -91,8 +114,8 @@ describe("last_accessed_by", () => {
     if (!r1.ok) throw new Error("setup");
     const r2 = service.remember(baseInput({ title: "second", body: "second body", confirm_write: true }));
     if (!r2.ok) throw new Error("setup");
-    service.getMemory(r1.value.memory_id, "agent:claude-code");
-    service.getMemory(r2.value.memory_id, "agent:cursor");
+    store.recordAccess(r1.value.memory_id, "agent:claude-code", new Date().toISOString());
+    store.recordAccess(r2.value.memory_id, "agent:cursor", new Date().toISOString());
     const ctx: CheckContext = {
       dataHome,
       store,
