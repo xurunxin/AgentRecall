@@ -259,12 +259,37 @@ export function rankRecall(input: {
 }): RankedItem[] {
   const now = input.now ?? new Date();
   const tokens = queryTokens(input.query);
+  // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+  // temporal policy. The ranker filters candidates
+  // by the documented rule:
+  //
+  //   - `valid_from` in the future  → excluded.
+  //   - `valid_until` in the past  → excluded.
+  //   - otherwise the entry is eligible.
+  //
+  // The filter runs BEFORE the lexical / access
+  // RRF so an excluded entry never appears in any
+  // source's rank list. The temporal-window
+  // status is reported in the explain output so
+  // callers can see why a memory was excluded.
+  const nowMs = now.getTime();
+  const isEligible = (entry: MemoryEntry): boolean => {
+    if (entry.valid_from !== undefined) {
+      const fromMs = Date.parse(entry.valid_from);
+      if (!Number.isNaN(fromMs) && fromMs > nowMs) return false;
+    }
+    if (entry.valid_until !== undefined) {
+      const untilMs = Date.parse(entry.valid_until);
+      if (!Number.isNaN(untilMs) && untilMs < nowMs) return false;
+    }
+    return true;
+  };
+  const eligibleCandidates = input.candidates.filter((e) => e.status === "active" && isEligible(e));
   // Stage 16 v1.1.1 PR-6 (issue #15): build the
   // `fts_lexical` source list. The rank is by
   // descending `lexicalNorm(contextQueryScore)`,
   // tie-broken by id ascending.
-  const lexicalRanked = [...input.candidates]
-    .filter((e) => e.status === "active")
+  const lexicalRanked = [...eligibleCandidates]
     .map((entry) => ({
       entry,
       lexical: lexicalNorm(contextQueryScore(entry, tokens))
@@ -292,8 +317,7 @@ export function rankRecall(input: {
   // per-actor access count desc (the current
   // actor's count first, then any other actor's
   // count as a tie-break), tie-broken by id asc.
-  const accessRanked = [...input.candidates]
-    .filter((e) => e.status === "active")
+  const accessRanked = [...eligibleCandidates]
     .map((entry) => {
       const currentActorCount =
         input.store !== undefined

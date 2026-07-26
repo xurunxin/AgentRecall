@@ -35,6 +35,7 @@ import { appendAudit, computeTrustBoost } from "./services/memory-service-helper
 import { MemoryReadService, type ExportMemoryContextInput, type ListResult, type MemoryBudgetResult, type ResolvedReadScope, type SearchResult } from "./services/memory-read-service.js";
 import { MemoryMaintenanceService, type MaintainMemoriesInput, type MaintainMemoriesResult, type MaintenanceAction } from "./services/memory-maintenance-service.js";
 import { MemoryWriteService, type RememberResult } from "./services/memory-write-service.js";
+import { explainProvenance, recordProvenance, type ProvenanceSourceKind, type ProvenanceExplanation } from "./services/provenance.js";
 import { ProjectIdentityResolver } from "./scope-resolver.js";
 import type { BudgetUsage, EntryFilters, SearchFilters, SQLiteMemoryStore } from "./sqlite-store.js";
 import { CURRENT_SCHEMA_VERSION } from "./sqlite-store.js";
@@ -202,7 +203,7 @@ export class MemoryService {
     return this.write.configureProjectBudget(project_id, budget, canonical_path, display_name);
   }
 
-  remember(input: RememberInput, ctx?: RequestContext): Result<RememberResult, "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate" | "idempotency_mismatch" | "idempotency_in_flight"> {
+  remember(input: RememberInput, ctx?: RequestContext): Result<RememberResult, "invalid_schema" | "invalid_state" | "invalid_scope" | "secret_detected" | "unauthorized" | "capacity_exceeded" | "duplicate_candidate" | "idempotency_mismatch" | "idempotency_in_flight"> {
     return this.write.remember(input, ctx);
   }
 
@@ -210,7 +211,7 @@ export class MemoryService {
     id: string,
     input: UpdateInput,
     ctx?: RequestContext
-  ): Result<{ memory_id: string }, "not_found" | "invalid_state" | "invalid_schema" | "secret_detected" | "capacity_exceeded" | "stale_revision" | "idempotency_mismatch" | "idempotency_in_flight"> {
+  ): Result<{ memory_id: string }, "not_found" | "invalid_state" | "invalid_schema" | "secret_detected" | "unauthorized" | "capacity_exceeded" | "stale_revision" | "idempotency_mismatch" | "idempotency_in_flight"> {
     return this.write.updateMemory(id, input, ctx);
   }
 
@@ -219,7 +220,7 @@ export class MemoryService {
     replacement: RememberInput;
     reason: string;
     idempotency_key?: string;
-  }, ctx?: RequestContext): Result<{ memory_id: string }, "not_found" | "invalid_state" | "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate" | "idempotency_mismatch" | "idempotency_in_flight"> {
+  }, ctx?: RequestContext): Result<{ memory_id: string }, "not_found" | "invalid_state" | "invalid_schema" | "invalid_scope" | "secret_detected" | "unauthorized" | "capacity_exceeded" | "duplicate_candidate" | "idempotency_mismatch" | "idempotency_in_flight"> {
     return this.write.supersedeMemory(input, ctx);
   }
 
@@ -229,7 +230,7 @@ export class MemoryService {
     reason: string;
     strategy?: "keep_first" | "keep_newest";
     idempotency_key?: string;
-  }, ctx?: RequestContext): Result<{ memory_id: string; merged_from?: string[] }, "not_found" | "invalid_state" | "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate" | "idempotency_mismatch" | "idempotency_in_flight"> {
+  }, ctx?: RequestContext): Result<{ memory_id: string; merged_from?: string[] }, "not_found" | "invalid_state" | "invalid_schema" | "invalid_scope" | "secret_detected" | "unauthorized" | "capacity_exceeded" | "duplicate_candidate" | "idempotency_mismatch" | "idempotency_in_flight"> {
     return this.write.mergeMemories(input, ctx);
   }
 
@@ -319,6 +320,114 @@ export class MemoryService {
       created_at: nowIso()
     });
     return { ok: true };
+  }
+
+  /**
+   * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+   * record a provenance link for a memory. The
+   * `source_kind` / `source_ref` pair identifies
+   * the upstream source (GitHub issue, PR, commit,
+   * tool call, session, or import batch). The
+   * `recorded_by` actor is taken from the trusted
+   * `RequestContext` when present, falling back to
+   * the service's `defaultActor`. A repeat call
+   * with the same `(memory_id, source_kind,
+   * source_ref)` triple is a no-op (the store's
+   * `INSERT OR IGNORE` on the table's primary key
+   * keeps the link chain deduplicated).
+   */
+  recordProvenance(input: {
+    memory_id: string;
+    source_kind: ProvenanceSourceKind;
+    source_ref: string;
+    actor_id?: string;
+  }): { ok: true } | { ok: false; error: "not_found" | "invalid_input" } {
+    const entry = this.store.peekEntry(input.memory_id);
+    if (entry === undefined) {
+      return { ok: false, error: "not_found" };
+    }
+    return recordProvenance(this.store, {
+      memory_id: input.memory_id,
+      source_kind: input.source_kind,
+      source_ref: input.source_ref,
+      recorded_by: input.actor_id ?? this.defaultActor
+    });
+  }
+
+  /**
+   * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+   * read the durable provenance link chain for a
+   * memory. The `summary` field is what the
+   * `explain_memory_provenance` MCP tool renders.
+   */
+  explainProvenance(memory_id: string): ProvenanceExplanation | { ok: false; error: "not_found" } {
+    const entry = this.store.peekEntry(memory_id);
+    if (entry === undefined) {
+      return { ok: false, error: "not_found" };
+    }
+    return explainProvenance(this.store, memory_id);
+  }
+
+  /**
+   * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+   * the trusted-user confirmation gate. Promotes an
+   * existing memory's `trust_level` to the value
+   * the trusted user approved, on the explicit
+   * `user_confirmed: true` flag. The MCP
+   * `confirm_memory_trust` tool is the canonical
+   * path; this method is the service-level entry
+   * point that the tool wraps.
+   *
+   * The promotion is restricted to the trust tiers
+   * that the user can legitimately approve
+   * (`user_confirmed`, `agent_observed`,
+   * `inferred`); `imported` is reserved for the
+   * import path. The flag is a literal `true` so a
+   * client that doesn't pass the flag fails the
+   * MCP schema before reaching this method.
+   */
+  confirmMemoryTrust(input: {
+    memory_id: string;
+    trust_level: "user_confirmed" | "agent_observed" | "inferred";
+    user_confirmed: true;
+    reason?: string;
+    actor_id?: string;
+  }):
+    | { ok: true; previous: MemoryEntry["trust_level"]; next: MemoryEntry["trust_level"] }
+    | { ok: false; error: "not_found" | "unauthorized" | "invalid_input"; message?: string } {
+    const entry = this.store.peekEntry(input.memory_id);
+    if (entry === undefined) {
+      return { ok: false, error: "not_found" };
+    }
+    if (input.user_confirmed !== true) {
+      return { ok: false, error: "unauthorized", message: "user_confirmed flag is required" };
+    }
+    // Apply the new trust tier via a CAS update so
+    // the audit log records the transition. The
+    // mutation is small enough to skip the v2
+    // idempotency reservation — the tool is already
+    // idempotent in the "called twice with the
+    // same memory" sense.
+    const actor = input.actor_id ?? this.defaultActor;
+    const previous = entry.trust_level;
+    this.store.updateEntry(input.memory_id, {
+      updated_at: nowIso(),
+      trust_level: input.trust_level
+    });
+    appendAudit(this.store, actor, {
+      memory_id: input.memory_id,
+      scope: entry.scope,
+      ...(entry.project_id !== undefined ? { project_id: entry.project_id } : {}),
+      event: "updated",
+      reason: input.reason ?? `trust_level confirmed to ${input.trust_level}`,
+      metadata: {
+        field: "trust_level",
+        previous,
+        next: input.trust_level,
+        trusted_user_confirmation: true
+      }
+    });
+    return { ok: true, previous, next: input.trust_level };
   }
 
 

@@ -506,6 +506,13 @@ describe("registerMemoryTools", () => {
 
     registerMemoryTools(server, fakeService());
 
+    // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+    // the canonical `registerMemoryTools` registers
+    // every tool (the `core` / `extended` profile
+    // split is the per-server decision; this test
+    // verifies the all-tools path). The four new
+    // memory-semantics tools are appended at the
+    // end of the registration order.
     expect(registered.map((tool) => tool.name)).toEqual([
       "recall_context",
       "remember",
@@ -522,7 +529,11 @@ describe("registerMemoryTools", () => {
       "plan_maintenance",
       "apply_maintenance",
       "explain_recall",
-      "list_backups"
+      "list_backups",
+      "record_memory_feedback",
+      "record_memory_provenance",
+      "explain_memory_provenance",
+      "confirm_memory_trust"
     ]);
     expect(registered[0]?.config.description).toContain("[TRIGGER] Call near the start of a coding task");
     for (const tool of registered) {

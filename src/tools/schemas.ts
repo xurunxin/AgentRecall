@@ -11,6 +11,27 @@ const maintenanceActions = [
   "merge_duplicates"
 ] as const;
 
+// Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4): the
+// memory semantics controlled fields are now exposed
+// through the MCP `remember` / `update_memory` schemas
+// so a normal coding agent can create tiered, pinned,
+// or temporally-bounded memories without bypassing the
+// tool surface. The trust_level / sensitivity
+// escalations are policy-gated — see
+// `confirm_memory_trust` for the trusted-user path.
+const memoryTiers = ["core", "working", "archival"] as const;
+const memorySensitivities = ["normal", "private", "restricted"] as const;
+const memoryTrustLevels = [
+  "user_confirmed",
+  "agent_observed",
+  "inferred",
+  "imported"
+] as const;
+const timestampSchema = z.string().datetime({ offset: true });
+const tierSchema = z.enum(memoryTiers);
+const sensitivitySchema = z.enum(memorySensitivities);
+const trustLevelSchema = z.enum(memoryTrustLevels);
+
 const nonEmptyString = z.string().trim().min(1);
 const ratingSchema = z.number().int().min(1).max(5);
 const stringListSchema = z.array(nonEmptyString).default([]);
@@ -36,7 +57,18 @@ const updateFieldNames = [
   "confidence",
   "status",
   "expires_at",
-  "review_after"
+  "review_after",
+  // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+  // memory semantics controlled fields. Listed here
+  // so the "use either patch or top-level fields" /
+  // "at least one update field" rules treat them
+  // like any other patch target.
+  "tier",
+  "pinned",
+  "valid_from",
+  "valid_until",
+  "sensitivity",
+  "trust_level"
 ] as const;
 
 function requireProjectIdentity(
@@ -108,10 +140,52 @@ export const rememberToolSchema = z
     // remember after a network blip, the same key replays
     // the original result (idempotency_key_reuse on key
     // collision with a different request body).
-    idempotency_key: nonEmptyString.optional()
+    idempotency_key: nonEmptyString.optional(),
+    // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+    // memory semantics controlled fields. All
+    // optional; the validator applies the canonical
+    // defaults (tier=working, pinned=false,
+    // sensitivity=normal, trust_level=agent_observed).
+    tier: tierSchema.optional(),
+    pinned: z.boolean().optional(),
+    valid_from: timestampSchema.optional(),
+    valid_until: timestampSchema.optional(),
+    sensitivity: sensitivitySchema.optional(),
+    trust_level: trustLevelSchema.optional(),
+    // Trusted-user confirmation. Required when
+    // `trust_level === "user_confirmed"` is set.
+    // The MCP `confirm_memory_trust` tool is the
+    // canonical way to set this flag; CLI scripts
+    // that want to bypass the MCP tool must pass
+    // it explicitly.
+    user_confirmed: z.boolean().optional()
   })
   .strict()
-  .superRefine(requireProjectIdentity);
+  .superRefine(requireProjectIdentity)
+  .superRefine((input, context) => {
+    // Temporal-window sanity: `valid_from` must be
+    // <= `valid_until` when both are supplied. The
+    // Zod parser already accepts each as ISO 8601;
+    // the cross-field check is in the validator
+    // (which also runs on this payload). A
+    // backwards window is unambiguously a bug.
+    if (input.valid_from !== undefined && input.valid_until !== undefined) {
+      if (Date.parse(input.valid_from) > Date.parse(input.valid_until)) {
+        context.addIssue({
+          code: "custom",
+          path: ["valid_from"],
+          message: "valid_from must be earlier than or equal to valid_until"
+        });
+      }
+    }
+    if (input.trust_level === "user_confirmed" && input.user_confirmed !== true) {
+      context.addIssue({
+        code: "custom",
+        path: ["user_confirmed"],
+        message: "trust_level 'user_confirmed' requires the user_confirmed flag (use confirm_memory_trust)"
+      });
+    }
+  });
 
 const entryFilterFields = {
   scope: scopeSchema.optional(),
@@ -184,7 +258,18 @@ const updatePatchFields = {
   confidence: ratingSchema.optional(),
   status: writableStatusSchema.optional(),
   expires_at: nonEmptyString.optional(),
-  review_after: nonEmptyString.optional()
+  review_after: nonEmptyString.optional(),
+  // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+  // memory semantics controlled fields. The patch
+  // can target any of these; trust / sensitivity
+  // escalations are policy-gated in
+  // `superRefine` below.
+  tier: tierSchema.optional(),
+  pinned: z.boolean().optional(),
+  valid_from: timestampSchema.optional(),
+  valid_until: timestampSchema.optional(),
+  sensitivity: sensitivitySchema.optional(),
+  trust_level: trustLevelSchema.optional()
 };
 
 export const updatePatchSchema = z.object(updatePatchFields).strict();
@@ -207,7 +292,13 @@ export const updateMemoryToolSchema = z
     // the service returns `stale_revision`. Surface this
     // through the MCP contract so a concurrent writer
     // wins the race and we don't clobber the new state.
-    expected_revision: z.number().int().nonnegative().optional()
+    expected_revision: z.number().int().nonnegative().optional(),
+    // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+    // trusted-user confirmation. Required when the
+    // patch raises the trust tier to `user_confirmed`
+    // or the sensitivity to `restricted`. Set by
+    // the `confirm_memory_trust` MCP tool.
+    user_confirmed: z.boolean().optional()
   })
   .strict()
   .superRefine((input, context) => {
@@ -230,6 +321,38 @@ export const updateMemoryToolSchema = z
         path: ["patch"],
         message: "update_memory requires at least one update field"
       });
+    }
+
+    // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+    // authorization for trust / sensitivity escalations.
+    // The MCP tool surface is the canonical trusted
+    // path; the user_confirmed flag must be supplied
+    // explicitly when the patch tries to escalate.
+    if (input.trust_level === "user_confirmed" && input.user_confirmed !== true) {
+      context.addIssue({
+        code: "custom",
+        path: ["user_confirmed"],
+        message: "trust_level 'user_confirmed' requires the user_confirmed flag (use confirm_memory_trust)"
+      });
+    }
+    if (input.sensitivity === "restricted" && input.user_confirmed !== true) {
+      context.addIssue({
+        code: "custom",
+        path: ["user_confirmed"],
+        message: "sensitivity 'restricted' requires the user_confirmed flag"
+      });
+    }
+
+    // Temporal-window sanity: `valid_from` must be <=
+    // `valid_until` when both are supplied.
+    if (input.valid_from !== undefined && input.valid_until !== undefined) {
+      if (Date.parse(input.valid_from) > Date.parse(input.valid_until)) {
+        context.addIssue({
+          code: "custom",
+          path: ["valid_from"],
+          message: "valid_from must be earlier than or equal to valid_until"
+        });
+      }
     }
   });
 
@@ -363,6 +486,71 @@ export const listBackupsToolSchema = z
   .object({})
   .strict();
 
+// Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4): the
+// memory semantics MCP tools. Each one wraps an
+// existing service helper and adds a thin
+// authorization layer; the actor identity always
+// comes from the trusted `RequestContext`, never
+// from the input payload.
+export const recordMemoryFeedbackToolSchema = z
+  .object({
+    id: nonEmptyString.optional(),
+    memory_id: nonEmptyString.optional(),
+    // The kind enum mirrors `MemoryService.recordFeedback`.
+    kind: z.enum(["up", "down", "pin", "hide"])
+  })
+  .strict()
+  .superRefine(requireConsistentMemoryId);
+
+export const recordMemoryProvenanceToolSchema = z
+  .object({
+    id: nonEmptyString.optional(),
+    memory_id: nonEmptyString.optional(),
+    source_kind: z.enum([
+      "issue",
+      "pr",
+      "commit",
+      "tool_call",
+      "session",
+      "import"
+    ]),
+    // Free-form identifier — URL, sha, batch id.
+    source_ref: nonEmptyString
+  })
+  .strict()
+  .superRefine(requireConsistentMemoryId);
+
+export const explainMemoryProvenanceToolSchema = z
+  .object({
+    id: nonEmptyString.optional(),
+    memory_id: nonEmptyString.optional()
+  })
+  .strict()
+  .superRefine(requireConsistentMemoryId);
+
+export const confirmMemoryTrustToolSchema = z
+  .object({
+    id: nonEmptyString.optional(),
+    memory_id: nonEmptyString.optional(),
+    // The trust tier the trusted user is
+    // confirming. The tool is the canonical
+    // way to promote a memory to
+    // `user_confirmed`; the validator only
+    // accepts the value if `user_confirmed:
+    // true` is also set (which this schema
+    // does for the caller).
+    trust_level: z.enum(["user_confirmed", "agent_observed", "inferred"]),
+    // The caller must echo `user_confirmed: true`
+    // to make the policy intent explicit. The
+    // tool does not consult the input actor
+    // identity; the actor comes from the
+    // `RequestContext` (per PR-1 #11).
+    user_confirmed: z.literal(true),
+    reason: nonEmptyString.optional()
+  })
+  .strict()
+  .superRefine(requireConsistentMemoryId);
+
 export const rememberSchema = rememberToolSchema;
 export const searchSchema = searchMemoriesToolSchema;
 export const getMemorySchema = getMemoryToolSchema;
@@ -378,6 +566,10 @@ export const planMaintenanceSchema = planMaintenanceToolSchema;
 export const applyMaintenanceSchema = applyMaintenanceToolSchema;
 export const explainRecallSchema = explainRecallToolSchema;
 export const listBackupsSchema = listBackupsToolSchema;
+export const recordFeedbackSchema = recordMemoryFeedbackToolSchema;
+export const recordProvenanceSchema = recordMemoryProvenanceToolSchema;
+export const explainProvenanceSchema = explainMemoryProvenanceToolSchema;
+export const confirmTrustSchema = confirmMemoryTrustToolSchema;
 
 export const memoryToolSchemas = {
   recall_context: recallContextToolSchema,
@@ -395,7 +587,17 @@ export const memoryToolSchemas = {
   plan_maintenance: planMaintenanceToolSchema,
   apply_maintenance: applyMaintenanceToolSchema,
   explain_recall: explainRecallToolSchema,
-  list_backups: listBackupsToolSchema
+  list_backups: listBackupsToolSchema,
+  // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+  // the four new memory-semantics tools. Each one
+  // wraps a service helper and adds a thin
+  // authorization layer; the actor identity always
+  // comes from the trusted `RequestContext` (PR-1
+  // #11), not from the input payload.
+  record_memory_feedback: recordMemoryFeedbackToolSchema,
+  record_memory_provenance: recordMemoryProvenanceToolSchema,
+  explain_memory_provenance: explainMemoryProvenanceToolSchema,
+  confirm_memory_trust: confirmMemoryTrustToolSchema
 } as const;
 
 export type MemoryToolName = keyof typeof memoryToolSchemas;

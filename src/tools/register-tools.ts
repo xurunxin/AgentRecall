@@ -70,7 +70,21 @@ export const memoryToolNames = [
   "plan_maintenance",
   "apply_maintenance",
   "explain_recall",
-  "list_backups"
+  "list_backups",
+  // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+  // memory semantics MCP tools. By default these
+  // are in the `extended` profile (PR-7 also
+  // adds a `core` / `extended` profile split);
+  // the public `registerMemoryTools(server, ...)`
+  // helper still registers every tool so the
+  // `p3-mcp-tool-annotations.test.ts` assertion
+  // continues to pass. The profile split is
+  // applied at the per-server `registerCoreTools`
+  // / `registerExtendedTools` boundary.
+  "record_memory_feedback",
+  "record_memory_provenance",
+  "explain_memory_provenance",
+  "confirm_memory_trust"
 ] as const satisfies readonly MemoryToolName[];
 
 const updateFieldNames = [
@@ -490,9 +504,27 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
     recall_context: textEnvelopeHandler("recall_context", memoryToolSchemas.recall_context, (input, _extra, ctx) =>
       service.exportMemoryContext(serviceInput<Parameters<MemoryService["exportMemoryContext"]>[0]>(input), ctx)
     ),
-    remember: envelopeHandler("remember", memoryToolSchemas.remember, (input, _extra, ctx) =>
-      service.remember(serviceInput<Parameters<MemoryService["remember"]>[0]>(input), ctx)
-    ),
+    remember: envelopeHandler("remember", memoryToolSchemas.remember, (input, _extra, ctx) => {
+      const result = service.remember(serviceInput<Parameters<MemoryService["remember"]>[0]>(input), ctx);
+      // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+      // auto-capture provenance. Every successful
+      // `remember` writes a `tool_call` link so the
+      // `explain_memory_provenance` tool can show the
+      // full chain back to the MCP call. The link
+      // uses the SDK's `requestId` (per PR-1 #11);
+      // a repeat call with the same `requestId` is a
+      // no-op (the table's PRIMARY KEY is
+      // `(memory_id, source_kind, source_ref)`).
+      if (result.ok && ctx?.tool_call_id !== undefined) {
+        service.recordProvenance({
+          memory_id: result.value.memory_id,
+          source_kind: "tool_call",
+          source_ref: ctx.tool_call_id,
+          actor_id: ctx.actor_id
+        });
+      }
+      return result;
+    }),
     search_memories: envelopeHandler("search_memories", memoryToolSchemas.search_memories, (input) =>
       service.searchMemories(serviceInput<Parameters<MemoryService["searchMemories"]>[0]>(input))
     ),
@@ -597,6 +629,66 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
     ),
     list_backups: envelopeHandler("list_backups", memoryToolSchemas.list_backups, (input) =>
       service.listBackups()
+    ),
+    // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+    // the four memory-semantics tools. Each one
+    // delegates to a service helper and forwards the
+    // `RequestContext.actor_id` (not a client-supplied
+    // identity) so a tool caller cannot impersonate
+    // another actor.
+    record_memory_feedback: envelopeHandler(
+      "record_memory_feedback",
+      memoryToolSchemas.record_memory_feedback,
+      (input, _extra, ctx) => {
+        const memoryId = memoryIdFromInput(input);
+        // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+        // the actor identity comes from the trusted
+        // `RequestContext` (PR-1 #11). A client cannot
+        // override it through tool input.
+        return service.recordFeedback({
+          memory_id: memoryId,
+          kind: input.kind,
+          actor_id: ctx?.actor_id
+        });
+      }
+    ),
+    record_memory_provenance: envelopeHandler(
+      "record_memory_provenance",
+      memoryToolSchemas.record_memory_provenance,
+      (input, _extra, ctx) =>
+        service.recordProvenance({
+          memory_id: memoryIdFromInput(input),
+          source_kind: input.source_kind,
+          source_ref: input.source_ref,
+          actor_id: ctx?.actor_id
+        })
+    ),
+    explain_memory_provenance: envelopeHandler(
+      "explain_memory_provenance",
+      memoryToolSchemas.explain_memory_provenance,
+      (input) => {
+        const memoryId = memoryIdFromInput(input);
+        const explanation = service.explainProvenance(memoryId);
+        if ("ok" in explanation) {
+          return explanation;
+        }
+        // Successful path: render the summary as the
+        // tool payload so an MCP client can show it
+        // verbatim.
+        return { ok: true, value: explanation };
+      }
+    ),
+    confirm_memory_trust: envelopeHandler(
+      "confirm_memory_trust",
+      memoryToolSchemas.confirm_memory_trust,
+      (input, _extra, ctx) =>
+        service.confirmMemoryTrust({
+          memory_id: memoryIdFromInput(input),
+          trust_level: input.trust_level,
+          user_confirmed: true,
+          ...(input.reason !== undefined ? { reason: input.reason } : {}),
+          actor_id: ctx?.actor_id
+        })
     )
   };
 }
@@ -646,7 +738,21 @@ const ANNOTATIONS: Record<MemoryToolName, { readOnlyHint: boolean; destructiveHi
   plan_maintenance: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
   apply_maintenance: { readOnlyHint: false, destructiveHint: true, idempotentHint: false },
   explain_recall: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
-  list_backups: { readOnlyHint: true, destructiveHint: false, idempotentHint: true }
+  list_backups: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+  // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+  // the four new memory-semantics tools. None are
+  // idempotent (a repeat `record_memory_feedback`
+  // is a new row, not a replay) and none are
+  // destructive (they don't touch the memory
+  // body). `record_memory_provenance` and
+  // `record_memory_feedback` are non-destructive
+  // writes; `confirm_memory_trust` mutates the
+  // `trust_level` column; `explain_memory_provenance`
+  // is a pure read.
+  record_memory_feedback: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+  record_memory_provenance: { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+  explain_memory_provenance: { readOnlyHint: true, destructiveHint: false, idempotentHint: true },
+  confirm_memory_trust: { readOnlyHint: false, destructiveHint: true, idempotentHint: false }
 };
 
 // Output schemas. We use a permissive `z.unknown()` for the
@@ -734,6 +840,75 @@ export function registerMemoryTools(server: MemoryToolServer, service: MemorySer
       // process-wide defaults and forced the
       // `buildToolRequestContext` to fabricate a `tool_call_id`
       // from `Date.now()` + `Math.random()`.
+      async (input: unknown, extra: unknown) => handlers[name](input, extra as HandlerExtra | undefined)
+    );
+  }
+}
+
+/**
+ * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+ * tool profile split. A `core` profile is what
+ * the default packaged server registers; an
+ * `extended` profile adds the four memory-semantics
+ * tools (record_memory_feedback,
+ * record_memory_provenance,
+ * explain_memory_provenance, confirm_memory_trust)
+ * plus the administrative tools (maintain_memories,
+ * plan_maintenance, apply_maintenance, merge_memories,
+ * supersede_memory, export_memory_context).
+ *
+ * The split exists so a normal coding agent isn't
+ * overloaded with administrative tools it should not
+ * call. The MCP server starts in the `core` profile
+ * by default; the `extended` profile is enabled via
+ * the `AGENT_RECALL_PROFILE=extended` env var (or a
+ * `--profile=extended` CLI flag, wired at the
+ * `bin/agent-recall.ts` entry point).
+ */
+export const CORE_TOOL_NAMES: readonly MemoryToolName[] = [
+  "recall_context",
+  "remember",
+  "search_memories",
+  "get_memory",
+  "list_memories",
+  "update_memory",
+  "forget_memory",
+  "get_memory_budget",
+  "explain_recall",
+  "list_backups"
+];
+
+export const EXTENDED_TOOL_NAMES: readonly MemoryToolName[] = memoryToolNames.filter(
+  (name) => !CORE_TOOL_NAMES.includes(name)
+);
+
+export function registerCoreTools(server: MemoryToolServer, service: MemoryService): void {
+  const handlers = createMemoryToolHandlers(service);
+  for (const name of CORE_TOOL_NAMES) {
+    server.registerTool(
+      name,
+      {
+        description: memoryToolDescriptions[name],
+        inputSchema: memoryToolSchemas[name],
+        outputSchema: GENERIC_OUTPUT_SCHEMA,
+        annotations: ANNOTATIONS[name]
+      },
+      async (input: unknown, extra: unknown) => handlers[name](input, extra as HandlerExtra | undefined)
+    );
+  }
+}
+
+export function registerExtendedTools(server: MemoryToolServer, service: MemoryService): void {
+  const handlers = createMemoryToolHandlers(service);
+  for (const name of EXTENDED_TOOL_NAMES) {
+    server.registerTool(
+      name,
+      {
+        description: memoryToolDescriptions[name],
+        inputSchema: memoryToolSchemas[name],
+        outputSchema: GENERIC_OUTPUT_SCHEMA,
+        annotations: ANNOTATIONS[name]
+      },
       async (input: unknown, extra: unknown) => handlers[name](input, extra as HandlerExtra | undefined)
     );
   }

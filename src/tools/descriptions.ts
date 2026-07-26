@@ -107,6 +107,34 @@ const TEXT: Record<MemoryToolName, Record<Segment, string>> = {
     INPUT: "None. Reads from the data home configured at server start.",
     OUTPUT: "{ backup_dir, entries: [{ name, size, mtimeMs }] } newest first.",
     FAILURE: "Empty entries when data home is unknown or the directory does not exist."
+  },
+  // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+  // the four new memory-semantics tools. Concise
+  // descriptions that fit the 80-char segment
+  // limit; the full contract is in the schema.
+  record_memory_feedback: {
+    TRIGGER: "When a memory was useful (up), misleading (down), or should always/hide.",
+    INPUT: "id | memory_id, kind: up|down|pin|hide. Actor is the request context, not input.",
+    OUTPUT: "{ ok: true } on success; { error: 'not_found' } when the id is unknown.",
+    FAILURE: "not_found. The feedback row is appended, not deduplicated."
+  },
+  record_memory_provenance: {
+    TRIGGER: "When you can link a memory to an issue, PR, commit, session, or import.",
+    INPUT: "id | memory_id, source_kind, source_ref (the canonical upstream id).",
+    OUTPUT: "{ ok: true, link: { source_kind, source_ref, recorded_by, recorded_at } }.",
+    FAILURE: "not_found. Repeat calls with the same triple are no-ops (PRIMARY KEY)."
+  },
+  explain_memory_provenance: {
+    TRIGGER: "When you need the full source-of-truth chain for a memory.",
+    INPUT: "id | memory_id. Nothing else; the chain lives in memory_provenance.",
+    OUTPUT: "{ memory_id, links[], summary[] } ordered by source_kind, recorded_at.",
+    FAILURE: "not_found. Empty links = the memory has no recorded provenance."
+  },
+  confirm_memory_trust: {
+    TRIGGER: "When a trusted user explicitly approves a memory's trust tier.",
+    INPUT: "id | memory_id, trust_level, user_confirmed: true, reason?.",
+    OUTPUT: "{ ok: true } on success; audits the transition with previous/next.",
+    FAILURE: "unauthorized without user_confirmed. not_found on unknown id."
   }
 };
 

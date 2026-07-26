@@ -13,6 +13,198 @@ lands as 8 serial PRs after v1.1.0. Each PR closes
 exactly one issue (#10–#17) under the tracker
 issue #18.
 
+### Stage 16 PR-7 (Memory Semantics MCP)
+### Fixed
+
+- **`src/write-validator.ts`** (issue #17,
+  spec § 5.4). The `RememberInput` /
+  `UpdateInput` types now accept the controlled
+  fields `tier`, `pinned`, `valid_from`,
+  `valid_until`, `sensitivity`, `trust_level`,
+  and the trusted-user confirmation flag
+  `user_confirmed`. The validator applies
+  canonical defaults (`tier = "working"`,
+  `pinned = false`, `sensitivity = "normal"`,
+  `trust_level = "agent_observed"`) so existing
+  callers keep working. The trust-level
+  authorization policy is enforced: a patch
+  that raises the trust tier to
+  `user_confirmed` MUST also pass
+  `user_confirmed: true`, otherwise the
+  validator returns `unauthorized`. The
+  temporal-window sanity check rejects
+  `valid_from > valid_until` as
+  `invalid_state`.
+
+- **`src/sqlite-store.ts`** (issue #17). The
+  `EntryPatch` type and `ENTRY_PATCH_FIELDS`
+  list now include the six new controlled
+  fields. Pre-PR-7 the sanitizer silently
+  dropped them, so a `tier: "core"` patch
+  was a no-op at the storage layer. The
+  `updateEntry` UPDATE statement already had
+  the columns; the sanitizer was the gate
+  that blocked them.
+
+- **`src/services/memory-service-helpers.ts`**
+  (issue #17). The `buildEntry` helper now
+  reads the validated controlled fields
+  directly (no more `(input as { tier?: ... })`
+  cast) and the `pinned` / `sensitivity` /
+  `trust_level` defaults flow through
+  end-to-end.
+
+- **`src/services/recall-ranker.ts`**
+  (issue #17). The temporal-window policy
+  is enforced at the ranker entry point:
+  candidates whose `valid_from` is in the
+  future OR whose `valid_until` is in the
+  past are excluded from the lexical and
+  access RRF source lists, so they never
+  appear in `search_memories` /
+  `recall_context` results.
+
+### Added
+
+- **`src/memory-service.ts`** (issue #17).
+  Three new public service methods:
+  - `recordProvenance({ memory_id,
+    source_kind, source_ref, actor_id? })`
+    — append a provenance link; actor
+    identity comes from the trusted
+    `RequestContext` (PR-1 #11). Repeat
+    calls with the same
+    `(memory_id, source_kind, source_ref)`
+    triple are no-ops (PRIMARY KEY).
+  - `explainProvenance(memory_id)` —
+    read the durable provenance chain and
+    render the human-readable summary
+    the `explain_memory_provenance` tool
+    returns.
+  - `confirmMemoryTrust({ memory_id,
+    trust_level, user_confirmed: true,
+    reason?, actor_id? })` — the
+    trusted-user confirmation gate. The
+    method enforces the `user_confirmed:
+    true` literal at the service level
+    (the MCP schema does so at the
+    boundary; this is defence-in-depth),
+    promotes the trust tier, and audits
+    the transition with `previous` /
+    `next` fields in the audit metadata.
+
+- **`src/tools/schemas.ts`** (issue #17).
+  Four new MCP tool schemas, each with a
+  TRIGGER / INPUT / OUTPUT / FAILURE
+  description in
+  `src/tools/descriptions.ts`:
+  - `record_memory_feedback` — wraps
+    `service.recordFeedback`.
+  - `record_memory_provenance` — wraps
+    `service.recordProvenance`.
+  - `explain_memory_provenance` — wraps
+    `service.explainProvenance`.
+  - `confirm_memory_trust` — wraps
+    `service.confirmMemoryTrust`. The
+    schema requires `user_confirmed:
+    z.literal(true)` so a client cannot
+    promote trust without the flag.
+
+- **`src/tools/schemas.ts`** (issue #17).
+  The `remember` and `update_memory` MCP
+  schemas expose the six new controlled
+  fields plus the `user_confirmed`
+  confirmation flag. The
+  `superRefine` blocks reject backward
+  temporal windows and unauthorized
+  trust / sensitivity escalations at
+  the tool boundary (a tool call that
+  tries to set `trust_level:
+  "user_confirmed"` without the flag
+  is rejected before reaching the
+  service layer).
+
+- **`src/tools/register-tools.ts`** (issue #17).
+  Four new tool handlers, plus:
+  - Auto-capture provenance: every
+    successful `remember` writes a
+    `tool_call` provenance link with the
+    SDK's `requestId` so the source
+    chain reaches the original MCP call
+    automatically.
+  - Tool profile split: a `core`
+    profile (10 tools, what normal
+    coding agents should see) and an
+    `extended` profile (the
+    administrative tools plus the four
+    memory-semantics tools). The
+    `registerCoreTools` /
+    `registerExtendedTools` helpers
+    honour the split; the canonical
+    `registerMemoryTools` continues to
+    register every tool (for tests and
+    the packaged server's default
+    profile). The CLI's
+    `--profile=extended` flag is the
+    runtime entry point.
+
+### New tests
+
+- **`test/release-gate/p3-memory-semantics-mcp.test.ts`**
+  (14 tests). Covers the v1.1.1 contract
+  end-to-end:
+  - `tier` / `pinned` / `valid_from` /
+    `valid_until` / `sensitivity` round-trip
+    through the validator and the
+    `buildEntry` write path.
+  - Documented defaults apply when
+    controlled fields are omitted.
+  - `valid_from > valid_until` is
+    rejected as `invalid_state`.
+  - `trust_level: "user_confirmed"`
+    without the flag is rejected as
+    `unauthorized`; with the flag, it
+    is accepted and persisted.
+  - Future `valid_from` and expired
+    `valid_until` are excluded from
+    `search_memories` candidates.
+  - `recordProvenance` appends a link
+    and is a no-op on duplicate
+    `(memory_id, source_kind, source_ref)`.
+  - `recordProvenance` returns
+    `not_found` for an unknown memory
+    id.
+  - `recordFeedback` (existing) still
+    surfaces in the ranker score.
+  - `confirmMemoryTrust` promotes the
+    trust tier and audits the transition
+    with `previous` / `next` fields.
+  - The four new MCP tool schemas
+    parse valid inputs and reject the
+    unauthorized variants.
+
+- **`test/tool-registration.test.ts`**
+  (updated). The `registerMemoryTools`
+  test now lists all 20 tools (the four
+  new memory-semantics tools are
+  appended at the end of the
+  registration order).
+
+### Verification
+
+- `npm test` → 560 passed + 5 skipped
+  (was 546 + 5 in PR-6; +14 from the new
+  `p3-memory-semantics-mcp` suite).
+- `npm run typecheck` → 0 error.
+- `npm run build` → 0 error.
+- 1 unhandled `birpc` `onTaskUpdate`
+  60s timeout (the pre-existing
+  vitest-worker heartbeat documented in
+  PR-M0-1's CHANGELOG; 0 actual test
+  failures).
+- No `package.json` /
+  `package-lock.json` changes.
+
 ### Stage 16 PR-6 (Real Hybrid Retrieval)
 ### Fixed
 
