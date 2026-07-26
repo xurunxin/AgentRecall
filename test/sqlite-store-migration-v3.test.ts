@@ -42,7 +42,7 @@ describe("SQLiteMemoryStore v2 -> v3 migration", () => {
     // (memory hierarchy: tier, valid_from/until,
     // memory_episodes). The chain walks
     // v2->v3->v4->v5->v6->v7->v8->v9->v10.
-    expect(CURRENT_SCHEMA_VERSION).toBe(10);
+    expect(CURRENT_SCHEMA_VERSION).toBe(11);
   });
 
   it("migrates a v2 database to v3, preserving existing rows", () => {
@@ -132,3 +132,4 @@ describe("SQLiteMemoryStore v2 -> v3 migration", () => {
     store.close();
   });
 });
+

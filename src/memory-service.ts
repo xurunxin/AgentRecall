@@ -522,10 +522,24 @@ export class MemoryService {
    * - mark the plan `completed` only when every
    *   destructive item succeeded.
    *
-   * If any destructive item fails (stale revision, scope
-   * mismatch, drift), the plan is marked `rejected` and
-   * no further items are attempted. The apply step never
-   * mutates an entry that is not in `proposed_actions`.
+   * Stage 16 v1.1.1 PR-5 (issue #12): the entire apply
+   * is now wrapped in a single `BEGIN IMMEDIATE`
+   * transaction. The plan transitions through
+   * `pending -> applying -> completed|rejected` inside
+   * the transaction so a failure on group N rolls back
+   * the business writes for groups 1..N-1 AND the
+   * state transition. The apply never mutates an
+   * entry that is not in `proposed_actions`.
+   *
+   * Crash semantics: a process crash before the
+   * transaction commits leaves the plan in `pending`
+   * (the `pending -> applying` transition is part of
+   * the same transaction). A process crash after
+   * `markApplying` but before `markCompleted` leaves
+   * the plan in `applying`; the next apply call sees
+   * `applying` and surfaces `plan_expired` so the
+   * operator can wait for the takeover window or mark
+   * the plan expired manually.
    */
   applyMaintenance(input: {
     plan_id: string;
@@ -598,12 +612,46 @@ export class MemoryService {
       return { ok: true, value: validation };
     }
 
+    // Stage 16 v1.1.1 PR-5 (issue #12): idempotent
+    // replay. The validator returned `ok: true` with
+    // a `replay` field when the plan is already
+    // completed and the idempotency key matches the
+    // one stored on the row. We return the original
+    // success result verbatim.
+    if (validation.replay !== undefined) {
+      appendAudit(this.store, this.defaultActor, {
+        scope: plan.scope,
+        ...(plan.project_id !== undefined ? { project_id: plan.project_id } : {}),
+        event: "apply_maintenance",
+        actor: "system:maintenance",
+        reason: "plan_replay",
+        metadata: {
+          plan_id: input.plan_id,
+          ok: true,
+          applied: validation.replay.applied,
+          rejected: validation.replay.rejected,
+          idempotency_key: input.idempotency_key,
+          replayed: true
+        }
+      });
+      return {
+        ok: true,
+        value: {
+          ok: true,
+          plan_id: input.plan_id,
+          applied: validation.replay.applied,
+          rejected: validation.replay.rejected,
+          idempotency_key: input.idempotency_key
+        }
+      };
+    }
+
     // Idempotent retry: same plan + same key = no-op
     // success. The validator already returned `ok: true`
     // with the plan; we just emit the audit and return.
     const destructiveItems = plan.proposed_actions.filter((a) => a.kind !== "retain");
     if (destructiveItems.length === 0) {
-      this.planStore.markCompleted(input.plan_id, input.idempotency_key);
+      this.planStore.markCompleted(input.plan_id, input.idempotency_key, { applied: 0, rejected: 0 });
       appendAudit(this.store, this.defaultActor, {
         scope: plan.scope,
         ...(plan.project_id !== undefined ? { project_id: plan.project_id } : {}),
@@ -677,60 +725,112 @@ export class MemoryService {
       ...(plan.project_id !== undefined ? { project_id: plan.project_id } : {})
     };
 
+    // Stage 16 v1.1.1 PR-5 (issue #12): the entire
+    // apply runs inside a single store transaction.
+    // The transaction opens with `markApplying` (the
+    // `pending -> applying` state transition); the
+    // group apply calls run inside the same
+    // transaction; the close writes
+    // `markCompleted` (the `applying -> completed`
+    // transition with the canonical result). A throw
+    // anywhere inside the transaction rolls back every
+    // mutation AND the state transition.
+    //
+    // The pre-mutation backup runs OUTSIDE the
+    // transaction (VACUUM INTO cannot run against a
+    // connection holding an open transaction; the
+    // per-group `maybeBackup` is also disabled inside
+    // the transaction for the same reason).
+    const totalTargetIds = plan.proposed_actions.filter((a) => a.kind !== "retain").length;
+    this.maintenance.applyPlannedPreBackup(totalTargetIds);
     let applied = 0;
     let rejected = 0;
-    for (const [, items] of groupsByFingerprint) {
-      const target_ids = items.map((a) => a.target_memory_id);
-      const expected_revisions: Record<string, number> = {};
-      for (const a of items) expected_revisions[a.target_memory_id] = a.expected_revision;
-      const result = this.maintenance.mergePlannedGroup({
-        scope,
-        target_ids,
-        expected_revisions,
-        reason: "apply_maintenance",
-        strategy: "keep_first"
+    let firstFailure: { reason: string; target_ids: string[] } | undefined;
+    try {
+      this.store.transaction(() => {
+        // Flip the plan to `applying`. If this
+        // transition fails (the plan is no longer
+        // `pending`), abort the apply with a clear
+        // error.
+        const transitioned = this.planStore.markApplying(input.plan_id);
+        if (!transitioned) {
+          throw new Error(
+            `plan ${input.plan_id} is no longer pending; another caller may have applied it`
+          );
+        }
+        for (const [, items] of groupsByFingerprint) {
+          const target_ids = items.map((a) => a.target_memory_id);
+          const expected_revisions: Record<string, number> = {};
+          for (const a of items) expected_revisions[a.target_memory_id] = a.expected_revision;
+          const result = this.maintenance.applyPlannedGroupInTransaction({
+            scope,
+            target_ids,
+            expected_revisions,
+            reason: "apply_maintenance",
+            strategy: "keep_first"
+          });
+          if (result.ok) {
+            applied += result.superseded_ids.length;
+            continue;
+          }
+          // The first failed group triggers the
+          // rollback. The transaction is closed by
+          // the throw; the plan state stays
+          // `pending` (the `markApplying` was
+          // rolled back too).
+          rejected += 1;
+          firstFailure = { reason: result.reason, target_ids };
+          throw new Error(
+            `apply_maintenance: group failed (${result.reason}) for target_ids=${target_ids.join(",")}`
+          );
+        }
+        // All groups succeeded. Persist the
+        // canonical result so a replay with the
+        // same key returns the same shape.
+        this.planStore.markCompleted(input.plan_id, input.idempotency_key, { applied, rejected: 0 });
       });
-      if (result.ok) {
-        applied += result.superseded_ids.length;
-        continue;
-      }
-      rejected += 1;
-      // On the first failed merge, mark the plan
-      // rejected and stop; we do NOT roll back already-
-      // applied groups (they are audited and reversible
-      // via the entry's own `superseded_by` + revision
-      // history). Spec § 6.2 calls for a fail-loud
-      // outcome; partial application is reported in the
-      // return value.
-      this.planStore.markRejected(input.plan_id);
+    } catch (error) {
+      // The transaction rolled back. The plan is
+      // back in `pending` (or `applying` if the
+      // crash happened after COMMIT; the next apply
+      // will see `applying` and surface
+      // `plan_expired`). Emit a single audit event
+      // for the failure.
       appendAudit(this.store, this.defaultActor, {
         scope: plan.scope,
         ...(plan.project_id !== undefined ? { project_id: plan.project_id } : {}),
         event: "apply_maintenance",
         actor: "system:maintenance",
-        reason: "plan_partial",
+        reason: "plan_apply_failed",
         metadata: {
           plan_id: input.plan_id,
           ok: false,
-          error: result.reason,
-          target_ids,
+          error: firstFailure?.reason ?? "transaction_error",
+          target_ids: firstFailure?.target_ids ?? [],
           applied,
-          rejected: rejected,
-          idempotency_key: input.idempotency_key
+          rejected,
+          idempotency_key: input.idempotency_key,
+          error_message: error instanceof Error ? error.message : String(error)
         }
       });
-      return {
-        ok: true,
-        value: {
-          ok: false,
-          plan_id: input.plan_id,
-          error: "stale_revision",
-          details: { reason: result.reason, target_ids, applied, rejected }
-        }
-      };
+      if (firstFailure !== undefined) {
+        return {
+          ok: true,
+          value: {
+            ok: false,
+            plan_id: input.plan_id,
+            error: "stale_revision",
+            details: { reason: firstFailure.reason, target_ids: firstFailure.target_ids, applied, rejected }
+          }
+        };
+      }
+      // Re-throw a generic transaction error so
+      // the caller sees something actionable. The
+      // `markApplying` was rolled back so a retry
+      // can re-apply.
+      return err("invalid_schema", `apply_maintenance transaction failed: ${error instanceof Error ? error.message : String(error)}`, { plan_id: input.plan_id });
     }
 
-    this.planStore.markCompleted(input.plan_id, input.idempotency_key);
     appendAudit(this.store, this.defaultActor, {
       scope: plan.scope,
       ...(plan.project_id !== undefined ? { project_id: plan.project_id } : {}),

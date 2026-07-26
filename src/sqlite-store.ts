@@ -107,7 +107,7 @@ export type SearchFilters = EntryFilters & {
  * (entries past their `valid_until` decay, entries
  * not yet at `valid_from` are excluded from recall).
  */
-export const CURRENT_SCHEMA_VERSION = 10;
+export const CURRENT_SCHEMA_VERSION = 11;
 
 /**
  * Stage 12 PR9: thrown by `updateEntryWithRevision` when
@@ -192,7 +192,12 @@ export type EntryPatch = Partial<Pick<MemoryEntry, EntryPatchField>> & Pick<Memo
  *                    wrong idempotency_key / hash drift);
  *                    no further applies
  */
-export type MaintenancePlanState = "pending" | "completed" | "expired" | "rejected";
+export type MaintenancePlanState =
+  | "pending"
+  | "applying"
+  | "completed"
+  | "expired"
+  | "rejected";
 export type MaintenancePlanRisk = "low" | "medium" | "high";
 export type MaintenancePlanActionType = "supersede" | "merge" | "forget" | "update" | "retain";
 
@@ -211,6 +216,28 @@ export type MaintenancePlanRow = {
   creator_actor_id: string;
   created_at: string;
   expires_at: string;
+  /**
+   * Stage 16 v1.1.1 PR-5 (issue #12). Set when
+   * the apply phase flips the plan from `pending`
+   * to `completed`. `null` until the first apply
+   * completes.
+   */
+  completed_at?: string | null;
+  /**
+   * Stage 16 v1.1.1 PR-5 (issue #12). JSON-encoded
+   * apply result. A replay with the same
+   * idempotency_key returns this verbatim instead
+   * of `idempotency_mismatch`. `null` until the
+   * first apply completes.
+   */
+  applied_result_json?: string | null;
+  /**
+   * Stage 16 v1.1.1 PR-5 (issue #12). The key the
+   * plan was last applied with. A replay with this
+   * key replays the `applied_result_json`; a replay
+   * with a different key is `idempotency_mismatch`.
+   */
+  idempotency_key_used?: string | null;
   state: MaintenancePlanState;
   /** JSON-encoded `summary: string[]` from the planning step. */
   summary_json: string;
@@ -796,6 +823,10 @@ export class SQLiteMemoryStore {
       this.migrate_v9_to_v10();
       return;
     }
+    if (version === 11) {
+      this.migrate_v10_to_v11();
+      return;
+    }
     throw new Error(`No migration registered for schema version ${version}`);
   }
 
@@ -1346,6 +1377,73 @@ export class SQLiteMemoryStore {
     }
   }
 
+  /**
+   * Stage 16 v1.1.1 PR-5 (issue #12, spec § 6.2):
+   * atomic maintenance plan apply. Schema v10 -> v11
+   * adds:
+   *   - `applying` to the `state` CHECK (the apply
+   *     phase transitions through `applying` so an
+   *     interrupted apply can be detected).
+   *   - `completed_at` column for the apply timestamp.
+   *   - `applied_result_json` column for the canonical
+   *     apply result (so a replay of a completed plan
+   *     with the same idempotency key returns the
+   *     original result, not `idempotency_mismatch`).
+   *   - `idempotency_key_used` column for the key
+   *     the plan was last applied with (replaces the
+   *     audit-log-walking `getAppliedMaintenanceKeys`).
+   */
+  private migrate_v10_to_v11(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      // SQLite does not support `ALTER TABLE ...
+      // DROP CONSTRAINT`, so we rebuild the table with
+      // the new `applying` state value and the three
+      // new columns. The rebuild is non-destructive
+      // because we copy every row verbatim.
+      const cols = this.db
+        .prepare("PRAGMA table_info(maintenance_plans)")
+        .all() as Array<{ name: string }>;
+      if (cols.some((c) => c.name === "completed_at")) {
+        this.db.exec("PRAGMA user_version = 11");
+        this.db.exec("COMMIT");
+        return;
+      }
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS maintenance_plans_v11 (
+          plan_id TEXT PRIMARY KEY,
+          plan_hash TEXT NOT NULL,
+          creator_actor_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          completed_at TEXT,
+          applied_result_json TEXT,
+          idempotency_key_used TEXT,
+          state TEXT NOT NULL CHECK (state IN ('pending','applying','completed','expired','rejected')),
+          summary_json TEXT NOT NULL,
+          scope TEXT NOT NULL CHECK (scope IN ('global','project')),
+          project_id TEXT,
+          risk TEXT NOT NULL CHECK (risk IN ('low','medium','high'))
+        ) STRICT;
+        INSERT OR IGNORE INTO maintenance_plans_v11
+          (plan_id, plan_hash, creator_actor_id, created_at,
+           expires_at, state, summary_json, scope, project_id, risk)
+        SELECT plan_id, plan_hash, creator_actor_id, created_at,
+               expires_at, state, summary_json, scope, project_id, risk
+          FROM maintenance_plans;
+        DROP TABLE maintenance_plans;
+        ALTER TABLE maintenance_plans_v11 RENAME TO maintenance_plans;
+        CREATE INDEX IF NOT EXISTS maintenance_plans_state_idx
+          ON maintenance_plans(state, expires_at);
+      `);
+      this.db.exec("PRAGMA user_version = 11");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   private addColumnIfMissing(table: string, column: string, definition: string): void {
     const cols = this.db
       .prepare(`PRAGMA table_info(${table})`)
@@ -1711,8 +1809,10 @@ export class SQLiteMemoryStore {
       .prepare(
         `INSERT INTO maintenance_plans
           (plan_id, plan_hash, creator_actor_id, created_at,
-           expires_at, state, summary_json, scope, project_id, risk)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           expires_at, completed_at, applied_result_json,
+           idempotency_key_used, state, summary_json,
+           scope, project_id, risk)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         plan.plan_id,
@@ -1720,6 +1820,9 @@ export class SQLiteMemoryStore {
         plan.creator_actor_id,
         plan.created_at,
         plan.expires_at,
+        plan.completed_at ?? null,
+        plan.applied_result_json ?? null,
+        plan.idempotency_key_used ?? null,
         plan.state,
         plan.summary_json,
         plan.scope,
@@ -1800,6 +1903,84 @@ export class SQLiteMemoryStore {
     this.db
       .prepare("UPDATE maintenance_plans SET state = ? WHERE plan_id = ?")
       .run(state, planId);
+  }
+
+  /**
+   * Stage 16 v1.1.1 PR-5 (issue #12): mark a plan
+   * `applying`. The apply phase transitions through
+   * `applying` so an interrupted apply can be
+   * detected by the next apply call (a plan stuck
+   * in `applying` past the takeover window is
+   * `expired` by the next call). Returns `true` if
+   * the transition succeeded (i.e. the plan was
+   * `pending`).
+   */
+  markMaintenancePlanApplying(planId: string): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE maintenance_plans
+            SET state = 'applying'
+          WHERE plan_id = ? AND state = 'pending'`
+      )
+      .run(planId);
+    return Number(result.changes ?? 0) === 1;
+  }
+
+  /**
+   * Stage 16 v1.1.1 PR-5 (issue #12): mark a plan
+   * `completed` AND persist the canonical apply
+   * result + the idempotency key the apply used.
+   * A replay with the same key returns the
+   * `appliedResult` verbatim. A replay with a
+   * different key surfaces `idempotency_mismatch`.
+   */
+  markMaintenancePlanCompleted(
+    planId: string,
+    idempotencyKey: string,
+    appliedResultJson: string,
+    completedAt: string
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE maintenance_plans
+            SET state = 'completed',
+                completed_at = ?,
+                applied_result_json = ?,
+                idempotency_key_used = ?
+          WHERE plan_id = ? AND state = 'applying'`
+      )
+      .run(completedAt, appliedResultJson, idempotencyKey, planId);
+  }
+
+  /**
+   * Stage 16 v1.1.1 PR-5 (issue #12): read the
+   * stored apply result for a completed plan. The
+   * caller passes the idempotency key it intends
+   * to use; the function returns the stored result
+   * if the key matches, or `undefined` if the plan
+   * was never applied or the key does not match.
+   */
+  getMaintenancePlanAppliedResult(
+    planId: string,
+    idempotencyKey: string
+  ): { result: unknown; completed_at: string } | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT applied_result_json, completed_at, idempotency_key_used
+           FROM maintenance_plans
+          WHERE plan_id = ? AND state = 'completed'`
+      )
+      .get(planId) as
+      | { applied_result_json: string; completed_at: string; idempotency_key_used: string }
+      | undefined;
+    if (row === undefined) return undefined;
+    if (row.idempotency_key_used !== idempotencyKey) return undefined;
+    try {
+      const result = JSON.parse(row.applied_result_json) as unknown;
+      return { result, completed_at: row.completed_at };
+    } catch {
+      return undefined;
+    }
   }
 
   expireOldMaintenancePlans(now: string): number {
