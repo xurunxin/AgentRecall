@@ -15,8 +15,27 @@ import {
 } from "./domain.js";
 import { detectSecrets, type SecretFinding } from "./secret-detector.js";
 
-type ValidationError = "invalid_schema" | "secret_detected";
+type ValidationError = "invalid_schema" | "secret_detected" | "invalid_state" | "unauthorized";
 type WritableStatus = Extract<MemoryStatus, "active" | "archived">;
+
+/**
+ * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4): the
+ * memory semantics controlled fields are exposed
+ * through `RememberInput` and `UpdateInput`. The MCP
+ * tools (PR-7) forward them end-to-end. The validator
+ * accepts the field set; the write service applies
+ * the authorization policy and temporal-window
+ * enforcement. The split keeps the validator a
+ * pure data-shape check and the service the policy
+ * gate.
+ */
+export const MEMORY_TIERS = ["core", "working", "archival"] as const;
+export const MEMORY_SENSITIVITIES = ["normal", "private", "restricted"] as const;
+export const MEMORY_TRUST_LEVELS = ["user_confirmed", "agent_observed", "inferred", "imported"] as const;
+
+export type MemoryTier = (typeof MEMORY_TIERS)[number];
+export type MemorySensitivity = (typeof MEMORY_SENSITIVITIES)[number];
+export type MemoryTrustLevel = (typeof MEMORY_TRUST_LEVELS)[number];
 
 export type RememberInput = {
   scope: MemoryScope;
@@ -50,6 +69,68 @@ export type RememberInput = {
    * client-side bug.
    */
   idempotency_key?: string;
+  /**
+   * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+   * memory tier. Default `'working'` when omitted.
+   * The ranker weights `tier` (core × 1.3, working
+   * × 1.0, archival × 0.7).
+   */
+  tier?: MemoryTier;
+  /**
+   * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+   * pinned memories are not auto-decayed by the
+   * `stale_penalty` component. Defaults to `false`.
+   */
+  pinned?: boolean;
+  /**
+   * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+   * ISO 8601 timestamp. The memory is not surfaced
+   * in `search_memories` / `recall_context` before
+   * this time. Optional; absent = always eligible.
+   */
+  valid_from?: string;
+  /**
+   * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+   * ISO 8601 timestamp. After this time the memory
+   * is excluded from candidates (the documented
+   * temporal policy: expired entries do not appear
+   * in recall results).
+   */
+  valid_until?: string;
+  /**
+   * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+   * sensitivity tier. `'restricted'` requires the
+   * caller to pass an actor with the `restricted:read`
+   * capability (enforced at the service layer, not
+   * the validator). Default `'normal'` for agent
+   * writes.
+   */
+  sensitivity?: MemorySensitivity;
+  /**
+   * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+   * trust level. The `'user_confirmed'` value is
+   * rejected by the validator unless the caller
+   * also passes `user_confirmed: true` (a separate
+   * trusted confirmation flag), or invokes
+   * `confirm_memory_trust` (a dedicated MCP tool).
+   * The validator keeps the field opt-in so the
+   * import / migration path can still stamp rows
+   * with `'imported'` without going through
+   * confirmation.
+   */
+  trust_level?: MemoryTrustLevel;
+  /**
+   * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+   * trusted-user confirmation. When the caller
+   * supplies `trust_level: "user_confirmed"`, they
+   * must also pass `user_confirmed: true` to prove
+   * the upgrade was authorized by a user (not
+   * impersonated by an agent). A real MCP client
+   * surfaces this as a `confirm_memory_trust` tool
+   * call; the standalone flag exists for CLI
+   * scripts and tests.
+   */
+  user_confirmed?: boolean;
 };
 
 export type ValidatedRememberInput = {
@@ -70,6 +151,12 @@ export type ValidatedRememberInput = {
   supersedes: string[];
   token_estimate: number;
   char_count: number;
+  tier: MemoryTier;
+  pinned: boolean;
+  valid_from?: string;
+  valid_until?: string;
+  sensitivity: MemorySensitivity;
+  trust_level: MemoryTrustLevel;
 };
 
 export type UpdateInput = Partial<
@@ -84,6 +171,12 @@ export type UpdateInput = Partial<
     | "status"
     | "expires_at"
     | "review_after"
+    | "tier"
+    | "pinned"
+    | "valid_from"
+    | "valid_until"
+    | "sensitivity"
+    | "trust_level"
   >
 > & {
   /**
@@ -99,6 +192,13 @@ export type UpdateInput = Partial<
    * Same semantics as on `RememberInput`.
    */
   idempotency_key?: string;
+  /**
+   * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+   * trusted-user confirmation. Required when the
+   * patch raises the trust level to `user_confirmed`
+   * or the sensitivity to `restricted`.
+   */
+  user_confirmed?: boolean;
 };
 
 export type ValidatedUpdateInput = UpdateInput;
@@ -114,6 +214,12 @@ const MUTABLE_UPDATE_FIELDS = new Set([
   "status",
   "expires_at",
   "review_after",
+  "tier",
+  "pinned",
+  "valid_from",
+  "valid_until",
+  "sensitivity",
+  "trust_level",
   "expected_revision",
   // Stage 14 PR-B2 (spec § 5.6): idempotency_key is
   // allowed on the update payload (it is a control
@@ -123,7 +229,13 @@ const MUTABLE_UPDATE_FIELDS = new Set([
   // produce entry changes. `idempotency_key` is read
   // by the write service's `checkIdempotency` helper
   // before any state change.
-  "idempotency_key"
+  "idempotency_key",
+  // Stage 16 v1.1.1 PR-7 (#17): the trusted-user
+  // confirmation flag. Like `idempotency_key` it is
+  // a control field, not a memory field; the write
+  // service reads it to gate the trust_level /
+  // sensitivity escalation policy.
+  "user_confirmed"
 ]);
 
 export function validateRememberInput(input: unknown): Result<ValidatedRememberInput, ValidationError> {
@@ -147,6 +259,13 @@ export function validateRememberInput(input: unknown): Result<ValidatedRememberI
   const expiresAt = parseOptionalNonEmptyString(input, "expires_at", issues);
   const reviewAfter = parseOptionalNonEmptyString(input, "review_after", issues);
   const supersedes = parseStringList(input.supersedes, "supersedes", issues, []);
+  const tier = input.tier === undefined ? "working" : parseTier(input.tier, issues);
+  const pinned = parsePinned(input.pinned, issues) ?? false;
+  const validFrom = parseOptionalTimestamp(input, "valid_from", issues);
+  const validUntil = parseOptionalTimestamp(input, "valid_until", issues);
+  const sensitivity = input.sensitivity === undefined ? "normal" : parseSensitivity(input.sensitivity, issues);
+  const trustLevel = input.trust_level === undefined ? "agent_observed" : parseTrustLevel(input.trust_level, issues);
+  const userConfirmed = parseUserConfirmed(input.user_confirmed, issues) ?? false;
 
   if (scope === "project" && projectId === undefined && projectPath === undefined) {
     issues.push("project_id");
@@ -165,9 +284,44 @@ export function validateRememberInput(input: unknown): Result<ValidatedRememberI
     importance === undefined ||
     confidence === undefined ||
     status === undefined ||
-    supersedes === undefined
+    supersedes === undefined ||
+    tier === undefined ||
+    sensitivity === undefined ||
+    trustLevel === undefined ||
+    userConfirmed === undefined
   ) {
     return invalidSchema(issues);
+  }
+
+  // Temporal-window sanity: valid_from must be <= valid_until
+  // when both are supplied. The MCP client is free to set
+  // either, but a backwards window is unambiguously a
+  // configuration bug — reject it as `invalid_state` so the
+  // caller can fix the input rather than produce a memory
+  // that is never eligible for recall.
+  if (validFrom !== undefined && validUntil !== undefined) {
+    if (Date.parse(validFrom) > Date.parse(validUntil)) {
+      return err(
+        "invalid_state",
+        "valid_from must be earlier than or equal to valid_until.",
+        { valid_from: validFrom, valid_until: validUntil }
+      );
+    }
+  }
+
+  // Trust-level authorization: 'user_confirmed' is a
+  // privileged transition. The validator accepts it ONLY
+  // when the caller also passes `user_confirmed: true` —
+  // the trusted-user confirmation flag. A real MCP client
+  // surfaces the flag through the `confirm_memory_trust`
+  // tool; the validator keeps the cross-check so an
+  // arbitrary `remember` call cannot self-promote.
+  if (trustLevel === "user_confirmed" && userConfirmed !== true) {
+    return err(
+      "unauthorized",
+      "trust_level 'user_confirmed' requires the user_confirmed flag (use the confirm_memory_trust MCP tool).",
+      { trust_level: trustLevel }
+    );
   }
 
   const secretFindings = findSecrets({ title, body, tags });
@@ -193,7 +347,13 @@ export function validateRememberInput(input: unknown): Result<ValidatedRememberI
     ...(expiresAt !== undefined ? { expires_at: expiresAt } : {}),
     ...(reviewAfter !== undefined ? { review_after: reviewAfter } : {}),
     supersedes,
-    ...size
+    ...size,
+    tier,
+    pinned,
+    ...(validFrom !== undefined ? { valid_from: validFrom } : {}),
+    ...(validUntil !== undefined ? { valid_until: validUntil } : {}),
+    sensitivity,
+    trust_level: trustLevel
   });
 }
 
@@ -257,6 +417,38 @@ export function validateUpdateInput(input: unknown): Result<ValidatedUpdateInput
     const reviewAfter = parseOptionalNonEmptyString(input, "review_after", issues);
     if (reviewAfter !== undefined) value.review_after = reviewAfter;
   }
+  // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+  // memory semantics controlled fields. The
+  // authorization policy is enforced below; the
+  // per-field parsers reject garbage values first.
+  if ("tier" in input) {
+    const tier = parseTier(input.tier, issues);
+    if (tier !== undefined) value.tier = tier;
+  }
+  if ("pinned" in input) {
+    const pinned = parsePinned(input.pinned, issues);
+    if (pinned !== undefined) value.pinned = pinned;
+  }
+  if ("valid_from" in input) {
+    const validFrom = parseOptionalTimestamp(input, "valid_from", issues);
+    if (validFrom !== undefined) value.valid_from = validFrom;
+  }
+  if ("valid_until" in input) {
+    const validUntil = parseOptionalTimestamp(input, "valid_until", issues);
+    if (validUntil !== undefined) value.valid_until = validUntil;
+  }
+  if ("sensitivity" in input) {
+    const sensitivity = parseSensitivity(input.sensitivity, issues);
+    if (sensitivity !== undefined) value.sensitivity = sensitivity;
+  }
+  if ("trust_level" in input) {
+    const trustLevel = parseTrustLevel(input.trust_level, issues);
+    if (trustLevel !== undefined) value.trust_level = trustLevel;
+  }
+  if ("user_confirmed" in input) {
+    const userConfirmed = parseUserConfirmed(input.user_confirmed, issues);
+    if (userConfirmed !== undefined) value.user_confirmed = userConfirmed;
+  }
   // Stage 12 PR9: optimistic-concurrency control. The
   // validator keeps `expected_revision` in the validated
   // shape so the write service can route the write
@@ -273,6 +465,30 @@ export function validateUpdateInput(input: unknown): Result<ValidatedUpdateInput
   }
   if (issues.length > 0) {
     return invalidSchema(issues);
+  }
+
+  // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+  // trust-level authorization for updates. The
+  // `user_confirmed` flag is required when the
+  // patch raises the trust tier to `user_confirmed`.
+  // Sensitivity escalations to `restricted` likewise
+  // require the flag — the canonical
+  // `confirm_memory_trust` MCP tool sets the flag,
+  // and a CLI script that wants to bypass the MCP
+  // tool must still pass it explicitly.
+  if (value.trust_level === "user_confirmed" && value.user_confirmed !== true) {
+    return err(
+      "unauthorized",
+      "trust_level 'user_confirmed' requires the user_confirmed flag (use the confirm_memory_trust MCP tool).",
+      { trust_level: value.trust_level }
+    );
+  }
+  if (value.sensitivity === "restricted" && value.user_confirmed !== true) {
+    return err(
+      "unauthorized",
+      "sensitivity 'restricted' requires the user_confirmed flag.",
+      { sensitivity: value.sensitivity }
+    );
   }
 
   const secretFindings = findSecrets(secretInputs);
@@ -395,6 +611,71 @@ function parseWritableStatus(value: unknown, issues: string[]): WritableStatus |
   }
   issues.push("status");
   return undefined;
+}
+
+function parseTier(value: unknown, issues: string[]): MemoryTier | undefined {
+  if (typeof value === "string" && (MEMORY_TIERS as readonly string[]).includes(value)) {
+    return value as MemoryTier;
+  }
+  issues.push("tier");
+  return undefined;
+}
+
+function parseSensitivity(value: unknown, issues: string[]): MemorySensitivity | undefined {
+  if (typeof value === "string" && (MEMORY_SENSITIVITIES as readonly string[]).includes(value)) {
+    return value as MemorySensitivity;
+  }
+  issues.push("sensitivity");
+  return undefined;
+}
+
+function parseTrustLevel(value: unknown, issues: string[]): MemoryTrustLevel | undefined {
+  if (typeof value === "string" && (MEMORY_TRUST_LEVELS as readonly string[]).includes(value)) {
+    return value as MemoryTrustLevel;
+  }
+  issues.push("trust_level");
+  return undefined;
+}
+
+function parsePinned(value: unknown, issues: string[]): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "boolean") return value;
+  issues.push("pinned");
+  return undefined;
+}
+
+function parseUserConfirmed(value: unknown, issues: string[]): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "boolean") return value;
+  issues.push("user_confirmed");
+  return undefined;
+}
+
+function parseOptionalTimestamp(
+  record: Record<string, unknown>,
+  field: string,
+  issues: string[]
+): string | undefined {
+  if (!(field in record) || record[field] === undefined) {
+    return undefined;
+  }
+  const value = record[field];
+  if (typeof value !== "string" || value.trim().length === 0) {
+    issues.push(field);
+    return undefined;
+  }
+  // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4): the
+  // value must be a real ISO 8601 timestamp; `Date.parse`
+  // is the cheapest portable check. We don't enforce
+  // a specific format (date-only vs full datetime)
+  // because the rest of the codebase already accepts
+  // both, but a non-parseable string is unambiguously
+  // a bug.
+  if (Number.isNaN(Date.parse(value))) {
+    issues.push(field);
+    return undefined;
+  }
+  return value;
 }
 
 function findSecrets(input: { title?: string; body?: string; tags?: string[] }): SecretFinding[] {

@@ -106,12 +106,14 @@ export type ImportSensitivityPolicy = "normal" | "private" | "restricted";
  */
 export type PreflightError =
   | "invalid_schema"
+  | "invalid_state"
   | "secret_detected"
   | "sensitivity_denied"
   | "identity_conflict"
   | "aggregate_budget"
   | "revision_drift"
-  | "bundle_garbled";
+  | "bundle_garbled"
+  | "unauthorized";
 
 export type PreflightResult = Result<
   {
@@ -630,7 +632,45 @@ function entryToRememberInput(entry: MemoryEntry): Record<string, unknown> {
       : {}),
     ...(entry.supersedes !== undefined && entry.supersedes.length > 0
       ? { supersedes: entry.supersedes }
-      : {})
+      : {}),
+    // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+    // memory semantics controlled fields. The
+    // bundle already has these (v1.1.0+);
+    // round-tripping them through preflight lets
+    // the validator catch a malformed bundle
+    // (e.g. `valid_from > valid_until`) before
+    // any row is written. `null` and `undefined`
+    // are both treated as "absent" because the
+    // live `MemoryEntry` represents the absence
+    // as `null` while the `RememberInput` shape
+    // has no `null`.
+    tier: entry.tier,
+    pinned: entry.pinned,
+    ...(entry.valid_from !== undefined && entry.valid_from !== null
+      ? { valid_from: entry.valid_from }
+      : {}),
+    ...(entry.valid_until !== undefined && entry.valid_until !== null
+      ? { valid_until: entry.valid_until }
+      : {}),
+    sensitivity: entry.sensitivity,
+    // The bundle's `trust_level` is forced to
+    // `"imported"` by `applyImport` regardless of
+    // what the bundle declares (unless the caller
+    // passes `restore_trust: true` AND
+    // `history_mode === "full_history"`). The
+    // preflight deliberately OMITS the field so
+    // the validator doesn't see a bundle-declared
+    // `user_confirmed` and reject it; the
+    // down-to-`imported` policy is enforced at
+    // apply time, not preflight. The preflight
+    // is about whether the entry can be written
+    // at all, not about what trust tier it ends
+    // up with.
+    //
+    // The other fields (tier, pinned, sensitivity,
+    // valid_from, valid_until) are preserved
+    // because they affect the entry shape itself.
+    trust_level: "agent_observed"
   };
 }
 

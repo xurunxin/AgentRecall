@@ -535,13 +535,19 @@ export function buildEntry(
     // v3 rows.
     revision: 1,
     writer_actor_id: "agent:pending",
-    pinned: false,
-    trust_level: "agent_observed",
-    sensitivity: "normal",
+    pinned: input.pinned,
+    trust_level: input.trust_level,
+    sensitivity: input.sensitivity,
     // Stage 15 PR-M3-1 (issue #9, spec § 6.5): the
-    // memory tier. Default `'working'`. Callers can
-    // override via the v1.1 `tier` input field.
-    tier: (input as { tier?: MemoryEntry["tier"] }).tier ?? "working",
+    // memory tier. The validator always supplies a
+    // normalised value; the legacy `(input as
+    // { tier?: MemoryEntry["tier"] }).tier ?? "working"`
+    // fallback is no longer needed because
+    // `validateRememberInput` now defaults to
+    // `'working'` when the caller omits the field.
+    tier: input.tier,
+    ...(input.valid_from !== undefined ? { valid_from: input.valid_from } : {}),
+    ...(input.valid_until !== undefined ? { valid_until: input.valid_until } : {}),
     metadata: {}
   };
 }

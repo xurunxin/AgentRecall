@@ -52,8 +52,8 @@ import {
   matchesReplacementScope
 } from "./memory-service-helpers.js";
 
-type RememberError = "invalid_schema" | "invalid_scope" | "secret_detected" | "capacity_exceeded" | "duplicate_candidate" | "idempotency_mismatch" | "idempotency_in_flight";
-type UpdateError = "not_found" | "invalid_state" | "invalid_schema" | "secret_detected" | "capacity_exceeded" | "stale_revision" | "idempotency_mismatch" | "idempotency_in_flight";
+type RememberError = "invalid_schema" | "invalid_scope" | "invalid_state" | "secret_detected" | "unauthorized" | "capacity_exceeded" | "duplicate_candidate" | "idempotency_mismatch" | "idempotency_in_flight";
+type UpdateError = "not_found" | "invalid_state" | "invalid_schema" | "secret_detected" | "unauthorized" | "capacity_exceeded" | "stale_revision" | "idempotency_mismatch" | "idempotency_in_flight";
 type SupersedeError = RememberError | "not_found" | "invalid_state";
 type MergeError = RememberError | "not_found" | "invalid_state";
 type ForgetError = "not_found" | "idempotency_mismatch" | "idempotency_in_flight";

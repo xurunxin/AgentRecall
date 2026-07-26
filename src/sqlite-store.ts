@@ -172,7 +172,21 @@ type EntryPatchField =
   | "superseded_by"
   | "token_estimate"
   | "char_count"
-  | "writer_actor_id";
+  | "writer_actor_id"
+  // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+  // memory semantics controlled fields. The
+  // patch accepts any of these so the write
+  // path can promote `tier`, toggle `pinned`,
+  // set the temporal window, or escalate
+  // trust / sensitivity. The authorization
+  // for the escalation is enforced in the
+  // validator, not the store.
+  | "tier"
+  | "pinned"
+  | "valid_from"
+  | "valid_until"
+  | "sensitivity"
+  | "trust_level";
 
 export type EntryPatch = Partial<Pick<MemoryEntry, EntryPatchField>> & Pick<MemoryEntry, "updated_at">;
 
@@ -422,7 +436,19 @@ const ENTRY_PATCH_FIELDS = [
   "superseded_by",
   "token_estimate",
   "char_count",
-  "writer_actor_id"
+  "writer_actor_id",
+  // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+  // memory semantics controlled fields. The
+  // sanitizer keeps them on the patch so the
+  // `updateEntry` UPDATE actually persists
+  // them; the pre-PR-7 list omitted these and
+  // silently dropped them on the floor.
+  "tier",
+  "pinned",
+  "valid_from",
+  "valid_until",
+  "sensitivity",
+  "trust_level"
 ] as const satisfies readonly EntryPatchField[];
 
 function sanitizeEntryPatch(patch: EntryPatch): EntryPatch {
