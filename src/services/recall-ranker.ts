@@ -65,6 +65,7 @@ export type RankedItem = {
     access_signal: number;
     feedback_signal: number;
     scope_priority: number;
+    tier_priority: number;
     stale_penalty: number;
     conflict_penalty: number;
     unsafe_content_penalty: number;
@@ -73,7 +74,7 @@ export type RankedItem = {
 };
 
 const WEIGHTS = {
-  lexical_relevance: 0.5,
+  lexical_relevance: 0.46,
   scope_affinity: 0.1,
   actor_trust: 0.1,
   importance: 0.08,
@@ -81,8 +82,15 @@ const WEIGHTS = {
   recency: 0.06,
   access_signal: 0.04,
   feedback_signal: 0.04,
-  scope_priority: 0.04
+  scope_priority: 0.04,
+  tier_priority: 0.06
 } as const;
+
+const TIER_WEIGHTS: Record<MemoryEntry["tier"], number> = {
+  core: 1.3,
+  working: 1.0,
+  archival: 0.7
+};
 
 const PENALTY_STALE = 0.05;
 const PENALTY_CONFLICT = 0.05;
@@ -210,6 +218,23 @@ function scopePriority(entry: MemoryEntry, primaryScope: "global" | "project"): 
   return 0;
 }
 
+/**
+ * Stage 15 PR-M3-1 (issue #9, spec § 6.5): the tier
+ * signal weights a memory by its hierarchy level:
+ *   - `'core'`     — pinned, high-value, × 1.3
+ *   - `'working'`  — current tasks, × 1.0
+ *   - `'archival'` — historical knowledge, × 0.7
+ *
+ * The signal is computed from the entry's `tier`
+ * field (default `'working'`). Entries past their
+ * `valid_until` or before their `valid_from` are
+ * excluded from candidates (the read service
+ * filters them before passing to the ranker).
+ */
+function tierPriority(entry: MemoryEntry): number {
+  return TIER_WEIGHTS[entry.tier];
+}
+
 export function rankRecall(input: {
   candidates: MemoryEntry[];
   query: string;
@@ -265,6 +290,7 @@ export function rankRecall(input: {
     const access = accessNormFromStore(input.store, entry);
     const feedback = feedbackNormFromStore(input.store, entry);
     const priority = scopePriority(entry, input.primaryScope);
+    const tier = tierPriority(entry);
     const stale = stalePenalty(entry, now);
     const conflict = conflictPenalty();
     const unsafe = unsafeContentPenalty();
@@ -288,7 +314,8 @@ export function rankRecall(input: {
       WEIGHTS.recency * recency +
       WEIGHTS.access_signal * access +
       WEIGHTS.feedback_signal * feedback +
-      WEIGHTS.scope_priority * priority -
+      WEIGHTS.scope_priority * priority +
+      WEIGHTS.tier_priority * tier -
       stale -
       conflict -
       unsafe;
@@ -305,6 +332,7 @@ export function rankRecall(input: {
         access_signal: access,
         feedback_signal: feedback,
         scope_priority: priority,
+        tier_priority: tier,
         stale_penalty: stale,
         conflict_penalty: conflict,
         unsafe_content_penalty: unsafe

@@ -93,8 +93,21 @@ export type SearchFilters = EntryFilters & {
  * `memory_recall_signals` (cached per-memory recall stats
  * for the ranker). The RRF fusion in the ranker uses both
  * to replace the placeholder feedback / access signals.
+ * v10 (Stage 15 PR-M3-1, issue #9) introduces the
+ * memory hierarchy:
+ *   - `memory_entries.tier` (`'core' | 'working' |
+ *     'archival'`, default `'working'`)
+ *   - `memory_entries.valid_from` / `valid_until`
+ *     (Unix ms; NULL = no boundary)
+ *   - `memory_episodes` table for episode-shaped
+ *     memories (parent_memory_id, summary,
+ *     started_at, ended_at, actor_id)
+ * The ranker reads `tier` (core × 1.3, working × 1.0,
+ * archival × 0.7) and `valid_from` / `valid_until`
+ * (entries past their `valid_until` decay, entries
+ * not yet at `valid_from` are excluded from recall).
  */
-export const CURRENT_SCHEMA_VERSION = 9;
+export const CURRENT_SCHEMA_VERSION = 10;
 
 /**
  * Stage 12 PR9: thrown by `updateEntryWithRevision` when
@@ -263,6 +276,10 @@ function decodeEntry(row: Row): MemoryEntry {
       "agent_observed") as MemoryEntry["trust_level"],
     sensitivity: (stringCell(row, "sensitivity") ||
       "normal") as MemoryEntry["sensitivity"],
+    // Stage 15 PR-M3-1 (issue #9, spec § 6.5): the
+    // memory tier. Defaults to 'working' for legacy
+    // rows that pre-date the v10 column.
+    tier: ((stringCell(row, "tier") || "working")) as MemoryEntry["tier"],
     metadata: decodeJson<Record<string, unknown>>(
       optionalStringCell(row, "metadata_json") ?? "{}"
     )
@@ -775,6 +792,10 @@ export class SQLiteMemoryStore {
       this.migrate_v8_to_v9();
       return;
     }
+    if (version === 10) {
+      this.migrate_v9_to_v10();
+      return;
+    }
     throw new Error(`No migration registered for schema version ${version}`);
   }
 
@@ -1269,6 +1290,62 @@ export class SQLiteMemoryStore {
     }
   }
 
+  /**
+   * Stage 15 PR-M3-1 (issue #9, spec § 6.5):
+   * v9 -> v10 schema migration. Introduces the
+   * memory hierarchy:
+   *
+   *   - `memory_entries.tier` — `'core' | 'working' |
+   *     'archival'`, default `'working'`. The ranker
+   *     reads this to weight recall (core × 1.3,
+   *     working × 1.0, archival × 0.7).
+   *   - `memory_entries.valid_from` / `valid_until`
+   *     — Unix ms boundaries. Entries past their
+   *     `valid_until` decay in score; entries not
+   *     yet at `valid_from` are excluded from
+   *     recall.
+   *   - `memory_episodes` — episode-shaped memory
+   *     (parent_memory_id, summary, started_at,
+   *     ended_at, actor_id). A "working" entry can
+   *     be linked to one or more episodes; the
+   *     ranker uses `parent_memory_id` to expand
+   *     candidates along the episode tree.
+   *
+   * All changes are additive (no-op for callers
+   * that do not use the new columns / tables).
+   */
+  private migrate_v9_to_v10(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.addColumnIfMissing(
+        "memory_entries",
+        "tier",
+        "TEXT NOT NULL DEFAULT 'working' CHECK (tier IN ('core','working','archival'))"
+      );
+      this.addColumnIfMissing("memory_entries", "valid_from", "INTEGER");
+      this.addColumnIfMissing("memory_entries", "valid_until", "INTEGER");
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_episodes (
+          episode_id TEXT PRIMARY KEY,
+          parent_memory_id TEXT,
+          summary TEXT NOT NULL,
+          started_at INTEGER NOT NULL,
+          ended_at INTEGER,
+          actor_id TEXT NOT NULL,
+          FOREIGN KEY (parent_memory_id) REFERENCES memory_entries(id) ON DELETE CASCADE
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS memory_episodes_parent_idx
+          ON memory_episodes(parent_memory_id);
+      `);
+      this.db.exec("PRAGMA user_version = 10");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   private addColumnIfMissing(table: string, column: string, definition: string): void {
     const cols = this.db
       .prepare(`PRAGMA table_info(${table})`)
@@ -1364,8 +1441,8 @@ export class SQLiteMemoryStore {
             importance, confidence, status, created_at, updated_at, last_accessed_at, last_accessed_by,
             access_count, expires_at, review_after, supersedes_json, superseded_by, token_estimate, char_count,
             revision, writer_actor_id, content_hash, pinned, trust_level, sensitivity,
-            valid_from, valid_until, deleted_at, metadata_json
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            valid_from, valid_until, deleted_at, tier, metadata_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `
         )
         .run(...this.entryParams(entry));
@@ -1552,6 +1629,7 @@ export class SQLiteMemoryStore {
             valid_from = ?,
             valid_until = ?,
             deleted_at = ?,
+            tier = ?,
             metadata_json = ?
           WHERE id = ?
         `
@@ -2365,6 +2443,10 @@ export class SQLiteMemoryStore {
       entry.valid_from ?? null,
       entry.valid_until ?? null,
       entry.deleted_at ?? null,
+      // Stage 15 PR-M3-1 (issue #9, spec § 6.5):
+      // `tier` defaults to 'working' for legacy
+      // entries that pre-date the v10 column.
+      entry.tier ?? "working",
       encodeJson(entry.metadata ?? {})
     ];
   }

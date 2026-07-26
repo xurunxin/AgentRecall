@@ -38,9 +38,11 @@ describe("SQLiteMemoryStore v2 -> v3 migration", () => {
     // (memory_provenance); PR-M1-2 bumped to 8
     // (project_identities + project_aliases_new);
     // PR-M1-3 bumped to 9 (memory_feedback +
-    // memory_recall_signals). The chain walks
-    // v2->v3->v4->v5->v6->v7->v8->v9.
-    expect(CURRENT_SCHEMA_VERSION).toBe(9);
+    // memory_recall_signals); PR-M3-1 bumped to 10
+    // (memory hierarchy: tier, valid_from/until,
+    // memory_episodes). The chain walks
+    // v2->v3->v4->v5->v6->v7->v8->v9->v10.
+    expect(CURRENT_SCHEMA_VERSION).toBe(10);
   });
 
   it("migrates a v2 database to v3, preserving existing rows", () => {

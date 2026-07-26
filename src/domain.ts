@@ -86,7 +86,18 @@ export type MemoryEntry = {
   pinned: boolean;
   trust_level: "user_confirmed" | "agent_observed" | "inferred" | "imported";
   sensitivity: "normal" | "private" | "restricted";
+  /**
+   * Stage 15 PR-M3-1 (issue #9, spec § 6.5): the
+   * memory tier. Default `'working'`. The ranker
+   * reads this to weight recall:
+   *   - `'core'`     — pinned, high-value, weighted × 1.3
+   *   - `'working'`  — current tasks, weighted × 1.0
+   *   - `'archival'` — historical knowledge, weighted × 0.7
+   */
+  tier: "core" | "working" | "archival";
+  /** ISO 8601 timestamp; entries not yet at this time are excluded from recall. */
   valid_from?: string;
+  /** ISO 8601 timestamp; entries past this time decay in score. */
   valid_until?: string;
   deleted_at?: string;
   metadata: Record<string, unknown>;

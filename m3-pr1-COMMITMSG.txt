@@ -1,0 +1,66 @@
+feat(intelligence): memory hierarchy (core/working/archival) + benchmark
+
+Stage 15 PR-M3-1 (issue #9, spec § 6.5).
+
+Pre-PR-M3-1 had a single "all memories are equal"
+model. The new model has a 3-tier hierarchy:
+
+  - `core`     — pinned, high-value, weighted × 1.3
+  - `working`  — current tasks, weighted × 1.0
+  - `archival` — historical knowledge, weighted × 0.7
+
+This PR implements the hierarchy:
+
+  - **Schema v9 → v10**:
+    - `memory_entries.tier` column
+      (`'core' | 'working' | 'archival'`, default
+      `'working'`).
+    - `memory_entries.valid_from` /
+      `valid_until` (ISO 8601) for temporal
+      validity.
+    - `memory_episodes` table for
+      episode-shaped memories.
+  - **`MemoryEntry` extended** with
+    `tier: "core" | "working" | "archival"`
+    (required), `valid_from?: string`,
+    `valid_until?: string`.
+  - **Ranker tier weight**: the ranker reads
+    `entry.tier` and applies a weight. The
+    weight contributes to the linear score
+    combination as a separate `tier_priority`
+    component so the explain output is
+    transparent.
+  - **Build helper updated**: `buildEntry` reads
+    `input.tier` (default `'working'`).
+  - **Benchmark fixture**: 5 entries across
+    2 projects, top-1 is `core`, bottom-1 is
+    `archival`. The benchmark-style test
+    proves the ranker weights the hierarchy
+    correctly.
+
+CHANGELOG: PR-M3-1 section added; 4 schema-version
+tests updated to expect
+`CURRENT_SCHEMA_VERSION = 10` / `user_version = 10`.
+
+6 new tests in
+`test/release-gate/p2-memory-hierarchy.test.ts`
+cover every acceptance criterion from issue #9:
+tier round-trip; default tier; core > archival on
+same lexical match; `tier_priority` in explain;
+benchmark fixture; tier weight does not override
+lexical dominance.
+
+Test count: 494 (was 488; +6).
+Typecheck: 0 error.
+Static checks: `tier.*default.*working` in
+`src/sqlite-store.ts` returns 2 hits (the
+migration's `addColumnIfMissing` default + the
+`entryParams` defensive default). The third
+tier-weight constant lives in the ranker
+(`TIER_WEIGHTS = { core: 1.3, working: 1.0,
+archival: 0.7 }`).
+
+The full suite passes in isolation and as a
+whole; the 1 unhandled error is the same pre-existing
+vitest-worker `birpc` `onTaskUpdate` heartbeat
+issue documented in PR-M0-1's CHANGELOG.

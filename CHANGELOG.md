@@ -967,6 +967,87 @@ serial PRs plus the M0-pre fix-test-infra PR below.
   `dist/`, `README.md`, `LICENSE`,
   `CHANGELOG.md` files in the would-be tarball.
 
+### Stage 15 PR-M3-1 (Memory Hierarchy + Benchmark)
+### Added
+
+- **`src/sqlite-store.ts`** —
+  `CURRENT_SCHEMA_VERSION` bumped 9 → 10. The new
+  `migrate_v9_to_v10` step adds:
+  - `memory_entries.tier` column
+    (`'core' | 'working' | 'archival'`, default
+    `'working'`). The ranker reads this to weight
+    recall: core × 1.3, working × 1.0,
+    archival × 0.7.
+  - `memory_entries.valid_from` /
+    `valid_until` (ISO 8601) for temporal
+    validity.
+  - `memory_episodes` table
+    (`episode_id PK, parent_memory_id, summary,
+    started_at, ended_at, actor_id`) for
+    episode-shaped memories.
+- **`src/domain.ts`** — `MemoryEntry` extended
+  with `tier: "core" | "working" | "archival"`
+  (required), `valid_from?: string`,
+  `valid_until?: string`.
+- **`src/services/recall-ranker.ts`** — new
+  `tier_priority` component in the explain
+  output. The ranker reads `entry.tier` and
+  applies a weight:
+  - `core` → 1.3
+  - `working` → 1.0
+  - `archival` → 0.7
+  The weight contributes to the linear score
+  combination as a separate component so the
+  explain output is transparent.
+- **`test/release-gate/p2-memory-hierarchy.test.ts`**
+  (6 tests). Locks down every acceptance
+  criterion from issue #9:
+    1. `tier` column round-trip.
+    2. Default `tier` is `'working'` for legacy
+       entries.
+    3. Ranker weights `tier`: core entry ranks
+       above archival entry at the same lexical
+       match.
+    4. `tier_priority` is exposed in the explain
+       components.
+    5. Benchmark fixture: 5 entries across 2
+       projects, top-1 is `core`, bottom-1 is
+       `archival`.
+    6. Ranker: tier weight does not override
+       lexical dominance (a working entry with
+       strong lexical match still beats a core
+       entry with no lexical match).
+
+### Verification
+
+- `npm test` → 0 failed / **494 passed** (was: 488)
+  / 5 black-box skipped in dev (no `dist/`);
+  **499 passed** when run after `npm run build`
+  / 1 unhandled error (the same pre-existing
+  vitest-worker `birpc` `onTaskUpdate` heartbeat
+  issue documented in PR-M0-1's CHANGELOG;
+  0 actual test failures).
+- `npm run typecheck` → 0 error.
+- 6 new p2-memory-hierarchy tests pass.
+- 64 existing test files pass unchanged.
+- Static check `grep -nE "tier.*default.*working" src/sqlite-store.ts`
+  returns 2 hits (the migration's
+  `addColumnIfMissing` default + the
+  `entryParams` defensive default). The PR
+  adds a third tier-weight constant in the
+  ranker (`TIER_WEIGHTS = { core: 1.3, working:
+  1.0, archival: 0.7 }`) and the `tier_priority`
+  component is exposed in the explain output.
+- Optional intelligence plugins (embedding,
+  tier policy) are default OFF; the ranker
+  returns a deterministic output when the
+  store is omitted (the `OFF` path covers
+  no-embedding / no-feedback / no-tier-policy).
+- Schema v9 → v10 migration is non-destructive:
+  the new columns default to NULL / `'working'`,
+  the new `memory_episodes` table starts empty.
+  Legacy v9 databases migrate cleanly.
+
 ## [1.0.0] — Stage 14 v1.0 (AgentRecall v1.0)
 
 Date: 2026-07-21
