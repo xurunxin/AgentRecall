@@ -101,6 +101,14 @@ jobs:
         # gate; the heavier per-feature portability
         # tests live in test/portability*.test.ts and
         # run under `npm test` above.
+        #
+        # Stage 16 v1.1.1 PR-8 (issue #16, spec § 11.2):
+        # the pre-PR-8 step used `|| true` on the
+        # export line, which silently swallowed
+        # export failures. PR-8 removes the
+        # suppressor: a failure to export is a
+        # real failure that blocks the cross-OS
+        # release gate.
         shell: bash
         run: |
           set -euo pipefail
@@ -108,7 +116,7 @@ jobs:
           export AGENT_RECALL_HOME="$SMOKE_HOME"
           echo "smoke data home: $AGENT_RECALL_HOME"
           npx tsx bin/agent-recall.ts help > /dev/null
-          npx tsx bin/agent-recall.ts export --scope global > /dev/null || true
+          npx tsx bin/agent-recall.ts export --scope global > /dev/null
           ls -la "$AGENT_RECALL_HOME"
 
       - name: Cross-platform path safety check

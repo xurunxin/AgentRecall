@@ -13,6 +13,133 @@ lands as 8 serial PRs after v1.1.0. Each PR closes
 exactly one issue (#10–#17) under the tracker
 issue #18.
 
+### Stage 16 PR-8 (Packaged MCP Black-Box + Cross-Platform Gate)
+### Fixed
+
+- **`src/tools/register-tools.ts`** (issue #16,
+  spec § 11.2). The v1.1.0 `outputSchema` was
+  `z.union([okSchema, failSchema])`. The MCP
+  SDK's `validateToolOutput` calls
+  `normalizeObjectSchema` on the registered
+  schema; a union is not an object, so the
+  function returned `undefined` and the SDK
+  then attempted `safeParseAsync(undefined,
+  result.structuredContent)` which throws
+  `Cannot read properties of undefined
+  (reading '_zod')` on every tool dispatch.
+  PR-8 flattens the envelope to a single
+  `z.object({ ok: z.boolean(), data?: ...,
+  error?: ..., meta: { ... } })` schema. The
+  SDK's `normalizeObjectSchema` accepts it
+  (it has a `.shape` property) and the
+  validation passes. The success / failure
+  discrimination is the responsibility of
+  the per-tool envelope (the
+  `buildEnvelopeResult` helper); the
+  `outputSchema` is documentation only.
+
+- **`src/index.ts`** (issue #16). The
+  `agent-recall connected on stdio` status
+  hint is now gated behind
+  `AGENT_RECALL_VERBOSE_STDIO=1` so the
+  black-box test can assert "no stderr leak
+  over the full lifecycle" without false
+  positives. The CLI / packaged binary
+  still prints the hint by default; the env
+  var opts into the quieter behaviour.
+
+- **`.github/workflows/release.yml`**
+  (issue #16). The `Upload artefact` step
+  had `path: agent-recall-*.tar.gz`; the
+  Windows matrix leg produces a `.zip` and
+  the upload step then failed with
+  `if-no-files-found: error` on the Windows
+  job. PR-8 adds `agent-recall-*.zip` to the
+  glob so both archive types are uploaded.
+
+- **`.github/workflows/ci.yml`** (issue #16).
+  The `Export round-trip smoke` step used
+  `npx tsx bin/agent-recall.ts export
+  --scope global > /dev/null || true`,
+  which silently swallowed export failures.
+  PR-8 removes the `|| true` suppressor;
+  any failure to export is a real failure
+  that blocks the cross-OS release gate.
+
+### Added
+
+- **`scripts/verify-artifact-globs.mjs`**
+  (issue #16). Dependency-free local check
+  that asserts:
+  - `package.json` `version` is a non-empty
+    string
+  - The release workflow's tarball + zip
+    globs are computable
+  - The canonical entry points
+    (`dist/src/index.js`,
+    `dist/bin/agent-recall.js`) exist
+  - `engines.node` is set
+  - The local Node runtime is consistent
+    with the CI matrix
+  Wired into `npm run verify:artifacts` so
+  a regression in the release script's
+  globs is caught in dev rather than on the
+  tag.
+
+- **`test/blackbox/mcp-client-e2e.test.ts`**
+  (issue #16, expanded). The v1.1.0 test
+  exercised only `initialize` /
+  `listTools` / `listResources` /
+  `list_memories`. PR-8 expands the suite
+  to cover the full documented mutation
+  lifecycle end-to-end:
+  - `remember` with `idempotency_key`;
+    replay returns the same `memory_id`.
+  - `idempotency_key` reuse with a
+    different body rejects as
+    `idempotency_mismatch`.
+  - `update_memory` with
+    `expected_revision` (CAS); stale CAS
+    rejects as `stale_revision`.
+  - `explain_recall` returns the canonical
+    `ranking_version = "coding-default-v2"`.
+  - `record_memory_feedback` (the PR-7
+    new tool) appends a row.
+  - `forget_memory` with
+    `idempotency_key`; replay returns the
+    same `released_chars`.
+  - The server's stderr is captured and
+    asserted empty over the full lifecycle
+    (a leak — an unhandled exception, a
+    forgotten `console.error`, a Zod stack
+    trace — turns into a CI gate failure).
+
+### Verification
+
+- `npm test` → 569 passed + 5 skipped (was
+  560 + 5 in PR-7; +9 from the expanded
+  black-box suite).
+- `npm run typecheck` → 0 error.
+- `npm run build` → 0 error.
+- `npm run verify:artifacts` → every
+  release-gate assertion passes locally.
+- 2 unhandled `birpc` `onTaskUpdate` 60s
+  timeouts (the pre-existing vitest-worker
+  heartbeat documented in PR-M0-1's
+  CHANGELOG; 0 actual test failures).
+- The pre-existing
+  `p0-release-v1.test.ts` and
+  `p0-cleanup.test.ts` suites still pass
+  (the flattened `outputSchema` is a
+  superset of the union; the existing
+  assertions check the envelope fields
+  directly, not the JSON-Schema shape).
+- No `package.json` /
+  `package-lock.json` changes (a
+  `verify:artifacts` script entry was
+  added; the script itself is in
+  `scripts/`).
+
 ### Stage 16 PR-7 (Memory Semantics MCP)
 ### Fixed
 

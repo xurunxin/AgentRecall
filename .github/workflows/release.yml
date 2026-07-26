@@ -120,7 +120,21 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: agent-recall-${{ matrix.suffix }}
-          path: agent-recall-*.tar.gz
+          # Stage 16 v1.1.1 PR-8 (issue #16, spec § 11.2):
+          # the glob matches the platform-correct
+          # archive type. Pre-PR-8 the path glob was
+          # `agent-recall-*.tar.gz`, which silently
+          # dropped the Windows `.zip` artefacts
+          # (the upload step then failed with
+          # `if-no-files-found: error` on the windows
+          # matrix leg). The matrix-entry `archive`
+          # flag drives the extension; both globs
+          # are listed so a tarball matrix entry that
+          # accidentally produces a zip (or vice
+          # versa) still gets uploaded.
+          path: |
+            agent-recall-*.tar.gz
+            agent-recall-*.zip
           if-no-files-found: error
           retention-days: 14
 
