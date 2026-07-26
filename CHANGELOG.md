@@ -683,6 +683,126 @@ serial PRs plus the M0-pre fix-test-infra PR below.
   `writer_actor_id` and the v1 `audit_events_v2`
   rebuild).
 
+### Stage 15 PR-M1-2 (Project Identity + Conflict Protection)
+### Fixed
+
+- **`src/scope-resolver.ts`** (issue #7, spec § 5.4).
+  Project identity binding had no enforcement: a
+  caller could submit any `project_id` + `project_path`
+  pair and the resolver would happily derive a new
+  `project_id` from a hash of the path. Two callers
+  in the same repo could land in two different
+  identities; a caller with a stale `project_id` could
+  silently mutate a sibling project's data.
+
+  The new resolver flow is:
+
+  1. canonicalise the caller's `project_path`
+     (resolve + realpath + symlink resolution +
+     Windows case-fold);
+  2. look up `project_identities` by the caller's
+     `project_id` (when supplied) — if the row
+     exists, its `canonical_path` is the source of
+     truth; if not, register a new identity;
+  3. look up `project_aliases_new` by the canonical
+     path (case-folded on Windows) — if the row
+     exists and points to a *different*
+     `project_id`, surface
+     `project_identity_conflict`;
+  4. worktree handling: when the caller's path is a
+     separate directory that shares a `git rev-parse
+     HEAD` with the identity's canonical path,
+     register a `worktree`-kind alias so subsequent
+     lookups hit the same identity.
+
+  The resolver returns the canonical path
+  (`project_path` in `ResolvedScope` is the identity's
+  canonical path, not the caller's raw path).
+
+### Added
+
+- **`src/sqlite-store.ts`** —
+  `CURRENT_SCHEMA_VERSION` bumped 7 → 8. The new
+  `migrate_v7_to_v8` step creates
+  `project_identities(project_id PK, canonical_path,
+  created_by, created_at)` and
+  `project_aliases_new(alias PK, project_id FK,
+  canonical_path, alias_kind, recorded_by,
+  recorded_at)`. Five new methods on
+  `SQLiteMemoryStore`:
+  - `createProjectIdentity(input)` — `INSERT OR
+    IGNORE`; idempotent under
+    `(project_id, canonical_path)`.
+  - `getProjectIdentity(projectId)`.
+  - `createProjectAlias(input)` — `INSERT OR IGNORE`;
+    idempotent under `alias`.
+  - `getProjectAliasByPath(alias)`.
+  - `listProjectAliases(projectId)`.
+- **`src/tools/error-codes.ts`** — `invalid_alias`
+  added to the stable code registry (paired with
+  `project_identity_conflict`). The two codes are
+  permanent; neither is retryable.
+- **`src/scope-resolver.ts`** — new
+  `resolveMemoryScopeWithStore(input, store,
+  recordedBy)` entry point that the read / write
+  services call to opt into the project identity
+  model. The no-store `resolveMemoryScope(input)`
+  remains for tests and the public-API façade; the
+  read / write services prefer the store-aware form.
+- **`src/memory-service.ts`**,
+  **`src/services/memory-read-service.ts`**,
+  **`src/services/memory-write-service.ts`** —
+  `InvalidScopeResult` widened to `Result<never,
+  "invalid_scope" | "project_identity_conflict">`
+  so the project identity error reaches the MCP
+  envelope.
+- **`test/release-gate/p2-project-identity.test.ts`**
+  (9 tests). Locks down every acceptance criterion
+  from issue #7:
+    1. `resolveMemoryScope` returns
+       `invalid_scope` for an unknown scope.
+    2. `scope: "global"` is a no-op (no DB touch).
+    3. `createProjectIdentity` + `getProjectIdentity`
+       round-trip.
+    4. `createProjectIdentity` is idempotent on
+       `(project_id, canonical_path)`.
+    5. Two calls with the same `project_id` and
+       *different* `project_path` add a new alias
+       (not a new canonical path) — the second
+       call returns the *first* canonical path.
+    6. Two calls with the same `project_path` and
+       *different* `project_id` surface
+       `project_identity_conflict` (the alias is
+       already bound to the first project).
+    7. Symlink resolution: the resolver
+       canonicalises via `realpathSync.native`
+       before the identity lookup, so the alias
+       is recorded under the canonical path
+       (case-folded on Windows).
+    8. `project_id`-only inputs without a
+       registered identity surface
+       `invalid_scope` (the agent cannot operate
+       on a project that has never been created).
+    9. `listProjectAliases` returns every alias
+       for a project, ordered by `alias` ASC.
+
+### Verification
+
+- `npm test` → 0 failed / **481 passed** (was: 472)
+  / 1 unhandled error (the same pre-existing
+  vitest-worker `birpc` `onTaskUpdate` heartbeat
+  issue documented in PR-M0-1's CHANGELOG;
+  0 actual test failures).
+- `npm run typecheck` → 0 error.
+- 9 new p2-project-identity tests pass.
+- 62 existing test files pass unchanged.
+- Cross-project writes are blocked at the resolver
+  layer: any `project_id` that conflicts with an
+  existing alias returns `project_identity_conflict`
+  before any mutation runs. The `MemoryWriteService`
+  forwards the resolver's `ok: false` so the MCP
+  envelope surfaces the conflict code.
+
 ## [1.0.0] — Stage 14 v1.0 (AgentRecall v1.0)
 
 Date: 2026-07-21

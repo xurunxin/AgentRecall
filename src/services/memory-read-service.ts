@@ -52,7 +52,16 @@ export type ResolvedReadScope = {
 
 export type ListResult = { items: MemoryEntry[] };
 
-export type InvalidScopeResult = Result<never, "invalid_scope">;
+// Stage 15 PR-M1-2 (issue #7, spec § 5.4): the read
+// surface now also surfaces `project_identity_conflict`
+// when the caller's `project_id` does not match the
+// identity pinned to the supplied `project_path` (or
+// vice versa). The MCP contract still keys off
+// `invalid_scope`; `project_identity_conflict` is a
+// more specific code so a client can surface a
+// helpful message ("this project is already pinned
+// to a different path").
+export type InvalidScopeResult = Result<never, "invalid_scope" | "project_identity_conflict">;
 
 export type SearchMemoryItem = Pick<
   MemoryEntry,
@@ -265,9 +274,22 @@ export class MemoryReadService {
     scope: MemoryScope;
     project_id?: string;
     project_path?: string;
-  }): Result<ResolvedReadScope, "invalid_scope"> {
+  }): Result<ResolvedReadScope, "invalid_scope" | "project_identity_conflict"> {
     const resolved = resolveMemoryScope(input);
-    if (!resolved.ok) return resolved;
+    if (!resolved.ok) {
+      // Stage 15 PR-M1-2: the resolver may now surface
+      // `project_identity_conflict` when the caller's
+      // `project_id` + `project_path` triple does not
+      // match an existing identity. `invalid_alias` is
+      // collapsed to `invalid_scope` for callers.
+      if (resolved.error === "invalid_alias") {
+        return err("invalid_scope", resolved.message, resolved.details);
+      }
+      if (resolved.error === "project_identity_conflict") {
+        return err("project_identity_conflict", resolved.message, resolved.details);
+      }
+      return err("invalid_scope", resolved.message, resolved.details);
+    }
     return ok(resolved.value);
   }
 
@@ -275,7 +297,7 @@ export class MemoryReadService {
     scope?: MemoryScope;
     project_id?: string;
     project_path?: string;
-  }): Result<ResolvedReadScope, "invalid_scope"> {
+  }): Result<ResolvedReadScope, "invalid_scope" | "project_identity_conflict"> {
     const scope: MemoryScope = input.scope ?? "global";
     return this.resolveReadScope({ scope, ...(input.project_id !== undefined ? { project_id: input.project_id } : {}), ...(input.project_path !== undefined ? { project_path: input.project_path } : {}) });
   }

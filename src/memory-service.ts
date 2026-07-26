@@ -52,7 +52,7 @@ export type {
 export type { MaintainMemoriesInput, MaintainMemoriesResult, MaintenanceAction } from "./services/memory-maintenance-service.js";
 export type { RememberResult } from "./services/memory-write-service.js";
 
-export type InvalidScopeResult = Result<never, "invalid_scope">;
+export type InvalidScopeResult = Result<never, "invalid_scope" | "project_identity_conflict">;
 
 // Local aliases for the type shapes that the façade reuses.
 type ListServiceFilters = EntryFilters & { project_path?: string };
@@ -732,6 +732,17 @@ export class MemoryService {
     project_id?: string;
     include_global?: boolean;
     top_k?: number;
+    /**
+     * Stage 15 PR-M1-1 (issue #6, spec § 5.3):
+     * optional `now` for deterministic explanations.
+     * When omitted, the ranker uses `new Date()`. Two
+     * calls with the same inputs but different `now`
+     * produce different `recency` scores, so the
+     * byte-identical explanation contract only holds
+     * when `now` is fixed. Tests should pass a fixed
+     * `now`; production callers can omit it.
+     */
+    now?: Date;
   }): Result<{ ranking_version: string; items: Array<{ memory_id: string; score: number; components: RankedItem["components"]; title: string; trust_boost: number }> }, "invalid_scope"> {
     if (input.scope === "project" && input.project_id === undefined) {
       return err("invalid_scope", "project scope requires project_id");
@@ -745,7 +756,8 @@ export class MemoryService {
       actor: {
         currentActor: this.defaultActor,
         actorForEntry: (entry) => entry.writer_actor_id
-      }
+      },
+      ...(input.now !== undefined ? { now: input.now } : {})
     });
     const limited = ranked.slice(0, topK);
     return {
