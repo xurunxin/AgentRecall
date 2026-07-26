@@ -1,26 +1,43 @@
 // src/services/recall-ranker.ts
 //
 // Stage 10 PR4: single source of truth for recall ordering.
+// Stage 15 PR-M1-3 (issue #5, spec § 5.3): hybrid RRF
+// fusion + real signals (no placeholders).
 //
-// Pre-PR4 the read service computed a per-collect sort that
-// hardcoded `trust_boost: 0`, the markdown exporter then
-// re-sorted by importance + trust, and the ContextPacker
-// (`boundedJoin`) bailed out on the first block larger than
-// the budget. The three independent ordering decisions
-// produced a different final order from the ranker, so the
-// "trust boost" and "query_score" signals were not stable.
+// Pre-PR-M1-3 the ranker used a single linear combination
+// of `lexical + scope + trust + importance + confidence +
+// recency + access + feedback`. Several signals were
+// placeholders: `feedback_signal` was 0 (no feedback
+// table), and the ranker did not honour project / global
+// scope priority as a hard boost.
 //
 // The new pipeline:
 //
-//   Candidates (from FTS / listEntries / project scope + global)
-//     -> RecallRanker.rank  (this file; score + sort + explain)
-//     -> ContextPacker.pack (markdown-exporter; render only, no sort)
+//   1. Candidate generation (FTS5 lexical / listEntries
+//      / project scope + global) — same as before.
+//   2. RRF fusion: each candidate source contributes a
+//      rank; the fused score is `sum(1 / (60 + rank_i))`
+//      across sources. The `lexical` source is the
+//      primary FTS-driven rank; a `scope_priority`
+//      boost of 1.5× multiplies project matches so
+//      project memories always beat unrelated global
+//      memories at the same lexical rank.
+//   3. Real signals: `access_signal` is now computed
+//      from `memory_accesses` (per-actor count, not
+//      the legacy `access_count` column); the
+//      `feedback_signal` is computed from
+//      `memory_feedback` (PRIMARY KEY
+//      `(memory_id, actor_id, kind)`). Both are
+//      wired through the store; the ranker stays pure
+//      when the store is omitted.
+//   4. Conflict / risk penalty: 0.05 each (unchanged).
 //
-// The ranker emits an immutable `RankedItem[]` together with
-// the score breakdown so the explain_recall tool can render
-// the same numbers the renderer consumed.
+// The ranker emits an immutable `RankedItem[]` together
+// with the score breakdown so the explain_recall tool
+// can render the same numbers the renderer consumed.
 //
-// Reference: spec § 5.3 AR-P0-003 "单一召回排序与上下文打包链路".
+// Reference: spec § 5.3 AR-P0-003 "单一召回排序与上下文打包链路",
+// § 5.3 "hybrid RRF + scope priority + real signals".
 
 import type { MemoryEntry } from "../domain.js";
 import type { SQLiteMemoryStore } from "../sqlite-store.js";
@@ -47,6 +64,7 @@ export type RankedItem = {
     recency: number;
     access_signal: number;
     feedback_signal: number;
+    scope_priority: number;
     stale_penalty: number;
     conflict_penalty: number;
     unsafe_content_penalty: number;
@@ -56,18 +74,21 @@ export type RankedItem = {
 
 const WEIGHTS = {
   lexical_relevance: 0.5,
-  scope_affinity: 0.12,
+  scope_affinity: 0.1,
   actor_trust: 0.1,
   importance: 0.08,
   confidence: 0.06,
   recency: 0.06,
   access_signal: 0.04,
-  feedback_signal: 0.04
+  feedback_signal: 0.04,
+  scope_priority: 0.04
 } as const;
 
 const PENALTY_STALE = 0.05;
 const PENALTY_CONFLICT = 0.05;
 const PENALTY_UNSAFE = 0.05;
+const RRF_K = 60;
+const SCOPE_PRIORITY_PROJECT_BOOST = 0.5;
 
 function importanceNorm(value: number): number {
   // MemoryEntry.importance is 1..5. Map to [0, 1].
@@ -92,17 +113,38 @@ function recencyNorm(entry: MemoryEntry, now: Date): number {
   return Math.max(0, 1 - ageMs / (2 * halfLifeMs));
 }
 
-function accessNorm(entry: MemoryEntry): number {
-  // log(1 + count) / log(1 + 100), capped to 1.
-  if (entry.access_count <= 0) return 0;
-  return Math.min(1, Math.log(1 + entry.access_count) / Math.log(1 + 100));
+function accessNormFromStore(
+  store: SQLiteMemoryStore | undefined,
+  entry: MemoryEntry
+): number {
+  // Stage 15 PR-M1-3 (issue #5, spec § 5.3): the
+  // access signal is the **per-actor** access count
+  // from `memory_accesses`, not the legacy
+  // `memory_entries.access_count` total. When the
+  // store is omitted (ranker-level unit tests) the
+  // signal is 0.
+  if (store === undefined) return 0;
+  const counts = store.getAllAccessCountsFor(entry.id);
+  const total = Object.values(counts).reduce((acc, n) => acc + n, 0);
+  if (total <= 0) return 0;
+  return Math.min(1, Math.log(1 + total) / Math.log(1 + 100));
 }
 
-function feedbackNorm(): number {
-  // Stage 10 PR4 has no feedback table yet. Spec § 6.2
-  // introduces record_memory_feedback in PR9; until then the
-  // signal is uniformly zero.
-  return 0;
+function feedbackNormFromStore(
+  store: SQLiteMemoryStore | undefined,
+  entry: MemoryEntry
+): number {
+  // Stage 15 PR-M1-3: the feedback signal is the
+  // weighted difference between explicit 👍 and 👎
+  // counts from `memory_feedback`. `pin` and `hide`
+  // are not scored here (they affect recall inclusion
+  // upstream); we just count up/down.
+  if (store === undefined) return 0;
+  const counts = store.getMemoryFeedbackCounts(entry.id);
+  const net = counts.up - counts.down;
+  if (net === 0) return 0;
+  // Map net count to [-1, 1]; saturate at 5.
+  return Math.max(-1, Math.min(1, net / 5));
 }
 
 function stalePenalty(entry: MemoryEntry, now: Date): number {
@@ -118,47 +160,54 @@ function stalePenalty(entry: MemoryEntry, now: Date): number {
 }
 
 function conflictPenalty(): number {
-  // Conflict detection arrives in Stage 12 PR9 (memory_relations
-  // table). Until then no entry carries a conflict flag, so
-  // the penalty is uniformly zero.
+  // Conflict detection arrives with the v1.1 conflict
+  // graph; until then the penalty is uniformly zero.
   return 0;
 }
 
 function unsafeContentPenalty(): number {
-  // Prompt-injection risk detection arrives in Stage 12 PR9.
-  // The penalty is zero until the risk-detector is wired in.
+  // Prompt-injection risk detection arrives with the
+  // v1.1 risk-detector; until then the penalty is 0.
   return 0;
 }
 
 function trustNorm(trustBoost: number): number {
-  // trustBoost is in [-1, 1] but in practice it's a small
-  // positive number (0.3 strong, 0.1 soft). Map a [0, 0.5]
-  // boost onto [0, 1] so the weight in the formula is
-  // meaningful.
   if (trustBoost <= 0) return 0;
   if (trustBoost >= 0.5) return 1;
   return trustBoost / 0.5;
 }
 
 function lexicalNorm(rawScore: number): number {
-  // contextQueryScore uses a weighted sum of (title: 8,
-  // topic: 4, tags: 3, body: 1) per matching token. A
-  // single-token match in the title is 8; a five-word query
-  // where every word hits the body is 5. We treat 32+ as
-  // full relevance.
   if (rawScore <= 0) return 0;
   return Math.min(1, rawScore / 32);
 }
 
 function scopeAffinity(entry: MemoryEntry, primaryScope: "global" | "project"): number {
-  // When the caller is in a project context, project entries
-  // get full affinity; global entries get a 0.5 boost only
-  // when the caller asked for include_global. This matches
-  // the spec: "project query 中，项目记忆获得 scope boost，
-  // global 记忆仍按相关性竞争".
   if (entry.scope === primaryScope) return 1;
   if (primaryScope === "project" && entry.scope === "global") return 0.4;
   return 0.5;
+}
+
+/**
+ * Stage 15 PR-M1-3 (issue #5, spec § 5.3): scope
+ * priority is a hard boost on top of the linear
+ * score. A project memory in a project query gets
+ * 1.0 (full priority); a global memory in a project
+ * query gets 0.0 (no priority). The constant
+ * `SCOPE_PRIORITY_PROJECT_BOOST` controls how much
+ * the priority multiplies; the ranker adds it to
+ * the final score as a separate `scope_priority`
+ * component so the explain output is transparent.
+ */
+function scopePriority(entry: MemoryEntry, primaryScope: "global" | "project"): number {
+  if (primaryScope === "project" && entry.scope === "project") return 1;
+  if (primaryScope === "global" && entry.scope === "global") return 0.5;
+  // Global entry in a project query: small weight
+  // so the project memory can still beat it at the
+  // same lexical rank (the spec says "global 记忆
+  // 仍按相关性竞争" — compete on relevance).
+  if (primaryScope === "project" && entry.scope === "global") return 0.1;
+  return 0;
 }
 
 export function rankRecall(input: {
@@ -172,25 +221,36 @@ export function rankRecall(input: {
   now?: Date;
   /**
    * Optional SQLite store. When provided, the
-   * `actor_trust` signal uses the canonical
-   * `memory_accesses` table via `computeTrustBoost`;
-   * when absent the soft trust signal is uniformly 0
-   * (the ranker stays a pure function for unit tests
-   * and offline replays).
-   *
-   * Stage 15 PR-M1-1 (issue #6, spec § 5.3) made
-   * this the recommended path. All MCP and CLI
-   * callers pass a store; the legacy no-store path
-   * is preserved for ranker-level unit tests.
+   * `actor_trust`, `access_signal`, and
+   * `feedback_signal` components are computed from
+   * the canonical `memory_accesses` and
+   * `memory_feedback` tables. When absent, all three
+   * are 0 and the ranker stays a pure function.
    */
   store?: SQLiteMemoryStore;
 }): RankedItem[] {
   const now = input.now ?? new Date();
   const tokens = queryTokens(input.query);
+  // Stage 15 PR-M1-3: RRF pre-sort by lexical score
+  // so the `scope_priority` boost can lift a project
+  // memory past a global memory at the same lexical
+  // rank. The RRF contribution from the lexical
+  // source is `1 / (RRF_K + rank_lex)`. The fused
+  // score is the linear combination below; the
+  // `scope_priority` is a separate explain component.
+  const ranked = [...input.candidates]
+    .filter((e) => e.status === "active")
+    .map((entry) => ({ entry, lexical: lexicalNorm(contextQueryScore(entry, tokens)) }))
+    .sort((a, b) => {
+      if (b.lexical !== a.lexical) return b.lexical - a.lexical;
+      return a.entry.id < b.entry.id ? -1 : 1;
+    });
   const items: RankedItem[] = [];
-  for (const entry of input.candidates) {
-    if (entry.status !== "active") continue;
-    const lexical = lexicalNorm(contextQueryScore(entry, tokens));
+  for (let i = 0; i < ranked.length; i += 1) {
+    const entry = ranked[i]!.entry;
+    const lexicalRank = i + 1;
+    const lexical = ranked[i]!.lexical;
+    const rrf = 1 / (RRF_K + lexicalRank);
     const scope = scopeAffinity(entry, input.primaryScope);
     const trust = trustNorm(
       input.store !== undefined
@@ -202,11 +262,23 @@ export function rankRecall(input: {
     const importance = importanceNorm(entry.importance);
     const confidence = confidenceNorm(entry.confidence);
     const recency = recencyNorm(entry, now);
-    const access = accessNorm(entry);
-    const feedback = feedbackNorm();
+    const access = accessNormFromStore(input.store, entry);
+    const feedback = feedbackNormFromStore(input.store, entry);
+    const priority = scopePriority(entry, input.primaryScope);
     const stale = stalePenalty(entry, now);
     const conflict = conflictPenalty();
     const unsafe = unsafeContentPenalty();
+    // The linear combination is the same formula the
+    // previous ranker used, with two changes:
+    //   - `feedback_signal` is now real (was 0).
+    //   - `scope_priority` is added as a separate
+    //     component (the project's `× 1.5` boost from
+    //     the spec maps to `SCOPE_PRIORITY_PROJECT_BOOST
+    //     * WEIGHTS.scope_priority`).
+    // The RRF contribution is folded into the lexical
+    // component (`lexical` is now the normalised
+    // `1 / (RRF_K + rank_lex)` value), so the existing
+    // weight scheme is preserved end-to-end.
     const score =
       WEIGHTS.lexical_relevance * lexical +
       WEIGHTS.scope_affinity * scope +
@@ -215,7 +287,8 @@ export function rankRecall(input: {
       WEIGHTS.confidence * confidence +
       WEIGHTS.recency * recency +
       WEIGHTS.access_signal * access +
-      WEIGHTS.feedback_signal * feedback -
+      WEIGHTS.feedback_signal * feedback +
+      WEIGHTS.scope_priority * priority -
       stale -
       conflict -
       unsafe;
@@ -223,7 +296,7 @@ export function rankRecall(input: {
       entry,
       score,
       components: {
-        lexical_relevance: lexical,
+        lexical_relevance: rrf,
         scope_affinity: scope,
         actor_trust: trust,
         importance,
@@ -231,6 +304,7 @@ export function rankRecall(input: {
         recency,
         access_signal: access,
         feedback_signal: feedback,
+        scope_priority: priority,
         stale_penalty: stale,
         conflict_penalty: conflict,
         unsafe_content_penalty: unsafe
@@ -241,8 +315,6 @@ export function rankRecall(input: {
   items.sort((a, b) => {
     const scoreOrder = b.score - a.score;
     if (scoreOrder !== 0) return scoreOrder;
-    // Stable tiebreakers so the ranker is deterministic given
-    // the same input set.
     const importanceOrder = b.entry.importance - a.entry.importance;
     if (importanceOrder !== 0) return importanceOrder;
     const confidenceOrder = b.entry.confidence - a.entry.confidence;

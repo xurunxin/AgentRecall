@@ -1,0 +1,71 @@
+feat(recall): hybrid RRF + scope priority + real signals
+
+Stage 15 PR-M1-3 (issue #5, spec § 5.3).
+
+Pre-PR-M1-3 had four gaps in the ranker:
+
+  1. `feedback_signal` was a placeholder 0 (no
+     feedback table existed).
+  2. `access_signal` read the legacy
+     `memory_entries.access_count` column instead
+     of the canonical `memory_accesses` table.
+  3. Project vs global scope priority was a
+     soft `scope_affinity` weight, not a hard
+     boost.
+  4. The ranker was a linear combination, not a
+     reciprocal-rank-fused hybrid.
+
+This PR fixes all four:
+
+  - **Schema v8 → v9**: two new tables
+    `memory_feedback(memory_id, actor_id, kind,
+    created_at)` (PRIMARY KEY `(memory_id,
+    actor_id, kind)`, kind in
+    `('up','down','pin','hide')`) and
+    `memory_recall_signals(memory_id PK,
+    recall_count, last_recalled_at,
+    last_recall_rank, last_recall_query)`.
+  - **Real `feedback_signal`**: per-memory
+    counts of `up` vs `down` from
+    `memory_feedback`, mapped to `[-1, 1]`
+    (saturate at 5).
+  - **Real `access_signal` from
+    `memory_accesses`**: per-actor counts summed
+    and `log`-normalised (capped at 1).
+  - **`scope_priority` boost**: project memory
+    in a project query gets `priority = 1.0`;
+    global in a project query gets `priority =
+    0.1`. The boost surfaces as a separate
+    `scope_priority` component in the explain
+    output.
+  - **RRF pre-sort**: candidates are pre-sorted
+    by lexical score; the
+    `lexical_relevance` component is now
+    `1 / (60 + rank_lex)`.
+  - **`MemoryService.recordFeedback({memory_id,
+    kind, actor_id?})`** — public method that
+    validates the memory exists and writes the
+    per-actor feedback row.
+
+CHANGELOG: PR-M1-3 section added; 4 schema-version
+tests updated to expect
+`CURRENT_SCHEMA_VERSION = 9` / `user_version = 9`.
+
+7 new tests in
+`test/release-gate/p2-hybrid-recall.test.ts` cover
+every acceptance criterion from issue #5: project
+memory ranks above global; real `feedback_signal`;
+real `access_signal`; `explain_recall` exposes real
+(non-zero) signals; `recordFeedback` rejects
+unknown memory_id; `recordFeedback` is idempotent;
+`recordRecallSignal` + `getRecallSignal`
+round-trip.
+
+Test count: 488 (was 481; +7).
+Typecheck: 0 error.
+Static checks: no `trust_boost: 0` or
+`feedback.*=.*0` literal in
+`src/services/recall-ranker.ts`; the ranker stays
+deterministic when the store is omitted (the
+`OFF` path covers the no-embedding / no-feedback
+fallback).

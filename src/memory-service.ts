@@ -283,6 +283,33 @@ export class MemoryService {
   // ============================================================
 
   /**
+   * Stage 15 PR-M1-3 (issue #5, spec § 5.3): record
+   * explicit per-actor feedback for a memory. The
+   * `kind` enum is `up` (👍), `down` (👎), `pin`
+   * (always surface), `hide` (always suppress). The
+   * ranker reads the per-`kind` counts to compute
+   * the `feedback_signal` component.
+   */
+  recordFeedback(input: {
+    memory_id: string;
+    kind: "up" | "down" | "pin" | "hide";
+    actor_id?: string;
+  }): { ok: true } | { ok: false; error: "not_found" } {
+    const entry = this.store.peekEntry(input.memory_id);
+    if (entry === undefined) {
+      return { ok: false, error: "not_found" };
+    }
+    this.store.recordMemoryFeedback({
+      memory_id: input.memory_id,
+      actor_id: input.actor_id ?? this.defaultActor,
+      kind: input.kind,
+      created_at: nowIso()
+    });
+    return { ok: true };
+  }
+
+
+  /**
    * Build a maintenance plan. Stage 15 PR-M0-4 (issue
    * #3, spec § 6.2): the plan is durable (written to
    * `maintenance_plans`) and each item carries its own
@@ -757,6 +784,11 @@ export class MemoryService {
         currentActor: this.defaultActor,
         actorForEntry: (entry) => entry.writer_actor_id
       },
+      // Stage 15 PR-M1-3 (issue #5, spec § 5.3):
+      // pass the store so the ranker can read
+      // `memory_accesses` + `memory_feedback` for
+      // real (non-placeholder) signals.
+      store: this.store,
       ...(input.now !== undefined ? { now: input.now } : {})
     });
     const limited = ranked.slice(0, topK);
