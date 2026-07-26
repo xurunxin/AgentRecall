@@ -86,8 +86,14 @@ describe("release-gate p2-trust-provenance (issue #6)", () => {
     seed(store, { id: "mem_e_1", title: "Postgres tuning", body: "primary key uses btree" });
     seed(store, { id: "mem_e_2", title: "Vacuum schedule", body: "autovacuum_naptime is 60s" });
 
-    const r1 = service.explainRecall({ query: "postgres", scope: "global" });
-    const r2 = service.explainRecall({ query: "postgres", scope: "global" });
+    // Stage 15 PR-M1-1 (issue #6, spec § 5.3): the
+    // `recency` signal depends on `now`. We pass a
+    // fixed `now` so the byte-identical contract
+    // holds (a moving clock would shift the last
+    // few significant digits of every score).
+    const fixedNow = new Date("2026-07-26T12:00:00.000Z");
+    const r1 = service.explainRecall({ query: "postgres", scope: "global", now: fixedNow });
+    const r2 = service.explainRecall({ query: "postgres", scope: "global", now: fixedNow });
     expect(r1.ok).toBe(true);
     expect(r2.ok).toBe(true);
     if (!r1.ok || !r2.ok) return;

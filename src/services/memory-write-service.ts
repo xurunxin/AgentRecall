@@ -782,8 +782,13 @@ export class MemoryWriteService {
     }
     const resolved = resolveMemoryScope(validated.value);
     if (!resolved.ok) {
+      // Stage 15 PR-M1-2: the resolver may now surface
+      // `project_identity_conflict`. The remember
+      // contract accepts the new error code so the
+      // cross-project write is refused at the entry
+      // point.
       if (auditRejections) auditRejected(this.ctx.store, this.ctx.defaultActor, input, resolved.error, resolved.details, ctx);
-      return resolved;
+      return resolved as Result<ResolvedRemember, RememberError>;
     }
     if (resolved.value.scope === "project" && resolved.value.project_id === undefined) {
       if (auditRejections) auditRejected(this.ctx.store, this.ctx.defaultActor, input, "invalid_scope", undefined, ctx);

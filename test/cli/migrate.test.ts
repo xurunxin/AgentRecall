@@ -44,7 +44,9 @@ describe("migrateCommand", () => {
     // Stage 15 PR-M0-4: bumped to 6 (maintenance_plans +
     // maintenance_plan_items).
     // Stage 15 PR-M1-1: bumped to 7 (memory_provenance).
-    expect(parsed.to).toBe(7);
+    // Stage 15 PR-M1-2: bumped to 8 (project_identities
+    // + project_aliases_new).
+    expect(parsed.to).toBe(8);
     store.close();
   });
 });

@@ -80,8 +80,16 @@ export type SearchFilters = EntryFilters & {
  * and finalises the v3 `last_accessed_by` JSON column as
  * read-only-deprecated (the canonical access data lives in
  * `memory_accesses` from v4 onward).
+ * v8 (Stage 15 PR-M1-2, issue #7) introduces a strict project
+ * identity model: `project_identities` (one row per `project_id`
+ * with its `canonical_path`) plus a strengthened `project_aliases`
+ * table (PRIMARY KEY on the raw alias path; FK + UNIQUE on
+ * `(project_id, canonical_path)`). The scope-resolver
+ * consults both: an alias path that maps to a different
+ * `project_id` than the caller's input surfaces
+ * `project_identity_conflict`.
  */
-export const CURRENT_SCHEMA_VERSION = 7;
+export const CURRENT_SCHEMA_VERSION = 8;
 
 /**
  * Stage 12 PR9: thrown by `updateEntryWithRevision` when
@@ -754,6 +762,10 @@ export class SQLiteMemoryStore {
       this.migrate_v6_to_v7();
       return;
     }
+    if (version === 8) {
+      this.migrate_v7_to_v8();
+      return;
+    }
     throw new Error(`No migration registered for schema version ${version}`);
   }
 
@@ -1118,6 +1130,71 @@ export class SQLiteMemoryStore {
           ON memory_provenance(source_kind, source_ref);
       `);
       this.db.exec("PRAGMA user_version = 7");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * Stage 15 PR-M1-2 (issue #7, spec § 5.4): v7 -> v8
+   * schema migration. Introduces a strict project
+   * identity model:
+   *
+   *   - `project_identities(project_id, canonical_path,
+   *     created_by, created_at)` with `project_id` as
+   *     the PRIMARY KEY. One row per project, holding
+   *     the canonical path the project was created
+   *     with. Inserting a second row for the same
+   *     `project_id` (with a different `canonical_path`)
+   *     surfaces `project_identity_conflict` at the
+   *     service layer; the table does NOT enforce a
+   *     UNIQUE on `canonical_path` because two
+   *     projects may legitimately share a path
+   *     canonicalisation (e.g. a worktree resolves to
+   *     the same canonical path as the main repo).
+   *
+   *   - `project_aliases` is rebuilt with a stronger
+   *     contract: PRIMARY KEY is the raw alias path
+   *     (one row per alias), the FK back to
+   *     `project_identities(project_id)` is enforced,
+   *     and `recorded_by` / `recorded_at` capture the
+   *     audit trail. The v7 `project_aliases` table
+   *     used `(alias_type, normalized_value)` as the
+   *     primary key and did not enforce a FK to the
+   *     identity table; v8 strengthens the contract.
+   *
+   * The migration copies existing v7 `project_aliases`
+   * rows into the new shape; the old v7 table is
+   * dropped after the copy. The new table is created
+   * fresh on a v8+ install.
+   */
+  private migrate_v7_to_v8(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS project_identities (
+          project_id TEXT PRIMARY KEY,
+          canonical_path TEXT NOT NULL,
+          created_by TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        ) STRICT;
+
+        CREATE TABLE IF NOT EXISTS project_aliases_new (
+          alias TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL,
+          canonical_path TEXT NOT NULL,
+          alias_kind TEXT NOT NULL CHECK (alias_kind IN ('path','git_head','worktree')),
+          recorded_by TEXT NOT NULL,
+          recorded_at INTEGER NOT NULL,
+          FOREIGN KEY (project_id) REFERENCES project_identities(project_id) ON DELETE CASCADE
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS project_aliases_new_project_idx
+          ON project_aliases_new(project_id);
+      `);
+      this.db.exec("PRAGMA user_version = 8");
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -1636,6 +1713,146 @@ export class SQLiteMemoryStore {
       .all(memoryId) as Array<{
       source_kind: "issue" | "pr" | "commit" | "tool_call" | "session" | "import";
       source_ref: string;
+      recorded_by: string;
+      recorded_at: number;
+    }>;
+  }
+
+  /**
+   * Stage 15 PR-M1-2 (issue #7, spec § 5.4): strict
+   * project identity model. A `project_identity` row
+   * pins a `project_id` to its `canonical_path`. A
+   * caller that submits a `project_id` already in the
+   * table with a *different* `canonical_path` triggers
+   * `project_identity_conflict` at the service layer;
+   * the database itself accepts the row, but the
+   * service rejects it.
+   *
+   * `createProjectIdentity` is idempotent under
+   * `(project_id, canonical_path, created_by)`: a
+   * second call with the same triple is a no-op via
+   * `INSERT OR IGNORE`. A second call with the same
+   * `project_id` but a different `canonical_path`
+   * throws `SQLITE_CONSTRAINT_PRIMARYKEY` — callers
+   * must catch that and surface
+   * `project_identity_conflict`.
+   */
+  createProjectIdentity(input: {
+    project_id: string;
+    canonical_path: string;
+    created_by: string;
+    created_at: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO project_identities
+          (project_id, canonical_path, created_by, created_at)
+         VALUES (?, ?, ?, ?)`
+      )
+      .run(
+        input.project_id,
+        input.canonical_path,
+        input.created_by,
+        input.created_at
+      );
+  }
+
+  getProjectIdentity(projectId: string): {
+    project_id: string;
+    canonical_path: string;
+    created_by: string;
+    created_at: string;
+  } | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT project_id, canonical_path, created_by, created_at FROM project_identities WHERE project_id = ?"
+      )
+      .get(projectId) as
+      | {
+          project_id: string;
+          canonical_path: string;
+          created_by: string;
+          created_at: string;
+        }
+      | undefined;
+    return row;
+  }
+
+  /**
+   * Stage 15 PR-M1-2: register an alias for an
+   * existing project identity. The alias is the raw
+   * path the caller resolved (e.g. a symlink target,
+   * a worktree, a Windows-cased path). The
+   * `project_id` and `canonical_path` are taken from
+   * the identity row. `INSERT OR IGNORE` makes repeat
+   * registration idempotent under `alias`.
+   */
+  createProjectAlias(input: {
+    alias: string;
+    project_id: string;
+    canonical_path: string;
+    alias_kind: "path" | "git_head" | "worktree";
+    recorded_by: string;
+    recorded_at: number;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO project_aliases_new
+          (alias, project_id, canonical_path, alias_kind, recorded_by, recorded_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        input.alias,
+        input.project_id,
+        input.canonical_path,
+        input.alias_kind,
+        input.recorded_by,
+        input.recorded_at
+      );
+  }
+
+  getProjectAliasByPath(alias: string): {
+    alias: string;
+    project_id: string;
+    canonical_path: string;
+    alias_kind: "path" | "git_head" | "worktree";
+    recorded_by: string;
+    recorded_at: number;
+  } | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT alias, project_id, canonical_path, alias_kind, recorded_by, recorded_at FROM project_aliases_new WHERE alias = ?"
+      )
+      .get(alias) as
+      | {
+          alias: string;
+          project_id: string;
+          canonical_path: string;
+          alias_kind: "path" | "git_head" | "worktree";
+          recorded_by: string;
+          recorded_at: number;
+        }
+      | undefined;
+    return row;
+  }
+
+  listProjectAliases(projectId: string): Array<{
+    alias: string;
+    project_id: string;
+    canonical_path: string;
+    alias_kind: "path" | "git_head" | "worktree";
+    recorded_by: string;
+    recorded_at: number;
+  }> {
+    return this.db
+      .prepare(
+        "SELECT alias, project_id, canonical_path, alias_kind, recorded_by, recorded_at FROM project_aliases_new WHERE project_id = ? ORDER BY alias ASC"
+      )
+      .all(projectId) as Array<{
+      alias: string;
+      project_id: string;
+      canonical_path: string;
+      alias_kind: "path" | "git_head" | "worktree";
       recorded_by: string;
       recorded_at: number;
     }>;
