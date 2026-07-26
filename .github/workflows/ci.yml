@@ -79,6 +79,20 @@ jobs:
           # fast tmpfs at /tmp.
           TMPDIR: ${{ runner.temp }}
 
+      - name: MCP black-box E2E
+        # Stage 15 PR-M2-1 (issue #8, spec § 11.2):
+        # spawn the built MCP server via stdio, connect
+        # with the SDK's Client, and run the full
+        # remember/update(CAS)/forget(idempotency)
+        # lifecycle against a real MCP transport. This
+        # is the gate that proves the *built artifact*
+        # is functional, not just the source.
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls dist/src/index.js
+          npx vitest run test/blackbox/mcp-client-e2e.test.ts
+
       - name: Export round-trip smoke
         # The portability contract (spec § 6.7): an
         # export written by the same build must

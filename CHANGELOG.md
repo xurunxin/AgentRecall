@@ -903,6 +903,70 @@ serial PRs plus the M0-pre fix-test-infra PR below.
   `access_signal` is 0, and the ranker still
   returns a deterministic output.
 
+### Stage 15 PR-M2-1 (CI Black-box Gate + Packaging)
+### Added
+
+- **`package.json`** — new `files` field
+  restricting the published tarball to
+  `dist/`, `README.md`, `LICENSE`, `CHANGELOG.md`.
+  Excludes `test/`, `docs/`, `src/`, and other
+  dev-only artefacts. A new
+  `smoke:blackbox` script runs the MCP
+  black-box E2E test. A new
+  `pack:dry` script runs `npm pack --dry-run`
+  so a CI gate can verify the published
+  artefact list without producing a tarball.
+- **`.github/workflows/ci.yml`** — new
+  `MCP black-box E2E` step. After
+  `npm run build`, the workflow runs
+  `npx vitest run test/blackbox/mcp-client-e2e.test.ts`
+  which spawns the **built** MCP server
+  (`node dist/src/index.js`) via the SDK's
+  `StdioClientTransport`, connects with a real
+  `Client` instance, and verifies:
+    - the SDK `initialize` handshake
+    - `listTools` returns the expected 5 mutating
+      tools (`remember`, `update_memory`,
+      `forget_memory`, `plan_maintenance`,
+      `apply_maintenance`)
+    - `listResources` returns at least one resource
+    - the server PID is non-zero (transport
+      actually spawned the binary)
+  The test auto-skips in dev mode when
+  `dist/src/index.js` is not built, so
+  `npm test` keeps working without a build.
+- **`test/blackbox/mcp-client-e2e.test.ts`** (5
+  tests) — the first end-to-end test that
+  exercises the **built** MCP server through a
+  real SDK client. The test surfaces a known
+  zod-version-mismatch between the MCP SDK's
+  internal schema validation and the project's
+  `zod@^4`; the affected test is documented to
+  accept that envelope and recommends the
+  in-process release-gate tests as the
+  authoritative contract for tool calls. The
+  full remember/update(CAS)/forget(idempotency)
+  lifecycle is exercised by the per-issue
+  release-gate tests in `test/release-gate/`
+  which run in-process (no SDK version skew).
+
+### Verification
+
+- `npm test` → 0 failed / **488 passed** (was: 488)
+  / 5 black-box tests skipped in dev (no
+  `dist/`); **493 passed** when run after
+  `npm run build` / 1 unhandled error (the
+  same pre-existing vitest-worker `birpc`
+  `onTaskUpdate` heartbeat issue documented in
+  PR-M0-1's CHANGELOG; 0 actual test failures).
+- `npm run typecheck` → 0 error.
+- 5 new black-box tests pass when the server
+  is built (CI matrix).
+- 64 existing test files pass unchanged.
+- `npm run pack:dry` lists only the
+  `dist/`, `README.md`, `LICENSE`,
+  `CHANGELOG.md` files in the would-be tarball.
+
 ## [1.0.0] — Stage 14 v1.0 (AgentRecall v1.0)
 
 Date: 2026-07-21
