@@ -17,6 +17,105 @@ are public-path correctness (the v1.1 primitives
 wired into the MCP / service / SQLite boundary)
 plus a real black-box gate.
 
+### v1.1.1 release verification — all 20 MCP tools + 5 resources exercised end-to-end
+
+`test/blackbox/mcp-all-tools-e2e.test.ts` (33
+tests, 4.3s on Windows). Runs against the **built**
+server (`dist/src/index.js`) through a real SDK
+`Client` + `StdioClientTransport`. Pre-PR-8 the
+`z.union([ok, fail])` `outputSchema` tripped the
+MCP SDK's `normalizeObjectSchema` and every
+`client.callTool` returned `isError: true` with
+`_zod`; PR-8 flattens the envelope to a single
+`z.object({ ok, data?, error?, meta })` so the
+SDK's output validation succeeds. Coverage:
+
+- **Surface** (2 tests): the canonical 20-tool
+  list (16 v1.1.0 + 4 v1.1.1 memory-semantics);
+  every tool carries the expected annotations
+  AND a non-null `outputSchema` of `type: "object"`
+  (PR-8 regression guard); 3 static resources
+  (`memory://health`, `memory://global/summary`,
+  `memory://projects`) + 2 templated resources
+  (`memory://project/{id}/summary`,
+  `memory://project/{id}/memory/{mid}`); server
+  PID is set and non-zero.
+- **Read tools** (8 tests): `list_memories`,
+  `get_memory` (with `id` and `memory_id` aliases),
+  `search_memories`, `get_memory_budget` (global
+  + project), `explain_recall` (asserts the v1.1.1
+  `coding-default-v2` ranking version),
+  `list_backups`. Every read asserts
+  `structuredContent.ok = true` AND
+  `_zod` does not appear in the legacy text
+  payload (the v1.1.0 regression sentinel).
+- **Text tools** (2 tests): `recall_context` and
+  `export_memory_context` return the markdown
+  body under `structuredContent.data.markdown`.
+- **Mutating tools** (10 tests):
+  - `update_memory` with `expected_revision`
+    succeeds; the same call with a stale
+    revision rejects as `stale_revision`.
+  - `update_memory` with `idempotency_key` replays
+    the original mutation on retry.
+  - `merge_memories` collapses 2 duplicates into 1
+    active row; `merged_from` lists the old ids.
+  - `supersede_memory` writes the new row and
+    flips the old row's audit to a
+    `superseded` event.
+  - `forget_memory` with `idempotency_key` replays
+    the original `released_chars`.
+  - `maintain_memories` `find_duplicates` returns
+    a non-empty `groups[]` and the seeded
+    exact-title+body triple surfaces under
+    `same_title_and_body`.
+  - `plan_maintenance` builds a durable plan
+    (`plan_id` matches `/^plan_/`, `risk` is
+    `low` or `high`); `apply_maintenance` with
+    `confirm: true` resolves the plan and
+    reports `applied + rejected > 0`.
+  - `apply_maintenance` on a non-existent
+    `plan_id` returns `{ ok: false,
+    error: "plan_not_found" }`.
+- **Memory-semantics tools** (4 tests): the four
+  v1.1.1 PR-7 tools — `record_memory_feedback`
+  (up vote), `record_memory_provenance`
+  (link to a commit sha),
+  `explain_memory_provenance` (the chain
+  includes the new commit link),
+  `confirm_memory_trust` (promote to
+  `user_confirmed` with explicit
+  `user_confirmed: true`).
+- **Resources** (5 tests): all 3 static +
+  2 templated resources return the expected
+  payload shape (health reports
+  `server_version` + `schema_version`; project
+  templates surface the seeded `project_id` and
+  the memory's audit chain).
+- **Error paths** (3 tests):
+  - `invalid_schema` for a `remember` missing
+    required fields surfaces as a JSON-RPC
+    `McpError` (PR-8 regression guard) AND the
+    fallback `failureCode` helper still extracts
+    `invalid_schema` from the legacy text
+    envelope.
+  - `not_found` for `get_memory` on a missing
+    id.
+  - `idempotency_mismatch` when the same key is
+    reused with a different body (matches
+    `idempotency_mismatch` / `key_reuse` /
+    `key was reused`).
+- **Stderr leak guard** (`afterAll`): the
+  server's stderr is captured via
+  `transport.stderr.on("data", ...)` and the
+  full lifecycle must write nothing. A leak
+  (an unhandled exception, a stack trace, a
+  `console.error` from a forgotten path) fails
+  the suite. The test sets
+  `AGENT_RECALL_VERBOSE_STDIO=0` so the
+  "connected on stdio" status hint does not
+  falsely trip the guard.
+
 ### Stage 16 PR-1 (MCP trusted context) — #11
 ### Fixed
 
