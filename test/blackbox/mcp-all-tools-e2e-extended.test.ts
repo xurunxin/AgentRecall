@@ -1,35 +1,40 @@
-// test/blackbox/mcp-all-tools-e2e.test.ts
+// test/blackbox/mcp-all-tools-e2e-extended.test.ts
 //
-// Stage 16 v1.1.1 (PR-8, issue #16): the authoritative
-// black-box E2E for the MCP server contract. v1.1.0's
-// zod v4 incompatibility made every callTool return
-// `isError: true` with `_zod` (see
+// Stage 16 v1.1.1 (PR-8, issue #16) + Stage 17
+// v1.1.2 (issue #22, Task 3 follow-up): the
+// **Extended-profile** authoritative black-box
+// E2E for the MCP server contract. v1.1.0's
+// zod v4 incompatibility made every callTool
+// return `isError: true` with `_zod` (see
 // `mcp-client-e2e.test.ts` for the legacy smoke).
-// v1.1.1 PR-8 flattens the `outputSchema` so the SDK's
-// `validateToolOutput` succeeds, and the AGENT_RECALL_VERBOSE_STDIO
-// env gates the "connected on stdio" hint so the
-// stderr-leak assertion can be honest.
+// v1.1.1 PR-8 flattens the `outputSchema` so the
+// SDK's `validateToolOutput` succeeds, and the
+// AGENT_RECALL_VERBOSE_STDIO env gates the
+// "connected on stdio" hint so the stderr-leak
+// assertion can be honest.
 //
-// This file picks up where `mcp-client-e2e.test.ts`
-// leaves off. It exercises **every** tool the server
-// registers (20 in v1.1.1) end-to-end through the real
-// SDK transport, plus all 5 resources, and asserts:
-//   - happy-path call returns `structuredContent.ok = true`
-//     and a populated `data` field;
-//   - error paths return `structuredContent.ok = false`
-//     and a typed `error.code`;
-//   - the v1.1.0 `z.union` regression does not
-//     re-surface on any tool (no `_zod` in the
-//     `content[0].text` for the happy path);
-//   - the server writes nothing to stderr over the
-//     full lifecycle.
+// Task 3 follow-up (review by ora-6): the
+// previous `mcp-all-tools-e2e.test.ts` used a
+// single file with an `itMaybeExt` helper that
+// skipped Extended-only assertions when
+// `AGENT_RECALL_PROFILE !== "extended"`. The
+// follow-up review pins a fail-closed contract:
+// Core and Extended coverage live in two
+// independent invocations (separate test files),
+// each spawns its own server process with the
+// pinned profile, and each FAILS HARD when the
+// build artifact is missing. This file pins the
+// Extended-profile surface and asserts the full
+// non-admin tool list end-to-end.
 //
 // The test runs against the **built** server
-// (`dist/src/index.js`), not the source. It auto-skips
-// in dev mode (no `dist/`) so `npm test` keeps
-// working without a build.
+// (`dist/src/index.js`), not the source. The
+// file FAILS HARD when `dist/` is absent (no
+// `it.skip`, no silent skip-on-no-dist): the
+// release-gate surface must surface a missing
+// build artifact as a deterministic failure.
 
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,43 +45,20 @@ import {
   CORE_TOOL_NAMES,
   EXTENDED_TOOL_NAMES
 } from "../../src/tools/register-tools.js";
-import { selectToolProfile } from "../../src/tools/profile.js";
+import { existsSync } from "node:fs";
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), "../../..");
 const SERVER_ENTRY = join(REPO_ROOT, "dist", "src", "index.js");
+
+// Task 3 follow-up: this test suite requires a
+// built MCP server artifact. The previous
+// implementation auto-skipped when `dist/` was
+// absent (via `it.skip`); the follow-up review
+// pins the fail-closed contract so a missing
+// build artifact surfaces as a deterministic
+// test failure (rather than a silently-passing
+// release-gate surface).
 const HAS_BUILT_ARTIFACT = existsSync(SERVER_ENTRY);
-
-// Stage 17 v1.1.2 (issue #22): the file is
-// profile-aware. The active profile is read from
-// `AGENT_RECALL_PROFILE` (the same env var the
-// server consults) so the assertions line up with
-// the tool list the server registers. The default
-// is `core` (the documented packaged default);
-// the file is also valid when run with
-// `AGENT_RECALL_PROFILE=extended`. The CI gate
-// runs the file twice (once per profile); a local
-// `npm test` run defaults to Core.
-//
-// The selector fail-closes on an unknown value;
-// we wrap it in a `try` so a typo in the test
-// runner's env surfaces as a clear vitest
-// collection error rather than a hard
-// `Error: Invalid AGENT_RECALL_PROFILE...`
-// throw from the module top-level.
-function readActiveProfile(): "core" | "extended" {
-  const raw = process.env.AGENT_RECALL_PROFILE;
-  try {
-    return selectToolProfile(raw === "" || raw === undefined ? undefined : raw);
-  } catch (error) {
-    throw new Error(
-      `mcp-all-tools-e2e: ${error instanceof Error ? error.message : String(error)}`
-    );
-  }
-}
-
-const ACTIVE_PROFILE: "core" | "extended" = readActiveProfile();
-const EXTENDED_SET = new Set<string>(EXTENDED_TOOL_NAMES);
-const isExtendedOnly = (name: string): boolean => EXTENDED_SET.has(name);
 
 // ============================================================
 // Shared tool result shape.
@@ -153,15 +135,6 @@ function failureCode(result: ToolResult): string {
   }
   throw new Error(`expected failure envelope, got isError=${result.isError} sc=${JSON.stringify(result.structuredContent)}`);
 }
-
-const itMaybe = HAS_BUILT_ARTIFACT ? it : it.skip;
-// Stage 17 v1.1.2 (issue #22): Extended-only
-// tests use a separate helper. In Core mode (the
-// packaged default) the test still runs to
-// completion but the Extended tests are reported
-// as skipped; in Extended mode the full surface
-// is exercised.
-const itMaybeExt = HAS_BUILT_ARTIFACT && ACTIVE_PROFILE === "extended" ? it : it.skip;
 
 // ============================================================
 // Test data factories.
@@ -290,7 +263,7 @@ interface ProjectMemoryResource {
 // Suite.
 // ============================================================
 
-describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
+describe("MCP all-tools black-box E2E - Extended profile (v1.1.2 #22 Task 3 follow-up)", () => {
   let dataHome: string | undefined;
   let client: Client | undefined;
   let transport: StdioClientTransport | undefined;
@@ -305,21 +278,34 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
   let singleMemoryId: string | undefined;
   let staleMemoryId: string | undefined;
 
+  // Fail-fast hook: a missing build artifact is
+  // a release-blocker and must surface as a
+  // deterministic test failure here rather than
+  // as a silent skip. The Task 3 follow-up
+  // review (ora-6) explicitly forbids
+  // `it.skip` / `describe.skip` for the
+  // release-gate surface.
+  beforeAll(() => {
+    if (!HAS_BUILT_ARTIFACT) {
+      throw new Error(
+        "blackbox test requires built artifact: run npm run build before running this suite"
+      );
+    }
+  });
+
   beforeAll(async () => {
-    if (!HAS_BUILT_ARTIFACT) return;
-    dataHome = mkdtempSync(join(tmpdir(), "lm-bb-all-"));
+    dataHome = mkdtempSync(join(tmpdir(), "lm-bb-all-ext-"));
     // Same env contract as `mcp-client-e2e.test.ts`:
     // suppress the CLI/MCP deprecation hint and the
     // "connected on stdio" hint so the stderr-leak
-    // assertion stays honest.
-    // Stage 17 v1.1.2 (issue #22): pin the
-    // spawned server to the active profile so the
-    // tool list the test asserts matches the
-    // tool list the server registers.
+    // assertion stays honest. The Task 3 follow-up
+    // pins this file to the Extended profile so the
+    // assertions line up with the tool list the
+    // server registers.
     const env = {
       ...process.env,
       AGENT_RECALL_HOME: dataHome,
-      AGENT_RECALL_PROFILE: ACTIVE_PROFILE,
+      AGENT_RECALL_PROFILE: "extended",
       AGENT_RECALL_SUPPRESS_MCP_DEPRECATION: "1",
       AGENT_RECALL_VERBOSE_STDIO: "0"
     };
@@ -337,7 +323,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
         }
       );
     }
-    client = new Client({ name: "all-tools-e2e", version: "1.1.2" }, { capabilities: {} });
+    client = new Client({ name: "all-tools-e2e-ext", version: "1.1.2" }, { capabilities: {} });
     await client.connect(transport);
     serverPid = transport.pid ?? undefined;
 
@@ -427,26 +413,18 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
   // Surface: tool list, resource list, server PID.
   // ----------------------------------------------------------
 
-  itMaybe("surface: registers the active profile's tools and 3 static + 2 templated resources", async () => {
+  it("surface: registers the full 20-tool Extended surface and 3 static + 2 templated resources", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const tools = await client.listTools();
     const names = tools.tools.map((t) => t.name).sort();
-    // Stage 17 v1.1.2 (issue #22): the tool list
-    // depends on the active profile. The Core
-    // profile (the packaged default) exposes the
-    // 10 read / write / plan tools in
-    // `CORE_TOOL_NAMES`; the Extended profile adds
-    // the 10 administrative / semantics tools in
-    // `EXTENDED_TOOL_NAMES`. The assertion
-    // compares against the canonical arrays in
-    // `register-tools.ts` rather than a
+    // The Extended profile registers Core +
+    // Extended (the full non-admin surface). The
+    // assertion compares against the canonical
+    // arrays in `register-tools.ts` rather than a
     // hand-maintained list so an addition to
     // either profile surfaces as a single source
     // of truth.
-    const expected =
-      ACTIVE_PROFILE === "core"
-        ? [...CORE_TOOL_NAMES].sort()
-        : [...CORE_TOOL_NAMES, ...EXTENDED_TOOL_NAMES].sort();
+    const expected = [...CORE_TOOL_NAMES, ...EXTENDED_TOOL_NAMES].sort();
     expect(names).toEqual(expected);
 
     // Every tool carries the canonical annotations
@@ -472,7 +450,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(tplNames).toEqual(["memory_project_memory", "memory_project_summary"]);
   });
 
-  itMaybe("surface: server PID is set and non-zero", () => {
+  it("surface: server PID is set and non-zero", () => {
     expect(serverPid).toBeDefined();
     expect(typeof serverPid).toBe("number");
     expect(serverPid).toBeGreaterThan(0);
@@ -482,7 +460,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
   // Read tools.
   // ----------------------------------------------------------
 
-  itMaybe("read: list_memories returns the pre-seeded entries", async () => {
+  it("read: list_memories returns the pre-seeded entries", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = await callTool(client, "list_memories", { scope: "global" });
     expect(r.isError).toBeFalsy();
@@ -498,7 +476,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(txt).not.toMatch(/_zod/);
   });
 
-  itMaybe("read: get_memory returns the entry + audit array", async () => {
+  it("read: get_memory returns the entry + audit array", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = await callTool(client, "get_memory", { memory_id: singleMemoryId });
     expect(r.isError).toBeFalsy();
@@ -509,7 +487,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(Array.isArray(v.audit)).toBe(true);
   });
 
-  itMaybe("read: get_memory with id (alias) returns the same entry", async () => {
+  it("read: get_memory with id (alias) returns the same entry", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = await callTool(client, "get_memory", { id: singleMemoryId });
     expect(r.isError).toBeFalsy();
@@ -517,7 +495,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(v.entry.id).toBe(singleMemoryId);
   });
 
-  itMaybe("read: search_memories finds the seeded entry by query", async () => {
+  it("read: search_memories finds the seeded entry by query", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = await callTool(client, "search_memories", {
       scope: "global",
@@ -530,7 +508,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(ids).toContain(singleMemoryId);
   });
 
-  itMaybe("read: get_memory_budget reports global budget + usage", async () => {
+  it("read: get_memory_budget reports global budget + usage", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = await callTool(client, "get_memory_budget", { scope: "global" });
     expect(r.isError).toBeFalsy();
@@ -539,7 +517,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(v.usage.active_entries).toBeGreaterThan(0);
   });
 
-  itMaybe("read: get_memory_budget project returns a project budget", async () => {
+  it("read: get_memory_budget project returns a project budget", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = await callTool(client, "get_memory_budget", {
       scope: "project",
@@ -550,7 +528,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(v.budget.max_active_entries).toBeGreaterThan(0);
   });
 
-  itMaybe("read: explain_recall returns ranking_version + per-item components", async () => {
+  it("read: explain_recall returns ranking_version + per-item components", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = await callTool(client, "explain_recall", {
       query: "duplicate alpha",
@@ -568,7 +546,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(typeof first.trust_boost).toBe("number");
   });
 
-  itMaybe("read: list_backups returns the backup dir + entries (empty for fresh data home)", async () => {
+  it("read: list_backups returns the backup dir + entries (empty for fresh data home)", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = await callTool(client, "list_backups", {});
     expect(r.isError).toBeFalsy();
@@ -581,7 +559,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
   // Text tools (markdown deliverables).
   // ----------------------------------------------------------
 
-  itMaybe("text: recall_context returns a markdown body for global scope", async () => {
+  it("text: recall_context returns a markdown body for global scope", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = (await callTool(client, "recall_context", { scope: "global" })) as TextToolResult;
     expect(r.isError).toBeFalsy();
@@ -590,7 +568,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(md.length).toBeGreaterThan(0);
   });
 
-  itMaybeExt("text: export_memory_context returns a markdown body for the seeded entries (Extended only)", async () => {
+  it("text: export_memory_context returns a markdown body for the seeded entries", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = (await callTool(client, "export_memory_context", {
       scope: "global",
@@ -605,7 +583,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
   // Mutating tools.
   // ----------------------------------------------------------
 
-  itMaybe("mutate: update_memory with expected_revision=1 succeeds", async () => {
+  it("mutate: update_memory with expected_revision=1 succeeds", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = await callTool(client, "update_memory", {
       memory_id: staleMemoryId,
@@ -617,7 +595,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(v.memory_id).toBe(staleMemoryId);
   });
 
-  itMaybe("mutate: update_memory with stale expected_revision rejects as stale_revision", async () => {
+  it("mutate: update_memory with stale expected_revision rejects as stale_revision", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = await callTool(client, "update_memory", {
       memory_id: staleMemoryId,
@@ -628,7 +606,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(failureCode(r)).toBe("stale_revision");
   });
 
-  itMaybe("mutate: update_memory with idempotency_key replays the original mutation", async () => {
+  it("mutate: update_memory with idempotency_key replays the original mutation", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const key = `bb-update-${Date.now()}`;
     const body = `bb-update-body-${Math.random()}`;
@@ -650,7 +628,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(v2.memory_id).toBe(singleMemoryId);
   });
 
-  itMaybeExt("mutate: merge_memories merges two duplicates into one active row (Extended only)", async () => {
+  it("mutate: merge_memories merges two duplicates into one active row", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const replacement = rememberArgs({
       title: "duplicate alpha (merged)",
@@ -670,7 +648,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(v.merged_from).toEqual(expect.arrayContaining([dupA, dupB]));
   });
 
-  itMaybeExt("mutate: supersede_memory marks the old row status=superseded (Extended only)", async () => {
+  it("mutate: supersede_memory marks the old row status=superseded", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const replacement = rememberArgs({
       title: "stale cas target (superseded)",
@@ -686,28 +664,14 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(r.isError).toBeFalsy();
     const v = data<SupersedeValue>(r);
     expect(v.memory_id).toMatch(/^mem_/);
-    // The supersede path flips the old row's
-    // `status` to `superseded` and records the new
-    // row's id in `superseded_by`. The title is
-    // left untouched (the replacement carries the
-    // new title). Verify via `get_memory` so we
-    // don't bake a `superseded` field into the
-    // service result shape.
     const after = await callTool(client, "get_memory", { memory_id: staleMemoryId });
     expect(after.isError).toBeFalsy();
     const afterData = data<GetValue>(after);
-    // We can't read the entry's `status` directly
-    // through the read tool's `entry` projection
-    // (it returns a subset of fields); instead we
-    // assert the entry is still retrievable and the
-    // audit log got a `superseded` event for it.
-    expect(afterData.audit.some((a: { event?: string }) => a.event === "superseded")).toBe(true);
+    expect(afterData.audit.some((a) => (a as { event?: string }).event === "superseded")).toBe(true);
   });
 
-  itMaybe("mutate: forget_memory with idempotency_key replays the original released_chars", async () => {
+  it("mutate: forget_memory with idempotency_key replays the original released_chars", async () => {
     if (client === undefined) throw new Error("client not initialised");
-    // Use a fresh entry so the forget path is exercised
-    // against an active row.
     const seed = await callTool(client, "remember", rememberArgs({
       title: "forget target",
       body: "forget me body",
@@ -733,12 +697,8 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(v2.released_chars).toBe(v1.released_chars);
   });
 
-  itMaybeExt("mutate: maintain_memories find_duplicates returns a non-empty groups list (Extended only)", async () => {
+  it("mutate: maintain_memories find_duplicates returns a non-empty groups list", async () => {
     if (client === undefined) throw new Error("client not initialised");
-    // Seed a fresh exact-title+body triple for
-    // this test so it is independent of the
-    // merge / supersede / plan-apply tests
-    // (those consume the suite-level dupA/B/C).
     const stamp = `dup-${Date.now()}`;
     const d1 = await callTool(client, "remember", rememberArgs({
       title: stamp, body: stamp, topic: "find-dup"
@@ -763,17 +723,12 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(v.action).toBe("find_duplicates");
     const groups = v.details?.groups ?? [];
     expect(groups.length).toBeGreaterThan(0);
-    // The triple we seeded must surface in the
-    // same_title_and_body group.
     const group = groups.find((g) => g.reason === "same_title_and_body" && g.memory_ids.includes(d3id));
     expect(group).toBeDefined();
   });
 
-  itMaybeExt("mutate: plan_maintenance builds a durable plan; apply_maintenance completes it (Extended only)", async () => {
+  it("mutate: plan_maintenance builds a durable plan; apply_maintenance completes it", async () => {
     if (client === undefined) throw new Error("client not initialised");
-    // Seed a fresh exact-title+body triple for
-    // this test so the plan actually has
-    // destructive items to apply.
     const stamp = `plan-${Date.now()}`;
     const p1 = await callTool(client, "remember", rememberArgs({
       title: stamp, body: stamp, topic: "plan"
@@ -792,16 +747,8 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     const pv = data<PlanValue>(plan);
     expect(pv.plan_id).toMatch(/^plan_/);
     expect(pv.proposed_actions.length).toBeGreaterThan(0);
-    // The plan's `state` lives in the durable
-    // `maintenance_plans` table; the service result
-    // only surfaces the plan id, scope, risk,
-    // proposed_actions, and the hash. The apply
-    // step below proves the plan is still in
-    // `pending` (it can transition to `completed`).
     expect(pv.risk).toMatch(/^(low|high)$/);
 
-    // The same plan id must be retrievable from the
-    // apply step (durable, not process-local).
     const apply = await callTool(client, "apply_maintenance", {
       plan_id: pv.plan_id,
       confirm: true,
@@ -814,7 +761,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(av.applied + av.rejected).toBeGreaterThan(0);
   });
 
-  itMaybeExt("mutate: apply_maintenance with unknown plan_id returns plan_not_found (Extended only)", async () => {
+  it("mutate: apply_maintenance with unknown plan_id returns plan_not_found", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = await callTool(client, "apply_maintenance", {
       plan_id: "plan_does_not_exist",
@@ -831,20 +778,18 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
   // Memory-semantics tools (v1.1.1 PR-7).
   // ----------------------------------------------------------
 
-  itMaybeExt("semantics: record_memory_feedback appends a row for the seed memory (Extended only)", async () => {
+  it("semantics: record_memory_feedback appends a row for the seed memory", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = await callTool(client, "record_memory_feedback", {
       memory_id: singleMemoryId,
       kind: "up"
     });
     expect(r.isError).toBeFalsy();
-    // The envelope `data` is the inner Result; v1.1.1
-    // returns `{ ok: true }` on success.
     const v = data<{ ok: boolean }>(r);
     expect(v.ok).toBe(true);
   });
 
-  itMaybeExt("semantics: record_memory_provenance links the seed memory to a commit sha (Extended only)", async () => {
+  it("semantics: record_memory_provenance links the seed memory to a commit sha", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = await callTool(client, "record_memory_provenance", {
       memory_id: singleMemoryId,
@@ -856,7 +801,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(v.ok).toBe(true);
   });
 
-  itMaybeExt("semantics: explain_memory_provenance returns the chain we just wrote (Extended only)", async () => {
+  it("semantics: explain_memory_provenance returns the chain we just wrote", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = await callTool(client, "explain_memory_provenance", {
       memory_id: singleMemoryId
@@ -868,7 +813,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(v.links.some((l) => l.source_kind === "commit")).toBe(true);
   });
 
-  itMaybeExt("semantics: confirm_memory_trust promotes the seed memory to user_confirmed (Extended only)", async () => {
+  it("semantics: confirm_memory_trust promotes the seed memory to user_confirmed", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = await callTool(client, "confirm_memory_trust", {
       memory_id: singleMemoryId,
@@ -883,7 +828,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
   // Resources (3 static + 2 templated).
   // ----------------------------------------------------------
 
-  itMaybe("resources: memory://health reports server_version + schema_version + active_profile", async () => {
+  it("resources: memory://health reports server_version + schema_version + active_profile=extended", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = (await client.readResource({ uri: "memory://health" })) as unknown as ResourceContents;
     const payload = JSON.parse(r.contents[0]!.text) as HealthResource;
@@ -891,18 +836,14 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(payload.server_version).toBeTruthy();
     expect(payload.schema_version).toBeGreaterThanOrEqual(10);
     expect(payload.backup.dir).toBeTruthy();
-    // v1.1.2 (issue #22): the health resource
-    // surfaces the active tool profile so an
-    // MCP client can verify the runtime tool
-    // surface without re-reading
-    // `AGENT_RECALL_PROFILE` from the env. The
-    // test spawned the server with the same
-    // profile it asserts on, so the two values
-    // must match.
-    expect(payload.active_profile).toBe(ACTIVE_PROFILE);
+    // Task 3 follow-up: the test spawned the
+    // server with `AGENT_RECALL_PROFILE=extended`,
+    // so the health resource must surface
+    // `active_profile === "extended"`.
+    expect(payload.active_profile).toBe("extended");
   });
 
-  itMaybe("resources: memory://global/summary returns status counts + recent activity", async () => {
+  it("resources: memory://global/summary returns status counts + recent activity", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = (await client.readResource({ uri: "memory://global/summary" })) as unknown as ResourceContents;
     const payload = JSON.parse(r.contents[0]!.text) as {
@@ -915,7 +856,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(payload.recent_activity.length).toBeGreaterThan(0);
   });
 
-  itMaybe("resources: memory://projects surfaces the project we wrote to", async () => {
+  it("resources: memory://projects surfaces the project we wrote to", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = (await client.readResource({ uri: "memory://projects" })) as unknown as ResourceContents;
     const payload = JSON.parse(r.contents[0]!.text) as { projects: Array<{ project_id: string }> };
@@ -923,7 +864,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(ids).toContain(projectId);
   });
 
-  itMaybe("resources: memory://project/{id}/summary template", async () => {
+  it("resources: memory://project/{id}/summary template", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = (await client.readResource({
       uri: `memory://project/${projectId}/summary`
@@ -935,7 +876,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(ids).toContain(projectMemoryId);
   });
 
-  itMaybe("resources: memory://project/{id}/memory/{mid} template returns the entry + audit", async () => {
+  it("resources: memory://project/{id}/memory/{mid} template returns the entry + audit", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = (await client.readResource({
       uri: `memory://project/${projectId}/memory/${projectMemoryId}`
@@ -951,7 +892,7 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
   // about typed `error.code` values.
   // ----------------------------------------------------------
 
-  itMaybe("errors: invalid_schema surfaces the typed failure envelope (no throw)", async () => {
+  it("errors: invalid_schema surfaces the typed failure envelope (no throw)", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = await callTool(client, "remember", {
       // missing `body`, `source`, `topic`, `title`,
@@ -963,14 +904,14 @@ describe("MCP all-tools black-box E2E (v1.1.1, issue #16)", () => {
     expect(failureCode(r)).toBe("invalid_schema");
   });
 
-  itMaybe("errors: not_found for get_memory on a missing id", async () => {
+  it("errors: not_found for get_memory on a missing id", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r = await callTool(client, "get_memory", { memory_id: "mem_does_not_exist" });
     expect(r.isError).toBe(true);
     expect(failureCode(r)).toBe("not_found");
   });
 
-  itMaybe("errors: idempotency_mismatch when the same key is reused with a different body", async () => {
+  it("errors: idempotency_mismatch when the same key is reused with a different body", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const key = `bb-idem-mismatch-${Date.now()}`;
     const r1 = await callTool(client, "remember", rememberArgs({

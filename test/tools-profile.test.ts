@@ -23,7 +23,8 @@
 import { describe, expect, it } from "vitest";
 import {
   CORE_TOOL_NAMES,
-  EXTENDED_TOOL_NAMES
+  EXTENDED_TOOL_NAMES,
+  memoryToolNames
 } from "../src/tools/register-tools.js";
 import {
   PROFILE_NAMES,
@@ -113,11 +114,86 @@ describe("profile -> tool set parity (Stage 17 v1.1.2 #22)", () => {
     // expose a tool that is not in one of the two
     // profiles; this test guards against an
     // accidental gap in the registry.
-    const union = new Set([...CORE_TOOL_NAMES, ...EXTENDED_TOOL_NAMES]);
-    // The two lists already cover the canonical
-    // list; the assertion is symmetric so a
-    // future addition to `memoryToolNames`
-    // surfaces as a failure here.
-    expect(union.size).toBe(CORE_TOOL_NAMES.length + EXTENDED_TOOL_NAMES.length);
+    //
+    // Bidirectional members-of comparison against
+    // the real `memoryToolNames` registry: a
+    // profile-side tool that is not in the
+    // registry surfaces as an "extra tool" failure
+    // here, and a registry-side tool that is not
+    // in either profile surfaces as a "missing
+    // tool" failure here.
+    const registry = new Set<string>(memoryToolNames);
+    const union = new Set<string>([...CORE_TOOL_NAMES, ...EXTENDED_TOOL_NAMES]);
+    // Every tool in the union must be in the
+    // registry (no profile-side extras).
+    for (const name of union) {
+      expect(registry.has(name), `profile union has tool ${name} not in memoryToolNames`).toBe(true);
+    }
+    // Every tool in the registry must be in the
+    // union (no registry-side gap).
+    for (const name of registry) {
+      expect(
+        union.has(name),
+        `memoryToolNames has tool ${name} not in CORE_TOOL_NAMES or EXTENDED_TOOL_NAMES`
+      ).toBe(true);
+    }
+    // The union has exactly the registry size.
+    expect(union.size).toBe(registry.size);
+  });
+});
+
+describe("resolveActiveProfile rejects non-string env values (Task 3 follow-up)", () => {
+  it("throws when AGENT_RECALL_PROFILE is null", () => {
+    expect(() =>
+      resolveActiveProfile({ AGENT_RECALL_PROFILE: null as unknown as string })
+    ).toThrowError(/AGENT_RECALL_PROFILE/);
+  });
+
+  it("throws when AGENT_RECALL_PROFILE is a number", () => {
+    expect(() =>
+      resolveActiveProfile({ AGENT_RECALL_PROFILE: 1 as unknown as string })
+    ).toThrowError(/AGENT_RECALL_PROFILE/);
+  });
+
+  it("throws when AGENT_RECALL_PROFILE is an object", () => {
+    expect(() =>
+      resolveActiveProfile({ AGENT_RECALL_PROFILE: { foo: "bar" } as unknown as string })
+    ).toThrowError(/AGENT_RECALL_PROFILE/);
+  });
+
+  it("throws when AGENT_RECALL_PROFILE is an array", () => {
+    expect(() =>
+      resolveActiveProfile({ AGENT_RECALL_PROFILE: ["extended"] as unknown as string })
+    ).toThrowError(/AGENT_RECALL_PROFILE/);
+  });
+
+  it("error message names AGENT_RECALL_PROFILE and the supported values", () => {
+    // The follow-up brief requires the error
+    // message to include the env var name and
+    // the supported value list so an operator
+    // can recover without reading the docs.
+    try {
+      resolveActiveProfile({ AGENT_RECALL_PROFILE: null as unknown as string });
+      throw new Error("expected resolveActiveProfile to throw");
+    } catch (error) {
+      expect(error instanceof Error).toBe(true);
+      const msg = (error as Error).message;
+      expect(msg).toMatch(/AGENT_RECALL_PROFILE/);
+      expect(msg).toMatch(/core/);
+      expect(msg).toMatch(/extended/);
+    }
+  });
+
+  it("still falls back to core when AGENT_RECALL_PROFILE is the empty string", () => {
+    // The empty string is documented Core
+    // fallback (operator unset the var); the
+    // selector must NOT throw on the empty
+    // string but still return `core`. The
+    // TypeScript signature accepts
+    // `string | undefined`, so a string-only
+    // input preserves the documented fallback
+    // contract while non-string inputs are
+    // rejected above.
+    expect(resolveActiveProfile({ AGENT_RECALL_PROFILE: "" })).toBe("core");
   });
 });

@@ -74,9 +74,42 @@ export function selectToolProfile(value: string | undefined): ToolProfile {
  * parameterised so the unit tests can drive
  * the selector without mutating the global
  * env.
+ *
+ * The empty string is treated as "operator
+ * did not set the var" and falls through to
+ * the documented Core default. A non-string
+ * value (`null`, `undefined`, a number, an
+ * object, an array) is a startup error: the
+ * MCP server must NEVER silently fall back to
+ * Core when the env var carries a malformed
+ * value. The error message names the env var
+ * and the supported values so an operator can
+ * recover without reading the docs.
  */
 export function resolveActiveProfile(env: NodeJS.ProcessEnv = process.env): ToolProfile {
   const raw = env.AGENT_RECALL_PROFILE;
-  const value = typeof raw === "string" ? raw.trim() : undefined;
+  // The documented Core fallback is reserved for
+  // "operator did not set the var" — that surfaces
+  // as either `undefined` (the env key is absent)
+  // or the empty string (the env key is present
+  // but blank). Both are intentionally accepted
+  // here. Anything else (a `null` from a test
+  // double, a number from a misconfigured process
+  // supervisor, an object from a JSON-encoded
+  // env) is a startup error: the MCP server must
+  // NEVER silently fall back to Core when the
+  // env var carries a malformed value. The error
+  // message names the env var and lists the
+  // supported values so an operator can recover
+  // without reading the docs.
+  if (raw === undefined) {
+    return selectToolProfile(undefined);
+  }
+  if (typeof raw !== "string") {
+    throw new Error(
+      `Invalid AGENT_RECALL_PROFILE value (non-string). Supported values: ${PROFILE_NAMES.join(", ")}.`
+    );
+  }
+  const value = raw.trim();
   return selectToolProfile(value === "" ? undefined : value);
 }

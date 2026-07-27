@@ -1,12 +1,14 @@
 // test/blackbox/mcp-client-e2e.test.ts
 //
 // Stage 15 PR-M2-1 (issue #8, spec § 11.2) +
-// Stage 16 v1.1.1 PR-8 (issue #16, spec § 11.2):
-// real MCP black-box E2E test. The test spawns the
-// actual MCP server binary via the SDK's
-// `StdioClientTransport`, connects with a real
-// `Client` instance, and exercises the documented
-// mutation / portability lifecycle end-to-end:
+// Stage 16 v1.1.1 PR-8 (issue #16, spec § 11.2)
+// + Stage 17 v1.1.2 (issue #22, Task 3
+// follow-up): real MCP black-box E2E test. The
+// test spawns the actual MCP server binary via
+// the SDK's `StdioClientTransport`, connects
+// with a real `Client` instance, and exercises
+// the documented mutation / portability
+// lifecycle end-to-end:
 //
 //   - initialize + listTools + listResources
 //   - remember with idempotency_key
@@ -29,9 +31,23 @@
 // (the `smoke:blackbox` script in `package.json`
 // and the CI matrix's `MCP black-box E2E` step).
 //
-// In a developer checkout that has not been built
-// yet, the test is skipped (rather than failing)
-// so `npm test` keeps working in dev mode.
+// Task 3 follow-up (review by ora-6): the
+// previous implementation auto-skipped when the
+// build artifact was missing (via `it.skip`).
+// The follow-up review pins a fail-closed
+// contract: a missing `dist/src/index.js` is a
+// release-blocker and must surface as a
+// deterministic test failure (rather than a
+// silently-passing release-gate surface). The
+// fail-fast `beforeAll` hook throws when the
+// artifact is absent.
+//
+// Task 3 follow-up also pins this file to the
+// Core profile (the v1.1.2 packaged default).
+// The Extended profile smoke assertions live
+// in `mcp-client-e2e-extended.test.ts`; the two
+// files are independent invocations rather than
+// a single file with a profile-aware skip gate.
 
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -41,32 +57,27 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import {
-  CORE_TOOL_NAMES,
-  EXTENDED_TOOL_NAMES
+  CORE_TOOL_NAMES
 } from "../../src/tools/register-tools.js";
-import { selectToolProfile } from "../../src/tools/profile.js";
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), "../../..");
 const SERVER_ENTRY = join(REPO_ROOT, "dist", "src", "index.js");
+
+// Task 3 follow-up: this test suite requires a
+// built MCP server artifact. The previous
+// implementation auto-skipped when `dist/` was
+// absent (via `it.skip`); the follow-up review
+// pins the fail-closed contract so a missing
+// build artifact surfaces as a deterministic
+// test failure (rather than a silently-passing
+// release-gate surface).
 const HAS_BUILT_ARTIFACT = existsSync(SERVER_ENTRY);
 
-// Stage 17 v1.1.2 (issue #22): the smoke test
-// is profile-aware. The default is `core` (the
-// packaged default); the assertions check the
-// Core tools. When the operator opts in via
-// `AGENT_RECALL_PROFILE=extended`, the full
-// 20-tool surface is asserted instead.
-function readActiveProfile(): "core" | "extended" {
-  const raw = process.env.AGENT_RECALL_PROFILE;
-  try {
-    return selectToolProfile(raw === "" || raw === undefined ? undefined : raw);
-  } catch (error) {
-    throw new Error(
-      `mcp-client-e2e: ${error instanceof Error ? error.message : String(error)}`
-    );
-  }
-}
-const ACTIVE_PROFILE: "core" | "extended" = readActiveProfile();
+// Task 3 follow-up: this file pins to the Core
+// profile (the v1.1.2 packaged default). The
+// Extended profile smoke assertions live in
+// `mcp-client-e2e-extended.test.ts`.
+const ACTIVE_PROFILE: "core" | "extended" = "core";
 
 interface ToolResult {
   content: Array<{ type: string; text: string }>;
@@ -99,14 +110,7 @@ function parseText(result: ToolResult): unknown {
   return JSON.parse(first.text);
 }
 
-const itMaybe = HAS_BUILT_ARTIFACT ? it : it.skip;
-// Stage 17 v1.1.2 (issue #22): Extended-only
-// smoke assertions. In Core mode (the packaged
-// default) the Extended tools are not registered
-// and the assertions are skipped.
-const itMaybeExt = HAS_BUILT_ARTIFACT && ACTIVE_PROFILE === "extended" ? it : it.skip;
-
-describe("MCP black-box E2E (issue #8 + issue #16)", () => {
+describe("MCP black-box E2E - Core profile (issue #8 + issue #16 + #22 Task 3 follow-up)", () => {
   let dataHome: string | undefined;
   let client: Client | undefined;
   let transport: StdioClientTransport | undefined;
@@ -121,9 +125,23 @@ describe("MCP black-box E2E (issue #8 + issue #16)", () => {
   // stderr is empty over the full lifecycle.
   let stderrChunks: string[] = [];
 
+  // Fail-fast hook: a missing build artifact is
+  // a release-blocker and must surface as a
+  // deterministic test failure here rather than
+  // as a silent skip. The Task 3 follow-up
+  // review (ora-6) explicitly forbids
+  // `it.skip` / `describe.skip` for the
+  // release-gate surface.
+  beforeAll(() => {
+    if (!HAS_BUILT_ARTIFACT) {
+      throw new Error(
+        "blackbox test requires built artifact: run npm run build before running this suite"
+      );
+    }
+  });
+
   beforeAll(async () => {
-    if (!HAS_BUILT_ARTIFACT) return;
-    dataHome = mkdtempSync(join(tmpdir(), "lm-bb-e2e-"));
+    dataHome = mkdtempSync(join(tmpdir(), "lm-bb-e2e-core-"));
     // Stage 16 v1.1.1 PR-8 (issue #16, spec § 11.2):
     // the canonical `agent-recall` binary entry
     // prints a one-shot CLI/MCP deprecation hint
@@ -141,9 +159,8 @@ describe("MCP black-box E2E (issue #8 + issue #16)", () => {
     // would falsely trip the leak guard; the
     // env var keeps the test honest.
     // Stage 17 v1.1.2 (issue #22): pin the
-    // spawned server to the active profile so
-    // the smoke assertions match the tool
-    // list the server registers.
+    // spawned server to the Core profile (the
+    // v1.1.2 packaged default).
     const env = {
       ...process.env,
       AGENT_RECALL_HOME: dataHome,
@@ -216,22 +233,19 @@ describe("MCP black-box E2E (issue #8 + issue #16)", () => {
     }
   }, 30_000);
 
-  itMaybe("skipped when dist/ is not built", () => {
-    expect(HAS_BUILT_ARTIFACT).toBe(true);
-  });
-
-  itMaybe("initialize + listTools + listResources", async () => {
+  it("initialize + listTools + listResources (Core profile)", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const tools = await client.listTools();
     const names = new Set(tools.tools.map((t) => t.name));
-    // Stage 17 v1.1.2 (issue #22): the
-    // Core-only smoke asserts the 10 Core
-    // tools. The Extended smoke asserts the
-    // 20-tool full surface (Core + Extended).
-    const expected =
-      ACTIVE_PROFILE === "core"
-        ? new Set<string>(CORE_TOOL_NAMES)
-        : new Set<string>([...CORE_TOOL_NAMES, ...EXTENDED_TOOL_NAMES]);
+    // Task 3 follow-up: this file is pinned to
+    // the Core profile (the v1.1.2 packaged
+    // default). The Extended profile smoke
+    // assertions live in
+    // `mcp-client-e2e-extended.test.ts`; the two
+    // files are independent invocations rather
+    // than a single file with a profile-aware
+    // skip gate.
+    const expected = new Set<string>(CORE_TOOL_NAMES);
     for (const name of expected) {
       expect(names.has(name), `expected tool ${name} in profile ${ACTIVE_PROFILE}`).toBe(true);
     }
@@ -241,7 +255,7 @@ describe("MCP black-box E2E (issue #8 + issue #16)", () => {
     expect(uris.length).toBeGreaterThan(0);
   });
 
-  itMaybe("remember with idempotency_key; replay returns the same memory_id", async () => {
+  it("remember with idempotency_key; replay returns the same memory_id", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const idempotencyKey = `bb-key-${Date.now()}`;
     const r1 = await callTool(client, "remember", {
@@ -279,7 +293,7 @@ describe("MCP black-box E2E (issue #8 + issue #16)", () => {
     expect(d2.value.memory_id).toBe(d1.value.memory_id);
   });
 
-  itMaybe("idempotency_key reuse with a different body rejects as idempotency_key_reuse", async () => {
+  it("idempotency_key reuse with a different body rejects as idempotency_key_reuse", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const idempotencyKey = `bb-reuse-${Date.now()}`;
     const r1 = await callTool(client, "remember", {
@@ -313,7 +327,7 @@ describe("MCP black-box E2E (issue #8 + issue #16)", () => {
     expect(txt).toMatch(/idempotency_mismatch|key_reuse|key was reused/);
   });
 
-  itMaybe("update_memory with expected_revision succeeds; stale CAS rejects", async () => {
+  it("update_memory with expected_revision succeeds; stale CAS rejects", async () => {
     if (client === undefined) throw new Error("client not initialised");
     // Create a memory
     const r1 = await callTool(client, "remember", {
@@ -352,7 +366,7 @@ describe("MCP black-box E2E (issue #8 + issue #16)", () => {
     expect(txt).toMatch(/stale_revision/);
   });
 
-  itMaybe("explain_recall returns the canonical ranking_version and at least one component", async () => {
+  it("explain_recall returns the canonical ranking_version and at least one component", async () => {
     if (client === undefined) throw new Error("client not initialised");
     // Seed a memory so the recall has at least
     // one candidate.
@@ -386,29 +400,7 @@ describe("MCP black-box E2E (issue #8 + issue #16)", () => {
     expect(data.value.items[0]?.components.lexical_relevance).toBeGreaterThan(0);
   });
 
-  itMaybeExt("record_memory_feedback appends a row; subsequent recall reflects the actor trust signal (Extended only)", async () => {
-    if (client === undefined) throw new Error("client not initialised");
-    const r1 = await callTool(client, "remember", {
-      scope: "global",
-      type: "fact",
-      topic: "blackbox",
-      title: "feedback target",
-      body: "feedback body",
-      tags: [],
-      source: { kind: "agent" },
-      importance: 3,
-      confidence: 3
-    });
-    expect(r1.isError).toBeFalsy();
-    const d1 = parseText(r1) as { ok: boolean; value: { memory_id: string } };
-    const fb = await callTool(client, "record_memory_feedback", {
-      memory_id: d1.value.memory_id,
-      kind: "up"
-    });
-    expect(fb.isError).toBeFalsy();
-  });
-
-  itMaybe("forget_memory with idempotency_key; replay returns the same released_chars", async () => {
+  it("forget_memory with idempotency_key; replay returns the same released_chars", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r1 = await callTool(client, "remember", {
       scope: "global",
@@ -441,7 +433,7 @@ describe("MCP black-box E2E (issue #8 + issue #16)", () => {
     expect(f2Data.value.released_chars).toBe(f1Data.value.released_chars);
   });
 
-  itMaybe("server PID is set (transport actually spawned the binary)", () => {
+  it("server PID is set (transport actually spawned the binary)", () => {
     expect(serverPid).toBeDefined();
     expect(typeof serverPid).toBe("number");
   });

@@ -224,17 +224,24 @@ surface without re-reading the env var.
 
 ### New tests
 
-- **`test/tools-profile.test.ts`** (NEW, 13 tests) —
-  covers `selectToolProfile`, `resolveActiveProfile`,
-  and the `CORE_TOOL_NAMES` / `EXTENDED_TOOL_NAMES`
-  partition. The selector's fail-closed contract is
-  asserted on `admin`, `Admin`, `EXTENDED`, `full`,
-  and `1` (a representative sample of plausible
-  typos / future profile names).
-- **`test/release-gate/p3-mcp-profile-default.test.ts`**
-  (NEW, 11 tests) — the v1.1.2 release-gate surface.
-  Spawns the **built** server in three configurations
-  and asserts:
+- **`test/tools-profile.test.ts`** (NEW, 19 tests after
+  Task 3 follow-up) — covers `selectToolProfile`,
+  `resolveActiveProfile`, and the bidirectional
+  `CORE_TOOL_NAMES` / `EXTENDED_TOOL_NAMES` /
+  `memoryToolNames` registry parity check. The
+  selector's fail-closed contract is asserted on
+  `admin`, `Admin`, `EXTENDED`, `full`, and `1`
+  (a representative sample of plausible typos /
+  future profile names). The follow-up adds the
+  null / number / object / array rejection path
+  (the brief requires non-string env inputs to
+  throw with a stable error message).
+- **`test/release-gate/profile-default/mcp-profile-default.test.ts`**
+  (NEW, 15 tests after Task 3 follow-up — relocated
+  from `test/release-gate/p3-mcp-profile-default.test.ts`)
+  — the v1.1.2 release-gate surface. Spawns the
+  **built** server in three configurations and
+  asserts:
   - Default env: `tools/list` is the 10-tool Core
     surface; `memory://health.active_profile === "core"`.
   - `AGENT_RECALL_PROFILE=extended`: `tools/list` is
@@ -252,29 +259,36 @@ surface without re-reading the env var.
     `strict_isolation` / `identity_status` /
     `allow_unbound_project_id` fields on the same
     payload.
-- **`test/blackbox/mcp-all-tools-e2e.test.ts`** —
-  refactored to be profile-aware. The file reads
-  `AGENT_RECALL_PROFILE` and asserts the tool list
-  against the canonical `CORE_TOOL_NAMES` /
-  `EXTENDED_TOOL_NAMES` arrays from `register-tools.ts`
-  (rather than a hand-maintained 20-tool literal).
-  Extended-only tools (10 of them: `export_memory_context`,
-  `merge_memories`, `supersede_memory`,
-  `maintain_memories`, `plan_maintenance`,
-  `apply_maintenance`, `record_memory_feedback`,
-  `record_memory_provenance`,
-  `explain_memory_provenance`, `confirm_memory_trust`)
-  use a new `itMaybeExt` helper that skips when
-  `AGENT_RECALL_PROFILE !== "extended"`. The CI gate
-  runs the file twice (once per profile); a default
-  `npm test` run exercises Core only and reports
-  the 10 Extended assertions as skipped.
-- **`test/blackbox/mcp-client-e2e.test.ts`** — same
-  profile-aware refactor; the legacy smoke now
-  asserts the Core set in default mode and the
-  full set in Extended mode. The
-  `record_memory_feedback` assertion uses the
-  `itMaybeExt` helper.
+  - The selector throws when `AGENT_RECALL_PROFILE`
+    is `null`, a number, an object, or an array
+    (Task 3 follow-up fail-closed contract).
+  - The selector still falls back to `core` on the
+    empty string (documented Core fallback).
+- **`test/blackbox/mcp-all-tools-e2e-core.test.ts`**
+  (NEW, 23 tests) + **`test/blackbox/mcp-all-tools-e2e-extended.test.ts`**
+  (NEW, 33 tests) — split from the previous
+  `test/blackbox/mcp-all-tools-e2e.test.ts`. The
+  Task 3 follow-up review pins two independent
+  invocations rather than a single file with an
+  `itMaybeExt` skip gate: the Core file pins the
+  v1.1.2 packaged default (10-tool surface), the
+  Extended file pins the explicit opt-in
+  (20-tool surface). Both files FAIL HARD when
+  the build artifact is missing — the previous
+  `it.skip` pattern is removed.
+- **`test/blackbox/mcp-client-e2e.test.ts`** (refactored,
+  7 tests after Task 3 follow-up) — pinned to the
+  Core profile (the v1.1.2 packaged default). The
+  Extended-only `record_memory_feedback` smoke
+  assertion moves to the new
+  `test/blackbox/mcp-client-e2e-extended.test.ts`.
+  The fail-hard `beforeAll` hook surfaces a
+  missing build artifact as a deterministic test
+  failure rather than a silent skip.
+- **`test/blackbox/mcp-client-e2e-extended.test.ts`**
+  (NEW, 3 tests) — the Extended-profile companion
+  smoke. Independent invocation; fail-hard when
+  `dist/` is missing.
 - **`test/mcp-v2-contract.test.ts`** — the
   `memory://health` test now also asserts
   `active_profile` (default = `core`); a new test
@@ -283,30 +297,49 @@ surface without re-reading the env var.
 
 ### Test count
 
-- `npm test` (dev mode, no `dist/`): **636 passed** +
-  11 skipped (was 579 + 42 in v1.1.1; the net change
-  is +57 unit tests and −31 blackbox-skipped tests
-  because the build is now required for the blackbox
-  gate). The two pre-existing flakes
-  (`test/doctor.test.ts` < 1000ms bound and
-  `test/multi-process-stress.test.ts` orphan data
-  homes on Windows) reproduce on the baseline and
-  are documented in the v1.1.1 + v1.1.2 CHANGELOG
-  entries.
-- `npm test` (with `dist/`): 648 tests run; the blackbox
-  suite reports 31 passed + 11 skipped in Core mode
-  and 42 passed in Extended mode.
+- `npm test` (after `npm run build`, with `dist/`):
+  **674 passed** / **0 skipped** across **79 test
+  files** (the canonical command; the same numbers
+  are quoted in `.superpowers/sdd/task-3-report.md`).
+  The +57 unit tests (579 → 636 in v1.1.1) and the
+  −11 blackbox-skipped tests are reflected as the
+  combined **+45 passed / −11 skipped** delta
+  versus the v1.1.1 baseline. Sub-counts for the
+  profile-specific invocations (per mode) are
+  documented in `task-3-report.md` (the Core mode
+  blackbox surface is **23 + 7 + 11 = 41 passed**;
+  the Extended mode blackbox surface is **33 + 3 +
+  11 = 47 passed**; the selector unit tests are
+  **19 + 4 = 23 passed** and run in both modes).
+- `npm test` (dev mode, no `dist/`): the new
+  blackbox and release-gate files FAIL HARD via a
+  `beforeAll` hook that throws when
+  `dist/src/index.js` is absent (the Task 3
+  follow-up fail-closed contract). The selector
+  unit tests in `tools-profile.test.ts` and
+  `mcp-profile-default.test.ts` always run in
+  dev mode (they do not require the build
+  artifact). The `multi-process-stress.test.ts`
+  Windows-only orphan-temp-dir flake is excluded
+  from the canonical run as in v1.1.1 + v1.1.2 #21
+  CHANGELOG entries.
 - `npm run typecheck` → 0 error.
 - `npm run build` → 0 error.
 
 ### Known non-blocking limits
 
-- The blackbox tests now spawn two server processes
-  (one per profile) when run end-to-end. The
-  Core-mode `tools/list` assertion is a strict
-  subset of the Extended-mode `tools/list` assertion,
-  and the difference is documented in
-  `p3-mcp-profile-default.test.ts`. The CI gate must
+- The blackbox tests now spawn **three** server
+  processes per `npm test` invocation when run
+  end-to-end (Core + Extended + the release-gate
+  smoke's three-profile spawn). The CI gate runs
+  each profile-specific file once; a default
+  `npm test` invocation exercises every profile
+  because the files pin their own profile via
+  the spawned env. The Core-mode `tools/list`
+  assertion is a strict subset of the
+  Extended-mode `tools/list` assertion, and the
+  difference is documented in
+  `mcp-profile-default.test.ts`. The CI gate must
   run the blackbox tests in both modes; the npm
   scripts and the docs in
   `docs/superpowers/plans/2026-07-26-v1-final-release-gate.md`
@@ -320,6 +353,14 @@ surface without re-reading the env var.
   agent is not expected to call administrative
   tools; the operator path (`AGENT_RECALL_PROFILE=extended`)
   is the documented escape hatch.
+- The previous `it.skip` pattern (used when
+  `dist/` was missing) is removed across the
+  release-gate surface. A fresh checkout must run
+  `npm run build` before `npm test` so the
+  blackbox tests can find the built MCP server.
+  The `npm test` script is unchanged; the missing
+  build artifact now surfaces as a deterministic
+  test failure rather than a silent skip.
 
 ## [1.1.1] — Stage 16 v1.1.1 (Idempotency v2 public path + black-box gate)
 

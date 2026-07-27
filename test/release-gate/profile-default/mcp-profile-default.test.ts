@@ -1,13 +1,13 @@
-// test/release-gate/p3-mcp-profile-default.test.ts
+// test/release-gate/profile-default/mcp-profile-default.test.ts
 //
 // Stage 17 v1.1.2 (issue #22, release plan
-// Task 3): the profile-default release gate. The
-// v1.1.2 contract pins the packaged default to
-// `core` and the only opt-in to `extended` (via
-// `AGENT_RECALL_PROFILE=extended`). An unknown
-// value is a startup error. This file spawns the
-// built server (`dist/src/index.js`) in three
-// configurations and asserts the surface +
+// Task 3) follow-up: the profile-default release
+// gate. The v1.1.2 contract pins the packaged
+// default to `core` and the only opt-in to
+// `extended` (via `AGENT_RECALL_PROFILE=extended`).
+// An unknown value is a startup error. This file
+// spawns the built server (`dist/src/index.js`) in
+// three configurations and asserts the surface +
 // health + startup behaviour for each:
 //
 //   1. Default env (no `AGENT_RECALL_PROFILE`).
@@ -26,29 +26,43 @@
 //      client cannot connect to a server that
 //      never started).
 //
-// The test file runs against the **built**
-// artifact (`dist/src/index.js`) and is skipped
-// in dev mode (no `dist/`) so `npm test` keeps
-// working in a fresh checkout.
+// Task 3 follow-up (review by ora-6):
+// this file FAILS HARD when the build artifact
+// is missing. The previous implementation used
+// `it.skip` to keep `npm test` working in a fresh
+// checkout; the follow-up brief pins the
+// fail-closed contract by throwing from the
+// `beforeAll` hook when `dist/src/index.js` is
+// absent. The selector unit tests (which don't
+// require the build artifact) live in this same
+// directory and always run.
 
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import {
   CORE_TOOL_NAMES,
   EXTENDED_TOOL_NAMES
-} from "../../src/tools/register-tools.js";
-import { resolveActiveProfile } from "../../src/tools/profile.js";
+} from "../../../src/tools/register-tools.js";
+import { resolveActiveProfile } from "../../../src/tools/profile.js";
 
-const REPO_ROOT = resolve(fileURLToPath(import.meta.url), "../../..");
+const REPO_ROOT = resolve(fileURLToPath(import.meta.url), "../../../..");
 const SERVER_ENTRY = join(REPO_ROOT, "dist", "src", "index.js");
+
+// Task 3 follow-up: this test suite requires a
+// built MCP server artifact. The previous
+// implementation auto-skipped when `dist/` was
+// absent; the follow-up review pins the
+// fail-closed contract so a missing build
+// artifact surfaces as a deterministic test
+// failure (rather than a silently-passing
+// release-gate surface).
 const HAS_BUILT_ARTIFACT = existsSync(SERVER_ENTRY);
-const itMaybe = HAS_BUILT_ARTIFACT ? it : it.skip;
 
 interface ResourceContents {
   contents: Array<{ uri: string; mimeType: string; text: string }>;
@@ -63,11 +77,25 @@ interface HealthResource {
   identity_status: "bound" | "unbound";
 }
 
-describe("release-gate p3-mcp-profile-default (Stage 17 v1.1.2 #22)", () => {
+describe("release-gate mcp-profile-default (Stage 17 v1.1.2 #22)", () => {
   let dataHome: string | undefined;
   let client: Client | undefined;
   let transport: StdioClientTransport | undefined;
   let serverPid: number | undefined;
+
+  // Fail-fast hook. The Task 3 follow-up review
+  // explicitly forbids `it.skip` for the
+  // release-gate surface; a missing build
+  // artifact is a release-blocker and must
+  // surface as a deterministic failure here
+  // rather than as a silent skip.
+  beforeAll(() => {
+    if (!HAS_BUILT_ARTIFACT) {
+      throw new Error(
+        "release-gate test requires built artifact: run npm run build before running this suite"
+      );
+    }
+  });
 
   afterEach(async () => {
     if (client !== undefined) {
@@ -125,7 +153,7 @@ describe("release-gate p3-mcp-profile-default (Stage 17 v1.1.2 #22)", () => {
     serverPid = transport.pid ?? undefined;
   }
 
-  itMaybe("default startup (no AGENT_RECALL_PROFILE) registers the Core profile (10 tools)", async () => {
+  it("default startup (no AGENT_RECALL_PROFILE) registers the Core profile (10 tools)", async () => {
     await spawnServer({ AGENT_RECALL_PROFILE: undefined });
     if (client === undefined) throw new Error("client not initialised");
     const tools = await client.listTools();
@@ -141,7 +169,7 @@ describe("release-gate p3-mcp-profile-default (Stage 17 v1.1.2 #22)", () => {
     }
   });
 
-  itMaybe("default startup exposes active_profile=core on memory://health", async () => {
+  it("default startup exposes active_profile=core on memory://health", async () => {
     await spawnServer({ AGENT_RECALL_PROFILE: undefined });
     if (client === undefined) throw new Error("client not initialised");
     const r = (await client.readResource({ uri: "memory://health" })) as unknown as ResourceContents;
@@ -156,7 +184,7 @@ describe("release-gate p3-mcp-profile-default (Stage 17 v1.1.2 #22)", () => {
     expect(payload.identity_status).toBe("bound");
   });
 
-  itMaybe("AGENT_RECALL_PROFILE=extended registers the full 20-tool surface", async () => {
+  it("AGENT_RECALL_PROFILE=extended registers the full 20-tool surface", async () => {
     await spawnServer({ AGENT_RECALL_PROFILE: "extended" });
     if (client === undefined) throw new Error("client not initialised");
     const tools = await client.listTools();
@@ -165,7 +193,7 @@ describe("release-gate p3-mcp-profile-default (Stage 17 v1.1.2 #22)", () => {
     expect(names).toEqual(expected);
   });
 
-  itMaybe("AGENT_RECALL_PROFILE=extended surfaces active_profile=extended on memory://health", async () => {
+  it("AGENT_RECALL_PROFILE=extended surfaces active_profile=extended on memory://health", async () => {
     await spawnServer({ AGENT_RECALL_PROFILE: "extended" });
     if (client === undefined) throw new Error("client not initialised");
     const r = (await client.readResource({ uri: "memory://health" })) as unknown as ResourceContents;
@@ -174,7 +202,7 @@ describe("release-gate p3-mcp-profile-default (Stage 17 v1.1.2 #22)", () => {
     expect(payload.active_profile).toBe("extended");
   });
 
-  itMaybe("AGENT_RECALL_PROFILE=core (explicit) is accepted as the Core default", async () => {
+  it("AGENT_RECALL_PROFILE=core (explicit) is accepted as the Core default", async () => {
     await spawnServer({ AGENT_RECALL_PROFILE: "core" });
     if (client === undefined) throw new Error("client not initialised");
     const tools = await client.listTools();
@@ -182,7 +210,7 @@ describe("release-gate p3-mcp-profile-default (Stage 17 v1.1.2 #22)", () => {
     expect(names).toEqual([...CORE_TOOL_NAMES].sort());
   });
 
-  itMaybe("AGENT_RECALL_PROFILE=foobar fails closed with a non-zero exit (no stdio binding)", async () => {
+  it("AGENT_RECALL_PROFILE=foobar fails closed with a non-zero exit (no stdio binding)", async () => {
     // The fail-closed contract: an unknown
     // value is a startup error. The server
     // must exit before binding to stdio so the
@@ -243,7 +271,7 @@ describe("release-gate p3-mcp-profile-default (Stage 17 v1.1.2 #22)", () => {
     }
   });
 
-  itMaybe("AGENT_RECALL_PROFILE=admin fails closed the same way as an unknown value", async () => {
+  it("AGENT_RECALL_PROFILE=admin fails closed the same way as an unknown value", async () => {
     // The fail-closed contract is symmetric:
     // any value outside {core, extended} is
     // refused. `admin` is a plausible typo /
@@ -286,11 +314,12 @@ describe("release-gate p3-mcp-profile-default (Stage 17 v1.1.2 #22)", () => {
 });
 
 // ============================================================
-// Selector unit tests under the release-gate umbrella
-// (run in dev mode without a built artifact).
+// Selector unit tests under the release-gate umbrella.
+// These tests do NOT require the built artifact
+// and always run in dev mode.
 // ============================================================
 
-describe("release-gate p3-mcp-profile-selector (Stage 17 v1.1.2 #22)", () => {
+describe("release-gate mcp-profile-selector (Stage 17 v1.1.2 #22)", () => {
   it("resolveActiveProfile returns core on an empty env", () => {
     expect(resolveActiveProfile({})).toBe("core");
   });
@@ -315,5 +344,41 @@ describe("release-gate p3-mcp-profile-selector (Stage 17 v1.1.2 #22)", () => {
     expect(() => resolveActiveProfile({ AGENT_RECALL_PROFILE: "1" })).toThrowError(
       /AGENT_RECALL_PROFILE/
     );
+  });
+
+  // Task 3 follow-up: the brief requires
+  // non-string env inputs to throw with a
+  // stable error message. The selector unit
+  // tests live here so they always run (no
+  // built artifact required) — guarding
+  // against future regressions where the
+  // selector accidentally swallows a `null`
+  // or numeric input.
+  beforeEach(() => {
+    // No-op; placeholder so vitest doesn't
+    // complain about unused imports if the
+    // describe shrinks in a future refactor.
+  });
+
+  it("resolveActiveProfile throws on a null env value", () => {
+    expect(() =>
+      resolveActiveProfile({ AGENT_RECALL_PROFILE: null as unknown as string })
+    ).toThrowError(/AGENT_RECALL_PROFILE/);
+  });
+
+  it("resolveActiveProfile throws on a numeric env value", () => {
+    expect(() =>
+      resolveActiveProfile({ AGENT_RECALL_PROFILE: 1 as unknown as string })
+    ).toThrowError(/AGENT_RECALL_PROFILE/);
+  });
+
+  it("resolveActiveProfile throws on an object env value", () => {
+    expect(() =>
+      resolveActiveProfile({ AGENT_RECALL_PROFILE: { foo: "bar" } as unknown as string })
+    ).toThrowError(/AGENT_RECALL_PROFILE/);
+  });
+
+  it("resolveActiveProfile still falls back to core on the empty string (documented fallback)", () => {
+    expect(resolveActiveProfile({ AGENT_RECALL_PROFILE: "" })).toBe("core");
   });
 });
