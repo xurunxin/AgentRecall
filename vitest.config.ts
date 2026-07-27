@@ -4,6 +4,12 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["test/**/*.test.ts"],
+    // The packaged lifecycle is an artifact-consumer suite, not a source-checkout
+    // suite. It fails closed when the extracted artifact env is absent and is
+    // invoked explicitly by release workflows after extraction.
+    exclude: process.env.AGENT_RECALL_EXTRACTED_ARTIFACT === undefined
+      ? ["test/blackbox/packaged-install.test.ts"]
+      : [],
     // Stage 1 migration tests rebuild tables and exercise the full DDL
     // path. With parallel workers this can stretch past the 5s default
     // timeout. 30s is generous for any single test in this project.

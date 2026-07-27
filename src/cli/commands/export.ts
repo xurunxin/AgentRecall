@@ -12,6 +12,10 @@ export function exportCommand(ctx: CliContext): CliResult {
   const projectPath = flagString(ctx.args, "project-path");
   const out = flagString(ctx.args, "out");
   const formatRaw = flagString(ctx.args, "format") ?? "markdown";
+  const historyMode = flagString(ctx.args, "history-mode") ?? "snapshot";
+  if (historyMode !== "snapshot" && historyMode !== "full_history") {
+    return { exitCode: 1, stdout: "", stderr: "export failed: invalid history_mode (expected snapshot or full_history)" };
+  }
   if (formatRaw !== "markdown" && formatRaw !== "json" && formatRaw !== "yaml") {
     return {
       exitCode: 1,
@@ -60,8 +64,10 @@ export function exportCommand(ctx: CliContext): CliResult {
       scope: resolved.value.scope,
       ...(resolved.value.project_id ? { project_id: resolved.value.project_id } : {})
     }),
-    format
-  });
+    format,
+    history_mode: historyMode,
+    source_actor_id: "user:cli",
+    store: ctx.store  });
   // v1.1.2 (issue #21): surface the binding status
   // for the legacy / strict-mode observability
   // contract. A bound export is the default; an

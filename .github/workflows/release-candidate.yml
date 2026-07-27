@@ -180,7 +180,8 @@ jobs:
           mkdir -p "$STAGE"
           cp -R dist "$STAGE/dist"
           cp package.json "$STAGE/package.json"
-          cp README.md "$STAGE/README.md"
+           cp README.md "$STAGE/README.md"
+           cp CHANGELOG.md "$STAGE/CHANGELOG.md"
           if [ -f LICENSE ]; then cp LICENSE "$STAGE/LICENSE"; fi
           VERSION="${GITHUB_REF_NAME#rc-}"
           if [ "$VERSION" = "$GITHUB_REF_NAME" ]; then VERSION="1.1.1"; fi
@@ -243,11 +244,11 @@ jobs:
         env:
           MATRIX_OS: ${{ matrix.os }}
           GITHUB_SHA: ${{ github.sha }}
-          RELEASE_HASHES_OUTPUT: ${{ runner.temp }}/release-artifact-hashes.json
+          RELEASE_HASHES_OUTPUT: "${{ runner.temp }}/release-artifact-hashes-${{ matrix.os }}.json"
         run: |
           set -euo pipefail
           node scripts/compute-artifact-hashes.mjs "$PACKAGE_PATH"
-          cat "$RUNNER_TEMP/release-artifact-hashes.json"
+          cat "$RELEASE_HASHES_OUTPUT"
 
       - name: Extracted-artifact lifecycle E2E
         # Stage 18 v1.1.2 (issue #28, task 9):
@@ -277,7 +278,15 @@ jobs:
           path: |
             ${{ runner.temp }}/test-summary-*.json
             ${{ runner.temp }}/migration-summary-*.json
-            ${{ runner.temp }}/release-artifact-hashes.json
+            ${{ runner.temp }}/release-artifact-hashes-${{ matrix.os }}.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload packaged candidate artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-package-${{ matrix.os }}-${{ github.sha }}
+          path: ${{ env.PACKAGE_PATH }}
           if-no-files-found: error
           retention-days: 14
 
@@ -416,8 +425,7 @@ jobs:
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          RELEASE_EVIDENCE_ARTIFACTS_JSON: '[{"name":"release-evidence.json","sha256":null},{"name":"release-candidate.json","sha256":null}]'
-          RELEASE_EVIDENCE_SHA256_JSON: ${{ env.RELEASE_EVIDENCE_SHA256_JSON }}
+          RELEASE_EVIDENCE_ARTIFACTS_JSON: '[]'
           RELEASE_EVIDENCE_CONCLUSION: success
         run: |
           set -euo pipefail
@@ -428,27 +436,25 @@ jobs:
           # platform. The map is forwarded to
           # `release-evidence.mjs` via
           # `RELEASE_EVIDENCE_SHA256_JSON`.
-          HASH_FILES=$(find "$RUNNER_TEMP/evidence-fragments" -type f -name 'release-artifact-hashes.json' | sort)
+          HASH_FILES=$(find "$RUNNER_TEMP/evidence-fragments" -type f -name 'release-artifact-hashes-*.json' | sort)
           if [ -z "$HASH_FILES" ]; then
-            echo "::error::no release-artifact-hashes.json fragments found"
+            echo "::error::no release-artifact-hashes fragments found"
             exit 1
           fi
           EVIDENCE_FRAGMENTS_DIR="$RUNNER_TEMP/evidence-fragments" node -e '
             const fs = require("node:fs");
             const path = require("node:path");
             const dir = process.env.EVIDENCE_FRAGMENTS_DIR;
-            const files = fs.readdirSync(dir).filter((name) => name === "release-artifact-hashes.json");
-            const map = {};
+            const files = fs.readdirSync(dir).filter((name) => /^release-artifact-hashes-.*\\.json$/.test(name));
+            const artifacts = [];
             for (const file of files) {
               const payload = JSON.parse(fs.readFileSync(path.join(dir, file), "utf8"));
-              for (const row of payload.artifacts) {
-                map[row.artifact_path] = row.sha256;
-              }
+              artifacts.push(...payload.artifacts);
             }
-            process.stdout.write(JSON.stringify(map));
-          ' > "$RUNNER_TEMP/sha256-checksums.json"
-          cat "$RUNNER_TEMP/sha256-checksums.json"
-          export RELEASE_EVIDENCE_SHA256_JSON="$(cat $RUNNER_TEMP/sha256-checksums.json)"
+            process.stdout.write(JSON.stringify(artifacts));
+          ' > "$RUNNER_TEMP/artifacts.json"
+          export RELEASE_EVIDENCE_ARTIFACTS_JSON="$(cat "$RUNNER_TEMP/artifacts.json")"
+          export RELEASE_EVIDENCE_SHA256_JSON="$(cat "$RUNNER_TEMP/artifacts.json")"
           node scripts/release-evidence.mjs
           node scripts/verify-release-evidence.mjs "$RUNNER_TEMP/release-evidence.json"
           cp "$RUNNER_TEMP/release-evidence.json" release-evidence.json

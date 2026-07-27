@@ -235,6 +235,8 @@ function knownNonBlockingLimits() {
     if (current !== "") limits.push(current.trim());
   }
   if (limits.length === 0) fail("CHANGELOG.md has no Known non-blocking limits entries");
+  const issue28 = limits.filter((entry) => /Issue #28|#28|Extracted-artifact/i.test(entry));
+  if (issue28.length === 0) fail("CHANGELOG.md Known non-blocking limits must document Issue #28 extracted-artifact lifecycle");
   return limits;
 }
 

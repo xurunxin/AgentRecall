@@ -76,6 +76,7 @@
 // step / script / ADR is a deterministic failure.
 
 import { strict as assert } from "node:assert";
+import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -252,12 +253,7 @@ describe("extracted-artifact lifecycle E2E (Stage 18 v1.1.2 issue #28, task 9)",
     if (process.platform !== "win32") {
       const probe = spawnSync("unzip", ["-v"], { stdio: "ignore" });
       if (probe.status !== 0) {
-        // The script's documented non-Windows path
-        // assumes `unzip` is on PATH; skip if the
-        // dev runner does not have it. The CI runner
-        // is the contract; this gate is permissive
-        // for local dev.
-        return;
+        throw new Error("POSIX release-gate requires unzip on PATH; install unzip or use a Node-native extractor");
       }
     }
     const tmp = mkdtempSync(join(tmpdir(), "agent-recall-extract-zip-"));
@@ -266,10 +262,7 @@ describe("extracted-artifact lifecycle E2E (Stage 18 v1.1.2 issue #28, task 9)",
       const archive = join(tmp, "agent-recall-1.1.2-windows-x64.zip");
       const packed = packZip(stage, archive);
       if (!packed.ok) {
-        // The local dev environment cannot pack a
-        // zip without admin tools. Skip silently —
-        // the CI contract is the gate.
-        return;
+        throw new Error(packed.reason);
       }
       const extractDir = join(tmp, "extracted");
       const platform = process.platform === "win32" ? "win32" : "darwin";
@@ -336,9 +329,16 @@ describe("extracted-artifact lifecycle E2E (Stage 18 v1.1.2 issue #28, task 9)",
         assert.ok(row.size_bytes > 0);
         assert.match(row.mtime, /^\d{4}-\d{2}-\d{2}T/);
         assert.equal(row.platform, "local");
+        const expected = createHash("sha256").update(readFileSync(row.artifact_path)).digest("hex");
+        assert.equal(row.sha256, expected, `independent SHA-256 mismatch for ${row.artifact_path}`);
       }
-      // The first row must correspond to the first CLI
-      // argument (positional stability).
+      const repeatPath = join(tmp, "release-artifact-hashes-repeat.json");
+      const repeat = runScript(hashScriptPath, [archiveA, archiveB], {
+        ...process.env, GITHUB_SHA: "abcdef0123456789abcdef0123456789abcdef01", MATRIX_OS: "local", RELEASE_HASHES_OUTPUT: repeatPath
+      });
+      assert.equal(repeat.status, 0);
+      const repeated = JSON.parse(read(repeatPath)) as typeof parsed;
+      assert.deepEqual(repeated.artifacts.map((row) => row.sha256), parsed.artifacts.map((row) => row.sha256));
       assert.match(parsed.artifacts[0]!.artifact_path, /linux-x64\.tar\.gz$/);
       assert.match(parsed.artifacts[1]!.artifact_path, /windows-x64\.zip$/);
     } finally {
@@ -506,10 +506,7 @@ describe("extracted-artifact lifecycle E2E (Stage 18 v1.1.2 issue #28, task 9)",
       // one non-blocking-limit reference. The Task 9
       // update is the marker that the section has
       // been touched.
-      assert.ok(
-        evidence.known_non_blocking_limits.length > 0,
-        "release evidence must carry at least one known non-blocking limit"
-      );
+      assert.ok(evidence.known_non_blocking_limits.some((entry) => /Issue #28|#28|Extracted-artifact/i.test(entry)), "evidence must carry the #28 extracted-artifact limit");
     } finally {
       rmSync(runnerTemp, { recursive: true, force: true });
     }

@@ -174,7 +174,8 @@ jobs:
           mkdir -p "$STAGE"
           cp -R dist "$STAGE/dist"
           cp package.json "$STAGE/package.json"
-          cp README.md "$STAGE/README.md"
+           cp README.md "$STAGE/README.md"
+           cp CHANGELOG.md "$STAGE/CHANGELOG.md"
           if [ -f LICENSE ]; then cp LICENSE "$STAGE/LICENSE"; fi
           echo "package contents:"
           find "$STAGE" -maxdepth 3 -type f | sort
@@ -358,16 +359,19 @@ jobs:
 
       - name: Extract
         shell: bash
+        env:
+          AGENT_RECALL_PACKAGED_ARTIFACT: ${{ runner.temp }}/smoke-package
+          AGENT_RECALL_EXTRACT_DIR: ${{ runner.temp }}/smoke-extracted
+          AGENT_RECALL_PLATFORM: ${{ matrix.os == 'windows-latest' && 'win32' || matrix.os == 'macos-latest' && 'darwin' || 'linux' }}
         run: |
           set -euo pipefail
-          cd pkg
-          ls -la
-          if [ "${{ matrix.archive }}" = "tar" ]; then
-            tar -xzf agent-recall-*.tar.gz
-          else
-            unzip -q agent-recall-*.zip
-          fi
-          ls -la
+          mkdir -p "$RUNNER_TEMP/smoke-package"
+          ARTIFACT=$(find pkg -maxdepth 1 -type f | head -n 1)
+          cp "$ARTIFACT" "$RUNNER_TEMP/smoke-package/$(basename "$ARTIFACT")"
+          export AGENT_RECALL_PACKAGED_ARTIFACT="$RUNNER_TEMP/smoke-package/$(basename "$ARTIFACT")"
+          node scripts/extract-release-artifact.mjs
+          rm -rf pkg
+          mv "$RUNNER_TEMP/smoke-extracted" pkg
 
       - name: Install runtime deps (production only)
         working-directory: pkg

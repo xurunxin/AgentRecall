@@ -53,13 +53,26 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import {
-  CORE_TOOL_NAMES,
-  EXTENDED_TOOL_NAMES
-} from "../../src/tools/register-tools.js";
+
+// These are the canonical wire lists from src/tools/register-tools.ts. Keep
+// this artifact test source-independent: update these literals whenever the
+// canonical lists change, then release-gate tests catch drift in the archive.
+const CORE_TOOL_NAMES = [
+  "recall_context", "remember", "search_memories", "get_memory", "list_memories",
+  "update_memory", "forget_memory", "get_memory_budget", "explain_recall", "list_backups"
+] as const;
+const EXTENDED_ONLY_TOOL_NAMES = [
+  "supersede_memory", "merge_memories", "maintain_memories", "export_memory_context",
+  "plan_maintenance", "apply_maintenance", "record_memory_feedback",
+  "record_memory_provenance", "explain_memory_provenance", "confirm_memory_trust"
+] as const;
+const EXTENDED_TOOL_NAMES = [...CORE_TOOL_NAMES, ...EXTENDED_ONLY_TOOL_NAMES] as const;
+const ADMIN_TOOL_NAMES = EXTENDED_TOOL_NAMES;
+
 
 // Task 9 fail-closed contract: the lifecycle
 // test requires an extracted artefact. The CI
@@ -82,8 +95,8 @@ const REQUIRED_FILES = [
   "dist/src/index.js",
   "dist/bin/agent-recall.js",
   "package.json",
-  "README.md"
-];
+  "README.md",
+  "CHANGELOG.md"];
 for (const rel of REQUIRED_FILES) {
   const path = join(ARTIFACT_DIR, rel);
   if (!existsSync(path)) {
@@ -174,7 +187,7 @@ interface LifecycleHarness {
 }
 
 async function startHarness(
-  profile: "core" | "extended" | "admin",
+  profile: "core" | "extended" | "admin" | undefined,
   dataHome: string
 ): Promise<LifecycleHarness> {
   const harness: LifecycleHarness = {
@@ -193,7 +206,7 @@ async function startHarness(
   const env: Record<string, string> = {
     ...(process.env as Record<string, string>),
     AGENT_RECALL_HOME: dataHome,
-    AGENT_RECALL_PROFILE: profile,
+    ...(profile === undefined ? {} : { AGENT_RECALL_PROFILE: profile }),
     AGENT_RECALL_SUPPRESS_MCP_DEPRECATION: "1",
     AGENT_RECALL_VERBOSE_STDIO: "0"
   };
@@ -233,10 +246,19 @@ async function stopHarness(harness: LifecycleHarness): Promise<void> {
     }
   }
   if (harness.serverPid !== undefined) {
+    try { process.kill(harness.serverPid, "SIGTERM"); } catch { /* already gone */ }
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      try { process.kill(harness.serverPid, 0); } catch { break; }
+      await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+    }
     try {
-      process.kill(harness.serverPid, "SIGTERM");
-    } catch {
-      // already gone
+      process.kill(harness.serverPid, 0);
+      process.kill(harness.serverPid, "SIGKILL");
+      await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    } catch { /* exited */ }
+    try { process.kill(harness.serverPid, 0); throw new Error(`server PID ${harness.serverPid} still exists after SIGKILL`); } catch (error) {
+      if (error instanceof Error && error.message.startsWith("server PID")) throw error;
     }
   }
   // Scenario (k): clean shutdown — assert the
@@ -298,7 +320,7 @@ describe("packaged-install lifecycle - Core profile (v1.1.2 #28, task 9)", () =>
 
   beforeAll(async () => {
     dataHome = makeDataHome("core");
-    harness = await startHarness("core", dataHome);
+    harness = await startHarness(undefined, dataHome);
   }, 30_000);
 
   afterAll(async () => {
@@ -317,6 +339,9 @@ describe("packaged-install lifecycle - Core profile (v1.1.2 #28, task 9)", () =>
     // handshake; the lifecycle test asserts the
     // canonical `server_version` shape on the
     // health resource.
+    // MCP SDK initialize response: the server registers tools and resources,
+    // and advertises no prompts/logging/subscription capabilities.
+    expect(harness.client.getServerCapabilities()).toEqual({ tools: { listChanged: true }, resources: { listChanged: true } });
     const r = (await harness.client.readResource({
       uri: "memory://health"
     })) as unknown as ResourceContents;
@@ -333,15 +358,7 @@ describe("packaged-install lifecycle - Core profile (v1.1.2 #28, task 9)", () =>
     const tools = await harness.client.listTools();
     const names = new Set(tools.tools.map((t) => t.name));
     const expected = new Set<string>(CORE_TOOL_NAMES);
-    for (const name of expected) {
-      expect(names.has(name), `expected Core tool ${name}`).toBe(true);
-    }
-    // Core is a strict subset of Extended; the
-    // Extended-only tools MUST NOT surface here.
-    const extended = new Set<string>(EXTENDED_TOOL_NAMES);
-    for (const name of names) {
-      expect(extended.has(name), `Core must not expose Extended tool ${name}`).toBe(false);
-    }
+    expect([...names].sort()).toEqual([...expected].sort());
     const resources = await harness.client.listResources();
     const staticUris = resources.resources.map((r) => r.uri).sort();
     expect(staticUris).toEqual([
@@ -486,6 +503,13 @@ describe("packaged-install lifecycle - Core profile (v1.1.2 #28, task 9)", () =>
     });
     expect(unknownBudget.isError).toBe(true);
     expect(failureCode(unknownBudget)).toBe("invalid_scope");
+    const conflict = await callTool(harness.client, "remember", {
+      scope: "project", project_id: `${projectId}-different`, project_path: projectPath,
+      type: "fact", topic: "proj", title: "conflict", body: "conflict", tags: [],
+      source: { kind: "agent" }, importance: 3, confidence: 3, confirm_write: true
+    });
+    expect(conflict.isError).toBe(true);
+    expect(failureCode(conflict)).toBe("project_identity_conflict");
   });
 
   it("(f) search + recall", async () => {
@@ -513,6 +537,7 @@ describe("packaged-install lifecycle - Core profile (v1.1.2 #28, task 9)", () =>
     expect(items.some((it) => it.title === target)).toBe(true);
     const recall = await callTool(harness.client, "recall_context", { scope: "global" });
     expect(recall.isError).toBeFalsy();
+    expect(JSON.stringify(data<unknown>(recall))).toContain("search body for the lifecycle");
   });
 
   it("(g) sensitivity / trust authorized + unauthorized (Core rejects restricted writes)", async () => {
@@ -579,24 +604,24 @@ describe("packaged-install lifecycle - Core profile (v1.1.2 #28, task 9)", () =>
     // scope. The CLI's `export` writes to its
     // own `--data-home` `exports/` directory
     // and reads from the same data home.
-    await callTool(harness.client, "remember", {
-      scope: "global",
-      type: "fact",
-      topic: "export",
-      title: "export target",
-      body: "export body",
-      tags: [],
-      source: { kind: "agent" },
-      importance: 3,
-      confidence: 3,
-      confirm_write: true
+    const exportSeed = await callTool(harness.client, "remember", {
+      scope: "global", type: "fact", topic: "export", title: "export target", body: "export body",
+      tags: [], source: { kind: "agent" }, importance: 3, confidence: 3, confirm_write: true
     });
+    const sourceDb = new DatabaseSync(join(dataHome, "memory.sqlite"));
+    const memoryId = (parseText(exportSeed) as { value: { memory_id: string } }).value.memory_id;
+    const now = Date.now();
+    sourceDb.prepare("INSERT OR IGNORE INTO memory_provenance (memory_id, source_kind, source_ref, recorded_by, recorded_at) VALUES (?, 'tool_call', ?, 'agent:packaged', ?)").run(memoryId, "packaged-export", now);
+    sourceDb.prepare("INSERT OR IGNORE INTO memory_relations (from_memory_id, to_memory_id, relation_type, confidence, metadata_json, created_at) VALUES (?, ?, 'related', 1.0, '{}', ?)").run(memoryId, memoryId, new Date(now).toISOString());
+    sourceDb.close();
     const exportResult = runArtifactCli(dataHome, [
       "export",
       "--scope",
       "global",
-      "--format",
-      "json"
+       "--format",
+       "json",
+       "--history-mode",
+       "full_history"
     ]);
     expect(exportResult.exitCode).toBe(0);
     const exportsDir = join(dataHome, "exports");
@@ -616,10 +641,18 @@ describe("packaged-install lifecycle - Core profile (v1.1.2 #28, task 9)", () =>
         exportsDir,
         "--scope",
         "global",
-        "--format",
-        "json"
-      ]);
-      expect(importResult.exitCode).toBe(0);
+         "--format",
+         "json",
+         "--history-mode",
+         "full_history"
+       ]);
+       expect(importResult.exitCode).toBe(0);
+       const importedDb = new DatabaseSync(join(importDataHome, "memory.sqlite"));
+       for (const table of ["memory_revisions", "audit_events", "memory_relations", "memory_provenance"]) {
+         const row = importedDb.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number | bigint };
+         expect(Number(row.count), `${table} must be restored by full_history import`).toBeGreaterThan(0);
+       }
+       importedDb.close();
     } finally {
       rmSync(importDataHome, { recursive: true, force: true });
     }
@@ -644,7 +677,13 @@ describe("packaged-install lifecycle - Core profile (v1.1.2 #28, task 9)", () =>
     });
     const help = runArtifactCli(dataHome, ["help"]);
     expect(help.exitCode).toBe(0);
-    expect(help.stdout).toMatch(/agent-recall/);
+    expect(help.stderr).toBe("");
+    const badExport = runArtifactCli(dataHome, ["export", "--format", "invalid"]);
+    expect(badExport.exitCode).not.toBe(0);
+    expect(badExport.stderr).toMatch(/invalid|usage|error/i);
+    const badImport = runArtifactCli(dataHome, ["import"]);
+    expect(badImport.exitCode).not.toBe(0);
+    expect(badImport.stderr).toMatch(/usage|error/i);
     const doctor = runArtifactCli(dataHome, ["doctor"]);
     expect(doctor.exitCode).toBeLessThanOrEqual(1);
     const backup = runArtifactCli(dataHome, ["backup"]);
@@ -691,10 +730,8 @@ describe("packaged-install lifecycle - Extended profile (v1.1.2 #28, task 9)", (
     if (harness === undefined || harness.client === undefined) throw new Error("harness not initialised");
     const tools = await harness.client.listTools();
     const names = new Set(tools.tools.map((t) => t.name));
-    const expected = new Set<string>([...CORE_TOOL_NAMES, ...EXTENDED_TOOL_NAMES]);
-    for (const name of expected) {
-      expect(names.has(name), `expected Extended tool ${name}`).toBe(true);
-    }
+    const expected = new Set<string>(EXTENDED_TOOL_NAMES);
+    expect([...names].sort()).toEqual([...expected].sort());
     const r = (await harness.client.readResource({ uri: "memory://health" })) as unknown as ResourceContents;
     const payload = JSON.parse(r.contents[0]!.text) as HealthResource;
     expect(payload.active_profile).toBe("extended");
@@ -707,13 +744,24 @@ describe("packaged-install lifecycle - Extended profile (v1.1.2 #28, task 9)", (
     expect(names.has("plan_maintenance")).toBe(true);
     expect(names.has("apply_maintenance")).toBe(true);
     expect(names.has("maintain_memories")).toBe(true);
-    // A `plan_maintenance` call is a no-op read
-    // on a fresh data home.
-    const plan = await callTool(harness.client, "plan_maintenance", {
-      scope: "global",
-      max_groups: 10
-    });
+    const duplicateArgs = {
+      scope: "global", type: "fact", topic: "maintenance", title: "duplicate target",
+      body: "same duplicate body", tags: ["duplicate"], source: { kind: "agent" },
+      importance: 3, confidence: 3, confirm_write: true
+    };
+    expect((await callTool(harness.client, "remember", duplicateArgs)).isError).toBeFalsy();
+    expect((await callTool(harness.client, "remember", duplicateArgs)).isError).toBeFalsy();
+    const plan = await callTool(harness.client, "plan_maintenance", { scope: "global", max_groups: 10 });
     expect(plan.isError).toBeFalsy();
+    const planned = data<{ plan_id: string; proposed_actions?: unknown[] }>(plan);
+    expect(planned.plan_id).toBeTruthy();
+    expect(planned.proposed_actions?.length ?? 0).toBeGreaterThan(0);
+    const apply = await callTool(harness.client, "apply_maintenance", { plan_id: planned.plan_id, confirm: true, idempotency_key: `maint-apply-${Date.now()}` });
+    expect(apply.isError).toBeFalsy();
+    const audit = new DatabaseSync(join((dataHome as string), "memory.sqlite"));
+    const auditCount = audit.prepare("SELECT COUNT(*) AS count FROM audit_events WHERE event LIKE '%maintenance%'").get() as { count: number | bigint };
+    expect(Number(auditCount.count)).toBeGreaterThan(0);
+    audit.close();
   });
 
   it("(k) clean shutdown (Extended)", () => {
@@ -733,22 +781,12 @@ describe("packaged-install lifecycle - Admin profile (v1.1.2 #28, task 9)", () =
 
   beforeAll(async () => {
     dataHome = makeDataHome("admin");
-    // Pre-install the operator capability so
-    // the admin profile passes its startup-time
-    // gate. The `CapabilityStore` writes the
-    // canonical `admin.cap` file under the data
-    // home; the test reads the raw token back
-    // from the on-disk file because the
-    // `status()` surface never returns it.
-    const { CapabilityStore } = await import("../../src/admin/capability.js");
-    const seedStore = new CapabilityStore(dataHome, { persistent: true });
-    const seedStatus = seedStore.grant({ label: "packaged-admin" });
-    if (seedStatus.kind !== "granted") {
-      throw new Error("expected admin grant to succeed");
-    }
-    adminCapabilityToken = (JSON.parse(readFileSync(seedStore.getPath(), "utf8")) as {
-      token: string;
-    }).token;
+    // Set capability through the packaged CLI; this test must never import
+    // implementation files from the source checkout.
+    const grant = runArtifactCli(dataHome, ["admin", "grant", "--label", "packaged-admin"]);
+    expect(grant.exitCode).toBe(0);
+    const capabilityRecord = JSON.parse(readFileSync(join(dataHome, "admin.cap"), "utf8")) as { token: string };
+    adminCapabilityToken = capabilityRecord.token;
     harness = await startHarness("admin", dataHome);
   }, 30_000);
 
@@ -763,10 +801,8 @@ describe("packaged-install lifecycle - Admin profile (v1.1.2 #28, task 9)", () =
     if (harness === undefined || harness.client === undefined) throw new Error("harness not initialised");
     const tools = await harness.client.listTools();
     const names = new Set(tools.tools.map((t) => t.name));
-    const expected = new Set<string>([...CORE_TOOL_NAMES, ...EXTENDED_TOOL_NAMES]);
-    for (const name of expected) {
-      expect(names.has(name), `expected Admin tool ${name}`).toBe(true);
-    }
+    const expected = new Set<string>(ADMIN_TOOL_NAMES);
+    expect([...names].sort()).toEqual([...expected].sort());
     const r = (await harness.client.readResource({ uri: "memory://health" })) as unknown as ResourceContents;
     const payload = JSON.parse(r.contents[0]!.text) as HealthResource;
     expect(payload.active_profile).toBe("admin");

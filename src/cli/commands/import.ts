@@ -76,6 +76,10 @@ export function importCommand(ctx: CliContext): CliResult {
       stderr: `usage: agent-recall import --format json (yaml is no longer supported; got "${formatRaw}")`
     };
   }
+  const historyMode = flagString(ctx.args, "history-mode") ?? "snapshot";
+  if (historyMode !== "snapshot" && historyMode !== "full_history") {
+    return { exitCode: 1, stdout: "", stderr: "import failed: invalid history_mode (expected snapshot or full_history)" };
+  }
   const conflictRaw = flagString(ctx.args, "conflict") ?? "keep";
   if (conflictRaw !== "keep" && conflictRaw !== "replace" && conflictRaw !== "merge" && conflictRaw !== "fail") {
     return {
@@ -115,7 +119,7 @@ export function importCommand(ctx: CliContext): CliResult {
       scope,
       projectId,
       formatRaw,
-      { conflict, dry_run: dryRun, actor: resolveActor(undefined) },
+      { conflict, dry_run: dryRun, actor: resolveActor(undefined), history_mode: historyMode, allow_restricted: true },
       ctx.ctx
     );
     if (json) {
