@@ -985,10 +985,18 @@ describe("packaged-install lifecycle - Core profile (v1.1.2 #28, task 9)", () =>
     writeFileSync(join(blockedHome, "backups"), "regular-file-blocks-mkdir");
     try {
       const badBackup = runArtifactCli(blockedHome, ["backup"]);
+      // Stage 18 v1.1.2 fourth follow-up (review by
+      // ora-8, Important #3): `src/cli/commands/backup.ts:40`
+      // hard-codes `exitCode: 2` in the failure path. The
+      // previous `exitCode === 1 || exitCode === 2` assertion
+      // was loose (any non-zero exit would have passed); pin
+      // the exact stable exit code so a future refactor that
+      // flips the catch to exit 1 trips a deterministic
+      // failure here.
       expect(
-        badBackup.exitCode === 2 || badBackup.exitCode === 1,
-        `backup should fail with non-zero exit (got ${badBackup.exitCode}, stderr=${JSON.stringify(badBackup.stderr)})`
-      ).toBe(true);
+        badBackup.exitCode,
+        `backup should fail with exit 2 (got ${badBackup.exitCode}, stderr=${JSON.stringify(badBackup.stderr)})`
+      ).toBe(2);
       expect(badBackup.stderr).toMatch(/\[backup_failed\]/);
     } finally {
       rmSync(blockedHome, { recursive: true, force: true });
@@ -1089,14 +1097,208 @@ describe("packaged-install lifecycle - Core profile (v1.1.2 #28, task 9)", () =>
       // `[internal_error]` (the dispatch catch).
       writeFileSync(corruptDbPath, "not a sqlite file");
       const corruptDoctor = runArtifactCli(corruptHome, ["doctor"]);
+      // Stage 18 v1.1.2 fourth follow-up (review
+      // by ora-8, Important #3): the previous
+      // `exitCode !== 0` + `/\[(internal_error|
+      // doctor_failed)\]/` assertion was loose
+      // (any non-zero exit and either stable
+      // code would have passed). "not a sqlite
+      // file" deterministically makes the
+      // SQLiteMemoryStore constructor throw, so
+      // the dispatch catch in src/cli/index.ts
+      // fires BEFORE the doctor handler is
+      // reached. The stable exit code is 3
+      // (`[internal_error]`). A separate test
+      // below covers the doctor-handler-level
+      // `[doctor_failed]` path (exit 2) where
+      // the DB opens successfully but the report
+      // has `fail > 0`.
       expect(
-        corruptDoctor.exitCode !== 0,
-        `corrupt doctor should fail non-zero (got ${corruptDoctor.exitCode}, stderr=${JSON.stringify(corruptDoctor.stderr)})`
-      ).toBe(true);
-      expect(corruptDoctor.stderr).toMatch(/\[(internal_error|doctor_failed)\]/);
+        corruptDoctor.exitCode,
+        `corrupt doctor should fail with exit 3 (got ${corruptDoctor.exitCode}, stderr=${JSON.stringify(corruptDoctor.stderr)})`
+      ).toBe(3);
+      expect(corruptDoctor.stderr).toMatch(/\[internal_error\]/);
     } finally {
       rmSync(corruptHome, { recursive: true, force: true });
     }
+  });
+
+  // ============================================================
+  // Stage 18 v1.1.2 fourth follow-up (review by
+  // ora-8, Important #1 + Important #3): pin the
+  // remaining stable CLI error codes via the
+  // PACKAGED CLI. Every assertion below targets
+  // exactly ONE failure path the brief lists; the
+  // stderr regex pins the literal `[code]` token
+  // (no soft character-class / OR fallbacks) and
+  // the exit code is pinned to its exact stable
+  // value (no `||`, no `<=`, no `!== 0`).
+  // ============================================================
+
+  it("(j.a) export --history-mode invalid surfaces [invalid_history_mode] exit 1", async () => {
+    if (dataHome === undefined) throw new Error("dataHome not initialised");
+    // src/cli/commands/export.ts:30-36: a non-{snapshot,
+    // full_history} history-mode is rejected BEFORE any
+    // store query runs (the rejection only inspects the
+    // arg). The stable code is `[invalid_history_mode]`
+    // and the exit is 1.
+    const result = runArtifactCli(dataHome, [
+      "export",
+      "--scope",
+      "global",
+      "--history-mode",
+      "invalid"
+    ]);
+    expect(
+      result.exitCode,
+      `export --history-mode invalid should fail with exit 1 (got ${result.exitCode}, stderr=${JSON.stringify(result.stderr)})`
+    ).toBe(1);
+    expect(result.stderr).toMatch(/\[invalid_history_mode\]/);
+  });
+
+  it("(j.b) import --history-mode invalid surfaces [invalid_history_mode] exit 1", async () => {
+    if (dataHome === undefined) throw new Error("dataHome not initialised");
+    // src/cli/commands/import.ts:97-103: the import
+    // command's history-mode validation mirrors the
+    // export side. The stable code is
+    // `[invalid_history_mode]` and the exit is 1.
+    // `--from` is required first (the missing-from
+    // path is the existing `(j) import` test); we
+    // pass `dataHome` as a stand-in for the export
+    // root since the validation fires BEFORE any
+    // store read.
+    const result = runArtifactCli(dataHome, [
+      "import",
+      "--from",
+      dataHome,
+      "--history-mode",
+      "invalid"
+    ]);
+    expect(
+      result.exitCode,
+      `import --history-mode invalid should fail with exit 1 (got ${result.exitCode}, stderr=${JSON.stringify(result.stderr)})`
+    ).toBe(1);
+    expect(result.stderr).toMatch(/\[invalid_history_mode\]/);
+  });
+
+  it("(j.c) import --conflict <bad> surfaces [invalid_conflict_policy] exit 1", async () => {
+    if (dataHome === undefined) throw new Error("dataHome not initialised");
+    // src/cli/commands/import.ts:104-111: a conflict
+    // policy that is not in
+    // {keep, replace, merge, fail} is rejected with
+    // `[invalid_conflict_policy]`, exit 1.
+    const result = runArtifactCli(dataHome, [
+      "import",
+      "--from",
+      dataHome,
+      "--conflict",
+      "bogus-policy"
+    ]);
+    expect(
+      result.exitCode,
+      `import --conflict bogus should fail with exit 1 (got ${result.exitCode}, stderr=${JSON.stringify(result.stderr)})`
+    ).toBe(1);
+    expect(result.stderr).toMatch(/\[invalid_conflict_policy\]/);
+  });
+
+  it("(j.d) import --scope project (no --project-id) surfaces [missing_project_id] exit 1", async () => {
+    if (dataHome === undefined) throw new Error("dataHome not initialised");
+    // src/cli/commands/import.ts:116-122: project-scope
+    // imports MUST carry a `--project-id`. The stable
+    // code is `[missing_project_id]` and the exit is 1.
+    const result = runArtifactCli(dataHome, [
+      "import",
+      "--from",
+      dataHome,
+      "--scope",
+      "project"
+    ]);
+    expect(
+      result.exitCode,
+      `import --scope project without --project-id should fail with exit 1 (got ${result.exitCode}, stderr=${JSON.stringify(result.stderr)})`
+    ).toBe(1);
+    expect(result.stderr).toMatch(/\[missing_project_id\]/);
+  });
+
+  it("(j.e) import inspect (no <batch_id>) surfaces [usage_error] exit 1", async () => {
+    if (dataHome === undefined) throw new Error("dataHome not initialised");
+    // src/cli/commands/import.ts:208-214: `import
+    // inspect` with no positional batch_id is the
+    // usage-error surface. The stable code is
+    // `[usage_error]` and the exit is 1.
+    const result = runArtifactCli(dataHome, [
+      "import",
+      "inspect"
+    ]);
+    expect(
+      result.exitCode,
+      `import inspect without batch_id should fail with exit 1 (got ${result.exitCode}, stderr=${JSON.stringify(result.stderr)})`
+    ).toBe(1);
+    expect(result.stderr).toMatch(/\[usage_error\]/);
+  });
+
+  it("(j.f) import inspect <unknown> surfaces [not_found] exit 1", async () => {
+    if (dataHome === undefined) throw new Error("dataHome not initialised");
+    // src/cli/commands/import.ts:218-229: `import
+    // inspect <batch_id>` queries the
+    // `import_batches` table. The MCP server has
+    // already initialised the table in this Core
+    // dataHome, so the CLI opens the DB cleanly and
+    // hits the not-found branch. The stable code is
+    // `[not_found]` and the exit is 1.
+    const result = runArtifactCli(dataHome, [
+      "import",
+      "inspect",
+      "no-such-batch-id-packaged-fourth-followup"
+    ]);
+    expect(
+      result.exitCode,
+      `import inspect <unknown> should fail with exit 1 (got ${result.exitCode}, stderr=${JSON.stringify(result.stderr)})`
+    ).toBe(1);
+    expect(result.stderr).toMatch(/\[not_found\]/);
+  });
+
+  it("(j.g) doctor with stale user_version surfaces [doctor_failed] exit 2 (handler-level fail)", async () => {
+    // Stage 18 v1.1.2 fourth follow-up (review by
+    // ora-8, Important #3): the `corrupt doctor`
+    // assertion above pins the dispatch-level
+    // `[internal_error]` path (exit 3) where the
+    // SQLiteMemoryStore constructor throws. The
+    // second stable path the doctor command emits
+    // is the handler-level `[doctor_failed]`
+    // (src/cli/commands/doctor.ts:32) — the DB opens
+    // successfully, but the doctor report has
+    // `fail > 0`, so the command surfaces
+    // `[doctor_failed]` on stderr with exit 2. The
+    // stable trigger: bump user_version past
+    // CURRENT_SCHEMA_VERSION; the
+    // `read_write_no_migrate` constructor does NOT
+    // re-migrate when user_version > 0, so the
+    // version stays at 99. The doctor opens the DB
+    // successfully (no constructor error) but
+    // `checkSchemaVersion` reads user_version ===
+    // 99 > 13 and returns `fail` → doctor report
+    // `exit_code` 2 → CLI surfaces `[doctor_failed]`.
+    // Use a fresh data home so we do not pollute the
+    // Core's `dataHome` for subsequent (k).
+    const localHome = makeDataHome("core-doctor-stale");
+    // Initialise the DB by calling `help` (the
+    // help command constructs the SQLiteMemoryStore,
+    // which runs the schema migrations on a fresh
+    // DB and creates the tables the doctor reads).
+    const initResult = runArtifactCli(localHome, ["help"]);
+    expect(initResult.exitCode).toBe(0);
+    {
+      const db = new DatabaseSync(join(localHome, "memory.sqlite"));
+      db.exec("PRAGMA user_version = 99");
+      db.close();
+    }
+    const doctorStale = runArtifactCli(localHome, ["doctor"]);
+    expect(
+      doctorStale.exitCode,
+      `doctor with stale user_version should fail with exit 2 (got ${doctorStale.exitCode}, stderr=${JSON.stringify(doctorStale.stderr)})`
+    ).toBe(2);
+    expect(doctorStale.stderr).toMatch(/\[doctor_failed\]/);
   });
 
   it("(k) clean shutdown", () => {
