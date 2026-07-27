@@ -95,6 +95,20 @@ import type { RequestContext } from "../request-context.js";
 export const CAPABILITY_FILENAME = "admin.cap";
 
 /**
+ * Stage 18 v1.1.2 follow-up (review by ora-8):
+ * the canonical capability token shape. A single
+ * exported `RegExp` keeps the validator and the
+ * store in lockstep — both layers reference the
+ * same constant so a future change to the token
+ * shape is a one-line edit. The regex matches
+ * exactly 64 hex chars (`0-9`, `a-f`); the
+ * `constantTimeEqual` comparison runs against the
+ * trimmed candidate, so the caller may pass the
+ * token with surrounding whitespace.
+ */
+export const CAPABILITY_TOKEN_SHAPE: RegExp = /^[0-9a-f]{64}$/;
+
+/**
  * The set of capability types the v1.1.2
  * release recognises. Each name maps to one
  * privileged operation:
@@ -532,7 +546,7 @@ function readCapabilityFromDisk(path: string): CapabilityRecord | undefined {
   }
   if (typeof parsed !== "object" || parsed === null) return undefined;
   const obj = parsed as Record<string, unknown>;
-  if (typeof obj.token !== "string" || !/^[0-9a-f]{64}$/.test(obj.token)) {
+  if (typeof obj.token !== "string" || !CAPABILITY_TOKEN_SHAPE.test(obj.token)) {
     return undefined;
   }
   if (typeof obj.created_at !== "string" || obj.created_at.length === 0) {
@@ -554,7 +568,7 @@ function parseCapabilityRecord(raw: string): CapabilityRecord {
     throw new Error("capability_malformed: not a JSON object");
   }
   const obj = parsed as Record<string, unknown>;
-  if (typeof obj.token !== "string" || !/^[0-9a-f]{64}$/.test(obj.token)) {
+  if (typeof obj.token !== "string" || !CAPABILITY_TOKEN_SHAPE.test(obj.token)) {
     throw new Error("capability_malformed: token is missing or not 64 hex chars");
   }
   if (typeof obj.created_at !== "string" || obj.created_at.length === 0) {
@@ -573,7 +587,7 @@ function parseCapabilityRecord(raw: string): CapabilityRecord {
 function sanitizeCapability(input: string | undefined | null): string | undefined {
   if (typeof input !== "string") return undefined;
   const trimmed = input.trim();
-  if (!/^[0-9a-f]{64}$/.test(trimmed)) return undefined;
+  if (!CAPABILITY_TOKEN_SHAPE.test(trimmed)) return undefined;
   return trimmed;
 }
 
@@ -730,7 +744,12 @@ export const _INTERNAL = {
   // canonical token length / charset
   // without copying the regex above.
   TOKEN_LENGTH: 64,
-  TOKEN_PATTERN: /^[0-9a-f]{64}$/,
+  // Stage 18 v1.1.2 follow-up (review by
+  // ora-8): reuse the exported
+  // `CAPABILITY_TOKEN_SHAPE` constant so
+  // the validator and the store share a
+  // single source of truth.
+  TOKEN_PATTERN: CAPABILITY_TOKEN_SHAPE,
   // The file mode the POSIX path enforces.
   POSIX_MODE: CAPABILITY_FILE_MODE,
   // The Windows ACL permission the ACL

@@ -201,6 +201,24 @@ export class MemoryService {
     return this.read.getMemory(id, accessedBy);
   }
 
+  /**
+   * Stage 18 v1.1.2 follow-up (review by ora-8):
+   * the public-boundary read that distinguishes
+   * `forbidden_visibility` from `not_found`. The
+   * MCP `get_memory` tool routes through this
+   * method so a caller without the
+   * `sensitivity_visibility` capability receives
+   * a stable `forbidden_visibility` error code
+   * (rather than `not_found`) and can branch on
+   * the failure mode without re-reading the row.
+   */
+  getMemoryWithVisibility(id: string): Result<
+    { entry: MemoryEntry; audit: MemoryAuditEvent[] },
+    "not_found" | "forbidden_visibility"
+  > {
+    return this.read.getMemoryWithVisibility(id);
+  }
+
   listMemories(filters: ListServiceFilters & { scope: "project"; project_id: string }): ListResult;
   listMemories(filters: ListServiceFilters & { scope: "project"; project_path: string }): ListResult;
   listMemories(filters: ListServiceFilters & { scope?: "global" }): ListResult;
@@ -437,7 +455,7 @@ export class MemoryService {
     reason?: string;
     actor_id?: string;
     capability?: string;
-  }):
+  }, ctx?: RequestContext):
     | {
         ok: true;
         memory_id: string;
@@ -445,6 +463,16 @@ export class MemoryService {
         next: MemoryEntry["trust_level"];
       }
     | { ok: false; error: "not_found" | "unauthorized" | "invalid_input"; message?: string } {
+    // Stage 18 v1.1.2 follow-up (review by ora-8):
+    // `peekEntry` is the write-path gate (the
+    // promotion is a trust-tier escalation). The
+    // SQL-boundary sensitivity predicate does
+    // NOT apply here — the row must be visible
+    // so the service can read the current
+    // `trust_level` and decide whether the
+    // transition is legal. The pre-follow-up
+    // overload (no options) is the explicit
+    // contract for this case.
     const entry = this.store.peekEntry(input.memory_id);
     if (entry === undefined) {
       return { ok: false, error: "not_found" };
@@ -473,7 +501,7 @@ export class MemoryService {
           previous: entry.trust_level,
           next: input.trust_level
         }
-      });
+      }, ctx);
       return { ok: false, error: "unauthorized", message: "trust promotion requires an operator capability; run `agent-recall admin grant` and supply the token" };
     }
     if (input.capability === undefined) {
@@ -492,13 +520,25 @@ export class MemoryService {
           previous: entry.trust_level,
           next: input.trust_level
         }
-      });
+      }, ctx);
       return { ok: false, error: "unauthorized", message: "trust promotion requires a capability token on the request" };
     }
+    // Stage 18 v1.1.2 follow-up (review by ora-8):
+    // prefer the caller's `RequestContext` for
+    // the authorization audit trail. The
+    // pre-follow-up implementation synthesised a
+    // fresh `randomUUID()` here, which made the
+    // `write_rejected` audit row unlinkable to
+    // the originating MCP request. The fix
+    // threads `ctx` through `appendAudit` and
+    // uses the caller's `request_id` /
+    // `session_id` / `tool_call_id` when
+    // available, falling back to a fresh UUID
+    // when the caller did not supply a context.
     const decision = this.capabilityStore.authorize({
       capability: input.capability,
       capability_type: "trust_promotion",
-      requestContext: buildRequestContext({
+      requestContext: ctx ?? buildRequestContext({
         ...(input.actor_id !== undefined ? { actor_override: input.actor_id } : {}),
         client_name: "memory-service",
         request_id: randomUUID()
@@ -520,7 +560,7 @@ export class MemoryService {
           previous: entry.trust_level,
           next: input.trust_level
         }
-      });
+      }, ctx);
       return { ok: false, error: "unauthorized", message: `trust promotion denied (${reason})` };
     }
     // Apply the new trust tier via a CAS update so
@@ -548,7 +588,7 @@ export class MemoryService {
         trusted_user_confirmation: true,
         capability_type: "trust_promotion"
       }
-    });
+    }, ctx);
     return { ok: true, memory_id: input.memory_id, previous, next: input.trust_level };
   }
 

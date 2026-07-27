@@ -207,6 +207,7 @@ export class MemoryMaintenanceService {
     const runMerge = (): { ok: true; keep_id: string; superseded_ids: string[]; changed: number } | { ok: false; reason: "stale_revision" | "target_missing" | "scope_mismatch" | "non_dedup_group" } => {
       const liveEntries: MemoryEntry[] = [];
       for (const id of input.target_ids) {
+        // write-path; sensitivity filter at the SQL boundary (peekEntry overload is safe here)
         const entry = this.ctx.store.peekEntry(id);
         if (entry === undefined || entry.status !== "active") {
           return { ok: false as const, reason: "target_missing" as const };
@@ -264,6 +265,7 @@ export class MemoryMaintenanceService {
     return this.ctx.store.transaction(() => {
       const forgotten: string[] = [];
       for (const id of input.target_ids) {
+        // write-path; sensitivity filter at the SQL boundary (peekEntry overload is safe here)
         const entry = this.ctx.store.peekEntry(id);
         if (entry === undefined) {
           return { ok: false as const, reason: "target_missing" as const };
@@ -371,6 +373,7 @@ export class MemoryMaintenanceService {
     for (const group of groups) {
       const liveEntries: MemoryEntry[] = [];
       for (const id of group.memory_ids) {
+        // write-path; sensitivity filter at the SQL boundary (peekEntry overload is safe here)
         const entry = this.ctx.store.peekEntry(id);
         if (entry !== undefined && entry.status === "active") liveEntries.push(entry);
       }
@@ -503,6 +506,7 @@ export class MemoryMaintenanceService {
     return this.ctx.store.transaction(() => {
       const forgotten: Array<{ memory_id: string; expires_at: string }> = [];
       for (const entry of expired) {
+        // write-path; sensitivity filter at the SQL boundary (peekEntry overload is safe here)
         const entryRef = this.ctx.store.peekEntry(entry.id);
         if (entryRef === undefined) continue;
         this.ctx.store.updateEntry(entry.id, {
@@ -780,6 +784,11 @@ export class MemoryMaintenanceService {
     reason: string;
     strategy: "keep_first" | "keep_newest";
   }, ctx?: RequestContext): { ok: true; keep_id: string; superseded_ids: string[]; changed: number } | { ok: false; reason: "stale_revision" | "target_missing" | "scope_mismatch" | "non_dedup_group" } {
+    // write-path; sensitivity filter at the SQL boundary (peekEntry overload is safe here).
+    // The public `applyPlannedGroupInTransaction` API is a thin wrapper around
+    // `mergePlannedGroup(..., inTransaction: true)`; the actual `peekEntry` lives
+    // in `mergePlannedGroup`. The comment is repeated here so future drift in
+    // the public surface is also hardened.
     return this.mergePlannedGroup({ ...input, inTransaction: true }, ctx);
   }
 

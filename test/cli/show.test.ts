@@ -82,4 +82,59 @@ describe("showCommand", () => {
     expect(result.stderr).toContain("usage");
     store.close();
   });
+
+  // Stage 18 v1.1.2 follow-up (review by ora-8):
+  // the CLI `show` command MUST apply the
+  // SQL-boundary sensitivity filter. A
+  // `sensitivity: "restricted"` row returns a
+  // stable `forbidden_visibility` error WITHOUT
+  // leaking title / body / tags / source /
+  // sensitivity. The fail-closed default
+  // (`actorMaxSensitivity: "normal"`) covers the
+  // operator-facing CLI; an admin-profile path
+  // is documented but out of scope here.
+  it("returns forbidden_visibility for a restricted row (fail-closed CLI default)", () => {
+    const dataHome = mkdtempSync(join(tmpdir(), "lm-cli-show-"));
+    const store = new SQLiteMemoryStore(join(dataHome, "memory.sqlite"));
+    // Pre-seed a `restricted` row directly via
+    // the store so the test does not depend on
+    // an operator capability.
+    store.insertEntry({
+      id: "mem_restricted_cli",
+      scope: "global",
+      type: "fact",
+      topic: "follow-up",
+      title: "secret title",
+      body: "secret body",
+      tags: ["secret"],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3,
+      status: "active",
+      created_at: "2026-07-27T00:00:00.000Z",
+      updated_at: "2026-07-27T00:00:00.000Z",
+      access_count: 0,
+      supersedes: [],
+      token_estimate: 1,
+      char_count: 2,
+      revision: 1,
+      writer_actor_id: "agent:test",
+      pinned: false,
+      trust_level: "agent_observed",
+      sensitivity: "restricted",
+      tier: "working",
+      metadata: {}
+    });
+    const args = parseArgs(["show", "mem_restricted_cli"]);
+    const result = showCommand({ dataHome, args, store });
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("forbidden_visibility");
+    // The error message MUST NOT leak the
+    // title / body / tags / source /
+    // sensitivity.
+    expect(result.stderr).not.toContain("secret title");
+    expect(result.stderr).not.toContain("secret body");
+    expect(result.stdout).toBe("");
+    store.close();
+  });
 });

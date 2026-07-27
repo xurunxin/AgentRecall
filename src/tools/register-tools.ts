@@ -505,7 +505,24 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
       service.exportMemoryContext(serviceInput<Parameters<MemoryService["exportMemoryContext"]>[0]>(input), ctx)
     ),
     remember: envelopeHandler("remember", memoryToolSchemas.remember, (input, _extra, ctx) => {
-      const result = service.remember(serviceInput<Parameters<MemoryService["remember"]>[0]>(input), ctx);
+      // Stage 18 v1.1.2 follow-up (review by ora-8):
+      // forward `capability` and `user_confirmed`
+      // explicitly to the service, mirroring the
+      // `update_memory` / `confirm_memory_trust`
+      // pattern. The pre-follow-up handler relied
+      // on `omitUndefined` to forward every
+      // defined key, which works for capability
+      // but is brittle against future schema
+      // drift. The explicit forwarding here is
+      // the documented v1.1.2 contract.
+      const casFields: { user_confirmed?: boolean; capability?: string } = {};
+      if (input.user_confirmed !== undefined) casFields.user_confirmed = input.user_confirmed;
+      if (input.capability !== undefined) casFields.capability = input.capability;
+      const payload: Parameters<MemoryService["remember"]>[0] = {
+        ...serviceInput<Parameters<MemoryService["remember"]>[0]>(input),
+        ...casFields
+      };
+      const result = service.remember(payload, ctx);
       // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
       // auto-capture provenance. Every successful
       // `remember` writes a `tool_call` link so the
@@ -541,7 +558,23 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
       // one release cycle so existing clients keep parsing
       // without errors; the value is dropped here.
       void input.accessed_by;
-      return service.getMemory(memoryId) ?? asNotFoundMemoryResult(memoryId);
+      // Stage 18 v1.1.2 follow-up (review by ora-8):
+      // route the read through
+      // `getMemoryWithVisibility` so the public
+      // boundary distinguishes
+      // `forbidden_visibility` (the row exists at
+      // a higher sensitivity) from `not_found`
+      // (the row does not exist). A caller
+      // without the `sensitivity_visibility`
+      // capability receives a stable
+      // `forbidden_visibility` error code on the
+      // v2 envelope's
+      // `structuredContent.error.code`; the row's
+      // title / body / tags / source /
+      // sensitivity are NOT surfaced.
+      const visibility = service.getMemoryWithVisibility(memoryId);
+      if (visibility.ok) return visibility;
+      return visibility;
     }),
     list_memories: envelopeHandler("list_memories", memoryToolSchemas.list_memories, (input) =>
       service.listMemories(serviceInput<Parameters<MemoryService["listMemories"]>[0]>(input))
@@ -711,7 +744,17 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
           ...(input.capability !== undefined ? { capability: input.capability } : {}),
           ...(input.reason !== undefined ? { reason: input.reason } : {}),
           actor_id: ctx?.actor_id
-        })
+          // Stage 18 v1.1.2 follow-up (review by
+          // ora-8): thread the `RequestContext`
+          // so every audit row produced by
+          // `confirmMemoryTrust` carries
+          // `request_id` / `session_id` /
+          // `tool_call_id`. The pre-follow-up
+          // implementation dropped `ctx` here,
+          // which made the audit trail
+          // unlinkable to the originating MCP
+          // request.
+        }, ctx)
     )
   };
 }

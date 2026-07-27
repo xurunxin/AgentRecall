@@ -77,6 +77,25 @@ export interface MemoryServerContext {
    * capability (see `src/index.ts`).
    */
   readonly capabilityStore?: CapabilityStore;
+  /**
+   * Stage 18 v1.1.2 follow-up (review by ora-8):
+   * the maximum sensitivity the resource layer
+   * is authorised to surface. The per-project
+   * single-memory resource (`memory://project/
+   * {project_id}/memory/{memory_id}`) MUST
+   * thread this value to the store's
+   * `peekEntry` overload so the SQL-boundary
+   * sensitivity predicate is enforced on the
+   * single-row read path (the pre-follow-up
+   * resource did `peekEntry(memoryId)` without
+   * the predicate and leaked restricted rows
+   * to callers without the
+   * `sensitivity_visibility` capability).
+   * Defaults to `"normal"` when the field is
+   * absent (older test mocks that pre-date
+   * the v1.1.2 follow-up).
+   */
+  readonly actorMaxSensitivity?: "normal" | "private" | "restricted";
 }
 
 type Variables = Record<string, string | string[] | undefined>;
@@ -274,12 +293,47 @@ export function registerMemoryResources(server: MemoryResourceServer, ctx: Memor
           identity_status: ctx.identityResolver.isAllowUnbound() ? "unbound" : "strict"
         });
       }
-      const entry = ctx.store.peekEntry(memoryId);
-      if (entry === undefined || entry.scope !== "project" || entry.project_id !== projectId) {
+      // Stage 18 v1.1.2 follow-up (review by ora-8):
+      // the SQL-boundary sensitivity filter must
+      // apply to the single-row read path. A row
+      // whose `sensitivity` exceeds the caller's
+      // `actorMaxSensitivity` returns
+      // `undefined` from the store's overloaded
+      // `peekEntry`. We distinguish
+      // "forbidden_visibility" from "not_found"
+      // by re-checking the underlying row with a
+      // privileged read (the same
+      // `peekEntry(memoryId)` call without
+      // `actorMaxSensitivity`). The
+      // `forbidden_visibility` error surfaces the
+      // stable code so a client can branch on
+      // the failure mode without parsing the
+      // human-readable message.
+      const filteredEntry = ctx.store.peekEntry(memoryId, {
+        actorMaxSensitivity: ctx.actorMaxSensitivity ?? "normal"
+      });
+      if (filteredEntry === undefined || filteredEntry.scope !== "project" || filteredEntry.project_id !== projectId) {
+        // Distinguish "forbidden_visibility" from
+        // "not_found" by reading the row without
+        // the filter. The privileged peek is
+        // safe: the caller is on the MCP server
+        // boundary; the SQL filter is the source
+        // of truth, the privileged peek is the
+        // diagnostic helper.
+        const raw = ctx.store.peekEntry(memoryId);
+        if (raw !== undefined && raw.scope === "project" && raw.project_id === projectId) {
+          return jsonResource(uri, {
+            ok: false,
+            error: "forbidden_visibility",
+            message: `memory ${memoryId} exceeds the caller's maximum sensitivity; run \`agent-recall admin grant\` and use the admin profile to surface this row`,
+            memory_id: memoryId,
+            entry_sensitivity: raw.sensitivity
+          });
+        }
         return jsonResource(uri, { ok: false, error: "not_found", message: `memory ${memoryId} not in project ${projectId}` });
       }
       const audit: MemoryAuditEvent[] = ctx.store.listAuditEvents({ memory_id: memoryId });
-      return jsonResource(uri, { entry, audit, identity_status: resolved.value.identity_status });
+      return jsonResource(uri, { entry: filteredEntry, audit, identity_status: resolved.value.identity_status });
     }
   );
 

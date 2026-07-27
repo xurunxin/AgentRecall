@@ -134,7 +134,17 @@ export async function main(): Promise<void> {
     defaultActor,
     identityResolver,
     activeProfile,
-    capabilityStore
+    capabilityStore,
+    // Stage 18 v1.1.2 follow-up (review by
+    // ora-8): the per-project single-memory
+    // resource (`memory://project/{id}/memory/
+    // {mid}`) MUST consult the same
+    // SQL-boundary sensitivity filter the
+    // service layer uses. With a loaded
+    // capability the resource layer raises the
+    // value to `"restricted"`; without one it
+    // stays at `"normal"` (fail-closed).
+    actorMaxSensitivity: capabilityStore.hasCapability() === true ? "restricted" : "normal"
   });
 
   const transport = new StdioServerTransport();

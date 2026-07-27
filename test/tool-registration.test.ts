@@ -20,6 +20,19 @@ function fakeService(overrides: Record<string, unknown> = {}) {
     remember: vi.fn(() => ({ ok: true, value: { memory_id: "mem_1", status: "active" } })),
     searchMemories: vi.fn(() => ({ items: [] })),
     getMemory: vi.fn(() => ({ entry: { id: "mem_1" }, audit: [] })),
+    // Stage 18 v1.1.2 follow-up (review by
+    // ora-8): the `get_memory` tool routes
+    // through `getMemoryWithVisibility` (the
+    // public-boundary read that distinguishes
+    // `forbidden_visibility` from `not_found`).
+    // The fake provides a default success shape
+    // so tests that pre-date the v1.1.2 follow-up
+    // keep working; tests that need to assert
+    // the new contract override the mock.
+    getMemoryWithVisibility: vi.fn(() => ({
+      ok: true,
+      value: { entry: { id: "mem_1" }, audit: [] }
+    })),
     listMemories: vi.fn(() => ({ items: [] })),
     updateMemory: vi.fn(() => ({ ok: true, value: { memory_id: "mem_1" } })),
     supersedeMemory: vi.fn(() => ({ ok: true, value: { memory_id: "mem_2" } })),
@@ -302,19 +315,24 @@ describe("memory tool schemas", () => {
       accessed_by: "agent:claude-code"
     });
 
-    // Handler does NOT forward the client-supplied
-    // accessed_by to the service; the service is called
-    // with just the memory id.
+    // Stage 18 v1.1.2 follow-up (review by ora-8):
+    // the handler routes through
+    // `getMemoryWithVisibility` (the public-boundary
+    // read that distinguishes `forbidden_visibility`
+    // from `not_found`). The mock is updated
+    // accordingly; the semantic ("the client-supplied
+    // actor is dropped; the service is called with
+    // just the memory id") is preserved.
     const service = fakeService();
-    service.getMemory.mockReturnValue({ entry: { id: "mem_1" }, audit: [] });
+    service.getMemoryWithVisibility.mockReturnValue({ ok: true, value: { entry: { id: "mem_1" }, audit: [] } });
     const handlers = createMemoryToolHandlers(service);
     await handlers.get_memory({ memory_id: "mem_1", accessed_by: "agent:claude-code" });
-    expect(service.getMemory).toHaveBeenCalledWith("mem_1");
+    expect(service.getMemoryWithVisibility).toHaveBeenCalledWith("mem_1");
 
     // And still calls with just the memory id when
     // accessed_by is absent.
     await handlers.get_memory({ memory_id: "mem_2" });
-    expect(service.getMemory).toHaveBeenLastCalledWith("mem_2");
+    expect(service.getMemoryWithVisibility).toHaveBeenLastCalledWith("mem_2");
   });
 });
 

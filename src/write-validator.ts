@@ -14,6 +14,15 @@ import {
   type Result
 } from "./domain.js";
 import { detectSecrets, type SecretFinding } from "./secret-detector.js";
+// Stage 18 v1.1.2 follow-up (review by ora-8):
+// reuse the canonical token shape exported by
+// the capability store. The validator is the
+// data-shape gate; the store performs the
+// authoritative comparison. Sharing a single
+// constant keeps the two layers in lockstep
+// (a future change to the token shape is a
+// one-line edit).
+import { CAPABILITY_TOKEN_SHAPE } from "./admin/capability.js";
 
 type ValidationError = "invalid_schema" | "secret_detected" | "invalid_state" | "unauthorized";
 type WritableStatus = Extract<MemoryStatus, "active" | "archived">;
@@ -708,7 +717,7 @@ function parseCapability(value: unknown, issues: string[]): string | undefined {
   }
   const trimmed = value.trim();
   if (trimmed.length === 0) return undefined;
-  if (!/^[0-9a-f]{64}$/.test(trimmed)) {
+  if (!CAPABILITY_TOKEN_SHAPE.test(trimmed)) {
     issues.push("capability");
     return undefined;
   }

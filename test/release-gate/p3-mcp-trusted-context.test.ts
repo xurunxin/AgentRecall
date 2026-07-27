@@ -112,26 +112,33 @@ describe("release-gate p3-mcp-trusted-context (Stage 16 PR-1 #11)", () => {
     // The schema still accepts `accessed_by` for one
     // release cycle; the handler drops it. The service
     // is called with just the memory id.
+    // Stage 18 v1.1.2 follow-up (review by ora-8):
+    // the handler routes through
+    // `getMemoryWithVisibility` (the public-boundary
+    // read that distinguishes
+    // `forbidden_visibility` from `not_found`); the
+    // spy is updated accordingly. The semantic
+    // ("the second actor arg is no longer forwarded")
+    // is the same.
     const r = service.remember(baseInput({ title: "t1", body: "b1" }));
     if (!r.ok) throw new Error("setup");
     const id = r.value.memory_id;
 
-    const handlers = createMemoryToolHandlers(service);
-    // Spy on the service's getMemory. We use a
-    // direct mock because the handler is async and the
-    // service is the only thing that can confirm the
-    // second argument is no longer forwarded.
-    const seen: Array<[string, string | undefined]> = [];
+    // Spy on the service's `getMemoryWithVisibility`.
+    const seen: Array<[string]> = [];
     const svc = {
       ...service,
-      getMemory: (idArg: string, actorArg?: string) => {
-        seen.push([idArg, actorArg]);
-        return service.getMemory(idArg, actorArg);
+      getMemoryWithVisibility: (idArg: string) => {
+        seen.push([idArg]);
+        return service.getMemoryWithVisibility(idArg);
       }
     } as unknown as MemoryService;
     const hs = createMemoryToolHandlers(svc);
     await hs.get_memory({ memory_id: id, accessed_by: "agent:malicious-impersonator" });
-    expect(seen).toEqual([[id, undefined]]);
+    // The handler dropped `accessed_by` and called
+    // the public-boundary read with the memory id
+    // only.
+    expect(seen).toEqual([[id]]);
   });
 
   it("SQLiteMemoryStore.peekEntry is a pure read (no access state change)", () => {

@@ -9,8 +9,32 @@ export function showCommand(ctx: CliContext): CliResult {
   if (id === undefined) {
     return { exitCode: 1, stdout: "", stderr: "usage: agent-recall show <memory_id>" };
   }
-  const entry = ctx.store.peekEntry(id);
+  // Stage 18 v1.1.2 follow-up (review by ora-8):
+  // the CLI read path MUST apply the same
+  // SQL-boundary sensitivity filter as the MCP /
+  // service layer. The CLI is fail-closed
+  // (`actorMaxSensitivity: "normal"`) so a
+  // `private` / `restricted` row returns a
+  // stable `forbidden_visibility` error without
+  // leaking title / body / tags. A future
+  // operator-facing flag can opt in to the
+  // broader sensitivity; the v1.1.2 contract
+  // pins the default to `"normal"`.
+  const entry = ctx.store.peekEntry(id, { actorMaxSensitivity: "normal" });
   if (entry === undefined) {
+    // Distinguish `forbidden_visibility` from
+    // `not_found` so a script can branch on the
+    // failure mode. The privileged peek is the
+    // diagnostic helper (mirrors the MCP
+    // resource path).
+    const raw = ctx.store.peekEntry(id);
+    if (raw !== undefined) {
+      return {
+        exitCode: 1,
+        stdout: "",
+        stderr: `forbidden_visibility: memory ${id} exceeds the operator's maximum sensitivity (${raw.sensitivity}); install an admin capability via \`agent-recall admin grant\` to surface this row`
+      };
+    }
     return { exitCode: 1, stdout: "", stderr: `memory not found: ${id}` };
   }
   const audit = ctx.store.getAuditEvents(id);

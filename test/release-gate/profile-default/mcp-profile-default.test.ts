@@ -50,6 +50,7 @@ import {
   EXTENDED_TOOL_NAMES
 } from "../../../src/tools/register-tools.js";
 import { resolveActiveProfile } from "../../../src/tools/profile.js";
+import { SQLiteMemoryStore } from "../../../src/sqlite-store.js";
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), "../../../..");
 const SERVER_ENTRY = join(REPO_ROOT, "dist", "src", "index.js");
@@ -332,6 +333,112 @@ describe("release-gate mcp-profile-default (Stage 17 v1.1.2 #22)", () => {
     } finally {
       try {
         rmSync(dataHomeLocal, { recursive: true, force: true });
+      } catch {
+        // best effort
+      }
+    }
+  });
+
+  // Stage 18 v1.1.2 follow-up (review by ora-8):
+  // an unauthorized call to `get_memory` on a
+  // `sensitivity: "restricted"` row must return a
+  // structured `forbidden_visibility` error; the
+  // title / body / tags / source / sensitivity
+  // MUST NOT appear in the response. Under the
+  // default Core profile the
+  // `actorMaxSensitivity` is `"normal"` (the v1.1.2
+  // fail-closed default — no capability is
+  // loaded), so a pre-seeded `restricted` row is
+  // invisible at the SQL boundary.
+  it("get_memory returns forbidden_visibility for a restricted row under the default fail-closed profile", async () => {
+    if (!HAS_BUILT_ARTIFACT) {
+      throw new Error(
+        "release-gate test requires built artifact: run npm run build before running this suite"
+      );
+    }
+    // Pre-create the data home, seed a
+    // restricted row directly via the store,
+    // then spawn the server.
+    const seedDataHome = mkdtempSync(join(tmpdir(), "lm-rg-profile-sens-"));
+    try {
+      const seedStore = new SQLiteMemoryStore(join(seedDataHome, "memory.sqlite"));
+      seedStore.insertEntry({
+        id: "mem_restricted_seed",
+        scope: "global",
+        type: "fact",
+        topic: "follow-up",
+        title: "secret title",
+        body: "secret body",
+        tags: ["secret"],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3,
+        status: "active",
+        created_at: "2026-07-27T00:00:00.000Z",
+        updated_at: "2026-07-27T00:00:00.000Z",
+        access_count: 0,
+        supersedes: [],
+        token_estimate: 1,
+        char_count: 2,
+        revision: 1,
+        writer_actor_id: "agent:test",
+        pinned: false,
+        trust_level: "agent_observed",
+        sensitivity: "restricted",
+        tier: "working",
+        metadata: {}
+      });
+      seedStore.close();
+      // Spawn the server against the seeded data
+      // home with the default (Core) profile.
+      // The default Core profile is fail-closed
+      // (`actorMaxSensitivity: "normal"`); the
+      // admin profile refuses to start without
+      // a capability, which would mask the SQL
+      // filter test. The test explicitly unsets
+      // `AGENT_RECALL_PROFILE` so it runs under
+      // Core even when the parent process env
+      // sets it (the canonical
+      // `AGENT_RECALL_PROFILE=admin` run is
+      // covered by `mcp-admin-default.test.ts`).
+      dataHome = seedDataHome;
+      const env: Record<string, string> = {
+        ...(process.env as Record<string, string>),
+        AGENT_RECALL_HOME: seedDataHome,
+        AGENT_RECALL_PROFILE: "", // explicit empty -> Core
+        AGENT_RECALL_SUPPRESS_MCP_DEPRECATION: "1",
+        AGENT_RECALL_VERBOSE_STDIO: "0"
+      };
+      transport = new StdioClientTransport({
+        command: process.execPath,
+        args: [SERVER_ENTRY],
+        env,
+        stderr: "pipe"
+      });
+      client = new Client(
+        { name: "profile-default-sens-e2e", version: "1.1.2" },
+        { capabilities: {} }
+      );
+      await client.connect(transport);
+      serverPid = transport.pid ?? undefined;
+      if (client === undefined) throw new Error("client not initialised");
+      const r = (await client.callTool({
+        name: "get_memory",
+        arguments: { memory_id: "mem_restricted_seed" }
+      })) as { isError?: boolean; structuredContent?: { ok: boolean; data?: unknown; error?: { code: string; message: string; details?: Record<string, unknown> } } };
+      expect(r.isError).toBe(true);
+      const sc = r.structuredContent;
+      expect(sc?.ok).toBe(false);
+      expect(sc?.error?.code).toBe("forbidden_visibility");
+      // The error MUST NOT leak the title / body
+      // / tags / source / sensitivity.
+      const combined = JSON.stringify(r);
+      expect(combined).not.toContain("secret title");
+      expect(combined).not.toContain("secret body");
+      expect(combined).not.toContain("secret");
+    } finally {
+      try {
+        rmSync(seedDataHome, { recursive: true, force: true });
       } catch {
         // best effort
       }

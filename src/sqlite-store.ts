@@ -1781,7 +1781,58 @@ export class SQLiteMemoryStore {
    * `recordMemoryAccess(memoryId, actorId)` explicitly after
    * the read.
    */
-  peekEntry(id: string): MemoryEntry | undefined {
+  peekEntry(id: string): MemoryEntry | undefined;
+  peekEntry(
+    id: string,
+    options: { actorMaxSensitivity?: "normal" | "private" | "restricted" }
+  ): MemoryEntry | undefined;
+  peekEntry(
+    id: string,
+    options: { actorMaxSensitivity?: "normal" | "private" | "restricted" } = {}
+  ): MemoryEntry | undefined {
+    // Stage 18 v1.1.2 follow-up (review by ora-8):
+    // the pre-follow-up `peekEntry` did
+    // `SELECT * FROM memory_entries WHERE id = ?`
+    // without the SQL-boundary sensitivity
+    // predicate, which let a caller bypass the
+    // filter by asking for one id at a time.
+    // The fix is to apply the same
+    // `actor_max_sensitivity` filter that
+    // `listEntries` / `searchEntries` apply. The
+    // default (`"normal"`) is fail-closed: a row
+    // whose `sensitivity` exceeds the value is
+    // hidden from the response (the row's
+    // existence is not even probed). A `undefined`
+    // option behaves exactly like the pre-follow-up
+    // contract — kept for backward compatibility
+    // with the maintenance / write paths that
+    // intentionally need to read every row.
+    if (options.actorMaxSensitivity === undefined) {
+      return this.readEntry(id);
+    }
+    // Two-step read: probe the visibility at the
+    // SQL boundary (so the row's existence is not
+    // leaked to a caller without the
+    // `sensitivity_visibility` capability), then
+    // decode via the canonical `readEntry` path
+    // so the derived `last_accessed_by` cache (the
+    // re-derivation from `memory_accesses`) is
+    // preserved. The two-step approach keeps the
+    // SQL filter as the only place sensitivity is
+    // decided and re-uses the existing decode /
+    // access-derivation logic byte-for-byte.
+    const order = options.actorMaxSensitivity === "restricted"
+      ? 3
+      : options.actorMaxSensitivity === "private"
+        ? 2
+        : 1;
+    const probe = this.db
+      .prepare(
+        `SELECT 1 FROM memory_entries WHERE id = ? AND ` +
+          `(CASE sensitivity WHEN 'restricted' THEN 3 WHEN 'private' THEN 2 ELSE 1 END) <= ?`
+      )
+      .get(id, order) as { 1: number } | undefined;
+    if (probe === undefined) return undefined;
     return this.readEntry(id);
   }
 

@@ -27,6 +27,7 @@ import {
   type ProjectScope,
   type Result
 } from "../domain.js";
+import type { MemorySensitivity } from "../write-validator.js";
 import { MarkdownExporter } from "../markdown-exporter.js";
 import { resolveMemoryScope, type ProjectIdentityResolver } from "../scope-resolver.js";
 import { CURRENT_SCHEMA_VERSION } from "../sqlite-store.js";
@@ -155,8 +156,67 @@ export class MemoryReadService {
      */
     accessedBy?: string
   ): { entry: MemoryEntry; audit: MemoryAuditEvent[] } | undefined {
-    const entry = this.ctx.store.peekEntry(id);
+    void accessedBy;
+    // Stage 18 v1.1.2 follow-up (review by ora-8):
+    // thread the read service's
+    // `actorMaxSensitivity` to the store's
+    // `peekEntry` overload so the single-row
+    // read goes through the same SQL-boundary
+    // sensitivity predicate as `listEntries`
+    // and `searchEntries`. A row whose
+    // `sensitivity` exceeds the value returns
+    // `undefined` — the caller cannot probe
+    // whether the row exists.
+    const entry = this.ctx.store.peekEntry(id, {
+      actorMaxSensitivity: this.ctx.actorMaxSensitivity ?? "normal"
+    });
     return entry === undefined ? undefined : { entry, audit: this.ctx.store.getAuditEvents(id) };
+  }
+
+  /**
+   * Stage 18 v1.1.2 follow-up (review by ora-8):
+   * the public-boundary read that distinguishes
+   * `forbidden_visibility` from `not_found`. The
+   * SQL filter is the source of truth; this
+   * method does a privileged peek when the
+   * filtered peek returns `undefined` to
+   * determine whether the row actually exists
+   * at a higher sensitivity. The MCP `get_memory`
+   * tool and the per-project resource route
+   * through this method so a client without
+   * the `sensitivity_visibility` capability
+   * receives a stable `forbidden_visibility`
+   * error code (NOT `not_found`) so it can
+   * branch on the failure mode.
+   */
+  getMemoryWithVisibility(id: string): Result<
+    { entry: MemoryEntry; audit: MemoryAuditEvent[] },
+    "not_found" | "forbidden_visibility"
+  > {
+    const filteredEntry = this.ctx.store.peekEntry(id, {
+      actorMaxSensitivity: this.ctx.actorMaxSensitivity ?? "normal"
+    });
+    if (filteredEntry !== undefined) {
+      return ok({ entry: filteredEntry, audit: this.ctx.store.getAuditEvents(id) });
+    }
+    // The filtered peek returned `undefined`.
+    // Two possibilities:
+    //   - the row does not exist (`not_found`);
+    //   - the row exists at a higher sensitivity
+    //     (`forbidden_visibility`).
+    // The privileged peek is a diagnostic
+    // helper, NOT the source of truth — the SQL
+    // filter is the source of truth for the
+    // read contract.
+    const raw = this.ctx.store.peekEntry(id);
+    if (raw === undefined) {
+      return err("not_found", `memory ${id} not found`, { memory_id: id });
+    }
+    return err(
+      "forbidden_visibility",
+      `memory ${id} exceeds the caller's maximum sensitivity; run \`agent-recall admin grant\` and use the admin profile to surface this row`,
+      { memory_id: id, entry_sensitivity: raw.sensitivity as MemorySensitivity }
+    );
   }
 
   listMemories(filters: ListServiceFilters & { scope: "project"; project_id: string }): ListResult;
