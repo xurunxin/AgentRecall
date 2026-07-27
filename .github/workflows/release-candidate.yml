@@ -1,0 +1,317 @@
+name: Release Candidate Gate
+
+on:
+  push:
+    branches: ["rc-*"]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: release-candidate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  matrix:
+    name: Matrix ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ["24"]
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Verify exact candidate SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Full release-critical test suite
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}
+          CI: "true"
+          STRESS_PROFILE: ci
+          RELEASE_EVIDENCE_SOURCE: matrix-full
+          MATRIX_OS: ${{ matrix.os }}
+          MATRIX_NODE_VERSION: ${{ matrix.node }}
+        run: |
+          set -euo pipefail
+          npm test -- --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-full.json"
+          node scripts/release-evidence.mjs --assert-vitest "$RUNNER_TEMP/vitest-full.json" "$RUNNER_TEMP/test-summary-matrix-full-${{ matrix.os }}.json"
+
+      - name: Migration tests v0 to v13
+        shell: bash
+        env:
+          CI: "true"
+          MATRIX_OS: ${{ matrix.os }}
+          MATRIX_NODE_VERSION: ${{ matrix.node }}
+          RELEASE_EVIDENCE_SOURCE: migration
+        run: |
+          set -euo pipefail
+          npx vitest run \
+            test/sqlite-store-migration.test.ts \
+            test/sqlite-store-migration-v3.test.ts \
+            test/release-gate/p0-migration.test.ts \
+            test/release-gate/p0-migration-backup.test.ts \
+            --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-migration.json"
+          node scripts/release-evidence.mjs --assert-vitest "$RUNNER_TEMP/vitest-migration.json" "$RUNNER_TEMP/test-summary-migration-${{ matrix.os }}.json"
+          node scripts/release-evidence.mjs --write-migration-summary "$RUNNER_TEMP/migration-summary-${{ matrix.os }}.json"
+
+      - name: Genuine concurrent stress release profile
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}
+          CI: "true"
+          STRESS_PROFILE: release
+          RELEASE_EVIDENCE_SOURCE: stress-release
+          MATRIX_OS: ${{ matrix.os }}
+          MATRIX_NODE_VERSION: ${{ matrix.node }}
+        run: |
+          set -euo pipefail
+          npx vitest run test/multi-process-stress.test.ts --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-stress.json"
+          node scripts/release-evidence.mjs --assert-vitest "$RUNNER_TEMP/vitest-stress.json" "$RUNNER_TEMP/test-summary-stress-${{ matrix.os }}.json"
+
+      - name: Backup and restore
+        shell: bash
+        env:
+          CI: "true"
+          MATRIX_OS: ${{ matrix.os }}
+          AGENT_RECALL_HOME: ${{ runner.temp }}/agent-recall-backup-${{ matrix.os }}
+        run: |
+          set -euo pipefail
+          npx vitest run test/backup.test.ts test/cli/backup.test.ts test/release-gate/p0-backup.test.ts test/release-gate/p0-migration-backup.test.ts
+          node dist/bin/agent-recall.js --data-home "$AGENT_RECALL_HOME" help > /dev/null
+          node dist/bin/agent-recall.js --data-home "$AGENT_RECALL_HOME" backup
+          BACKUP_PATH="$(node -e 'const fs=require("node:fs"); const path=require("node:path"); const dir=path.join(process.env.AGENT_RECALL_HOME,"backups"); const files=fs.readdirSync(dir).filter((name)=>name.endsWith(".sqlite")).sort(); if(files.length===0) process.exit(1); process.stdout.write(path.join(dir,files[files.length-1]));')"
+          node dist/bin/agent-recall.js --data-home "$AGENT_RECALL_HOME" restore --from "$BACKUP_PATH" --confirm
+
+      - name: Strict snapshot and import round-trip
+        shell: bash
+        env:
+          CI: "true"
+          MATRIX_OS: ${{ matrix.os }}
+        run: |
+          set -euo pipefail
+          npx vitest run \
+            test/release-gate/p1-atomic-import.test.ts \
+            test/release-gate/p3-strict-import.test.ts \
+            test/release-gate/p3-full-history-import.test.ts \
+            test/release-gate/p3-import-preflight-budget.test.ts \
+            test/release-gate/p3-import-batch-lineage.test.ts \
+            test/cli/import-preflight.test.ts \
+            test/portability-import.test.ts
+
+      - name: Cleanup and process leak checks
+        shell: bash
+        env:
+          CI: "true"
+          MATRIX_OS: ${{ matrix.os }}
+        run: |
+          set -euo pipefail
+          npx vitest run test/release-gate/p0-cleanup.test.ts test/multi-process-stress.test.ts --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-cleanup.json"
+          node scripts/release-evidence.mjs --assert-vitest "$RUNNER_TEMP/vitest-cleanup.json" "$RUNNER_TEMP/test-summary-cleanup-${{ matrix.os }}.json"
+
+      - name: MCP black-box source/build smoke
+        shell: bash
+        env:
+          CI: "true"
+          MATRIX_OS: ${{ matrix.os }}
+          AGENT_RECALL_SUPPRESS_MCP_DEPRECATION: "1"
+        run: |
+          set -euo pipefail
+          npx vitest run \
+            test/blackbox/mcp-client-e2e.test.ts \
+            test/blackbox/mcp-client-e2e-extended.test.ts \
+            test/blackbox/mcp-all-tools-e2e-core.test.ts \
+            test/blackbox/mcp-all-tools-e2e-extended.test.ts \
+            test/release-gate/admin-default/mcp-admin-default.test.ts
+
+      - name: Verify release artifact globs
+        run: npm run verify:artifacts
+
+      - name: Upload matrix evidence fragments
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence-fragment-matrix-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/test-summary-*.json
+            ${{ runner.temp }}/migration-summary-*.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload built candidate artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-dist-${{ matrix.os }}-${{ github.sha }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 14
+
+  mcp-blackbox-extracted:
+    name: Extracted artifact MCP ${{ matrix.os }} / Node ${{ matrix.node }}
+    needs: matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ["24"]
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Verify exact candidate SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install test dependencies
+        run: npm ci
+
+      - name: Download built candidate artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: candidate-dist-${{ matrix.os }}-${{ github.sha }}
+          path: dist
+
+      - name: Run all profile MCP black-box tests against extracted artifact
+        shell: bash
+        env:
+          CI: "true"
+          AGENT_RECALL_SUPPRESS_MCP_DEPRECATION: "1"
+          MATRIX_OS: ${{ matrix.os }}
+          MATRIX_NODE_VERSION: ${{ matrix.node }}
+          RELEASE_EVIDENCE_SOURCE: mcp-blackbox-extracted
+        run: |
+          set -euo pipefail
+          npx vitest run \
+            test/blackbox/mcp-client-e2e.test.ts \
+            test/blackbox/mcp-client-e2e-extended.test.ts \
+            test/blackbox/mcp-all-tools-e2e-core.test.ts \
+            test/blackbox/mcp-all-tools-e2e-extended.test.ts \
+            test/release-gate/admin-default/mcp-admin-default.test.ts \
+            --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-extracted.json"
+          node scripts/release-evidence.mjs --assert-vitest "$RUNNER_TEMP/vitest-extracted.json" "$RUNNER_TEMP/test-summary-extracted-${{ matrix.os }}.json"
+
+      - name: Upload extracted MCP evidence fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence-fragment-extracted-${{ matrix.os }}
+          path: ${{ runner.temp }}/test-summary-extracted-${{ matrix.os }}.json
+          if-no-files-found: error
+          retention-days: 14
+
+  verify-artifact-globs:
+    name: Verify artifact globs
+    needs: matrix
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build candidate
+        run: npm run build
+
+      - name: Verify release artifact globs
+        run: npm run verify:artifacts
+
+  record-evidence:
+    name: Record release evidence
+    if: ${{ always() }}
+    needs: [matrix, mcp-blackbox-extracted, verify-artifact-globs]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any release-critical job failed or was skipped
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ needs.matrix.result }}" = success
+          test "${{ needs.mcp-blackbox-extracted.result }}" = success
+          test "${{ needs.verify-artifact-globs.result }}" = success
+
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download all evidence fragments
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-evidence-fragment-*
+          path: ${{ runner.temp }}/evidence-fragments
+          merge-multiple: true
+
+      - name: Generate and verify release evidence
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_EVIDENCE_ARTIFACTS_JSON: '[{"name":"release-evidence.json","sha256":null},{"name":"release-candidate.json","sha256":null}]'
+          RELEASE_EVIDENCE_CONCLUSION: success
+        run: |
+          set -euo pipefail
+          node scripts/release-evidence.mjs
+          node scripts/verify-release-evidence.mjs "$RUNNER_TEMP/release-evidence.json"
+          cp "$RUNNER_TEMP/release-evidence.json" release-evidence.json
+          cp "$RUNNER_TEMP/release-candidate.json" release-candidate.json
+
+      - name: Upload release evidence artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence-${{ github.sha }}
+          path: |
+            release-evidence.json
+            release-candidate.json
+          if-no-files-found: error
+          retention-days: 90

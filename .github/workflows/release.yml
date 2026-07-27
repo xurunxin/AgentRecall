@@ -1,32 +1,12 @@
 # .github/workflows/release.yml
 #
-# Stage 13 PR11 (spec § 11.2): the cross-platform
-# packaging smoke. Triggered on a tag push matching
-# `v*` (e.g. `v1.0.0`); also runnable manually via
-# `workflow_dispatch` for a pre-release dry run.
+# Tag-only publication smoke. A release tag is accepted only
+# when its commit is the exact commit recorded by a successful
+# Release Candidate Gate workflow. Legacy commit-status contexts
+# are intentionally not used as the release gate.
 #
-# What it does:
-#   1. Build `dist/` on each target OS.
-#   2. Pack the distribution into a `.tar.gz` (linux
-#      / mac) or `.zip` (windows) with a manifest
-#      listing the entry points.
-#   3. Smoke-test the package in a clean checkout:
-#      install nothing, untar/zip into a fresh dir,
-#      run `node dist/src/index.js` (MCP) and
-#      `node dist/bin/agent-recall.js help` (CLI).
-#      The MCP server uses stdio so we just confirm
-#      it starts and reports the protocol version.
-#
-# Tagging convention:
-#   git tag v1.0.0
-#   git push origin v1.0.0
-# The matrix produces 3 artifacts:
-#   agent-recall-1.0.0-linux-x64.tar.gz
-#   agent-recall-1.0.0-darwin-x64.tar.gz
-#   agent-recall-1.0.0-windows-x64.zip
-# Upload them to a GitHub Release via
-# `softprops/action-gh-release@v2` (or pin a known
-# version once we land this).
+# The package and smoke matrix remains cross-platform so the
+# published archives are built and exercised on all target OSes.
 
 name: Release
 
@@ -34,18 +14,102 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      dry_run:
-        description: "Skip the GitHub Release publish step"
-        required: false
-        default: "true"
 
 permissions:
   contents: write
+  actions: read
 
 jobs:
+  verify-release-evidence:
+    name: Verify exact candidate evidence
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact tag commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Resolve successful candidate workflow for this SHA
+        id: candidate
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "release-candidate.yml",
+              event: "push",
+              status: "completed",
+              per_page: 100
+            });
+            const candidate = runs.find((run) => run.head_sha === context.sha && run.conclusion === "success");
+            if (!candidate) {
+              core.setFailed(`no successful release-candidate.yml run verifies ${context.sha}`);
+              return;
+            }
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: candidate.id,
+              per_page: 100
+            });
+            const evidence = artifacts.find((artifact) => artifact.name === `release-evidence-${context.sha}` && !artifact.expired);
+            if (!evidence) {
+              core.setFailed(`candidate run ${candidate.id} has no release evidence artifact for ${context.sha}`);
+              return;
+            }
+            core.setOutput("run_id", String(candidate.id));
+            core.setOutput("workflow_url", candidate.html_url);
+            core.setOutput("conclusion", candidate.conclusion);
+
+      - name: Download release evidence artifact
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.candidate.outputs.run_id }}
+          name: release-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/release-evidence
+
+      - name: Verify tag commit SHA equals candidate SHA
+        shell: bash
+        env:
+          CANDIDATE_WORKFLOW_URL: ${{ steps.candidate.outputs.workflow_url }}
+          CANDIDATE_CONCLUSION: ${{ steps.candidate.outputs.conclusion }}
+        run: |
+          set -euo pipefail
+          tag_commit_sha="$(git rev-parse HEAD)"
+          candidate_sha="$(node -e 'const fs=require("node:fs"); const p=process.argv[1]; const e=JSON.parse(fs.readFileSync(p,"utf8")); process.stdout.write(e.release_commit);' "$RUNNER_TEMP/release-evidence/release-candidate.json")"
+          if [ "$tag_commit_sha" != "$GITHUB_SHA" ]; then
+            echo "tag_commit_sha does not equal GITHUB_SHA"
+            exit 1
+          fi
+          if [ "$tag_commit_sha" != "$candidate_sha" ]; then
+            echo "tag_commit_sha does not equal verified candidate release_commit"
+            exit 1
+          fi
+          test -n "$CANDIDATE_WORKFLOW_URL"
+          test "$CANDIDATE_CONCLUSION" = success
+
+      - name: Verify release-evidence.json contract
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Run evidence verifier
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+        run: node scripts/verify-release-evidence.mjs "$RUNNER_TEMP/release-evidence/release-evidence.json"
+
   package:
+    needs: verify-release-evidence
+
     name: Package ${{ matrix.os }} / Node ${{ matrix.node }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -65,7 +129,10 @@ jobs:
             archive: zip
             suffix: windows-x64
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout exact tag commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Set up Node.js ${{ matrix.node }}
         uses: actions/setup-node@v4
@@ -107,7 +174,7 @@ jobs:
           mkdir -p "$STAGE"
           cp -R dist "$STAGE/dist"
           cp package.json "$STAGE/package.json"
-          cp README.md "$STAGE/README.md" 2>/dev/null || true
+          cp README.md "$STAGE/README.md"
           if [ -f LICENSE ]; then cp LICENSE "$STAGE/LICENSE"; fi
           echo "package contents:"
           find "$STAGE" -maxdepth 3 -type f | sort
@@ -117,11 +184,7 @@ jobs:
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
-          if [ -z "$VERSION" ]; then
-            # workflow_dispatch on a non-tag ref:
-            # fall back to the package.json version.
-            VERSION="$(node -e "process.stdout.write(require('./package.json').version)")"
-          fi
+          test -n "$VERSION"
           STAGE="stage-agent-recall-${{ matrix.suffix }}"
           if [ "${{ matrix.archive }}" = "tar" ]; then
             tar -czf "agent-recall-${VERSION}-${{ matrix.suffix }}.tar.gz" -C "$STAGE" .

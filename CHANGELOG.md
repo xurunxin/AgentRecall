@@ -5,6 +5,36 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [1.1.2] — Stage 18 v1.1.2 release candidate gate (#27, Task 8)
+
+### Added
+
+- **Release Candidate Gate** — pushing an exact commit to an `rc-*` branch
+  runs the release-critical Ubuntu / macOS / Windows matrix on Node 24,
+  including the release concurrency profile, migrations, backup / restore,
+  strict snapshot import, cleanup, and artifact-glob checks.
+- **Exact tag guard** — `release.yml` is tag-only and refuses to package a tag
+  unless a successful `release-candidate.yml` run has `head_sha` equal to the
+  tag commit SHA. The guard uses the GitHub Actions workflow URL and
+  conclusion, not legacy commit-status contexts.
+- **`release-evidence.json` contract** — the candidate artifact records
+  `candidate_sha` / `release_commit`, matrix OS / Node / job URLs / conclusions /
+  durations, test counts, migration results for v0 through v13, artifact names,
+  `sha256_checksums`, and known non-blocking limits. The evidence verifier
+  fails closed on a missing field, failed test, skipped release-critical test,
+  or SHA mismatch.
+
+### Known non-blocking limits
+
+- Task 9 will replace the extracted built-`dist` MCP fixture with the final
+  extracted package artifact; the candidate job and all profile test wiring are
+  already present in this task.
+- Task 10 will populate real SHA-256 values for release archives; this task
+  preserves the `artifacts` and `sha256_checksums` fields as explicit JSON
+  placeholders rather than claiming hashes that were not computed.
+- GitHub Actions runs are not executed locally; operators must push the frozen
+  `rc-*` commit and retain the resulting workflow URL in issue #19.
+
 ## [1.1.2] — Stage 18 v1.1.2 (Authoritative import preflight + aggregate budgets, issue #24, task 5)
 
 The v1.1.1 follow-up roadmap left issue **#24** on the

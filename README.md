@@ -429,6 +429,36 @@ Generated markdown exports are stored at:
 
 Markdown exports are for inspection and handoff. Manual edits under `exports/` may be overwritten by `maintain_memories` with `action: "rebuild_markdown_index"`.
 
+## Release Candidate Gate
+
+Operators publish only from a commit with exact, retained release evidence:
+
+1. Freeze the intended commit and push it to an `rc-*` branch, for example:
+   `git push origin HEAD:rc-1.1.2-candidate`. This triggers
+   `.github/workflows/release-candidate.yml` on Ubuntu, macOS, and Windows with
+   Node 24. Do not add release-blocking changes after the run; a new commit
+   requires a new candidate run and invalidates the earlier evidence.
+2. Wait for the `Release Candidate Gate` workflow to finish successfully. The
+   run checks the exact candidate SHA, release stress profile, migrations,
+   backup / restore, strict snapshot import, cleanup, MCP profiles, and
+   artifact globs. It uploads `release-evidence.json` and
+   `release-candidate.json`.
+3. Before tagging, copy the candidate commit SHA and the workflow run URL into
+   [issue #19](https://github.com/xurx/agent-recall/issues/19). In a review or
+   issue comment, cite both values explicitly, for example:
+   `candidate SHA: <40-char SHA>; workflow:
+   https://github.com/xurx/agent-recall/actions/runs/<run-id>`.
+4. Push the release tag only after the evidence is green:
+   `git tag v1.1.2 <candidate-sha> && git push origin v1.1.2`. `release.yml`
+   finds a successful candidate workflow for that exact SHA, verifies the
+   evidence artifact and `release_commit`, and fails closed if the tag points
+   anywhere else. A tag cannot rely on legacy commit-status contexts alone.
+
+The evidence artifact is the operator's audit link: it contains the candidate
+SHA, workflow URL and job URLs with conclusions and durations, OS / Node details,
+test and migration counts, artifact names, and known non-blocking limits. The
+real archive hashes remain explicit placeholders until Task 10 completes.
+
 ## Changelog
 
 Stage-level changes are tracked in [`CHANGELOG.md`](./CHANGELOG.md).

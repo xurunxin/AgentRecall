@@ -29,6 +29,8 @@ import { fileURLToPath } from "node:url";
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), "..", "..");
 const PKG_PATH = join(REPO_ROOT, "package.json");
 const DIST_ENTRY = join(REPO_ROOT, "dist", "src", "index.js");
+const RELEASE_WORKFLOW_PATH = join(REPO_ROOT, ".github", "workflows", "release.yml");
+const CANDIDATE_WORKFLOW_PATH = join(REPO_ROOT, ".github", "workflows", "release-candidate.yml");
 
 function fail(message) {
   console.error(`\u2717 ${message}`);
@@ -113,7 +115,45 @@ function main() {
     console.log("- package.json files: (not set; release workflow globs the dist/ tree)");
   }
 
-  // 7. The release workflow's smoke step expects
+  // 7. The release and candidate workflows must both
+  // keep the artifact contract executable. This check is
+  // deliberately textual and dependency-free: it catches
+  // a workflow edit that removes the verification step,
+  // drops the Windows zip glob, or changes the Node 24
+  // candidate matrix without requiring a YAML package.
+  if (!existsSync(CANDIDATE_WORKFLOW_PATH)) {
+    fail(".github/workflows/release-candidate.yml is missing");
+    return;
+  }
+  if (!existsSync(RELEASE_WORKFLOW_PATH)) {
+    fail(".github/workflows/release.yml is missing");
+    return;
+  }
+  const candidateWorkflow = readFileSync(CANDIDATE_WORKFLOW_PATH, "utf8");
+  const releaseWorkflow = readFileSync(RELEASE_WORKFLOW_PATH, "utf8");
+  for (const os of ["ubuntu-latest", "macos-latest", "windows-latest"]) {
+    if (!candidateWorkflow.includes(os)) {
+      fail(`release-candidate.yml is missing ${os}`);
+      return;
+    }
+  }
+  if (!candidateWorkflow.includes("node: [\"24\"]") || !candidateWorkflow.includes("npm run verify:artifacts")) {
+    fail("release-candidate.yml must pin Node 24 and run npm run verify:artifacts");
+    return;
+  }
+  for (const glob of ["agent-recall-*.tar.gz", "agent-recall-*.zip"]) {
+    if (!releaseWorkflow.includes(glob)) {
+      fail(`release.yml is missing upload glob ${glob}`);
+      return;
+    }
+  }
+  if (!releaseWorkflow.includes("if-no-files-found: error")) {
+    fail("release.yml artifact upload must fail when no files are found");
+    return;
+  }
+  ok("release and candidate workflow artifact contracts: present");
+
+  // 8. The release workflow's smoke step expects
   //    the runtime to be Node 18+; the Node
   //    version used in the test is read from
   //    process.version for diagnostic purposes.

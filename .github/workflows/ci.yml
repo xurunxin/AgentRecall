@@ -30,7 +30,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "rc-*"]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -53,6 +53,8 @@ jobs:
         node: ["24"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Set up Node.js ${{ matrix.node }}
         uses: actions/setup-node@v4
@@ -110,7 +112,7 @@ jobs:
         # run under `npm test` above.
         #
         # Stage 16 v1.1.1 PR-8 (issue #16, spec § 11.2):
-        # the pre-PR-8 step used `|| true` on the
+        # the pre-PR-8 step used a shell suppressor on the
         # export line, which silently swallowed
         # export failures. PR-8 removes the
         # suppressor: a failure to export is a
@@ -126,7 +128,42 @@ jobs:
           npx tsx bin/agent-recall.ts export --scope global > /dev/null
           ls -la "$AGENT_RECALL_HOME"
 
+      - name: Candidate release-critical gates
+        if: ${{ startsWith(github.ref, 'refs/heads/rc-') }}
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}
+          CI: "true"
+          STRESS_PROFILE: release
+          AGENT_RECALL_SUPPRESS_MCP_DEPRECATION: "1"
+        run: |
+          set -euo pipefail
+          npx vitest run test/multi-process-stress.test.ts
+          npx vitest run \
+            test/sqlite-store-migration.test.ts \
+            test/sqlite-store-migration-v3.test.ts \
+            test/release-gate/p0-migration.test.ts \
+            test/release-gate/p0-migration-backup.test.ts \
+            test/backup.test.ts \
+            test/cli/backup.test.ts \
+            test/release-gate/p0-backup.test.ts \
+            test/release-gate/p0-cleanup.test.ts \
+            test/release-gate/p1-atomic-import.test.ts \
+            test/release-gate/p3-strict-import.test.ts \
+            test/release-gate/p3-full-history-import.test.ts \
+            test/release-gate/p3-import-preflight-budget.test.ts \
+            test/release-gate/p3-import-batch-lineage.test.ts \
+            test/cli/import-preflight.test.ts \
+            test/blackbox/mcp-client-e2e.test.ts \
+            test/blackbox/mcp-client-e2e-extended.test.ts \
+            test/blackbox/mcp-all-tools-e2e-core.test.ts \
+            test/blackbox/mcp-all-tools-e2e-extended.test.ts \
+            test/release-gate/admin-default/mcp-admin-default.test.ts
+          npm run verify:artifacts
+
       - name: Cross-platform path safety check
+
+
         # On Windows / macOS the filesystem is
         # case-insensitive by default. The portability
         # filename map is case-sensitive by design
