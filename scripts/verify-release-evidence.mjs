@@ -94,6 +94,51 @@ function verifyArtifacts(evidence) {
   if (evidence.sha256_checksums === null || typeof evidence.sha256_checksums !== "object" || Array.isArray(evidence.sha256_checksums)) {
     fail("sha256_checksums must be an object");
   }
+  // Stage 18 v1.1.2 (issue #29, task 10): the
+  // artifact manifest MUST cover all three
+  // publication platforms (linux-x64 / darwin-x64 /
+  // win32-x64). The release-publication gate refuses
+  // to mint a tag from an evidence file that is
+  // missing a platform, regardless of whether the
+  // candidate workflow produced a partial run.
+  const requiredPlatforms = ["linux-x64", "darwin-x64", "win32-x64"];
+  const covered = new Set();
+  for (const [index, artifact] of evidence.artifacts.entries()) {
+    if (artifact === null || typeof artifact !== "object") {
+      fail(`artifacts[${index}] must be an object`);
+    }
+    const name = typeof artifact.name === "string"
+      ? artifact.name
+      : typeof artifact.artifact_path === "string"
+        ? artifact.artifact_path
+        : "";
+    if (name.length === 0) fail(`artifacts[${index}].name (or artifact_path) is required`);
+    for (const platform of requiredPlatforms) {
+      if (name.includes(platform)) covered.add(platform);
+    }
+  }
+  for (const platform of requiredPlatforms) {
+    if (!covered.has(platform)) {
+      fail(`artifacts is missing the ${platform} platform archive`);
+    }
+  }
+}
+
+function verifyVersion(evidence) {
+  // Stage 18 v1.1.2 (issue #29, task 10): the
+  // evidence file MUST carry a top-level `version`
+  // field equal to the release version the tag
+  // guard is about to publish. A mismatch between
+  // the evidence `version` and the package's
+  // canonical `1.1.2` would let a stale candidate
+  // run sneak a different release through the
+  // publication gate.
+  if (typeof evidence.version !== "string" || evidence.version.trim() === "") {
+    fail("evidence.version is required");
+  }
+  if (evidence.version !== "1.1.2") {
+    fail(`evidence.version must equal "1.1.2" (got "${evidence.version}")`);
+  }
 }
 
 function main() {
@@ -109,7 +154,8 @@ function main() {
     "sha256_checksums",
     "test_summary",
     "migration_summary",
-    "known_non_blocking_limits"
+    "known_non_blocking_limits",
+    "version"
   ]) {
     if (!Object.prototype.hasOwnProperty.call(evidence, field)) fail(`release evidence is missing ${field}`);
   }
@@ -123,6 +169,7 @@ function main() {
   verifyCiRuns(evidence);
   verifyReleaseWorkflow(evidence);
   verifyArtifacts(evidence);
+  verifyVersion(evidence);
   verifyTestSummary(evidence);
   verifyMigrationSummary(evidence);
   if (!Array.isArray(evidence.known_non_blocking_limits) || evidence.known_non_blocking_limits.length === 0) {

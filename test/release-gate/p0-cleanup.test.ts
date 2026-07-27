@@ -124,16 +124,16 @@ describe("release-gate p0-cleanup (Stage 14 PR-D)", () => {
     expect(changelog).toMatch(/### Stage 14 PR-C \(Doctor Checks\)/);
   });
 
-  it("package.json version is 1.1.1 (master plan rule: v1.1.1 release bumps to 1.1.1)", () => {
-    // Stage 16 v1.1.1: the 8-PR v1.1.1 follow-up
-    // (PR-1..PR-8) is released. The v1.0 release-gate
-    // cleanup contract is preserved by asserting
-    // the version is now `1.1.1` (semver major=1
-    // is unchanged; minor is unchanged; patch is
-    // bumped for the public-path + black-box fixes
-    // over v1.1.0; the lock file is unaffected).
+  it("package.json version is 1.1.2 (master plan rule: v1.1.2 release bumps to 1.1.2)", () => {
+    // Stage 18 v1.1.2 (issue #29, Task 10): the v1.1.2
+    // patch release over v1.1.1. The release-gate
+    // cleanup contract is preserved by asserting the
+    // version is now `1.1.2` (semver major=1 /
+    // minor=1 are unchanged; patch is bumped for the
+    // release-publication gate over v1.1.1; the lock
+    // file is unaffected).
     const repoRoot = join(import.meta.dirname, "..", "..");
     const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8")) as { version: string };
-    expect(pkg.version).toBe("1.1.1");
+    expect(pkg.version).toBe("1.1.2");
   });
 });

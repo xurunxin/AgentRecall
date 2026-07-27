@@ -35,6 +35,36 @@ a personal tool, but the file structure is here for future contributors).
 - GitHub Actions runs are not executed locally; operators must push the frozen
   `rc-*` commit and retain the resulting workflow URL in issue #19.
 
+### Release
+
+This `### Release` subsection is the immutable publication record for the
+v1.1.2 tag. The actual `release_commit` / `tag` / `date` / platform
+artifacts / SHA-256 values are populated by `scripts/prepare-release.mjs`
+when the operator runs the publication step on the verified candidate
+commit (the script writes `release-notes.md` and
+`issue-19-evidence-comment.md` under `ARTIFACT_DIR`; paste them into the
+GitHub Release body and issue #19 by hand after review). The contract
+that the values MUST satisfy is fixed by ADR-0004:
+
+- `release_commit` MUST equal `git rev-parse HEAD` at publication time AND
+  the `release_commit` carried by `release-evidence.json`.
+- `tag` MUST be `v1.1.2`. The legacy tags `v1.0.0` / `v1.1.0` / `v1.1.1`
+  are never moved.
+- `artifacts` MUST cover all three publication platforms
+  (`linux-x64` / `darwin-x64` / `win32-x64`); the
+  `scripts/verify-release-evidence.mjs` verifier enforces this AND the
+  `version: "1.1.2"` field on the evidence document.
+- `sha256_checksums` MUST equal the per-archive SHA-256 recorded by
+  `scripts/compute-artifact-hashes.mjs` in
+  `release-artifact-hashes.json`.
+- `npm publish out of scope for v1.1.2` — `package.json` stays
+  `private: true`; the GitHub release artefacts are the canonical
+  distribution surface.
+
+The concrete values are intentionally NOT pre-baked into this CHANGELOG
+entry; they are written by the script at publication time so the
+`release_commit` cannot drift away from the verified candidate SHA.
+
 ## [1.1.2] — Stage 18 v1.1.2 (Extracted-artifact MCP lifecycle E2E, issue #28, task 9)
 
 The v1.1.1 follow-up roadmap left issue **#28**

@@ -279,6 +279,13 @@ async function main() {
   const migrationSummary = readMigrationSummary();
   const evidence = {
     schema_version: 1,
+    // Stage 18 v1.1.2 (issue #29, Task 10): the
+    // evidence file carries the canonical package
+    // version the release-publication gate mints.
+    // The `verify-release-evidence.mjs` verifier
+    // requires this field to equal `1.1.2`; a
+    // mismatch or missing field fails closed.
+    version: "1.1.2",
     candidate_sha: sha,
     release_commit: sha,
     tag: process.env.GITHUB_REF_TYPE === "tag" ? (process.env.GITHUB_REF_NAME ?? null) : null,

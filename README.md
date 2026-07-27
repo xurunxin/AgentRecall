@@ -556,6 +556,70 @@ AGENT_RECALL_SUPPRESS_MCP_DEPRECATION="1" \
 The gate is documented in
 [`docs/adr/0003-extracted-artifact-lifecycle.md`](docs/adr/0003-extracted-artifact-lifecycle.md).
 
+## Immutability + Evidence
+
+The publication step is governed by the immutable-tag + evidence-comment
+contract documented in
+[`docs/adr/0004-immutable-tag-and-evidence.md`](docs/adr/0004-immutable-tag-and-evidence.md).
+The operator-facing surface is `scripts/prepare-release.mjs`:
+
+- The existing tags `v1.0.0` / `v1.1.0` / `v1.1.1` are **never** moved.
+  `prepare-release.mjs` refuses to override any tag that already exists;
+  the script source does not contain `git tag -f` / `git push --force` /
+  `git push --tags`, and a CI failure is the regression signal.
+- `GITHUB_SHA` MUST equal `git rev-parse HEAD` at publication time. A
+  mismatch exits 1 with a structured `stderr` line; the script will not
+  mint a tag from a commit that is not checked out.
+- `ARTIFACT_DIR` MUST contain all three platform release archives
+  (`linux-x64` / `darwin-x64` / `win32-x64`) AND the canonical
+  `release-artifact-hashes.json` produced by
+  `scripts/compute-artifact-hashes.mjs`. A missing platform or a stale
+  hash manifest exits 1.
+- `DRY_RUN=1` is the default: the script validates every input and
+  writes `release-notes.md` + `issue-19-evidence-comment.md` under
+  `ARTIFACT_DIR`, but it does **not** create the annotated tag. Re-run
+  with `DRY_RUN=0` after reviewing the artefacts to mint the tag.
+- The author identity is carried by the `--author` flag on `git tag
+  -a`; the script never calls `git config` and does not touch the
+  developer's `~/.gitconfig`.
+- The two output files carry the full 9-field contract the master plan
+  brief names:
+  `release_commit` / `tag` / `ci_runs` / `release_workflow` /
+  `artifacts` / `sha256_checksums` / `test_summary` /
+  `migration_summary` / `known_non_blocking_limits`. Both files also
+  explicitly note that **npm publish out of scope for v1.1.2** —
+  `package.json` stays `private: true`; the GitHub release artefacts
+  are the canonical distribution surface.
+
+### Usage
+
+```bash
+# Dry-run: validate inputs and write the two artefacts
+# without creating the tag. The script refuses to
+# override an existing tag, refuses to publish from a
+# non-checked-out commit, refuses a partial artifact
+# manifest, and refuses to call `npm publish`.
+GITHUB_SHA="$(git rev-parse HEAD)" \
+ARTIFACT_DIR="$PWD/dist-stage" \
+RELEASE_TAG="v1.1.2" \
+DRY_RUN="1" \
+  node scripts/prepare-release.mjs
+
+# After reviewing release-notes.md + issue-19-evidence-comment.md,
+# re-run with DRY_RUN=0 to mint the annotated tag locally:
+GITHUB_SHA="$(git rev-parse HEAD)" \
+ARTIFACT_DIR="$PWD/dist-stage" \
+RELEASE_TAG="v1.1.2" \
+DRY_RUN="0" \
+  node scripts/prepare-release.mjs
+
+# Then push the tag explicitly (the script never invokes `git push`):
+git push origin v1.1.2
+```
+
+The script is dependency-free (Node 18+ stdlib only) and is verified by
+`test/release-gate/p3-release-immutability.test.ts`.
+
 ## Changelog
 
 Stage-level changes are tracked in [`CHANGELOG.md`](./CHANGELOG.md).

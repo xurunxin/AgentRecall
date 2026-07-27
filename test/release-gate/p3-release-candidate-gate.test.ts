@@ -135,6 +135,11 @@ describe("release candidate exact-SHA gate (#27)", () => {
 
     assert.equal(evidence["candidate_sha"], sha);
     assert.equal(evidence["release_commit"], sha);
+    // Stage 18 v1.1.2 (issue #29, Task 10): the
+    // evidence must include `version` so the
+    // release-publication gate can correlate the
+    // evidence with the package metadata.
+    assert.equal(evidence["version"], "1.1.2");
     assert.equal(evidence["tag"], null);
     assert.deepEqual(evidence["ci_runs"], ciRuns);
     assert.deepEqual(evidence["test_summary"], testSummary);
@@ -153,6 +158,10 @@ describe("release candidate exact-SHA gate (#27)", () => {
     const sha = "fedcba9876543210fedcba9876543210fedcba98";
     const validEvidence = {
       schema_version: 1,
+      // Stage 18 v1.1.2 (issue #29, Task 10): the
+      // evidence file MUST carry the `version`
+      // field the release-publication gate mints.
+      version: "1.1.2",
       candidate_sha: sha,
       release_commit: sha,
       tag: null,
@@ -176,7 +185,16 @@ describe("release candidate exact-SHA gate (#27)", () => {
         conclusion: "success",
         duration_ms: 1000
       },
-      artifacts: [],
+      // Stage 18 v1.1.2 (issue #29, Task 10): the
+      // `artifacts` array MUST cover all three
+      // publication platforms (linux-x64 / darwin-x64
+      // / win32-x64). A partial manifest is rejected
+      // by the verifier.
+      artifacts: [
+        { name: "agent-recall-1.1.2-linux-x64.tar.gz", sha256: "a".repeat(64) },
+        { name: "agent-recall-1.1.2-darwin-x64.tar.gz", sha256: "b".repeat(64) },
+        { name: "agent-recall-1.1.2-win32-x64.zip", sha256: "c".repeat(64) }
+      ],
       sha256_checksums: {},
       test_summary: { passed: 10, failed: 0, skipped: 0, total: 10 },
       migration_summary: migrationSummary(),
