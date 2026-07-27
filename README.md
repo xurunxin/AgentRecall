@@ -459,6 +459,99 @@ SHA, workflow URL and job URLs with conclusions and durations, OS / Node details
 test and migration counts, artifact names, and known non-blocking limits. The
 real archive hashes remain explicit placeholders until Task 10 completes.
 
+## Extracted-artifact lifecycle E2E
+
+A separate CI gate (`.github/workflows/release-candidate.yml` `matrix` job
++ `.github/workflows/release.yml` `verify-extracted-artifacts` job) exercises
+the **packaged** release archive end-to-end on Linux, macOS, and Windows.
+The gate is independent of the source / build smoke (`mcp-blackbox-extracted`),
+which still downloads the built `dist/` and runs the existing blackbox suites.
+
+The lifecycle gates:
+
+1. `Pack candidate release artifact` — mirror the production `release.yml`
+   `Strip dev-only artefacts` + `Pack` steps (`.tar.gz` on Linux / macOS,
+   `.zip` on Windows).
+2. `Extract candidate release artifact` — call
+   `node scripts/extract-release-artifact.mjs` with the archive path +
+   `$RUNNER_TEMP/agent-recall-extracted` + the platform tag (`linux` /
+   `darwin` / `win32`). The script spawns `tar -xzf` on POSIX,
+   PowerShell `Expand-Archive` on Windows, or `unzip -q -o` for Linux /
+   macOS `.zip` archives, then asserts the extracted tree contains the
+   canonical entry points (`dist/src/index.js` +
+   `dist/bin/agent-recall.js` + `package.json`).
+3. `Install runtime deps in extracted artifact` — `npm install --omit=dev`
+   inside the extracted tree. The archive's `package.json` `files` list
+   ships `dist` + `README.md` + `LICENSE` + `CHANGELOG.md` and does NOT
+   ship `node_modules`; the install step matches the consumer surface.
+4. `Compute candidate release artifact hashes` — call
+   `node scripts/compute-artifact-hashes.mjs` on the archive. The script
+   writes `release-artifact-hashes.json` (`{ schema_version,
+   candidate_sha, generated_at, artifacts: [{ platform, artifact_path,
+   sha256, size_bytes, mtime }] }`). The matrix uploads the JSON as part
+   of the evidence fragment.
+5. `Extracted-artifact lifecycle E2E` — run
+   `npx vitest run test/blackbox/packaged-install.test.ts` with
+   `AGENT_RECALL_EXTRACTED_ARTIFACT` pointing at the extracted directory.
+   The suite spawns the **packaged** MCP server (`<extracted>/dist/src/index.js`)
+   and runs the 11 documented lifecycle scenarios end-to-end (initialize +
+   capability negotiation; exact tools / resources discovery; remember +
+   idempotent replay + key-reuse rejection; CAS update + stale revision
+   rejection; project identity registration / lookup / conflict; search +
+   recall; sensitivity / trust authorised + unauthorised; maintenance
+   plan / apply; snapshot export / import round-trip through the
+   **packaged** CLI; backup / doctor / CLI entry points through the
+   packaged CLI; clean shutdown with empty stderr).
+6. `record-evidence` aggregates every matrix leg's
+   `release-artifact-hashes.json` into a single `sha256_checksums` map
+   keyed on `artifact_path`, and `scripts/release-evidence.mjs`
+   forwards it into `release-evidence.json`.
+
+The `release.yml` `verify-extracted-artifacts` matrix re-downloads each
+platform artefact, re-extracts it, re-computes SHA-256, and re-runs the
+lifecycle E2E. A failure on ANY platform blocks the tag (the `smoke`
+matrix's `needs` list grows to include the new gate).
+
+### Run the lifecycle locally
+
+Operators can exercise the gate outside CI:
+
+```bash
+# Build a fresh archive (same as `release.yml`):
+npm run build
+STAGE="stage-agent-recall"
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+cp -R dist "$STAGE/dist"
+cp package.json "$STAGE/package.json"
+cp README.md "$STAGE/README.md"
+[ -f LICENSE ] && cp LICENSE "$STAGE/LICENSE"
+VERSION=$(node -e 'console.log(require("./package.json").version)')
+tar -czf "agent-recall-${VERSION}-linux-x64.tar.gz" -C "$STAGE" .
+
+# Extract + verify (the same script CI uses):
+AGENT_RECALL_PACKAGED_ARTIFACT="agent-recall-${VERSION}-linux-x64.tar.gz" \
+AGENT_RECALL_EXTRACT_DIR="$PWD/extracted" \
+AGENT_RECALL_PLATFORM="linux" \
+  node scripts/extract-release-artifact.mjs
+
+# Install runtime deps in the extracted tree:
+(cd extracted && npm install --omit=dev)
+
+# Compute hashes (CI uses this for the `sha256_checksums` field):
+GITHUB_SHA="$(git rev-parse HEAD)" \
+MATRIX_OS="linux" \
+  node scripts/compute-artifact-hashes.mjs "agent-recall-${VERSION}-linux-x64.tar.gz"
+
+# Run the lifecycle E2E against the extracted artefact:
+AGENT_RECALL_EXTRACTED_ARTIFACT="$PWD/extracted" \
+AGENT_RECALL_SUPPRESS_MCP_DEPRECATION="1" \
+  npx vitest run test/blackbox/packaged-install.test.ts
+```
+
+The gate is documented in
+[`docs/adr/0003-extracted-artifact-lifecycle.md`](docs/adr/0003-extracted-artifact-lifecycle.md).
+
 ## Changelog
 
 Stage-level changes are tracked in [`CHANGELOG.md`](./CHANGELOG.md).

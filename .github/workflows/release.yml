@@ -215,9 +215,115 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  verify-extracted-artifacts:
+    # Stage 18 v1.1.2 (issue #28, task 9): the
+    # final cross-platform gate. Downloads every
+    # platform archive produced by the `package`
+    # matrix, re-extracts each, recomputes the
+    # SHA-256 hashes via `compute-artifact-hashes.mjs`
+    # (the same dependency-free script the candidate
+    # workflow uses), and runs the full
+    # extracted-artifact MCP lifecycle
+    # (`test/blackbox/packaged-install.test.ts`)
+    # against each one. A failure on ANY platform
+    # blocks the tag (the job `needs: package`, so
+    # the `smoke` matrix cannot start before this
+    # gate is green).
+    name: Extracted artifact lifecycle ${{ matrix.os }} / Node ${{ matrix.node }}
+    needs: package
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ["24"]
+    steps:
+      - name: Checkout exact tag commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install test dependencies
+        run: npm ci
+
+      - name: Determine platform suffix
+        id: platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then SUFFIX="windows-x64"; ARCHIVE_TYPE="zip"; PLATFORM_TAG="win32"
+          elif [ "$RUNNER_OS" = "macOS" ]; then SUFFIX="darwin-x64"; ARCHIVE_TYPE="tar"; PLATFORM_TAG="darwin"
+          else SUFFIX="linux-x64"; ARCHIVE_TYPE="tar"; PLATFORM_TAG="linux"; fi
+          echo "SUFFIX=${SUFFIX}" >> "$GITHUB_OUTPUT"
+          echo "ARCHIVE_TYPE=${ARCHIVE_TYPE}" >> "$GITHUB_OUTPUT"
+          echo "PLATFORM_TAG=${PLATFORM_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Download platform package
+        uses: actions/download-artifact@v4
+        with:
+          name: agent-recall-${{ steps.platform.outputs.SUFFIX }}
+          path: pkg
+
+      - name: Extract platform package
+        shell: bash
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+          AGENT_RECALL_PACKAGED_ARTIFACT: pkg/agent-recall-*${{ steps.platform.outputs.SUFFIX }}
+          AGENT_RECALL_EXTRACT_DIR: ${{ runner.temp }}/agent-recall-extracted-${{ steps.platform.outputs.SUFFIX }}
+          AGENT_RECALL_PLATFORM: ${{ steps.platform.outputs.PLATFORM_TAG }}
+        run: |
+          set -euo pipefail
+          ARTIFACT=$(ls pkg/agent-recall-*.$([ "${{ steps.platform.outputs.ARCHIVE_TYPE }}" = "tar" ] && echo "tar.gz" || echo "zip") | head -n 1)
+          echo "artifact: $ARTIFACT"
+          AGENT_RECALL_PACKAGED_ARTIFACT="$ARTIFACT" \
+          AGENT_RECALL_EXTRACT_DIR="$RUNNER_TEMP/agent-recall-extracted-${{ steps.platform.outputs.SUFFIX }}" \
+          AGENT_RECALL_PLATFORM="${{ steps.platform.outputs.PLATFORM_TAG }}" \
+            node scripts/extract-release-artifact.mjs
+
+      - name: Re-verify SHA-256 against the platform archive
+        shell: bash
+        env:
+          GITHUB_SHA: ${{ github.sha }}
+          MATRIX_OS: ${{ matrix.os }}
+          RELEASE_HASHES_OUTPUT: ${{ runner.temp }}/release-artifact-hashes-${{ steps.platform.outputs.SUFFIX }}.json
+        run: |
+          set -euo pipefail
+          ARTIFACT=$(ls pkg/agent-recall-*.$([ "${{ steps.platform.outputs.ARCHIVE_TYPE }}" = "tar" ] && echo "tar.gz" || echo "zip") | head -n 1)
+          node scripts/compute-artifact-hashes.mjs "$ARTIFACT"
+          cat "$RUNNER_TEMP/release-artifact-hashes-${{ steps.platform.outputs.SUFFIX }}.json"
+
+      - name: Install runtime deps in extracted artifact
+        working-directory: ${{ runner.temp }}/agent-recall-extracted-${{ steps.platform.outputs.SUFFIX }}
+        run: npm install --omit=dev
+
+      - name: Extracted-artifact MCP lifecycle E2E
+        # Stage 18 v1.1.2 (issue #28, task 9):
+        # the 11-scenario MCP lifecycle against the
+        # EXTRACTED artifact on this platform. The
+        # Core profile is the packaged default;
+        # the test asserts the Core tool list
+        # surfaces, the extended / admin profiles
+        # round-trip cleanly when the env vars +
+        # capability flip, and clean shutdown
+        # produces zero stderr.
+        shell: bash
+        env:
+          CI: "true"
+          AGENT_RECALL_SUPPRESS_MCP_DEPRECATION: "1"
+          AGENT_RECALL_EXTRACTED_ARTIFACT: ${{ runner.temp }}/agent-recall-extracted-${{ steps.platform.outputs.SUFFIX }}
+        run: |
+          set -euo pipefail
+          npx vitest run test/blackbox/packaged-install.test.ts
+
   smoke:
     name: Smoke ${{ matrix.os }}
-    needs: package
+    needs: [package, verify-extracted-artifacts]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

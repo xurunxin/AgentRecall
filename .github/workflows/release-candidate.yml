@@ -149,6 +149,124 @@ jobs:
             test/blackbox/mcp-all-tools-e2e-extended.test.ts \
             test/release-gate/admin-default/mcp-admin-default.test.ts
 
+      - name: Pack candidate release artifact
+        # Stage 18 v1.1.2 (issue #28, task 9):
+        # mirror the production release.yml packaging
+        # step (strip dev-only artefacts, then pack the
+        # stage directory into a `.tar.gz` on
+        # Linux / macOS or a `.zip` on Windows). The
+        # matrix job re-uses the SAME `dist/` it just
+        # built and uploaded; the packaged-install
+        # E2E then extracts THIS archive (not the
+        # `dist/` upload) so the lifecycle test
+        # exercises the real consumer surface.
+        shell: bash
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            SUFFIX="windows-x64"
+            ARCHIVE_TYPE="zip"
+          else
+            SUFFIX="linux-x64"
+            ARCHIVE_TYPE="tar"
+          fi
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            SUFFIX="darwin-x64"
+          fi
+          STAGE="stage-agent-recall-${SUFFIX}"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          cp -R dist "$STAGE/dist"
+          cp package.json "$STAGE/package.json"
+          cp README.md "$STAGE/README.md"
+          if [ -f LICENSE ]; then cp LICENSE "$STAGE/LICENSE"; fi
+          VERSION="${GITHUB_REF_NAME#rc-}"
+          if [ "$VERSION" = "$GITHUB_REF_NAME" ]; then VERSION="1.1.1"; fi
+          if [ "$ARCHIVE_TYPE" = "tar" ]; then
+            PACKAGE_PATH="agent-recall-${VERSION}-${SUFFIX}.tar.gz"
+            tar -czf "$PACKAGE_PATH" -C "$STAGE" .
+          else
+            PACKAGE_PATH="agent-recall-${VERSION}-${SUFFIX}.zip"
+            (cd "$STAGE" && powershell -NoProfile -Command "Compress-Archive -Path '*' -DestinationPath '../${PACKAGE_PATH}' -Force") > /dev/null
+          fi
+          echo "package contents:"
+          find "$STAGE" -maxdepth 3 -type f | sort
+          ls -la "$PACKAGE_PATH"
+          echo "PACKAGE_PATH=$PACKAGE_PATH" >> "$GITHUB_ENV"
+          echo "STAGE_DIR=$STAGE" >> "$GITHUB_ENV"
+
+      - name: Extract candidate release artifact
+        # Stage 18 v1.1.2 (issue #28, task 9):
+        # dependency-free platform-aware extraction
+        # (`tar -xzf` on POSIX, PowerShell
+        # `Expand-Archive` on Windows). The script
+        # also asserts the extracted tree contains
+        # the canonical entry points
+        # (`dist/src/index.js` / `dist/bin/agent-recall.js`
+        # / `package.json`); a partial extraction
+        # halts the matrix leg.
+        shell: bash
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+          AGENT_RECALL_PACKAGED_ARTIFACT: ${{ env.PACKAGE_PATH }}
+          AGENT_RECALL_EXTRACT_DIR: ${{ runner.temp }}/agent-recall-extracted
+          AGENT_RECALL_PLATFORM: ${{ matrix.os == 'ubuntu-latest' && 'linux' || matrix.os == 'macos-latest' && 'darwin' || 'win32' }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/agent-recall-extracted-parent"
+          node scripts/extract-release-artifact.mjs
+          echo "AGENT_RECALL_EXTRACTED_ARTIFACT=$RUNNER_TEMP/agent-recall-extracted" >> "$GITHUB_ENV"
+
+      - name: Install runtime deps in extracted artifact
+        # Stage 18 v1.1.2 (issue #28, task 9):
+        # the packaged archive does NOT include
+        # `node_modules/` (the `package.json` `files`
+        # list ships `dist`, `README.md`, `LICENSE`,
+        # `CHANGELOG.md`). The lifecycle E2E consumes
+        # the artifact as a consumer would, so the
+        # production-only deps must be installed
+        # inside the extracted directory. The
+        # `npm install --omit=dev` step is identical
+        # to the `smoke` job in `release.yml`.
+        working-directory: ${{ runner.temp }}/agent-recall-extracted
+        run: npm install --omit=dev
+
+      - name: Compute candidate release artifact hashes
+        # Stage 18 v1.1.2 (issue #28, task 9):
+        # SHA-256 + size_bytes per platform artifact.
+        # The output JSON feeds the
+        # `record-evidence` job's
+        # `sha256_checksums` field.
+        shell: bash
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+          GITHUB_SHA: ${{ github.sha }}
+          RELEASE_HASHES_OUTPUT: ${{ runner.temp }}/release-artifact-hashes.json
+        run: |
+          set -euo pipefail
+          node scripts/compute-artifact-hashes.mjs "$PACKAGE_PATH"
+          cat "$RUNNER_TEMP/release-artifact-hashes.json"
+
+      - name: Extracted-artifact lifecycle E2E
+        # Stage 18 v1.1.2 (issue #28, task 9):
+        # the 11-scenario MCP lifecycle test against
+        # the EXTRACTED, runtime-installed
+        # release artifact (not the source `dist/`).
+        # The test fails closed when
+        # `AGENT_RECALL_EXTRACTED_ARTIFACT` is missing
+        # or the canonical entry points are absent.
+        shell: bash
+        env:
+          CI: "true"
+          MATRIX_OS: ${{ matrix.os }}
+          AGENT_RECALL_SUPPRESS_MCP_DEPRECATION: "1"
+          AGENT_RECALL_EXTRACTED_ARTIFACT: ${{ env.AGENT_RECALL_EXTRACTED_ARTIFACT }}
+        run: |
+          set -euo pipefail
+          npx vitest run test/blackbox/packaged-install.test.ts
+
       - name: Verify release artifact globs
         run: npm run verify:artifacts
 
@@ -159,6 +277,7 @@ jobs:
           path: |
             ${{ runner.temp }}/test-summary-*.json
             ${{ runner.temp }}/migration-summary-*.json
+            ${{ runner.temp }}/release-artifact-hashes.json
           if-no-files-found: error
           retention-days: 14
 
@@ -298,9 +417,38 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           RELEASE_EVIDENCE_ARTIFACTS_JSON: '[{"name":"release-evidence.json","sha256":null},{"name":"release-candidate.json","sha256":null}]'
+          RELEASE_EVIDENCE_SHA256_JSON: ${{ env.RELEASE_EVIDENCE_SHA256_JSON }}
           RELEASE_EVIDENCE_CONCLUSION: success
         run: |
           set -euo pipefail
+          # Stage 18 v1.1.2 (issue #28, task 9):
+          # aggregate every matrix leg's
+          # `release-artifact-hashes.json` into a
+          # single `sha256_checksums` map keyed by
+          # platform. The map is forwarded to
+          # `release-evidence.mjs` via
+          # `RELEASE_EVIDENCE_SHA256_JSON`.
+          HASH_FILES=$(find "$RUNNER_TEMP/evidence-fragments" -type f -name 'release-artifact-hashes.json' | sort)
+          if [ -z "$HASH_FILES" ]; then
+            echo "::error::no release-artifact-hashes.json fragments found"
+            exit 1
+          fi
+          EVIDENCE_FRAGMENTS_DIR="$RUNNER_TEMP/evidence-fragments" node -e '
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const dir = process.env.EVIDENCE_FRAGMENTS_DIR;
+            const files = fs.readdirSync(dir).filter((name) => name === "release-artifact-hashes.json");
+            const map = {};
+            for (const file of files) {
+              const payload = JSON.parse(fs.readFileSync(path.join(dir, file), "utf8"));
+              for (const row of payload.artifacts) {
+                map[row.artifact_path] = row.sha256;
+              }
+            }
+            process.stdout.write(JSON.stringify(map));
+          ' > "$RUNNER_TEMP/sha256-checksums.json"
+          cat "$RUNNER_TEMP/sha256-checksums.json"
+          export RELEASE_EVIDENCE_SHA256_JSON="$(cat $RUNNER_TEMP/sha256-checksums.json)"
           node scripts/release-evidence.mjs
           node scripts/verify-release-evidence.mjs "$RUNNER_TEMP/release-evidence.json"
           cp "$RUNNER_TEMP/release-evidence.json" release-evidence.json

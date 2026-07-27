@@ -35,6 +35,236 @@ a personal tool, but the file structure is here for future contributors).
 - GitHub Actions runs are not executed locally; operators must push the frozen
   `rc-*` commit and retain the resulting workflow URL in issue #19.
 
+## [1.1.2] — Stage 18 v1.1.2 (Extracted-artifact MCP lifecycle E2E, issue #28, task 9)
+
+The v1.1.1 follow-up roadmap left issue **#28**
+on the list. Task 8 / #27 wired the
+`mcp-blackbox-extracted` matrix job (it downloads
+the candidate workflow's built `dist/` and runs
+the existing MCP blackbox suites against the
+artefact), but it did NOT exercise the
+cross-platform packaging step (Linux `.tar.gz` /
+macOS `.tar.gz` / Windows `.zip`) or the
+consumer-side extraction step (PowerShell
+`Expand-Archive` on Windows, `tar -xzf` on POSIX).
+v1.1.2 closes that gap with a single
+extracted-artifact lifecycle E2E that exercises
+the full MCP surface against a packaged archive
+on every commit, plus a final cross-platform gate
+in `release.yml` that re-runs the lifecycle
+against every published tag.
+
+### Added
+
+- **`scripts/extract-release-artifact.mjs`**
+  (NEW, dependency-free) — the single source of
+  truth for the cross-platform archive extraction.
+  Reads `AGENT_RECALL_PACKAGED_ARTIFACT` +
+  `AGENT_RECALL_EXTRACT_DIR` + `AGENT_RECALL_PLATFORM`
+  env vars; spawns `tar -xzf` on POSIX, PowerShell
+  `Expand-Archive` on Windows, or `unzip -q -o`
+  on Linux/macOS `.zip`. Verifies the extracted
+  tree contains the canonical entry points
+  (`dist/src/index.js` /
+  `dist/bin/agent-recall.js` / `package.json`);
+  a partial extraction is a non-zero exit so
+  the matrix leg halts cleanly under
+  `set -euo pipefail`.
+- **`scripts/compute-artifact-hashes.mjs`** (NEW,
+  dependency-free) — SHA-256 + size_bytes +
+  mtime per release archive. Reads
+  `GITHUB_SHA` + `MATRIX_OS` env vars + artifact
+  paths from `argv`; writes
+  `release-artifact-hashes.json` (default name;
+  override via `RELEASE_HASHES_OUTPUT`). The
+  record-evidence job aggregates every matrix
+  leg's JSON into a single
+  `sha256_checksums` map keyed on `artifact_path`
+  that `release-evidence.mjs` forwards into
+  `release-evidence.json`.
+- **`test/blackbox/packaged-install.test.ts`**
+  (NEW) — the 11-scenario MCP lifecycle E2E
+  against the EXTRACTED artefact. Default Core
+  profile (the packaged default); Extended /
+  Admin opt-in via env vars + capability. Scenarios:
+  initialize / capability negotiation; exact
+  tools + resources discovery (Core / Extended /
+  Admin canonical list); remember + idempotent
+  replay + key-reuse rejection; CAS update +
+  stale revision rejection; project identity
+  registration / lookup / conflict; search +
+  recall; sensitivity / trust authorised +
+  unauthorised (`forbidden_visibility` on
+  restricted reads); maintenance plan / apply on
+  the permitted profile; snapshot export /
+  import round-trip through the **packaged CLI**
+  (`node <extracted>/dist/bin/agent-recall.js`);
+  backup / doctor / CLI entry points through the
+  packaged CLI; clean shutdown with empty stderr
+  (modulo the documented allowed diagnostics) +
+  no leaked process + no leaked temp directory.
+  Fails closed when `AGENT_RECALL_EXTRACTED_ARTIFACT`
+  is unset (no `it.skip` / `describe.skip`).
+- **`.github/workflows/release-candidate.yml`** —
+  the matrix job grows three new steps:
+  - `Pack candidate release artifact` — mirrors
+    `release.yml`'s strip-dev + pack pattern
+    (`.tar.gz` on Linux / macOS, `.zip` on
+    Windows);
+  - `Extract candidate release artifact` — calls
+    `scripts/extract-release-artifact.mjs` on the
+    freshly packed archive;
+  - `Install runtime deps in extracted artifact`
+    — `npm install --omit=dev` inside the
+    extracted tree (the archive's `package.json`
+    `files` list ships `dist` + `README.md` +
+    `LICENSE` + `CHANGELOG.md`, NOT
+    `node_modules`);
+  - `Compute candidate release artifact hashes`
+    — calls `scripts/compute-artifact-hashes.mjs`
+    and uploads the JSON alongside the existing
+    evidence fragment;
+  - `Extracted-artifact lifecycle E2E` — runs
+    `test/blackbox/packaged-install.test.ts`
+    against the extracted artefact. The matrix
+    uploads the hash JSON as part of the
+    evidence fragment; the `record-evidence`
+    job aggregates every matrix leg's hashes
+    into the `sha256_checksums` field.
+- **`.github/workflows/release.yml`** — a new
+  `verify-extracted-artifacts` matrix job sits
+  between `package` and `smoke`. It downloads
+  every platform artefact, re-extracts it via
+  `scripts/extract-release-artifact.mjs`,
+  re-computes SHA-256 via
+  `scripts/compute-artifact-hashes.mjs`,
+  installs runtime deps, and re-runs
+  `test/blackbox/packaged-install.test.ts`
+  against each one. A failure on ANY platform
+  blocks the tag (the `smoke` matrix's `needs`
+  list grows to include the new gate).
+- **`docs/adr/0003-extracted-artifact-lifecycle.md`**
+  (NEW) — documents the cross-platform
+  artefact E2E flow, the failure semantics,
+  and the known limits (Windows PowerShell
+  `Expand-Archive` dependency; matrix leg does
+  not patch the release workflow's package
+  output; per-matrix `npm install --omit=dev`
+  cost).
+
+### New tests
+
+- **`test/release-gate/p3-extracted-artifact-lifecycle.test.ts`**
+  (NEW) — the release-gate surface for Task 9:
+  - `scripts/extract-release-artifact.mjs`
+    dependency-free + exits 0 on a mock `.tar.gz`.
+  - `scripts/extract-release-artifact.mjs` exits
+    non-zero when the extracted tree is missing
+    the canonical entry points.
+  - `scripts/extract-release-artifact.mjs` handles
+    `.zip` via PowerShell `Expand-Archive` on
+    Windows OR POSIX `unzip` elsewhere.
+  - `scripts/compute-artifact-hashes.mjs`
+    dependency-free + writes valid JSON with
+    `sha256` + `size_bytes` per artefact.
+  - `release-candidate.yml` wires
+    `extract-and-verify` + `extracted-lifecycle-e2e`
+    + packaged-install test into the matrix job.
+  - `release.yml` downloads the three platform
+    artefacts and re-runs
+    `packaged-install.test.ts` against each.
+  - `ADR-0003` documents the cross-platform
+    artefact E2E flow.
+  - `CHANGELOG.md` + `README.md` are updated.
+  - `scripts/release-evidence.mjs` survives the
+    documented `known_non_blocking_limits`
+    contract (the
+    `### Known non-blocking limits` section in
+    CHANGELOG.md is consumed by
+    `scripts/release-evidence.mjs` verbatim).
+
+### Existing tests updated
+
+- **`test/blackbox/mcp-client-e2e.test.ts`** +
+  **`test/blackbox/mcp-client-e2e-extended.test.ts`**
+  + **`test/blackbox/mcp-all-tools-e2e-core.test.ts`**
+  + **`test/blackbox/mcp-all-tools-e2e-extended.test.ts`**
+  + **`test/release-gate/admin-default/mcp-admin-default.test.ts`**
+  — every existing assertion still passes; the
+  new `packaged-install.test.ts` adds the full
+  consumer-surface gate without weakening the
+  source / build smoke. No `it.skip` /
+  `describe.skip` introduced anywhere on the
+  release-gate surface.
+- **`.github/workflows/release-candidate.yml`** —
+  the `matrix` job's `needs` graph is unchanged
+  (the new steps are additive at the end of the
+  leg); the `record-evidence` job's `needs`
+  list is unchanged (it already `always()`
+  -gates every downstream job).
+
+### Verification
+
+- `npm test --exclude '**/multi-process-stress.test.ts'` →
+  every existing test still passes; the new
+  `p3-extracted-artifact-lifecycle` suite adds
+  9 release-gate tests.
+- `npm run typecheck` → 0 error.
+- `npm run build` → 0 error.
+- `npm run verify:artifacts` → 0 error (the
+  release-glob contract is unchanged; the new
+  scripts are not consumed by `verify-artifacts`
+  but the script asserts the candidate / release
+  workflow contracts that the Task 9 update
+  preserves).
+- No `package.json` / `package-lock.json` /
+  `tsconfig.json` / `vitest.config.ts` changes
+  (the Task 9 contract is enforced at the
+  CI + release-publication layer; the
+  runtime path is unchanged).
+- No new npm dependency; the new scripts rely
+  on Node 18+ stdlib (`node:child_process`,
+  `node:crypto`, `node:fs`).
+
+### Known non-blocking limits
+
+- **Windows PowerShell `Expand-Archive` dependency**
+  — the Windows extraction path requires
+  PowerShell on PATH (the Windows runner image
+  ships it). A future minimised runner image
+  without PowerShell would need a Node-native
+  fallback (`node:zlib` + a tar parser). The
+  v1.1.2 contract documents PowerShell as the
+  primary Windows path; the fallback is a
+  follow-up.
+- **Matrix leg does not patch the release
+  workflow's package output** — the matrix
+  job produces its OWN archive (via the new
+  `Pack candidate release artifact` step),
+  separate from `release.yml`'s `package`
+  matrix. Both archives carry the same `dist/`
+  (built once in each leg); the hash paths
+  differ. The `sha256_checksums` field is keyed
+  on `artifact_path`, so the two archives'
+  hashes coexist on the evidence document
+  without collision.
+- **`npm install --omit=dev` cost** — the
+  matrix leg pays the install cost once per
+  matrix entry (3 OSes × 1 Node = 3 installs);
+  the release workflow's
+  `verify-extracted-artifacts` matrix pays the
+  same cost on top of the existing `smoke`
+  matrix's install. The lockfile is unchanged
+  so the per-matrix install cost is ~10s on the
+  reference runner.
+- **No immutable tag guard yet** — Task 10
+  / #29 is the immutable tag guard; it sits
+  orthogonally to the Task 9 extracted-artifact
+  lifecycle and pins the SHA-256 manifest into
+  `release-evidence.json`'s `artifacts` field.
+  The `sha256_checksums` map produced by Task 9
+  is the input Task 10 reads.
+
 ## [1.1.2] — Stage 18 v1.1.2 (Authoritative import preflight + aggregate budgets, issue #24, task 5)
 
 The v1.1.1 follow-up roadmap left issue **#24** on the
