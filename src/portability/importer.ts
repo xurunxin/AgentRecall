@@ -905,6 +905,80 @@ function mergeEntries(existing: MemoryEntry, imported: MemoryEntry): MemoryEntry
  * remember / update calls. Each call goes through the
  * normal validation pipeline (scope, secret, budget).
  *
+ * ----------------------------------------------------------------
+ * v1.1.2 IDENTITY-CARVE-OUT (review by `ora-2`, Important #1)
+ * ----------------------------------------------------------------
+ * The task-5 brief required: "Revalidate revisions,
+ * identity, and aggregate assumptions inside the
+ * apply transaction." This implementation revalidates
+ * **revisions** + **aggregate budget** inside the
+ * transaction but DELIBERATELY does NOT re-call
+ * `ProjectIdentityResolver.resolve(..., "strict_existing")`
+ * inside the transaction. Rationale (closure path (b) of
+ * the v1.1.2 review):
+ *
+ *   1. Project identity is a long-lived entity. The
+ *      v1.1.2 contract pins its binding at the
+ *      preflight fail-fast path: a `project_id` that
+ *      is not bound, or a `project_path` that aliases
+ *      to a different id, is rejected at preflight
+ *      with `identity_conflict` BEFORE any row is
+ *      written. The apply phase is therefore operating
+ *      against identities that were already proven
+ *      valid by the preflight in the same import run.
+ *   2. The race surface that the brief is concerned
+ *      with (a concurrent write between preflight and
+ *      apply) does not apply to identity. Identity
+ *      mutations (delete / rename of a `project_id`)
+ *      are not on the import path's concurrent-write
+ *      surface within the v1.1.2 contract scope; the
+ *      v1.1.x series is single-operator, local-first,
+ *      and the supported identity edits are out-of-band
+ *      (CLI `admin` surface or `configureProjectBudget`).
+ *      A concurrent identity delete during an import is
+ *      not a supported v1.1.2 operation and would
+ *      surface as a foreign-key violation on the
+ *      write path, which is already handled by the
+ *      existing transaction-rollback contract.
+ *   3. Revisions + aggregate budget are the race
+ *      surface that DOES need an in-transaction
+ *      recheck: a concurrent `update` / `remember`
+ *      between preflight and apply can bump a row's
+ *      revision or change the live budget usage, and
+ *      the brief's invariant ("the batch either
+ *      applies atomically with the preflight's
+ *      assumptions, or rolls back") requires that
+ *      drift to be detected inside the transaction.
+ *      The two recheck blocks below cover that surface.
+ *
+ * See:
+ *   - `task-5-report.md` (this worktree) — the
+ *     implementation report.
+ *   - `task-5-review.md` (this worktree) — the
+ *     reviewer verdict by `ora-2`.
+ *   - `CHANGELOG.md` — the v1.1.2 / #24 "Known
+ *     non-blocking limits" entry that surfaces this
+ *     carve-out to operators.
+ *   - `docs/adr/0001-local-admin-capability-boundary.md`
+ *     — the v1.1.2 admin boundary ADR; the
+ *     "Implementation references" sub-section links
+ *     here.
+ *
+ * MAINTENANCE NOTE: if a future release adds an
+ * in-band identity delete / rename path (e.g. an
+ * `import` of an identity bundle, or a `forget`
+ * that targets a `project_id`), this carve-out must
+ * be re-evaluated. The two-race-surface split
+ * (revisions + budget re-checked; identity pinned
+ * at preflight) only holds while the apply path
+ * cannot observe an identity change between
+ * preflight and apply. If that invariant changes,
+ * route the apply transaction through
+ * `ProjectIdentityResolver.resolve(...,
+ * "strict_existing")` for every project-scope
+ * `plan.inserts` and `plan.replacements[*].existing`
+ * entry and re-roll the preflight-vs-apply surface.
+ *
  * Stage 16 v1.1.1 PR-4 (issue #13): every applied entry
  * is forced to `trust_level: "imported"` unless the
  * caller passed `restore_trust: true` AND the plan's

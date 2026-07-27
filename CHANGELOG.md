@@ -203,6 +203,7 @@ never leave a half-applied batch.
 
 ### Known non-blocking limits
 
+- apply-time revalidation covers revisions + aggregate budget; identity is treated as long-lived and re-checked only at preflight. See docs/adr/0001-local-admin-capability-boundary.md and applyImport doc comment for the rationale.
 - The CLI `import` command does not surface
   a `--capability` flag yet. The
   `restore_trust: true` + `full_history`

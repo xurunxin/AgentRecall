@@ -324,3 +324,25 @@ copies the value from a side channel (or the
 
 Accepted; tracked in the v1.1.2 release notes
 (`#23` section).
+
+## Implementation references
+
+- `src/portability/importer.ts` — the
+  `applyImport` doc comment carries the
+  v1.1.2 / #24 identity-carve-out
+  documented in the
+  `Known non-blocking limits` sub-section
+  of the v1.1.2 / #24 CHANGELOG entry.
+  The carve-out records the closure
+  decision that the apply transaction
+  re-validates revisions + aggregate
+  budget but does not re-call
+  `ProjectIdentityResolver.resolve(...,
+  "strict_existing")`, because identity
+  is a long-lived entity pinned at the
+  preflight fail-fast path. See the
+  review verdict by `ora-2` recorded in
+  `.superpowers/sdd/task-5-review.md`
+  for the closure rationale and the
+  maintenance note for the future
+  identity delete / rename path.
