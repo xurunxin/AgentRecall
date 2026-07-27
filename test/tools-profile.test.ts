@@ -1,21 +1,29 @@
 // test/tools-profile.test.ts
 //
-// Stage 17 v1.1.2 (issue #22): the MCP server's
+// Stage 17 v1.1.2 (issue #22) + Stage 18 v1.1.2
+// (issue #23, ADR-0001): the MCP server's
 // profile selector. The selector reads the
 // `AGENT_RECALL_PROFILE` env var, defaults to
-// `core` when unset, accepts `core` / `extended`,
-// and fail-closes on any other value. The test
-// is the executable contract for `selectToolProfile`
-// and `resolveActiveProfile`; the file is placed
-// next to the existing `tools-descriptions.test.ts`
-// so the tooling conventions (no test doubles, no
-// package.json changes, vitest only) line up.
+// `core` when unset, accepts `core` / `extended` /
+// `admin`, and fail-closes on any other value.
+// The `admin` value is opt-in; the
+// capability-gate check at startup (see
+// `src/index.ts`) refuses to bind a profile=admin
+// server without a valid operator capability.
+// The test is the executable contract for
+// `selectToolProfile` and `resolveActiveProfile`;
+// the file is placed next to the existing
+// `tools-descriptions.test.ts` so the tooling
+// conventions (no test doubles, no package.json
+// changes, vitest only) line up.
 //
-// The v1.1.2 contract pins two rules:
+// The v1.1.2 contract pins three rules:
 //
 //   1. Default = `core` (the safe, low-surface
 //      default for an unconfigured packaged server).
-//   2. Fail-closed on unknown values. The error
+//   2. `extended` / `admin` are opt-in via the
+//      `AGENT_RECALL_PROFILE` env var.
+//   3. Fail-closed on unknown values. The error
 //      message names the env var so an operator
 //      can discover the contract from the runtime
 //      output without reading the docs.
@@ -32,7 +40,7 @@ import {
   selectToolProfile
 } from "../src/tools/profile.js";
 
-describe("selectToolProfile (Stage 17 v1.1.2 #22)", () => {
+describe("selectToolProfile (Stage 17 v1.1.2 #22 + Stage 18 v1.1.2 #23)", () => {
   it("defaults to core when the value is undefined", () => {
     expect(selectToolProfile(undefined)).toBe("core");
   });
@@ -54,8 +62,22 @@ describe("selectToolProfile (Stage 17 v1.1.2 #22)", () => {
     expect(selectToolProfile("extended")).toBe("extended");
   });
 
+  // Stage 18 v1.1.2 (issue #23, ADR-0001): the
+  // selector now accepts `admin` as a valid
+  // profile. The startup-time capability gate
+  // (in `src/index.ts`) is the FAILURE path; the
+  // selector's job is to surface the value so the
+  // downstream gate can produce the correct
+  // error message ("admin requires a capability")
+  // rather than the generic "unknown profile".
+  it("accepts the admin profile name (capability gate is enforced at startup)", () => {
+    expect(selectToolProfile("admin")).toBe("admin");
+  });
+
   it("fail-closes on unknown values with a stable error message", () => {
-    expect(() => selectToolProfile("admin")).toThrowError(/AGENT_RECALL_PROFILE/);
+    // `admin` / `Admin` are now valid; the
+    // fail-closed cases are typo / future
+    // profile additions.
     expect(() => selectToolProfile("Admin")).toThrowError(/AGENT_RECALL_PROFILE/);
     expect(() => selectToolProfile("EXTENDED")).toThrowError(/AGENT_RECALL_PROFILE/);
     expect(() => selectToolProfile("full")).toThrowError(/AGENT_RECALL_PROFILE/);
@@ -63,16 +85,16 @@ describe("selectToolProfile (Stage 17 v1.1.2 #22)", () => {
   });
 
   it("exposes the canonical profile name list", () => {
-    // The v1.1.2 contract exposes two profiles.
-    // The list is the source of truth for the
-    // error message and for any future
-    // profile-validation helper that needs to
-    // enumerate the supported names.
-    expect(PROFILE_NAMES).toEqual(["core", "extended"]);
+    // The v1.1.2 + v1.1.2 #23 contract exposes
+    // three profiles. The list is the source of
+    // truth for the error message and for any
+    // future profile-validation helper that
+    // needs to enumerate the supported names.
+    expect(PROFILE_NAMES).toEqual(["core", "extended", "admin"]);
   });
 });
 
-describe("resolveActiveProfile (Stage 17 v1.1.2 #22)", () => {
+describe("resolveActiveProfile (Stage 17 v1.1.2 #22 + Stage 18 v1.1.2 #23)", () => {
   it("returns core when AGENT_RECALL_PROFILE is unset", () => {
     expect(resolveActiveProfile({})).toBe("core");
   });
@@ -89,17 +111,27 @@ describe("resolveActiveProfile (Stage 17 v1.1.2 #22)", () => {
     expect(resolveActiveProfile({ AGENT_RECALL_PROFILE: "extended" })).toBe("extended");
   });
 
+  // Stage 18 v1.1.2 (issue #23, ADR-0001): the
+  // resolver accepts the admin profile. The
+  // startup-time capability gate is the
+  // FAILURE path; the resolver surfaces the
+  // value so the gate can produce the correct
+  // error message.
+  it("returns admin when AGENT_RECALL_PROFILE='admin'", () => {
+    expect(resolveActiveProfile({ AGENT_RECALL_PROFILE: "admin" })).toBe("admin");
+  });
+
   it("fail-closes when AGENT_RECALL_PROFILE is any other value", () => {
-    expect(() => resolveActiveProfile({ AGENT_RECALL_PROFILE: "admin" })).toThrowError(
-      /AGENT_RECALL_PROFILE/
-    );
+    // `admin` is now valid; the fail-closed
+    // cases are typo / case-sensitivity checks
+    // (the selector is case-sensitive).
     expect(() => resolveActiveProfile({ AGENT_RECALL_PROFILE: "Core" })).toThrowError(
       /AGENT_RECALL_PROFILE/
     );
   });
 });
 
-describe("profile -> tool set parity (Stage 17 v1.1.2 #22)", () => {
+describe("profile -> tool set parity (Stage 17 v1.1.2 #22 + Stage 18 v1.1.2 #23)", () => {
   it("CORE_TOOL_NAMES and EXTENDED_TOOL_NAMES are disjoint", () => {
     const core = new Set(CORE_TOOL_NAMES);
     for (const name of EXTENDED_TOOL_NAMES) {

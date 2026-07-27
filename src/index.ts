@@ -16,6 +16,7 @@ import { resolveActiveProfile, type ToolProfile } from "./tools/profile.js";
 import { resolveActor } from "./actor.js";
 import { ProjectIdentityResolver } from "./scope-resolver.js";
 import { serverVersion } from "./server-version.js";
+import { CapabilityStore } from "./admin/capability.js";
 
 export function serverName(): string {
   return "agent-recall";
@@ -36,12 +37,21 @@ export function resolveDataHome(env: NodeJS.ProcessEnv = process.env): string {
   return resolve(expandHome(configured === undefined || configured.length === 0 ? "~/.agent-recall" : configured));
 }
 
-export function createService(dataHome = resolveDataHome()): MemoryService {
+export function createService(
+  dataHome = resolveDataHome(),
+  options: { capabilityStore?: CapabilityStore } = {}
+): MemoryService {
   const store = new SQLiteMemoryStore(join(dataHome, "memory.sqlite"));
   const exporter = new MarkdownExporter(join(dataHome, "exports"));
   // Resolve AGENT_RECALL_ACTOR -> structured actor (e.g. agent:claude-code).
   // Falls back to "agent:unknown" inside resolveActor when the env var is unset.
-  return new MemoryService(store, exporter, resolveActor(undefined), dataHome);
+  return new MemoryService(
+    store,
+    exporter,
+    resolveActor(undefined),
+    dataHome,
+    options.capabilityStore
+  );
 }
 
 export async function main(): Promise<void> {
@@ -62,7 +72,26 @@ export async function main(): Promise<void> {
   // that silently half-starts.
   const activeProfile: ToolProfile = resolveActiveProfile();
   const dataHome = resolveDataHome();
-  const service = createService(dataHome);
+  // Stage 18 v1.1.2 (issue #23, ADR-0001): load the
+  // operator capability at startup. The store
+  // fails closed when the file is missing /
+  // malformed / permission-drifted; the in-memory
+  // token is empty in that case. The
+  // `admin` profile refuses to start without a
+  // valid capability; `core` / `extended`
+  // start in fail-closed mode (a privileged
+  // write is rejected at the service layer).
+  const capabilityStore = new CapabilityStore(dataHome, { persistent: true });
+  if (activeProfile === "admin" && !capabilityStore.hasCapability()) {
+    console.error(
+      `${serverName()} failed to start: AGENT_RECALL_PROFILE=admin requires a valid operator capability. ` +
+        `Run \`agent-recall admin grant\` (in the CLI) to install one, then start the server. ` +
+        `The capability file is ${CapabilityStore.capabilityPath(dataHome)}.`
+    );
+    process.exitCode = 1;
+    return;
+  }
+  const service = createService(dataHome, { capabilityStore });
   const defaultActor = resolveActor(undefined);
   // v1.1.2 (issue #21): construct one identity
   // resolver per MCP process and share it with the
@@ -77,14 +106,20 @@ export async function main(): Promise<void> {
     name: serverName(),
     version: serverVersion()
   });
-  // v1.1.2 (issue #22): the per-profile tool
-  // registration. `core` is the packaged default
-  // (the safe, low-surface option for an
-  // unconfigured server). `extended` adds the
-  // four memory-semantics tools plus the
-  // administrative tools (plan/apply maintenance,
-  // merge, supersede, export, maintain). The
-  // shared `createMemoryToolHandlers` factory is
+  // v1.1.2 (issue #22) + Stage 18 v1.1.2
+  // (issue #23): the per-profile tool registration.
+  // `core` is the packaged default (the safe,
+  // low-surface option for an unconfigured
+  // server). `extended` adds the four
+  // memory-semantics tools plus the administrative
+  // tools (plan/apply maintenance, merge,
+  // supersede, export, maintain). `admin`
+  // registers the same surface as `extended`; the
+  // difference is the startup-time capability
+  // gate (above) and the in-memory capability
+  // token that the service consults on
+  // privileged writes. The shared
+  // `createMemoryToolHandlers` factory is
   // unchanged; the per-profile gate is the
   // `registerCoreTools` / `registerExtendedTools`
   // boundary.
@@ -98,7 +133,8 @@ export async function main(): Promise<void> {
     dataHome,
     defaultActor,
     identityResolver,
-    activeProfile
+    activeProfile,
+    capabilityStore
   });
 
   const transport = new StdioServerTransport();
@@ -109,9 +145,15 @@ export async function main(): Promise<void> {
   // black-box test can assert "no stderr leak
   // over the lifecycle" without false positives.
   // Operators who want the old behaviour opt
-  // in via the env var.
+  // in via the env var. Stage 18 v1.1.2 (issue
+  // #23, ADR-0001) adds the active profile to
+  // the hint so an operator can verify the
+  // admin-boundary state at a glance.
   if (process.env.AGENT_RECALL_VERBOSE_STDIO === "1") {
-    console.error(`${serverName()} connected on stdio (profile=${activeProfile})`);
+    const capabilityHint = activeProfile === "admin" ? " capability=loaded" : "";
+    console.error(
+      `${serverName()} connected on stdio (profile=${activeProfile}${capabilityHint})`
+    );
   }
 }
 

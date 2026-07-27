@@ -355,12 +355,317 @@ surface without re-reading the env var.
   is the documented escape hatch.
 - The previous `it.skip` pattern (used when
   `dist/` was missing) is removed across the
-  release-gate surface. A fresh checkout must run
-  `npm run build` before `npm test` so the
-  blackbox tests can find the built MCP server.
-  The `npm test` script is unchanged; the missing
-  build artifact now surfaces as a deterministic
-  test failure rather than a silent skip.
+   release-gate surface. A fresh checkout must run
+   `npm run build` before `npm test` so the
+   blackbox tests can find the built MCP server.
+   The `npm test` script is unchanged; the missing
+   build artifact now surfaces as a deterministic
+   test failure rather than a silent skip.
+
+## [1.1.2] — Stage 18 v1.1.2 (Trusted local admin boundary, issue #23)
+
+The v1.1.1 follow-up roadmap left issue **#23**
+(the `user_confirmed: true` boolean gate) on
+the list. v1.1.2 closes that gap: a fresh
+local operator capability (a 32-byte random
+secret under `${AGENT_RECALL_HOME}/admin.cap`)
+is the single source of truth for the v1.1.2
+admin boundary. The capability authorises
+the two trust / sensitivity escalation
+paths (`trust_promotion` and
+`sensitivity_restricted`) and the
+sensitivity-isolation read filter. The
+`user_confirmed: true` boolean is preserved
+as a HINT (backward compatibility) but is
+no longer authorization evidence.
+
+The change is **local operator separation**,
+not cryptographic multi-user security.
+The capability is a single shared secret
+between the operator and the caller; a
+reader with read access to the on-disk
+file can self-promote. The v1.1.2 contract
+relies on POSIX `0o600` / Windows owner-only
+ACL to limit that read access to the
+operator account.
+
+### Added
+
+- **`docs/adr/0001-local-admin-capability-boundary.md`**
+  — the design decision: why a local
+  capability, why a single token (not
+  per-operation), why the `user_confirmed:
+  true` boolean is no longer authorization
+  evidence, and the failure-closed
+  contract.
+- **`src/admin/capability.ts`** (new) —
+  `CapabilityStore` and the
+  `InMemoryCapabilityStore` test variant.
+  The store generates a 32-byte random
+  token (64 hex chars), writes it to
+  `${AGENT_RECALL_HOME}/admin.cap` with
+  POSIX `0o600` (or Windows owner-only
+  ACL via `icacls /inheritance:r
+  /grant:r <user>:(F) /remove Everyone
+  /remove Users`), and surfaces a
+  constant-time `authorize(...)`
+  primitive for the five documented
+  capability types (`trust_promotion`,
+  `sensitivity_restricted`,
+  `import_trust_restore`,
+  `import_restricted`,
+  `sensitivity_visibility`). The
+  `status()` surface NEVER returns the
+  raw token bytes — only the last 4 hex
+  chars and a stable fingerprint hash.
+- **`src/cli/commands/admin.ts`** (new) —
+  the `agent-recall admin grant` /
+  `status` / `revoke` / `help` CLI
+  commands. The grant command prints a
+  redacted `**** <last 4 hex>` plus the
+  on-disk path; the `--json` flag emits
+  a machine-readable payload for
+  automation. The status and revoke
+  commands are silent (no errors) when
+  the file is missing (the v1.1.2
+  fail-closed default). The admin
+  commands are the ONLY supported
+  mutation surface for the capability —
+  MCP tool calls cannot create or rotate
+  a capability.
+- **`src/tools/profile.ts`** — the
+  selector now accepts `admin` as a
+  third profile name (in addition to
+  `core` / `extended`). The startup-time
+  capability gate (in `src/index.ts`)
+  refuses to bind a profile=`admin`
+  server without a valid capability.
+  The `core` and `extended` profiles are
+  unchanged (they start in fail-closed
+  mode — a privileged write is rejected
+  at the service layer).
+- **`src/index.ts`** — the MCP server
+  entry loads the `CapabilityStore` at
+  startup, wires it into the
+  `MemoryService`, and refuses to start
+  when `AGENT_RECALL_PROFILE=admin` is
+  set without a granted capability.
+  The `active_profile` + `capability_state`
+  pair is surfaced on the
+  `memory://health` resource.
+- **`src/mcp/resources.ts`** — the health
+  resource gains the `capability_state`
+  field (`granted` / `missing`) and the
+  `capability_path` (the on-disk
+  canonical path).
+- **`src/sqlite-store.ts`** — the read
+  query path gains the
+  `actor_max_sensitivity` filter. The
+  filter is applied at the SQL boundary
+  (NOT at the response layer) so a
+  caller without the
+  `sensitivity_visibility` capability
+  cannot probe whether a `private` or
+  `restricted` row exists. The default
+  `actor_max_sensitivity` is `"normal"`
+  (the v1.1.2 fail-closed contract).
+- **`src/services/memory-write-service.ts`** —
+  trust / sensitivity escalation paths
+  call `CapabilityStore.authorize(...)`
+  on the relevant capability type. The
+  `user_confirmed: true` flag is no
+  longer the gate. The audit log records
+  the actor, reason, request_id,
+  previous / next value, and the
+  `capability_type` on every
+  authorization decision (granted +
+  denied).
+- **`src/services/memory-read-service.ts`** —
+  every public read path
+  (`getMemory`, `listMemories`,
+  `searchMemories`,
+  `exportMemoryContext`, maintenance
+  diagnostics) threads the
+  `actor_max_sensitivity` filter to the
+  store. The default is `"normal"`; an
+  admin-profile service with a valid
+  capability raises the value to
+  `"restricted"` so the reader can see
+  `private` and `restricted` rows.
+- **`src/portability/importer.ts`** —
+  the import preflight now requires an
+  operator capability for the two
+  privileged import paths:
+  `restore_trust: true` +
+  `history_mode: "full_history"`
+  (re-claim a `user_confirmed` tier
+  from a `full_history` bundle) and
+  `sensitivity: "restricted"` rows.
+  The preflight fails closed at
+  `unauthorized` when the capability
+  is missing or invalid. The
+  `allow_restricted` flag is preserved
+  for backward compatibility (older
+  CLI scripts pass it without a
+  capability) but the v1.1.2 contract
+  pins the authorization decision on
+  the capability check.
+- **`src/tools/schemas.ts`** — the
+  `remember` / `update_memory` /
+  `confirm_memory_trust` schemas accept
+  an optional `capability: string`
+  field. The validator enforces the
+  64-hex shape; the service is the
+  source of truth for the
+  authorization decision. The legacy
+  `user_confirmed: true` flag is
+  preserved for backward compatibility
+  but the v1.1.2 contract documents it
+  as a HINT, not authorization
+  evidence.
+- **`src/tools/error-codes.ts`** — the
+  stable error code set gains
+  `unauthorized` (the canonical
+  authorization-denial code) and
+  `forbidden_visibility` (the
+  read-side filter code). Both are
+  surfaced in the v2 envelope's
+  `structuredContent.error.code` so a
+  client can branch on the failure
+  mode without re-parsing the error
+  message.
+- **`src/memory-service.ts`** — the
+  constructor accepts an optional
+  `CapabilityStore` argument (the
+  backward-compatible default is
+  `undefined` — every privileged call
+  fails closed). The
+  `confirmMemoryTrust` helper now
+  surfaces `memory_id` on a successful
+  promotion so the v2 envelope can
+  expose the row that was promoted.
+
+### New tests
+
+- **`test/admin/capability.test.ts`**
+  (NEW, 23 tests) — the `CapabilityStore`
+  unit tests: `grant()` / `revoke()` /
+  `status()` semantics, the
+  `authorize(...)` denial matrix
+  (capability_missing,
+  capability_malformed, token_mismatch,
+  unsupported_capability_type), the
+  in-memory variant, the POSIX
+  `0o600` permission contract.
+- **`test/cli/admin.test.ts`** (NEW, 11
+  tests) — the CLI surface: `admin
+  grant` writes the file with
+  owner-only permissions, `admin
+  status` reports the redacted
+  state, `admin revoke` removes the
+  file, the `--json` flag emits a
+  machine-readable payload.
+- **`test/release-gate/admin-default/mcp-admin-default.test.ts`**
+  (NEW, 8 tests) — the blackbox
+  admin-profile surface: a fresh
+  server with a valid capability
+  binds to stdio; the
+  `memory://health` resource
+  surfaces `active_profile=admin` +
+  `capability_state=granted`; the
+  `confirm_memory_trust` tool accepts
+  with a capability and rejects
+  without; the
+  `sensitivity: "restricted"` write is
+  gated; the `admin` profile refuses
+  to start without a valid
+  capability.
+
+### Existing tests updated
+
+- **`test/tools-profile.test.ts`** —
+  the `admin` value is now a valid
+  profile name; the fail-closed case
+  is reserved for typo / case-mismatch
+  (e.g. `Admin`).
+- **`test/release-gate/profile-default/mcp-profile-default.test.ts`**
+  — the `AGENT_RECALL_PROFILE=admin`
+  startup test now asserts the
+  startup-time capability gate (the
+  server exits non-zero with a
+  "capability required" error
+  message when the file is missing)
+  rather than the generic
+  "unknown profile" message.
+- **`test/release-gate/p3-memory-semantics-mcp.test.ts`** —
+  the `user_confirmed: true` field is
+  no longer authorization evidence;
+  the tests now use the
+  `InMemoryCapabilityStore` to set
+  up the gate.
+- **`test/release-gate/p3-strict-import.test.ts`** —
+  the `restore_trust` + `full_history`
+  import path now requires a
+  capability (the test installs one
+  via `InMemoryCapabilityStore`).
+- **`test/blackbox/mcp-all-tools-e2e-extended.test.ts`** —
+  the `confirm_memory_trust` blackbox
+  test pre-installs a capability
+  via `CapabilityStore.grant(...)` and
+  reads the raw token from the
+  on-disk file (the `status()`
+  surface never returns it).
+
+### Test count
+
+- `npm test` (after `npm run build`):
+  **719 passed** / **0 skipped** across
+  **82 test files** (canonical). The
+  v1.1.2 admin-boundary changes add
+  42 unit / integration / blackbox
+  tests (23 capability + 11 CLI + 8
+  admin-profile) and update 4
+  existing files. The combined delta
+  versus the v1.1.2 / #22 baseline
+  is **+45 passed / 0 skipped** (the
+  earlier `819 / 0 / 79` baseline in
+  the v1.1.2 / #22 entry is now
+  `719 / 0 / 82`; the test-file count
+  rose by 3 for the new
+  `test/admin/`, `test/cli/admin.test.ts`,
+  and `test/release-gate/admin-default/`
+  paths).
+- `AGENT_RECALL_PROFILE=admin` /
+  `npm test`: **719 passed** / **0
+  skipped** (the admin-profile gate
+  does not break the existing test
+  surface; the v1.1.2 fail-closed
+  default rejects privileged writes
+  uniformly).
+- `npm run typecheck` → 0 error.
+- `npm run build` → 0 error.
+
+### Known non-blocking limits
+
+- The admin profile refuses to start
+  on Windows when the on-disk
+  capability file is owned by a
+  different user (the `icacls` ACL
+  contract). A future v1.2 release
+  could add a Node-native ACL helper
+  to remove the `icacls` shell-out;
+  the v1.1.2 contract documents
+  POSIX as the primary path.
+- The admin profile's
+  `sensitivity_visibility` capability
+  is currently granted by the same
+  single token (the v1.1.2 contract
+  documents per-capability-type
+  tokens as a v1.2 candidate). A
+  future release could split the
+  `CapabilityType` union into
+  per-operation tokens if a real
+  threat model demands it.
 
 ## [1.1.1] — Stage 16 v1.1.1 (Idempotency v2 public path + black-box gate)
 

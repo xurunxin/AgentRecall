@@ -141,24 +141,38 @@ export const rememberToolSchema = z
     // the original result (idempotency_key_reuse on key
     // collision with a different request body).
     idempotency_key: nonEmptyString.optional(),
-    // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
-    // memory semantics controlled fields. All
-    // optional; the validator applies the canonical
-    // defaults (tier=working, pinned=false,
-    // sensitivity=normal, trust_level=agent_observed).
-    tier: tierSchema.optional(),
-    pinned: z.boolean().optional(),
-    valid_from: timestampSchema.optional(),
-    valid_until: timestampSchema.optional(),
-    sensitivity: sensitivitySchema.optional(),
-    trust_level: trustLevelSchema.optional(),
-    // Trusted-user confirmation. Required when
-    // `trust_level === "user_confirmed"` is set.
-    // The MCP `confirm_memory_trust` tool is the
-    // canonical way to set this flag; CLI scripts
-    // that want to bypass the MCP tool must pass
-    // it explicitly.
-    user_confirmed: z.boolean().optional()
+  // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+  // memory semantics controlled fields. All
+  // optional; the validator applies the canonical
+  // defaults (tier=working, pinned=false,
+  // sensitivity=normal, trust_level=agent_observed).
+  tier: tierSchema.optional(),
+  pinned: z.boolean().optional(),
+  valid_from: timestampSchema.optional(),
+  valid_until: timestampSchema.optional(),
+  sensitivity: sensitivitySchema.optional(),
+  trust_level: trustLevelSchema.optional(),
+  // Trusted-user confirmation. Stage 18 v1.1.2
+  // (issue #23, ADR-0001) keeps the field for
+  // backward compatibility but the v1.1.2 contract
+  // documents it as a HINT, not authorization
+  // evidence. The server-side `CapabilityStore`
+  // is the only thing that authorises a
+  // `user_confirmed` trust tier or a `restricted`
+  // sensitivity. The schema accepts the value
+  // here so older clients keep parsing; the
+  // service layer performs the actual
+  // authorization.
+  user_confirmed: z.boolean().optional(),
+  // Stage 18 v1.1.2 (issue #23, ADR-0001): the
+  // operator capability token. Optional on the
+  // wire. Required when the request escalates the
+  // trust tier to `user_confirmed` or the
+  // sensitivity to `restricted`. The schema
+  // accepts the value as a free-form string so
+  // the validator can reject malformed tokens
+  // (the validator enforces the 64-hex shape).
+  capability: z.string().optional()
   })
   .strict()
   .superRefine(requireProjectIdentity)
@@ -294,11 +308,21 @@ export const updateMemoryToolSchema = z
     // wins the race and we don't clobber the new state.
     expected_revision: z.number().int().nonnegative().optional(),
     // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
-    // trusted-user confirmation. Required when the
-    // patch raises the trust tier to `user_confirmed`
-    // or the sensitivity to `restricted`. Set by
-    // the `confirm_memory_trust` MCP tool.
-    user_confirmed: z.boolean().optional()
+    // trusted-user confirmation. Stage 18 v1.1.2
+    // (issue #23, ADR-0001) keeps the field for
+    // backward compatibility but the v1.1.2
+    // contract documents it as a HINT, not
+    // authorization evidence. The server-side
+    // `CapabilityStore` is the only thing that
+    // authorises a `user_confirmed` trust tier or
+    // a `restricted` sensitivity.
+    user_confirmed: z.boolean().optional(),
+    // Stage 18 v1.1.2 (issue #23, ADR-0001): the
+    // operator capability token. Required when
+    // the patch escalates the trust tier to
+    // `user_confirmed` or the sensitivity to
+    // `restricted`.
+    capability: z.string().optional()
   })
   .strict()
   .superRefine((input, context) => {
@@ -540,12 +564,20 @@ export const confirmMemoryTrustToolSchema = z
     // true` is also set (which this schema
     // does for the caller).
     trust_level: z.enum(["user_confirmed", "agent_observed", "inferred"]),
-    // The caller must echo `user_confirmed: true`
-    // to make the policy intent explicit. The
-    // tool does not consult the input actor
-    // identity; the actor comes from the
-    // `RequestContext` (per PR-1 #11).
+    // Stage 18 v1.1.2 (issue #23, ADR-0001): the
+    // `user_confirmed: true` flag is preserved for
+    // backward compatibility (existing clients
+    // keep parsing) but the v1.1.2 contract
+    // documents it as a HINT, not authorization
+    // evidence. The actual authorization is the
+    // server-side `CapabilityStore` check.
     user_confirmed: z.literal(true),
+    // Stage 18 v1.1.2 (issue #23, ADR-0001): the
+    // operator capability token. Required for a
+    // `user_confirmed` promotion; the service
+    // layer rejects the request when this is
+    // missing or invalid.
+    capability: z.string().optional(),
     reason: nonEmptyString.optional()
   })
   .strict()

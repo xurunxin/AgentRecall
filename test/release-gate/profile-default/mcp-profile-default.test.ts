@@ -271,14 +271,18 @@ describe("release-gate mcp-profile-default (Stage 17 v1.1.2 #22)", () => {
     }
   });
 
-  it("AGENT_RECALL_PROFILE=admin fails closed the same way as an unknown value", async () => {
-    // The fail-closed contract is symmetric:
-    // any value outside {core, extended} is
-    // refused. `admin` is a plausible typo /
-    // future profile name; the test pins the
-    // symmetric behaviour so a future change
-    // (e.g. adding `admin` as a valid value)
-    // surfaces as a single test diff.
+  it("AGENT_RECALL_PROFILE=admin refuses to start without a valid operator capability", async () => {
+    // Stage 18 v1.1.2 (issue #23, ADR-0001): the
+    // `admin` profile is a valid selector value
+    // (Task 3 follow-up: the selector accepts it),
+    // BUT the server refuses to bind to stdio when
+    // no valid capability is installed at
+    // `AGENT_RECALL_HOME/admin.cap`. The fail-closed
+    // contract is enforced by the MCP server entry
+    // (not the selector) so the startup error
+    // surfaces a "capability required" message
+    // rather than the generic "unknown profile"
+    // message.
     const dataHomeLocal = mkdtempSync(join(tmpdir(), "lm-rg-profile-admin-"));
     try {
       const child = spawn(
@@ -300,9 +304,31 @@ describe("release-gate mcp-profile-default (Stage 17 v1.1.2 #22)", () => {
       const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
         child.once("exit", (code, signal) => resolve({ code, signal }));
       });
+      // The server must exit non-zero (the
+      // capability-gate refuses to bind to stdio).
       expect(exit.code).not.toBe(0);
       const stderrText = Buffer.concat(stderrChunks).toString("utf8");
+      // The error message names the
+      // `AGENT_RECALL_PROFILE=admin` profile AND
+      // the `admin grant` remediation so an
+      // operator can recover without reading
+      // the docs.
       expect(stderrText).toMatch(/AGENT_RECALL_PROFILE/);
+      expect(stderrText).toMatch(/admin/);
+      expect(stderrText).toMatch(/capability/i);
+      // The server must not have written a
+      // server-side message to stdout. The MCP
+      // protocol runs over stdio; a successful
+      // server leaves stdout empty until the
+      // first client message.
+      const stdoutChunks: Buffer[] = [];
+      child.stdout?.on("data", (chunk: Buffer) => stdoutChunks.push(chunk));
+      // We have to read the stdout here. The
+      // `exit` event has already fired (the
+      // server exits before binding), so the
+      // stdout stream should be empty / closed.
+      const stdoutText = Buffer.concat(stdoutChunks).toString("utf8").trim();
+      expect(stdoutText).toBe("");
     } finally {
       try {
         rmSync(dataHomeLocal, { recursive: true, force: true });

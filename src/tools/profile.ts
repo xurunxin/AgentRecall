@@ -1,30 +1,54 @@
 // src/tools/profile.ts
 //
 // Stage 17 v1.1.2 (issue #22, spec § 5.5 + release
-// plan Task 3): the MCP server's tool-profile
-// selector. The selector reads the
-// `AGENT_RECALL_PROFILE` env var at process
-// startup, defaults to `core` (the safe,
-// low-surface default for an unconfigured
-// packaged server), and fail-closes on any
-// other value. The selector is a single source
-// of truth: `index.ts` consumes it to pick
-// between `registerCoreTools` and
-// `registerExtendedTools`, and `resources.ts`
+// plan Task 3) + Stage 18 v1.1.2 (issue #23, ADR-0001):
+// the MCP server's tool-profile selector. The
+// selector reads the `AGENT_RECALL_PROFILE` env
+// var at process startup, defaults to `core` (the
+// safe, low-surface default for an unconfigured
+// packaged server), and fail-closes on any other
+// value. The selector is a single source of
+// truth: `index.ts` consumes it to pick between
+// `registerCoreTools` / `registerExtendedTools`
+// / `registerAdminTools`, and `resources.ts`
 // surfaces the resolved profile on
 // `memory://health.active_profile`.
 //
-// The v1.1.2 contract pins three rules:
+// The v1.1.2 contract pins four rules:
 //
 //   1. The packaged default is `core`.
-//   2. `core` and `extended` are the only valid
-//      values. `extended` is opt-in (the admin
-//      surface is not enabled by default).
-//   3. An unknown value is a startup error. The
-//      error message names `AGENT_RECALL_PROFILE`
-//      and lists the supported values so an
-//      operator can recover without reading the
-//      docs.
+//   2. `core` is safe-by-default (the
+//      unconfigured server registers the
+//      10-tool read / write / plan surface).
+//   3. `extended` is opt-in (the additional
+//      10-tool memory-semantics +
+//      administrative surface).
+//   4. `admin` is opt-in via
+//      `AGENT_RECALL_PROFILE=admin` AND a
+//      valid operator-installed capability
+//      (the `CapabilityStore` admin boundary
+//      from Task 4 / #23). A bare `admin`
+//      profile without a capability
+//      fail-closes at startup (the server
+//      refuses to bind to stdio).
+//
+// The selector only resolves the NAME; the
+// capability check is performed by the MCP
+// server entry (which can fail closed before
+// binding to stdio). The selector itself
+// accepts `admin` as a valid value so the
+// downstream capability gate can produce the
+// correct error message (the more specific
+// "admin profile requires a capability"
+// path) rather than the generic "unknown
+// profile" path.
+//
+// An unknown value (anything outside
+// {core, extended, admin}) is still a startup
+// error. The error message names
+// `AGENT_RECALL_PROFILE` and lists the
+// supported values so an operator can recover
+// without reading the docs.
 //
 // This module is intentionally a leaf (no
 // imports beyond the standard `process` types)
@@ -32,7 +56,7 @@
 // MCP server entry and the CLI without
 // pulling in the broader tool registry.
 
-export const PROFILE_NAMES = ["core", "extended"] as const;
+export const PROFILE_NAMES = ["core", "extended", "admin"] as const;
 
 export type ToolProfile = (typeof PROFILE_NAMES)[number];
 

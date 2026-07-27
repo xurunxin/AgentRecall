@@ -34,6 +34,7 @@ import { listBackups } from "../backup.js";
 import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ProjectIdentityResolver } from "../scope-resolver.js";
 import type { ToolProfile } from "../tools/profile.js";
+import type { CapabilityStore } from "../admin/capability.js";
 
 export interface MemoryServerContext {
   readonly store: SQLiteMemoryStore;
@@ -53,8 +54,8 @@ export interface MemoryServerContext {
   readonly identityResolver: ProjectIdentityResolver;
   /**
    * v1.1.2 (issue #22): the active tool profile the
-   * server was started with (`"core"` or
-   * `"extended"`). Surfaced on the health resource as
+   * server was started with (`"core"`, `"extended"`,
+   * or `"admin"`). Surfaced on the health resource as
    * `active_profile` so an operator / MCP client can
    * branch on the runtime tool surface without
    * re-reading `AGENT_RECALL_PROFILE` from the
@@ -64,6 +65,18 @@ export interface MemoryServerContext {
    * absent so the contract stays deterministic.
    */
   readonly activeProfile?: ToolProfile;
+  /**
+   * Stage 18 v1.1.2 (issue #23, ADR-0001): the
+   * operator capability store. The health
+   * resource surfaces the load state (granted
+   * vs missing) so an operator can verify
+   * the admin-boundary state without
+   * re-reading the on-disk file. The
+   * `active_profile === "admin"` profile
+   * refuses to start without a granted
+   * capability (see `src/index.ts`).
+   */
+  readonly capabilityStore?: CapabilityStore;
 }
 
 type Variables = Record<string, string | string[] | undefined>;
@@ -309,6 +322,20 @@ export function registerMemoryResources(server: MemoryResourceServer, ctx: Memor
       // legacy unbound mode via
       // `AGENT_RECALL_ALLOW_UNBOUND_PROJECT_ID=1`.
       const allowUnbound = ctx.identityResolver.isAllowUnbound();
+      // Stage 18 v1.1.2 (issue #23, ADR-0001):
+      // surface the admin boundary state. The
+      // capability file path is reported so an
+      // operator can verify the file's location
+      // without re-reading the docs; the `state`
+      // is `granted` when the in-memory token is
+      // loaded, `missing` otherwise. The
+      // `active_profile` / `capability_state`
+      // pair is the documented "is the admin
+      // surface available right now?" probe.
+      const capabilityState = ctx.capabilityStore?.hasCapability() === true
+        ? "granted"
+        : "missing";
+      const capabilityPath = ctx.capabilityStore?.getPath();
       return jsonResource(uri, {
         status: "ok",
         server_version: serverVersion(),
@@ -328,16 +355,29 @@ export function registerMemoryResources(server: MemoryResourceServer, ctx: Memor
         // v1.1.2 (issue #22): the active MCP tool
         // profile. `"core"` is the packaged default;
         // `"extended"` is opt-in via
-        // `AGENT_RECALL_PROFILE=extended`. The field
-        // is sourced from the per-server
-        // `activeProfile` context so an MCP client
-        // can verify the runtime tool surface
-        // without re-reading the env var (mirrors
-        // the v1.1.2 `identity_status` contract).
-        // Defaults to `"core"` when the context
-        // omits the field (older test mocks that
-        // pre-date the profile split).
+        // `AGENT_RECALL_PROFILE=extended`; `"admin"`
+        // is opt-in via `AGENT_RECALL_PROFILE=admin`
+        // AND a valid capability. The field is
+        // sourced from the per-server `activeProfile`
+        // context so an MCP client can verify the
+        // runtime tool surface without re-reading
+        // the env var (mirrors the v1.1.2
+        // `identity_status` contract). Defaults to
+        // `"core"` when the context omits the field
+        // (older test mocks that pre-date the
+        // profile split).
         active_profile: ctx.activeProfile ?? "core",
+        // Stage 18 v1.1.2 (issue #23, ADR-0001):
+        // the admin boundary state. `granted` is
+        // the active state when the in-memory
+        // capability token is loaded (the
+        // `AGENT_RECALL_PROFILE=admin` profile
+        // refuses to start in this state without
+        // a granted capability). `missing` is the
+        // documented fail-closed state for
+        // `core` / `extended` profiles.
+        capability_state: capabilityState,
+        ...(capabilityPath !== undefined ? { capability_path: capabilityPath } : {}),
         backup: {
           dir: backupDir,
           entry_count: backupEntries.length,

@@ -7,6 +7,7 @@
 import { resolveDataHome } from "../index.js";
 import { SQLiteMemoryStore } from "../sqlite-store.js";
 import { ProjectIdentityResolver } from "../scope-resolver.js";
+import { adminCommand } from "./commands/admin.js";
 import { auditCommand } from "./commands/audit.js";
 import { backupCommand, restoreCommand } from "./commands/backup.js";
 import { doctorCommand } from "./commands/doctor.js";
@@ -66,6 +67,7 @@ Commands:
   backup     Run a manual backup
   restore    Restore from a verified backup
   migrate    Run schema migrations
+  admin      Manage the operator capability (grant / status / revoke)
   help       Show this help
 
 Global flags:
@@ -88,7 +90,8 @@ const dispatch: Record<string, CommandHandler> = {
   import: importCommand,
   backup: backupCommand,
   restore: restoreCommand,
-  migrate: migrateCommand
+  migrate: migrateCommand,
+  admin: adminCommand
 };
 
 export async function runCli(

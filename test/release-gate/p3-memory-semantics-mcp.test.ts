@@ -123,7 +123,14 @@ describe("release-gate p3-memory-semantics-mcp (issue #17, spec § 5.4)", () => 
   // -------------------------------------------------------------
   // Authorization policy: user_confirmed requires the flag
   // -------------------------------------------------------------
-  it("rejects trust_level=user_confirmed without user_confirmed flag (unauthorized)", () => {
+  it("rejects trust_level=user_confirmed without an operator capability (unauthorized)", () => {
+    // Stage 18 v1.1.2 (issue #23, ADR-0001): the
+    // v1.1.1 `user_confirmed: true` flag is no
+    // longer authorization evidence. The
+    // validator no longer gates on the flag; the
+    // service performs the capability check.
+    // Without a capability store, the service
+    // rejects the request with `unauthorized`.
     const r = service.remember(
       baseRemember({
         trust_level: "user_confirmed"
@@ -134,17 +141,107 @@ describe("release-gate p3-memory-semantics-mcp (issue #17, spec § 5.4)", () => 
     expect(r.error).toBe("unauthorized");
   });
 
-  it("accepts trust_level=user_confirmed with user_confirmed=true", () => {
+  it("rejects trust_level=user_confirmed with a malformed capability (unauthorized)", () => {
+    // The service accepts the `capability` field
+    // (validator extracts it) but rejects the
+    // request when the token does not match the
+    // on-disk store. The test here uses a
+    // well-formed but unmatched token; the
+    // service returns `unauthorized` with a
+    // `token_mismatch` reason in the details.
     const r = service.remember(
       baseRemember({
         trust_level: "user_confirmed",
-        user_confirmed: true
+        user_confirmed: true,
+        // 64 hex chars (matches the validator's
+        // shape) but does NOT match any
+        // capability the service knows about
+        // (the test service has no
+        // `CapabilityStore` installed).
+        capability: "0".repeat(64)
       }) as Parameters<MemoryService["remember"]>[0]
     );
-    expect(r.ok).toBe(true);
-    if (!r.ok) return;
-    const got = store.getEntry(r.value.memory_id);
-    expect(got?.trust_level).toBe("user_confirmed");
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.error).toBe("unauthorized");
+  });
+
+  it("accepts trust_level=user_confirmed with a valid operator capability", async () => {
+    // Stage 18 v1.1.2 (issue #23, ADR-0001): the
+    // v1.1.1 `user_confirmed: true` flag is no
+    // longer authorization evidence. The
+    // canonical authorization is the operator
+    // capability; the test installs a fresh
+    // capability via the `CapabilityStore` and
+    // supplies the token on the request. The
+    // service accepts the request and the row
+    // carries `trust_level: "user_confirmed"`.
+    const { CapabilityStore } = await import("../../src/admin/capability.js");
+    const capDb = mkdtempSync(join(tmpdir(), "lm-rg-semantics-cap-"));
+    try {
+      const capStore2 = new SQLiteMemoryStore(join(capDb, "memory.sqlite"));
+      const capStore = new CapabilityStore(capDb, { persistent: false });
+      const grantStatus = capStore.grant({ label: "rg-test" });
+      if (grantStatus.kind !== "granted") {
+        throw new Error("expected grant to succeed");
+      }
+      // Recover the freshly-generated token via a
+      // synthetic authorization request. The
+      // `InMemoryCapabilityStore.authorize(...)`
+      // path does not surface the raw token; the
+      // test relies on the store's `grant()`
+      // having stored it. We re-derive the token
+      // by granting again (the second grant
+      // overwrites the in-memory record) and
+      // read it via a synthetic comparison.
+      // The cleanest approach: a fresh
+      // `CapabilityStore` instance with a
+      // pre-seeded capability record. The
+      // `InMemoryCapabilityStore` accepts an
+      // initial record in the constructor, so
+      // we can pass the token we know was just
+      // generated. But the `CapabilityStore`
+      // does not expose the token. The test
+      // here uses an `InMemoryCapabilityStore`
+      // with a known token, then constructs a
+      // `MemoryService` against it.
+      const { InMemoryCapabilityStore } = await import("../../src/admin/capability.js");
+      const knownToken = "a".repeat(64);
+      const inMemStore = new InMemoryCapabilityStore({
+        token: knownToken,
+        created_at: new Date().toISOString(),
+        label: "rg-test"
+      });
+      const capService = new MemoryService(
+        capStore2,
+        undefined,
+        "agent:test",
+        capDb,
+        // Structural cast: the `MemoryService`
+        // constructor's `capabilityStore`
+        // parameter is typed as the
+        // `CapabilityStore` class; the
+        // `InMemoryCapabilityStore` has the same
+        // `authorize(...)` / `hasCapability()`
+        // / `getPath()` surface, so the cast is
+        // a no-op at runtime. The service
+        // consults only the duck-typed methods.
+        inMemStore as unknown as ConstructorParameters<typeof MemoryService>[4]
+      );
+      const r = capService.remember(
+        baseRemember({
+          trust_level: "user_confirmed",
+          user_confirmed: true,
+          capability: knownToken
+        }) as Parameters<MemoryService["remember"]>[0]
+      );
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      const got = capStore2.getEntry(r.value.memory_id);
+      expect(got?.trust_level).toBe("user_confirmed");
+    } finally {
+      try { rmSync(capDb, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
   });
 
   // -------------------------------------------------------------
@@ -276,7 +373,14 @@ describe("release-gate p3-memory-semantics-mcp (issue #17, spec § 5.4)", () => 
   // -------------------------------------------------------------
   // confirmMemoryTrust — the trusted-user confirmation gate
   // -------------------------------------------------------------
-  it("confirmMemoryTrust promotes trust_level with user_confirmed: true and audits the transition", () => {
+  it("confirmMemoryTrust rejects without a capability store (unauthorized)", () => {
+    // Stage 18 v1.1.2 (issue #23, ADR-0001): the
+    // `confirmMemoryTrust` service helper now
+    // requires a `CapabilityStore`. Without a
+    // store, the helper returns `unauthorized`
+    // BEFORE the row is updated; the audit log
+    // records the rejection under the
+    // `write_rejected` event.
     const r = service.remember(
       baseRemember() as Parameters<MemoryService["remember"]>[0]
     );
@@ -284,41 +388,34 @@ describe("release-gate p3-memory-semantics-mcp (issue #17, spec § 5.4)", () => 
     const confirm = service.confirmMemoryTrust({
       memory_id: r.value.memory_id,
       trust_level: "user_confirmed",
-      user_confirmed: true,
+      user_confirmed: true as const,
       reason: "human review approved"
     });
-    expect(confirm.ok).toBe(true);
-    if (!confirm.ok) return;
-    expect(confirm.previous).toBe("agent_observed");
-    expect(confirm.next).toBe("user_confirmed");
-    const got = store.getEntry(r.value.memory_id);
-    expect(got?.trust_level).toBe("user_confirmed");
-    const audit = store.listAuditEvents({ memory_id: r.value.memory_id });
-    const trustAudit = audit.find((a) => a.metadata.trusted_user_confirmation === true);
-    expect(trustAudit).toBeDefined();
+    expect(confirm.ok).toBe(false);
+    if (confirm.ok) return;
+    expect(confirm.error).toBe("unauthorized");
   });
 
-  it("confirmMemoryTrust rejects without user_confirmed: true (unauthorized)", () => {
+  it("confirmMemoryTrust rejects with a mismatched capability (unauthorized)", () => {
+    // The service accepts a `capability` arg on
+    // the input. The token is well-formed (64 hex
+    // chars) but does NOT match the on-disk
+    // store. The helper returns `unauthorized`
+    // with a `token_mismatch` reason in the
+    // message.
     const r = service.remember(
       baseRemember() as Parameters<MemoryService["remember"]>[0]
     );
     if (!r.ok) throw new Error("setup");
-    // The MCP schema enforces `user_confirmed: z.literal(true)`
-    // before reaching the service, so the only path to the
-    // service without the flag is a direct service call.
-    // The service still rejects it as a defence-in-depth check.
     const confirm = service.confirmMemoryTrust({
       memory_id: r.value.memory_id,
       trust_level: "user_confirmed",
-      // The MCP tool passes `user_confirmed: true`; the
-      // service's signature is the source of truth and
-      // would not even let you build this call without it
-      // (TypeScript's literal narrowing). The test
-      // therefore asserts the schema-level enforcement,
-      // not the service-level fallback.
-      user_confirmed: true as const
+      user_confirmed: true as const,
+      capability: "0".repeat(64)
     });
-    expect(confirm.ok).toBe(true);
+    expect(confirm.ok).toBe(false);
+    if (confirm.ok) return;
+    expect(confirm.error).toBe("unauthorized");
   });
 
   // -------------------------------------------------------------

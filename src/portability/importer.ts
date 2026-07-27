@@ -186,8 +186,34 @@ export type ImportOptions = {
    * in this release is the explicit
    * `--restore-trust` CLI flag; remote signing
    * infrastructure is explicitly a non-goal.
+   *
+   * Stage 18 v1.1.2 (issue #23, ADR-0001): the
+   * `restore_trust` flag is now gated on a valid
+   * `capability` (see below). A bare
+   * `restore_trust: true` without a capability is
+   * rejected at preflight with `unauthorized`.
+   * The flag itself is preserved for backward
+   * compatibility; the v1.1.2 contract pins the
+   * authorization decision on the
+   * `import_trust_restore` capability type.
    */
   restore_trust?: boolean;
+  /**
+   * Stage 18 v1.1.2 (issue #23, ADR-0001): the
+   * operator capability token. Required when the
+   * import would re-claim a non-`imported` trust
+   * tier (`restore_trust: true` + `full_history`)
+   * OR a `sensitivity: "restricted"` row
+   * (`allow_restricted: true`). The preflight
+   * calls `MemoryService.adminCapabilityStore.authorize(...)`
+   * on the matching capability type and rejects
+   * the bundle with `unauthorized` when the
+   * capability is missing, malformed, or
+   * mismatched. The token is NEVER surfaced in
+   * the error message; the failure surfaces the
+   * stable `unauthorized` reason code.
+   */
+  capability?: string;
 };
 
 export type ImportResult = {
@@ -308,6 +334,56 @@ export function preflightImport(
       }
     }
   }
+  // Stage 18 v1.1.2 (issue #23, ADR-0001): the
+  // import-time admin boundary. The preflight
+  // determines whether the bundle requires
+  // capability authorization (a `restore_trust`
+  // import OR a `restricted`-sensitivity entry)
+  // and, when it does, calls the
+  // `MemoryService.adminCapabilityStore` to
+  // authorise the import. A missing or invalid
+  // capability fails closed at preflight (the
+  // bundle is rejected with `unauthorized`
+  // before any entry is written).
+  const requiresImportTrustRestore = options.history_mode === "full_history" && options.restore_trust === true;
+  const requiresImportRestricted = bundle.entries.some((e) => e.sensitivity === "restricted");
+  if ((requiresImportTrustRestore || requiresImportRestricted) && service.adminCapabilityStore === undefined) {
+    return err(
+      "unauthorized",
+      `import requires an operator capability; run \`agent-recall admin grant\` and pass the token via the \`capability\` import option`,
+      {
+        capability_type: requiresImportTrustRestore ? "import_trust_restore" : "import_restricted"
+      }
+    );
+  }
+  if (requiresImportTrustRestore || requiresImportRestricted) {
+    const capability = options.capability;
+    if (capability === undefined) {
+      return err(
+        "unauthorized",
+        `import requires a capability token; pass the option \`capability: "<token>"\` on the import call`,
+        {
+          capability_type: requiresImportTrustRestore ? "import_trust_restore" : "import_restricted"
+        }
+      );
+    }
+    const decision = service.adminCapabilityStore!.authorize({
+      capability,
+      capability_type: requiresImportTrustRestore ? "import_trust_restore" : "import_restricted",
+      requestContext: {
+        actor_id: "agent:importer" as never,
+        request_id: `import-preflight-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      }
+    });
+    if (!decision.ok) {
+      return err(
+        "unauthorized",
+        `import capability check failed: ${decision.reason}`,
+        { reason: decision.reason, capability_type: requiresImportTrustRestore ? "import_trust_restore" : "import_restricted" }
+      );
+    }
+  }
+
   // For each entry: schema / secret / sensitivity
   // / id / revision. The live project identity
   // resolver runs in `strict_existing` mode so a
@@ -357,10 +433,21 @@ export function preflightImport(
       );
     }
     // 3. sensitivity policy.
+    // Stage 18 v1.1.2 (issue #23, ADR-0001): the
+    // `allow_restricted` flag is now gated on the
+    // `CapabilityStore`. The flag itself is
+    // preserved for backward compatibility (older
+    // CLI scripts pass it without a capability),
+    // but the v1.1.2 contract pins the
+    // authorization decision on the
+    // `sensitivity_restricted` /
+    // `import_restricted` capability. A bare
+    // `allow_restricted: true` without a
+    // capability is rejected at preflight.
     if (entry.sensitivity === "restricted" && options.allow_restricted !== true) {
       return err(
         "sensitivity_denied",
-        `entry ${entry.id} has sensitivity=restricted; pass allow_restricted=true to import`,
+        `entry ${entry.id} has sensitivity=restricted; pass allow_restricted=true AND an operator capability to import`,
         { entry_id: entry.id }
       );
     }

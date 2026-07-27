@@ -553,10 +553,22 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
       // the patchable fields; the CAS / idempotency fields
       // must be merged in here so the service's
       // `checkIdempotency` and CAS guards see them.
+      // Stage 18 v1.1.2 (issue #23, ADR-0001):
+      // `user_confirmed` and `capability` are also
+      // control fields. The validator accepts them
+      // (for backward compatibility) and the service
+      // performs the actual authorization decision.
       const patch = patchFromUpdateInput(input);
-      const casFields: { idempotency_key?: string; expected_revision?: number } = {};
+      const casFields: {
+        idempotency_key?: string;
+        expected_revision?: number;
+        user_confirmed?: boolean;
+        capability?: string;
+      } = {};
       if (input.idempotency_key !== undefined) casFields.idempotency_key = input.idempotency_key;
       if (input.expected_revision !== undefined) casFields.expected_revision = input.expected_revision;
+      if (input.user_confirmed !== undefined) casFields.user_confirmed = input.user_confirmed;
+      if (input.capability !== undefined) casFields.capability = input.capability;
       return service.updateMemory(
         memoryIdFromInput(input),
         Object.keys(casFields).length === 0 ? patch : { ...patch, ...casFields },
@@ -686,6 +698,17 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
           memory_id: memoryIdFromInput(input),
           trust_level: input.trust_level,
           user_confirmed: true,
+          // Stage 18 v1.1.2 (issue #23, ADR-0001):
+          // forward the operator capability to the
+          // service. The MCP tool itself does not
+          // inspect the value; the service calls
+          // `CapabilityStore.authorize(...)` on the
+          // `trust_promotion` capability type. The
+          // flag is forwarded only when the
+          // caller supplied it (older clients that
+          // pre-date v1.1.2 do not have the field
+          // at all).
+          ...(input.capability !== undefined ? { capability: input.capability } : {}),
           ...(input.reason !== undefined ? { reason: input.reason } : {}),
           actor_id: ctx?.actor_id
         })

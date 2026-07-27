@@ -27,6 +27,8 @@ import {
   type RememberInput,
   type UpdateInput,
   type ValidatedRememberInput,
+  type MemorySensitivity,
+  type MemoryTrustLevel,
   validateRememberInput,
   validateUpdateInput
 } from "../write-validator.js";
@@ -51,6 +53,12 @@ import {
   evaluateEntryBudget,
   matchesReplacementScope
 } from "./memory-service-helpers.js";
+import {
+  CapabilityStore,
+  type AuthorizationDecision,
+  type AuthorizationRequest,
+  type CapabilityRecord
+} from "../admin/capability.js";
 
 type RememberError = "invalid_schema" | "invalid_scope" | "invalid_state" | "secret_detected" | "unauthorized" | "capacity_exceeded" | "duplicate_candidate" | "idempotency_mismatch" | "idempotency_in_flight";
 type UpdateError = "not_found" | "invalid_state" | "invalid_schema" | "secret_detected" | "unauthorized" | "capacity_exceeded" | "stale_revision" | "idempotency_mismatch" | "idempotency_in_flight";
@@ -92,6 +100,16 @@ export type WriteContext = {
    * id alone).
    */
   identityResolver: ProjectIdentityResolver;
+  /**
+   * Stage 18 v1.1.2 (issue #23, ADR-0001): the
+   * operator capability store. The write service
+   * calls `authorize(...)` on the
+   * `trust_promotion` and `sensitivity_restricted`
+   * capability types before accepting a privileged
+   * write. The default (when this is omitted) is a
+   * fail-closed store that always denies.
+   */
+  capabilityStore?: CapabilityStore | { authorize(input: AuthorizationRequest): AuthorizationDecision };
   /** Returns the configured project scope (or creates one with default budget). */
   configureProjectBudget: (
     project_id: string,
@@ -103,6 +121,80 @@ export type WriteContext = {
 
 export class MemoryWriteService {
   constructor(private readonly ctx: WriteContext) {}
+
+  /**
+   * Stage 18 v1.1.2 (issue #23, ADR-0001):
+   * `CapabilityStore` is the single source of truth
+   * for trust / sensitivity authorization. The write
+   * service consults the store whenever a privileged
+   * transition is requested. The function fails
+   * closed when the store is missing or denies.
+   */
+  private authorizeCapability(
+    capabilityType: "trust_promotion" | "sensitivity_restricted",
+    capability: string | undefined,
+    ctx: RequestContext | undefined
+  ): { ok: true } | { ok: false; reason: string; message: string; capability_type: string } {
+    const store = this.ctx.capabilityStore;
+    if (store === undefined) {
+      return {
+        ok: false,
+        reason: "capability_missing",
+        message: `${capabilityType} requires a CapabilityStore (admin profile not active)`,
+        capability_type: capabilityType
+      };
+    }
+    if (capability === undefined) {
+      return {
+        ok: false,
+        reason: "capability_missing",
+        message: `${capabilityType} requires a capability token on the request`,
+        capability_type: capabilityType
+      };
+    }
+    const decision = store.authorize({
+      capability,
+      capability_type: capabilityType,
+      requestContext: ctx ?? buildEmptyRequestContext()
+    });
+    if (decision.ok) return { ok: true };
+    return {
+      ok: false,
+      reason: decision.reason,
+      message: authorizationDenialMessage(decision.reason, capabilityType),
+      capability_type: capabilityType
+    };
+  }
+
+  /**
+   * Stage 18 v1.1.2 (issue #23, ADR-0001): the
+   * privileged write gate. Returns `{ ok: true }`
+   * when the request does NOT require authorization
+   * OR when the supplied capability token matches
+   * the on-disk store. Returns a structured
+   * `unauthorized` decision otherwise. The gate is
+   * the single source of truth for the two
+   * privileged transitions; the validator does
+   * NOT consult the gate.
+   */
+  private checkPrivilegedWriteAuthorization(
+    input: { trust_level: MemoryTrustLevel | undefined; sensitivity: MemorySensitivity | undefined; capability: string | undefined },
+    ctx: RequestContext | undefined
+  ): { ok: true } | { ok: false; reason: string; message: string; capability_type: string } {
+    const trustRequiresAuth = input.trust_level === "user_confirmed";
+    const sensitivityRequiresAuth = input.sensitivity === "restricted";
+    if (!trustRequiresAuth && !sensitivityRequiresAuth) {
+      return { ok: true };
+    }
+    // Trust promotion takes priority over the
+    // sensitivity escalation when both are
+    // requested. The error message names the
+    // actual operation the caller is performing.
+    if (trustRequiresAuth) {
+      return this.authorizeCapability("trust_promotion", input.capability, ctx);
+    }
+    return this.authorizeCapability("sensitivity_restricted", input.capability, ctx);
+  }
 
   configureProjectBudget(
     project_id: string,
@@ -217,6 +309,38 @@ export class MemoryWriteService {
       // `fresh` — fall through to the v2-in-transaction
       // helper below.
     }
+    // Stage 18 v1.1.2 (issue #23, ADR-0001):
+    // trust / sensitivity authorization gate. The
+    // validator no longer enforces the
+    // `user_confirmed: true` flag; the
+    // `CapabilityStore.authorize(...)` call is
+    // the only thing that authorises a privileged
+    // write. The check runs BEFORE the resolver
+    // and the budget evaluation so a denied
+    // privileged call cannot burn an idempotency
+    // reservation. The denial is audited under
+    // the `write_rejected` event so the actor /
+    // request_id / reason are visible.
+    const capDecision = this.checkPrivilegedWriteAuthorization(
+      {
+        trust_level: input.trust_level,
+        sensitivity: input.sensitivity,
+        capability: input.capability
+      },
+      ctx
+    );
+    if (!capDecision.ok) {
+      auditRejected(this.ctx.store, this.ctx.defaultActor, input, "unauthorized", {
+        reason: capDecision.reason,
+        capability_type: capDecision.capability_type,
+        previous: { trust_level: undefined, sensitivity: undefined },
+        next: { trust_level: input.trust_level, sensitivity: input.sensitivity }
+      }, ctx);
+      return err("unauthorized", capDecision.message, {
+        reason: capDecision.reason,
+        capability_type: capDecision.capability_type
+      });
+    }
     const prepared = this.prepareRemember(input, true, ctx);
     if (!prepared.ok) {
       return prepared;
@@ -325,6 +449,38 @@ export class MemoryWriteService {
     if (!validated.ok) {
       auditRejectedForEntry(this.ctx.store, this.ctx.defaultActor, current, validated.error, validated.details, ctx);
       return err(validated.error, validated.message, validated.details);
+    }
+
+    // Stage 18 v1.1.2 (issue #23, ADR-0001): the
+    // trust / sensitivity authorization gate for
+    // updates. An update that escalates
+    // `trust_level` to `user_confirmed` or
+    // `sensitivity` to `restricted` requires the
+    // operator capability. The previous
+    // `trust_level` / `sensitivity` is captured so
+    // the audit event records the transition.
+    const capDecision = this.checkPrivilegedWriteAuthorization(
+      {
+        trust_level: validated.value.trust_level,
+        sensitivity: validated.value.sensitivity,
+        capability: validated.value.capability
+      },
+      ctx
+    );
+    if (!capDecision.ok) {
+      auditRejectedForEntry(this.ctx.store, this.ctx.defaultActor, current, "unauthorized", {
+        reason: capDecision.reason,
+        capability_type: capDecision.capability_type,
+        previous: { trust_level: current.trust_level, sensitivity: current.sensitivity },
+        next: {
+          trust_level: validated.value.trust_level ?? current.trust_level,
+          sensitivity: validated.value.sensitivity ?? current.sensitivity
+        }
+      }, ctx);
+      return err("unauthorized", capDecision.message, {
+        reason: capDecision.reason,
+        capability_type: capDecision.capability_type
+      });
     }
 
     const patch: Record<string, unknown> = { ...validated.value };
@@ -1187,4 +1343,58 @@ export class MemoryWriteService {
       warnings: warnings ?? prepared.budget.warnings
     };
   }
+}
+
+// ============================================================
+// Stage 18 v1.1.2 (issue #23, ADR-0001) helpers.
+// ============================================================
+
+/**
+ * Human-readable authorization denial
+ * messages. The messages name the env var +
+ * CLI command so an operator can recover
+ * without reading the docs. The token value
+ * is NEVER surfaced (the function takes
+ * only the stable reason code).
+ */
+function authorizationDenialMessage(
+  reason: string,
+  capabilityType: "trust_promotion" | "sensitivity_restricted"
+): string {
+  const op =
+    capabilityType === "trust_promotion"
+      ? "trust promotion to user_confirmed"
+      : "writing a memory with sensitivity=restricted";
+  switch (reason) {
+    case "capability_missing":
+      return `${op} requires an operator capability; run \`agent-recall admin grant\` and supply the token on the request`;
+    case "capability_malformed":
+      return `the supplied capability token is malformed (expected 64 hex chars)`;
+    case "permission_drift":
+      return `the on-disk capability file no longer satisfies the owner-only permission contract; re-run \`agent-recall admin grant\``;
+    case "token_mismatch":
+      return `the supplied capability token does not match the on-disk token`;
+    case "unsupported_capability_type":
+      return `the requested capability type is not recognised`;
+    default:
+      return `${op} denied (${reason})`;
+  }
+}
+
+/**
+ * Build a placeholder `RequestContext` for
+ * the case where the service is called
+ * without one (legacy callers, the CLI
+ * scripts). The `actor_id` is the
+ * service's `defaultActor` so audit
+ * attribution stays intact. The
+ * `request_id` is a fresh UUID so audit
+ * events emitted from the same call can be
+ * tied to the same authorization decision.
+ */
+function buildEmptyRequestContext(): RequestContext {
+  return {
+    actor_id: "agent:unknown" as RequestContext["actor_id"],
+    request_id: randomUUID()
+  };
 }

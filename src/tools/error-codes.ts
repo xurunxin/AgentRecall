@@ -45,6 +45,14 @@ export const STABLE_ERROR_CODES = [
   "not_found",
   "secret_detected",
   "unsafe_content",
+  // Stage 18 v1.1.2 (issue #23, ADR-0001):
+  // privilege / authorization. The
+  // `unauthorized` code is the stable
+  // contract for the `CapabilityStore`
+  // denial reasons (trust promotion,
+  // restricted sensitivity, etc.).
+  "unauthorized",
+  "forbidden_visibility",
   // Capacity and lifecycle
   "capacity_exceeded",
   "duplicate",

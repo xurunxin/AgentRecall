@@ -165,26 +165,71 @@ describe("release-gate p3-strict-import (Stage 16 PR-4 #13)", () => {
     ).toThrow(/preflight failed: secret_detected/);
   });
 
-  it("preflight rejects sensitivity=restricted unless allow_restricted=true", () => {
+  it("preflight rejects sensitivity=restricted unless allow_restricted=true and a capability is provided", async () => {
     const exportDir = mkdtempSync(join(tmpdir(), "lm-rg-strict-bundle-"));
     const restricted = baseEntry({ sensitivity: "restricted" });
     writeBundle(exportDir, [restricted]);
 
+    // Stage 18 v1.1.2 (issue #23, ADR-0001): the
+    // `sensitivity=restricted` import now requires
+    // BOTH `allow_restricted: true` AND an
+    // operator capability. Without a
+    // capability, the preflight fails closed with
+    // `unauthorized` (the more specific reason
+    // comes after the capability check).
     expect(() =>
       planImport(service, exportDir, "global", undefined, "json", {
         conflict: "keep",
         dry_run: false,
         actor: "agent:rg"
       })
-    ).toThrow(/sensitivity_denied/);
+    ).toThrow(/unauthorized/);
 
-    // With allow_restricted, preflight passes.
-    const preflight = preflightImport(
+    // Without `allow_restricted`, the per-entry
+    // sensitivity check rejects the bundle. The
+    // preflight is the source of the failure.
+    const noAllowResult = preflightImport(
       service, exportDir, "global", undefined, "json", {
         conflict: "keep",
         dry_run: true,
+        actor: "agent:rg"
+      }
+    );
+    expect(noAllowResult.ok).toBe(false);
+    if (noAllowResult.ok) return;
+    // Without a capability installed, the
+    // preflight surfaces `unauthorized` (the
+    // v1.1.2 capability gate) BEFORE the
+    // per-entry `sensitivity_denied` check.
+    // The v1.1.2 contract pins the
+    // authorization decision on the
+    // capability check; the `sensitivity_denied`
+    // reason is preserved for bundles that
+    // arrive with a valid capability but
+    // without the `allow_restricted` flag.
+    expect(noAllowResult.error).toBe("unauthorized");
+
+    // With allow_restricted + capability, preflight passes.
+    const { InMemoryCapabilityStore } = await import("../../src/admin/capability.js");
+    const knownToken = "a".repeat(64);
+    const capStore = new InMemoryCapabilityStore({
+      token: knownToken,
+      created_at: new Date().toISOString()
+    });
+    const capService = new MemoryService(
+      store,
+      undefined,
+      "agent:rg",
+      dataHome,
+      capStore as unknown as ConstructorParameters<typeof MemoryService>[4]
+    );
+    const preflight = preflightImport(
+      capService, exportDir, "global", undefined, "json", {
+        conflict: "keep",
+        dry_run: true,
         actor: "agent:rg",
-        allow_restricted: true
+        allow_restricted: true,
+        capability: knownToken
       }
     );
     expect(preflight.ok).toBe(true);
@@ -333,7 +378,7 @@ describe("release-gate p3-strict-import (Stage 16 PR-4 #13)", () => {
     expect(v2Norm.entries[0].trust_level).toBe("imported");
   });
 
-  it("snapshot mode imports the current entry fields; full_history mode preserves the chain", () => {
+  it("snapshot mode imports the current entry fields; full_history mode preserves the chain", async () => {
     const exportDir = mkdtempSync(join(tmpdir(), "lm-rg-strict-bundle-"));
     const entryWithRevisions: MemoryEntry = baseEntry();
     writeBundle(exportDir, [entryWithRevisions]);
@@ -360,12 +405,32 @@ describe("release-gate p3-strict-import (Stage 16 PR-4 #13)", () => {
     // out of scope for this release cycle and
     // the live revisions table starts empty
     // post-snapshot).
-    const fullHistory = planImport(service, exportDir, "global", undefined, "json", {
+    // Stage 18 v1.1.2 (issue #23, ADR-0001): a
+    // `restore_trust: true` + `full_history`
+    // import requires an operator capability.
+    // The test installs one via the
+    // `InMemoryCapabilityStore` and supplies the
+    // token on the import options.
+    const { InMemoryCapabilityStore } = await import("../../src/admin/capability.js");
+    const knownToken = "b".repeat(64);
+    const capStore = new InMemoryCapabilityStore({
+      token: knownToken,
+      created_at: new Date().toISOString()
+    });
+    const capService = new MemoryService(
+      store,
+      undefined,
+      "agent:rg",
+      dataHome,
+      capStore as unknown as ConstructorParameters<typeof MemoryService>[4]
+    );
+    const fullHistory = planImport(capService, exportDir, "global", undefined, "json", {
       conflict: "keep",
       dry_run: true,
       actor: "agent:rg",
       history_mode: "full_history",
-      restore_trust: true
+      restore_trust: true,
+      capability: knownToken
     });
     expect(fullHistory.history_mode).toBe("full_history");
   });

@@ -295,6 +295,28 @@ describe("MCP all-tools black-box E2E - Extended profile (v1.1.2 #22 Task 3 foll
 
   beforeAll(async () => {
     dataHome = mkdtempSync(join(tmpdir(), "lm-bb-all-ext-"));
+    // Stage 18 v1.1.2 (issue #23, ADR-0001):
+    // pre-install a valid operator capability so
+    // the Extended profile can authorise the
+    // `confirm_memory_trust` and
+    // `sensitivity_restricted` writes the suite
+    // exercises. The capability is the same
+    // canonical shape the CLI `admin grant`
+    // command produces; the test seeds it
+    // directly into the on-disk file so the
+    // server's startup-time load picks it up.
+    const { CapabilityStore } = await import("../../src/admin/capability.js");
+    CapabilityStore.capabilityPath(dataHome);
+    // `persistent: true` so the on-disk file
+    // is written; the server's startup-time
+    // load picks it up. The test reads the
+    // raw token from the file directly
+    // (the `status()` surface never returns
+    // it; only the redacted `token_tail` /
+    // `fingerprint`).
+    const seedCap = new CapabilityStore(dataHome, { persistent: true });
+    const seedStatus = seedCap.grant({ label: "blackbox-extended" });
+    expect(seedStatus.kind).toBe("granted");
     // Same env contract as `mcp-client-e2e.test.ts`:
     // suppress the CLI/MCP deprecation hint and the
     // "connected on stdio" hint so the stderr-leak
@@ -813,12 +835,31 @@ describe("MCP all-tools black-box E2E - Extended profile (v1.1.2 #22 Task 3 foll
     expect(v.links.some((l) => l.source_kind === "commit")).toBe(true);
   });
 
-  it("semantics: confirm_memory_trust promotes the seed memory to user_confirmed", async () => {
+  it("semantics: confirm_memory_trust promotes the seed memory to user_confirmed (with capability)", async () => {
     if (client === undefined) throw new Error("client not initialised");
+    // Stage 18 v1.1.2 (issue #23, ADR-0001): the
+    // `confirm_memory_trust` tool now requires an
+    // operator capability. The `beforeAll` hook
+    // pre-installs a valid capability; the test
+    // passes the matching token on the request.
+    const { CapabilityStore } = await import("../../src/admin/capability.js");
+    // `persistent: true` so the on-disk file
+    // is read on construction. The `status()`
+    // surface never returns the raw token; the
+    // test reads it from the file directly
+    // (the canonical CLI / blackbox side
+    // channel).
+    const capStore = new CapabilityStore(dataHome!, { persistent: true });
+    const onDisk = capStore.status();
+    expect(onDisk.kind).toBe("granted");
+    const fs = await import("node:fs");
+    const onDiskRaw = fs.readFileSync(capStore.getPath(), "utf8");
+    const onDiskJson = JSON.parse(onDiskRaw) as { token: string };
     const r = await callTool(client, "confirm_memory_trust", {
       memory_id: singleMemoryId,
       trust_level: "user_confirmed",
       user_confirmed: true,
+      capability: onDiskJson.token,
       reason: "blackbox smoke"
     });
     expect(r.isError).toBeFalsy();

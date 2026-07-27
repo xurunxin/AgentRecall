@@ -25,6 +25,7 @@
 // depend on each other.
 
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { err, nowIso, type MemoryAuditEvent, type MemoryBudget, type MemoryEntry, type MemoryScope, type ProjectScope, type Result } from "./domain.js";
 import { MarkdownExporter } from "./markdown-exporter.js";
 import { resolveActor } from "./actor.js";
@@ -40,7 +41,8 @@ import { ProjectIdentityResolver } from "./scope-resolver.js";
 import type { BudgetUsage, EntryFilters, SearchFilters, SQLiteMemoryStore } from "./sqlite-store.js";
 import { CURRENT_SCHEMA_VERSION } from "./sqlite-store.js";
 import { type RememberInput, type UpdateInput } from "./write-validator.js";
-import type { RequestContext } from "./request-context.js";
+import { buildRequestContext, type RequestContext } from "./request-context.js";
+import { CapabilityStore } from "./admin/capability.js";
 
 // Re-export the public types from the read service so the
 // existing `import { ListResult, ... } from "../memory-service"`
@@ -92,6 +94,16 @@ export class MemoryService {
    * apply it later, and the apply step verifies the
    * per-item `expected_revision` (CAS) before mutating. */
   private readonly planStore: MaintenancePlanStore;
+  /**
+   * Stage 18 v1.1.2 (issue #23, ADR-0001): the
+   * operator capability store. The service exposes
+   * the same store through both the write path
+   * (trust / sensitivity authorization) and the
+   * service-level `confirmMemoryTrust` helper. When
+   * the store is absent, all privileged writes are
+   * fail-closed.
+   */
+  private readonly capabilityStore: CapabilityStore | undefined;
 
   constructor(
     store: SQLiteMemoryStore,
@@ -106,7 +118,17 @@ export class MemoryService {
      * Data home directory, used as the destination for `backups/`.
      * If unset, automatic backup is disabled.
      */
-    private readonly dataHome?: string
+    private readonly dataHome?: string,
+    /**
+     * Stage 18 v1.1.2 (issue #23, ADR-0001): the
+     * operator capability store. The MCP server
+     * constructs one from the data home at
+     * startup; the CLI uses a separate instance
+     * for the admin commands. The default
+     * `undefined` is fail-closed — privileged
+     * writes are rejected.
+     */
+    capabilityStore?: CapabilityStore
   ) {
     const resolveActorFn = (override?: string) => resolveActor(override ?? undefined, process.env);
     const resolveExporterFn = (): MarkdownExporter =>
@@ -121,16 +143,26 @@ export class MemoryService {
     // resolver may create).
     const identityResolver = new ProjectIdentityResolver(store, defaultActor);
 
+    this.capabilityStore = capabilityStore;
     this.read = new MemoryReadService({
       store,
       defaultActor,
       identityResolver,
-      resolveExporter: resolveExporterFn
+      resolveExporter: resolveExporterFn,
+      // Stage 18 v1.1.2 (issue #23, ADR-0001): the
+      // SQL-boundary sensitivity filter. When a
+      // capability is loaded into the service, the
+      // read service is allowed to surface
+      // `private` and `restricted` rows; without
+      // a capability the fail-closed default
+      // (`"normal"`) hides them.
+      actorMaxSensitivity: capabilityStore?.hasCapability() === true ? "restricted" : "normal"
     });
     this.write = new MemoryWriteService({
       store,
       defaultActor,
       identityResolver,
+      ...(capabilityStore !== undefined ? { capabilityStore } : {}),
       configureProjectBudget: (project_id, budget, canonical_path, display_name) =>
         this.configureProjectBudget(project_id, budget, canonical_path, display_name)
     });
@@ -150,6 +182,12 @@ export class MemoryService {
    *  by the resource layer and the index entry point. */
   get store(): SQLiteMemoryStore {
     return this._store;
+  }
+
+  /** Stage 18 v1.1.2 (issue #23, ADR-0001): the
+   *  capability store backing this service. */
+  get adminCapabilityStore(): CapabilityStore | undefined {
+    return this.capabilityStore;
   }
 
   // ============================================================
@@ -369,11 +407,15 @@ export class MemoryService {
   }
 
   /**
-   * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+   * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4)
+   * + Stage 18 v1.1.2 (issue #23, ADR-0001):
    * the trusted-user confirmation gate. Promotes an
    * existing memory's `trust_level` to the value
-   * the trusted user approved, on the explicit
-   * `user_confirmed: true` flag. The MCP
+   * the trusted user approved. The
+   * `CapabilityStore.authorize(...)` call is the
+   * only thing that authorises a trust promotion;
+   * the legacy `user_confirmed: true` flag is a
+   * HINT, not authorization evidence. The MCP
    * `confirm_memory_trust` tool is the canonical
    * path; this method is the service-level entry
    * point that the tool wraps.
@@ -382,9 +424,11 @@ export class MemoryService {
    * that the user can legitimately approve
    * (`user_confirmed`, `agent_observed`,
    * `inferred`); `imported` is reserved for the
-   * import path. The flag is a literal `true` so a
-   * client that doesn't pass the flag fails the
-   * MCP schema before reaching this method.
+   * import path. The capability check rejects
+   * a privileged call before the row is updated;
+   * the audit log records the rejection with the
+   * actor, request_id, reason, and the previous /
+   * next trust tier.
    */
   confirmMemoryTrust(input: {
     memory_id: string;
@@ -392,15 +436,92 @@ export class MemoryService {
     user_confirmed: true;
     reason?: string;
     actor_id?: string;
+    capability?: string;
   }):
-    | { ok: true; previous: MemoryEntry["trust_level"]; next: MemoryEntry["trust_level"] }
+    | {
+        ok: true;
+        memory_id: string;
+        previous: MemoryEntry["trust_level"];
+        next: MemoryEntry["trust_level"];
+      }
     | { ok: false; error: "not_found" | "unauthorized" | "invalid_input"; message?: string } {
     const entry = this.store.peekEntry(input.memory_id);
     if (entry === undefined) {
       return { ok: false, error: "not_found" };
     }
-    if (input.user_confirmed !== true) {
-      return { ok: false, error: "unauthorized", message: "user_confirmed flag is required" };
+    // Stage 18 v1.1.2 (issue #23, ADR-0001): the
+    // capability check is the gate. The
+    // `user_confirmed: true` flag is preserved
+    // for backward compatibility (the schema
+    // requires it via `z.literal(true)`) but it
+    // is NOT the authorization evidence. The
+    // audit log records the rejection when the
+    // capability is missing.
+    if (this.capabilityStore === undefined) {
+      const reason = "capability_missing";
+      appendAudit(this.store, this.defaultActor, {
+        memory_id: input.memory_id,
+        scope: entry.scope,
+        ...(entry.project_id !== undefined ? { project_id: entry.project_id } : {}),
+        event: "write_rejected",
+        actor: "system",
+        reason: "unauthorized",
+        metadata: {
+          capability_type: "trust_promotion",
+          reason,
+          field: "trust_level",
+          previous: entry.trust_level,
+          next: input.trust_level
+        }
+      });
+      return { ok: false, error: "unauthorized", message: "trust promotion requires an operator capability; run `agent-recall admin grant` and supply the token" };
+    }
+    if (input.capability === undefined) {
+      const reason = "capability_missing";
+      appendAudit(this.store, this.defaultActor, {
+        memory_id: input.memory_id,
+        scope: entry.scope,
+        ...(entry.project_id !== undefined ? { project_id: entry.project_id } : {}),
+        event: "write_rejected",
+        actor: "system",
+        reason: "unauthorized",
+        metadata: {
+          capability_type: "trust_promotion",
+          reason,
+          field: "trust_level",
+          previous: entry.trust_level,
+          next: input.trust_level
+        }
+      });
+      return { ok: false, error: "unauthorized", message: "trust promotion requires a capability token on the request" };
+    }
+    const decision = this.capabilityStore.authorize({
+      capability: input.capability,
+      capability_type: "trust_promotion",
+      requestContext: buildRequestContext({
+        ...(input.actor_id !== undefined ? { actor_override: input.actor_id } : {}),
+        client_name: "memory-service",
+        request_id: randomUUID()
+      })
+    });
+    if (!decision.ok) {
+      const reason = decision.reason;
+      appendAudit(this.store, this.defaultActor, {
+        memory_id: input.memory_id,
+        scope: entry.scope,
+        ...(entry.project_id !== undefined ? { project_id: entry.project_id } : {}),
+        event: "write_rejected",
+        actor: "system",
+        reason: "unauthorized",
+        metadata: {
+          capability_type: "trust_promotion",
+          reason,
+          field: "trust_level",
+          previous: entry.trust_level,
+          next: input.trust_level
+        }
+      });
+      return { ok: false, error: "unauthorized", message: `trust promotion denied (${reason})` };
     }
     // Apply the new trust tier via a CAS update so
     // the audit log records the transition. The
@@ -424,10 +545,11 @@ export class MemoryService {
         field: "trust_level",
         previous,
         next: input.trust_level,
-        trusted_user_confirmation: true
+        trusted_user_confirmation: true,
+        capability_type: "trust_promotion"
       }
     });
-    return { ok: true, previous, next: input.trust_level };
+    return { ok: true, memory_id: input.memory_id, previous, next: input.trust_level };
   }
 
 

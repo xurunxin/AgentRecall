@@ -106,32 +106,46 @@ export type RememberInput = {
    * writes.
    */
   sensitivity?: MemorySensitivity;
-  /**
-   * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
-   * trust level. The `'user_confirmed'` value is
-   * rejected by the validator unless the caller
-   * also passes `user_confirmed: true` (a separate
-   * trusted confirmation flag), or invokes
-   * `confirm_memory_trust` (a dedicated MCP tool).
-   * The validator keeps the field opt-in so the
-   * import / migration path can still stamp rows
-   * with `'imported'` without going through
-   * confirmation.
-   */
-  trust_level?: MemoryTrustLevel;
-  /**
-   * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
-   * trusted-user confirmation. When the caller
-   * supplies `trust_level: "user_confirmed"`, they
-   * must also pass `user_confirmed: true` to prove
-   * the upgrade was authorized by a user (not
-   * impersonated by an agent). A real MCP client
-   * surfaces this as a `confirm_memory_trust` tool
-   * call; the standalone flag exists for CLI
-   * scripts and tests.
-   */
-  user_confirmed?: boolean;
-};
+    /**
+     * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4)
+     * + Stage 18 v1.1.2 (issue #23, ADR-0001): the
+     * `trust_level` field. The `'user_confirmed'`
+     * value is a privileged transition; v1.1.2
+     * removes the legacy `user_confirmed: true`
+     * gate and replaces it with the operator-side
+     * `CapabilityStore.authorize(...)` check (see
+     * `src/admin/capability.ts`). The validator
+     * still accepts the field; the service performs
+     * the authorization decision.
+     */
+    trust_level?: MemoryTrustLevel;
+    /**
+     * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
+     * trusted-user confirmation. Stage 18 v1.1.2
+     * (issue #23, ADR-0001) keeps the field for
+     * backward compatibility but the v1.1.2 contract
+     * documents it as a HINT, not authorization
+     * evidence. The server-side `CapabilityStore` is
+     * the only thing that authorises a `user_confirmed`
+     * trust tier or a `restricted` sensitivity. The
+     * flag is preserved so existing MCP clients keep
+     * parsing their payloads; the validator accepts
+     * it without gating on it.
+     */
+    user_confirmed?: boolean;
+    /**
+     * Stage 18 v1.1.2 (issue #23, ADR-0001): the
+     * operator capability token. Optional on the
+     * wire; the validator extracts the value when
+     * present. The service calls
+     * `CapabilityStore.authorize(...)` on the
+     * `trust_promotion` and `sensitivity_restricted`
+     * capability types before accepting the
+     * privileged write. The token is NEVER logged
+     * or surfaced in error messages.
+     */
+    capability?: string;
+  };
 
 export type ValidatedRememberInput = {
   scope: MemoryScope;
@@ -157,6 +171,14 @@ export type ValidatedRememberInput = {
   valid_until?: string;
   sensitivity: MemorySensitivity;
   trust_level: MemoryTrustLevel;
+  /**
+   * Stage 18 v1.1.2 (issue #23, ADR-0001): the
+   * operator capability token. Optional. The
+   * service calls `CapabilityStore.authorize(...)`
+   * on the relevant capability type when a
+   * privileged transition is requested.
+   */
+  capability?: string;
 };
 
 export type UpdateInput = Partial<
@@ -192,14 +214,30 @@ export type UpdateInput = Partial<
    * Same semantics as on `RememberInput`.
    */
   idempotency_key?: string;
-  /**
-   * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
-   * trusted-user confirmation. Required when the
-   * patch raises the trust level to `user_confirmed`
-   * or the sensitivity to `restricted`.
-   */
-  user_confirmed?: boolean;
-};
+    /**
+     * Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4)
+     * + Stage 18 v1.1.2 (issue #23, ADR-0001):
+     * trusted-user confirmation. Stage 18 keeps the
+     * field for backward compatibility but the
+     * v1.1.2 contract documents it as a HINT, not
+     * authorization evidence. The server-side
+     * `CapabilityStore` is the only thing that
+     * authorises a `user_confirmed` trust tier or
+     * a `restricted` sensitivity.
+     */
+    user_confirmed?: boolean;
+    /**
+     * Stage 18 v1.1.2 (issue #23, ADR-0001): the
+     * operator capability token. Optional on the
+     * wire; the validator extracts the value when
+     * present. The service calls
+     * `CapabilityStore.authorize(...)` on the
+     * `trust_promotion` and `sensitivity_restricted`
+     * capability types before accepting the
+     * privileged update.
+     */
+    capability?: string;
+  };
 
 export type ValidatedUpdateInput = UpdateInput;
 
@@ -266,6 +304,7 @@ export function validateRememberInput(input: unknown): Result<ValidatedRememberI
   const sensitivity = input.sensitivity === undefined ? "normal" : parseSensitivity(input.sensitivity, issues);
   const trustLevel = input.trust_level === undefined ? "agent_observed" : parseTrustLevel(input.trust_level, issues);
   const userConfirmed = parseUserConfirmed(input.user_confirmed, issues) ?? false;
+  const capability = parseCapability(input.capability, issues);
 
   if (scope === "project" && projectId === undefined && projectPath === undefined) {
     issues.push("project_id");
@@ -309,20 +348,21 @@ export function validateRememberInput(input: unknown): Result<ValidatedRememberI
     }
   }
 
-  // Trust-level authorization: 'user_confirmed' is a
-  // privileged transition. The validator accepts it ONLY
-  // when the caller also passes `user_confirmed: true` —
-  // the trusted-user confirmation flag. A real MCP client
-  // surfaces the flag through the `confirm_memory_trust`
-  // tool; the validator keeps the cross-check so an
-  // arbitrary `remember` call cannot self-promote.
-  if (trustLevel === "user_confirmed" && userConfirmed !== true) {
-    return err(
-      "unauthorized",
-      "trust_level 'user_confirmed' requires the user_confirmed flag (use the confirm_memory_trust MCP tool).",
-      { trust_level: trustLevel }
-    );
-  }
+  // Trust-level authorization (Stage 18 v1.1.2
+  // issue #23, ADR-0001): the validator no longer
+  // gates on the `user_confirmed: true` flag.
+  // The flag is preserved for backward
+  // compatibility (older clients keep parsing) but
+  // the v1.1.2 contract documents it as a HINT,
+  // not authorization evidence. The actual
+  // authorization is the `CapabilityStore.authorize
+  // (capability, requestContext)` call performed by
+  // the service layer against the
+  // `trust_promotion` capability type. The
+  // validator's only policy at this level is to
+  // parse the input correctly; the service
+  // returns `unauthorized` when the capability is
+  // missing or does not match.
 
   const secretFindings = findSecrets({ title, body, tags });
   if (secretFindings.length > 0) {
@@ -353,7 +393,8 @@ export function validateRememberInput(input: unknown): Result<ValidatedRememberI
     ...(validFrom !== undefined ? { valid_from: validFrom } : {}),
     ...(validUntil !== undefined ? { valid_until: validUntil } : {}),
     sensitivity,
-    trust_level: trustLevel
+    trust_level: trustLevel,
+    ...(capability !== undefined ? { capability } : {})
   });
 }
 
@@ -449,6 +490,10 @@ export function validateUpdateInput(input: unknown): Result<ValidatedUpdateInput
     const userConfirmed = parseUserConfirmed(input.user_confirmed, issues);
     if (userConfirmed !== undefined) value.user_confirmed = userConfirmed;
   }
+  if ("capability" in input) {
+    const capability = parseCapability(input.capability, issues);
+    if (capability !== undefined) value.capability = capability;
+  }
   // Stage 12 PR9: optimistic-concurrency control. The
   // validator keeps `expected_revision` in the validated
   // shape so the write service can route the write
@@ -467,29 +512,15 @@ export function validateUpdateInput(input: unknown): Result<ValidatedUpdateInput
     return invalidSchema(issues);
   }
 
-  // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
-  // trust-level authorization for updates. The
-  // `user_confirmed` flag is required when the
-  // patch raises the trust tier to `user_confirmed`.
-  // Sensitivity escalations to `restricted` likewise
-  // require the flag — the canonical
-  // `confirm_memory_trust` MCP tool sets the flag,
-  // and a CLI script that wants to bypass the MCP
-  // tool must still pass it explicitly.
-  if (value.trust_level === "user_confirmed" && value.user_confirmed !== true) {
-    return err(
-      "unauthorized",
-      "trust_level 'user_confirmed' requires the user_confirmed flag (use the confirm_memory_trust MCP tool).",
-      { trust_level: value.trust_level }
-    );
-  }
-  if (value.sensitivity === "restricted" && value.user_confirmed !== true) {
-    return err(
-      "unauthorized",
-      "sensitivity 'restricted' requires the user_confirmed flag.",
-      { sensitivity: value.sensitivity }
-    );
-  }
+  // Stage 18 v1.1.2 (issue #23, ADR-0001): the
+  // validator no longer gates on the
+  // `user_confirmed: true` flag. The flag is a HINT;
+  // authorization is performed by the service layer's
+  // `CapabilityStore.authorize(...)` call. The
+  // validator's only policy at this level is to parse
+  // the input correctly; the service returns
+  // `unauthorized` when the capability is missing or
+  // does not match the on-disk token.
 
   const secretFindings = findSecrets(secretInputs);
   if (secretFindings.length > 0) {
@@ -649,6 +680,39 @@ function parseUserConfirmed(value: unknown, issues: string[]): boolean | undefin
   if (typeof value === "boolean") return value;
   issues.push("user_confirmed");
   return undefined;
+}
+
+/**
+ * Stage 18 v1.1.2 (issue #23, ADR-0001): the
+ * operator capability token. The validator
+ * enforces the canonical token shape (64 hex
+ * chars) and rejects anything else so the
+ * service can compare the value with a
+ * constant-time check against the on-disk
+ * token. The validator does NOT compare the
+ * value against the on-disk token itself —
+ * the `CapabilityStore.authorize(...)` call
+ * is the only authoritative comparison. A
+ * missing / malformed capability is
+ * tolerated (the value is just absent from
+ * the validated shape) so the service can
+ * surface the stable `unauthorized` error
+ * with the specific `capability_missing`
+ * reason.
+ */
+function parseCapability(value: unknown, issues: string[]): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") {
+    issues.push("capability");
+    return undefined;
+  }
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return undefined;
+  if (!/^[0-9a-f]{64}$/.test(trimmed)) {
+    issues.push("capability");
+    return undefined;
+  }
+  return trimmed;
 }
 
 function parseOptionalTimestamp(

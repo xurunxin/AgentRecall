@@ -57,6 +57,21 @@ export type EntryFilters = {
    * `until` (which filters `created_at`).
    */
   updated_until?: string;
+  /**
+   * Stage 18 v1.1.2 (issue #23, ADR-0001): the
+   * maximum sensitivity the caller is
+   * authorised to read. The store filters
+   * rows whose `sensitivity` exceeds the
+   * value at the SQL boundary (NOT at the
+   * response layer); a caller without the
+   * `sensitivity_visibility` capability
+   * cannot see `private` or `restricted`
+   * rows. Valid values: `"normal"` (the
+   * default; only `normal` rows visible),
+   * `"private"`, `"restricted"`. The order
+   * normal < private < restricted.
+   */
+  actor_max_sensitivity?: "normal" | "private" | "restricted";
 };
 
 export type SearchFilters = EntryFilters & {
@@ -524,6 +539,40 @@ function buildEntryWhere(filters: EntryFilters, alias: string): { where: string;
   if (filters.updated_until !== undefined) {
     clauses.push(`${column("updated_at")} <= ?`);
     params.push(filters.updated_until);
+  }
+  // Stage 18 v1.1.2 (issue #23, ADR-0001): the
+  // sensitivity visibility filter is applied at
+  // the SQL boundary (NOT at the response layer)
+  // so a caller without the
+  // `sensitivity_visibility` capability cannot
+  // even probe whether a `private` or `restricted`
+  // row exists. The filter is encoded as a
+  // `CASE WHEN ...` order so a missing
+  // `actor_max_sensitivity` defaults to `"normal"`
+  // (the documented fail-closed default).
+  if (filters.actor_max_sensitivity !== undefined) {
+    const max = filters.actor_max_sensitivity;
+    const order = max === "restricted" ? 3 : max === "private" ? 2 : 1;
+    clauses.push(
+      `(CASE ${column("sensitivity")} ` +
+        `WHEN 'restricted' THEN 3 ` +
+        `WHEN 'private' THEN 2 ` +
+        `ELSE 1 END) <= ?`
+    );
+    params.push(order);
+  } else {
+    // Default: only `normal` rows are visible.
+    // The v1.1.2 fail-closed contract pins
+    // this for any read path that does not
+    // explicitly opt in via the capability
+    // check (i.e. every default read).
+    clauses.push(
+      `(CASE ${column("sensitivity")} ` +
+        `WHEN 'restricted' THEN 3 ` +
+        `WHEN 'private' THEN 2 ` +
+        `ELSE 1 END) <= ?`
+    );
+    params.push(1);
   }
 
   return {

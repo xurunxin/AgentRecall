@@ -114,6 +114,22 @@ export type ReadContext = {
   exporter?: MarkdownExporter;
   /** Returns the MarkdownExporter for read-side exports. */
   resolveExporter: () => MarkdownExporter;
+  /**
+   * Stage 18 v1.1.2 (issue #23, ADR-0001): the
+   * maximum sensitivity the read service is
+   * authorised to surface. The store applies
+   * this filter at the SQL boundary; rows
+   * whose `sensitivity` exceeds the value
+   * are excluded from every public read path
+   * (`getMemory`, `listMemories`,
+   * `searchMemories`, `exportMemoryContext`,
+   * maintenance diagnostics). The default
+   * (`"normal"`) is fail-closed; the MCP
+   * server's admin profile overrides the
+   * value to `"restricted"` once the
+   * capability check passes.
+   */
+  actorMaxSensitivity?: "normal" | "private" | "restricted";
 };
 
 export class MemoryReadService {
@@ -155,7 +171,14 @@ export class MemoryReadService {
     return {
       items: this.ctx.store.listEntries({
         ...this.entryFiltersForRead(filters, resolved.value),
-        status: filters.status ?? "active"
+        status: filters.status ?? "active",
+        // Stage 18 v1.1.2 (issue #23, ADR-0001):
+        // the SQL-boundary sensitivity filter
+        // (the v1.1.2 fail-closed contract). A
+        // caller without the `sensitivity_visibility`
+        // capability cannot see `private` or
+        // `restricted` rows.
+        actor_max_sensitivity: this.ctx.actorMaxSensitivity ?? "normal"
       })
     };
   }
@@ -188,13 +211,20 @@ export class MemoryReadService {
     const limit = filters.limit ?? 10;
     const query = filters.query;
     const resolvedFilters = this.entryFiltersForRead(storeFilters, resolved.value);
+    // Stage 18 v1.1.2 (issue #23, ADR-0001):
+    // the SQL-boundary sensitivity filter. The
+    // default (`"normal"`) is fail-closed; the
+    // admin profile overrides via
+    // `ReadContext.actorMaxSensitivity`.
+    const maxSensitivity = this.ctx.actorMaxSensitivity ?? "normal";
     const projectFtsItems =
       resolved.value.scope === "project"
         ? this.ctx.store.searchEntries({
             ...resolvedFilters,
             query,
             status,
-            limit: 10_000
+            limit: 10_000,
+            actor_max_sensitivity: maxSensitivity
           })
         : [];
     const globalFtsItems =
@@ -213,7 +243,8 @@ export class MemoryReadService {
             ...(storeFilters.updated_until !== undefined
               ? { updated_until: storeFilters.updated_until }
               : {}),
-            limit: 10_000
+            limit: 10_000,
+            actor_max_sensitivity: maxSensitivity
           })
         : [];
     // Dedup (FTS may return the same id in both
@@ -292,7 +323,13 @@ export class MemoryReadService {
       scope: input.scope,
       ...(resolvedProjectId !== undefined ? { project_id: resolvedProjectId } : {}),
       status: "active",
-      limit: 10_000
+      limit: 10_000,
+      // Stage 18 v1.1.2 (issue #23, ADR-0001):
+      // the budget accounting is filtered to the
+      // caller's authorised sensitivity. A
+      // `private` row counts against the budget
+      // only for callers who can see it.
+      actor_max_sensitivity: this.ctx.actorMaxSensitivity ?? "normal"
     });
     return {
       budget,
@@ -529,7 +566,10 @@ export class MemoryReadService {
         ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
         status: "active",
         query,
-        limit: 10_000
+        limit: 10_000,
+        // Stage 18 v1.1.2 (issue #23, ADR-0001):
+        // SQL-boundary sensitivity filter.
+        actor_max_sensitivity: this.ctx.actorMaxSensitivity ?? "normal"
       });
     }
     return this.activeEntriesForScope(scope);
@@ -550,7 +590,10 @@ export class MemoryReadService {
       scope: scope.scope,
       ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
       status: "active",
-      limit: 10_000
+      limit: 10_000,
+      // Stage 18 v1.1.2 (issue #23, ADR-0001):
+      // SQL-boundary sensitivity filter.
+      actor_max_sensitivity: this.ctx.actorMaxSensitivity ?? "normal"
     });
   }
 }
