@@ -143,6 +143,18 @@ npm run cli -- backup
 npm run cli -- migrate --yes
 npm run cli -- export --format json              # Stage 8: json / yaml / markdown
 npm run cli -- export --format yaml
+# Stage 18 v1.1.2 (issue #24, task 5): the import
+# preflight is the authoritative gate. A bundle
+# that contains `sensitivity: "restricted"` rows
+# OR uses `restore_trust: true` + `full_history`
+# requires an operator capability. The capability
+# is installed via `agent-recall admin grant` (see
+# ADR-0001); the programmatic import
+# (`importMemoryExport(..., { capability })`)
+# accepts the token, the CLI will accept a
+# `--capability <token>` flag in a follow-up.
+npm run cli -- import --from <export-root> --scope global --format json
+npm run cli -- import --from <export-root> --scope project --project-id <id> --format json
 ```
 
 After `npm run build`, the same commands are available via the `agent-recall`
@@ -232,6 +244,18 @@ maintenance actions (`rebuild_markdown_index`, `expire_due`,
 - `update_memory` accepts either a `patch` object or top-level update fields, but not both.
 - `remember` rejects unknown fields and only accepts supported memory types, source kinds, ratings, and writable statuses.
 - Service errors are returned as structured JSON text. `export_memory_context` returns markdown text.
+
+## Import Preflight + Capability Boundary
+
+The `import` path (CLI `agent-recall import --from <export-root> --scope ...` and the programmatic `importMemoryExport(...)` API) runs an authoritative preflight that closes any of these gaps **before** any row is written:
+
+- **Schema / enum / secret** — invalid enums and `secret_detected` (e.g. `sk-...` API keys in `body`) reject the bundle.
+- **Project identity** — every project-scope entry is routed through `ProjectIdentityResolver.resolve(..., "strict_existing")`. A `project_id` that has not been registered surfaces `identity_conflict`; a `project_path` that aliases to a different id also surfaces `identity_conflict`. The v1.1.2 strict-by-default contract is enforced (no silent identity creation from a `project_id`-only input).
+- **Sensitivity / trust authorization** — a `restore_trust: true` + `full_history` import OR a bundle that contains `sensitivity: "restricted"` rows requires an operator capability. The bare `restore_trust` / `allow_restricted` flag without a capability is rejected at preflight with `unauthorized`. The capability is installed via `agent-recall admin grant` (see [ADR-0001](docs/adr/0001-local-admin-capability-boundary.md)) and passed to the import via the `capability` option. The CLI does NOT silently `restore_trust`; the `restore_trust` + `full_history` import is the only way to re-claim a `user_confirmed` tier, and it must be paired with a valid `import_trust_restore` capability.
+- **Aggregate budget** — the batch is checked against the configured `max_active_entries`, `max_total_chars`, `max_topic_chars`, and `max_index_chars` (the v1.1.1 PR-4 placeholder against `Number.MAX_SAFE_INTEGER` was useless; the v1.1.2 contract pins the check on the real configured limits). Replacements / merges release the existing entry's `char_count` and index size, so the budget is computed against the **net** impact (the preflight emits a deterministic `before` / `after` summary on the `PreflightPlan`).
+- **Apply-time revalidation** — the `applyImport` step re-reads the live store INSIDE the transaction. A preflight / apply race (a concurrent write that bumped a row's revision, or a budget drift between preflight and apply) rolls the entire batch back atomically. The `import_batches` row is never written on a failed apply (Task 7 #26 will add the persistent lineage surface; the v1.1.2 contract ships the "no completed batch row on a failed apply" rule).
+
+A failed preflight leaves the live store untouched and returns the preflight error in the structured envelope (`error.code` is one of `identity_conflict`, `secret_detected`, `aggregate_budget`, `sensitivity_denied`, `unauthorized`, `revision_drift`, `invalid_schema`, `bundle_garbled`).
 
 ## Configuration
 

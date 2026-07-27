@@ -5,6 +5,219 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [1.1.2] — Stage 18 v1.1.2 (Authoritative import preflight + aggregate budgets, issue #24, task 5)
+
+The v1.1.1 follow-up roadmap left issue **#24** on the
+list. The v1.1.2 preflight was running only a
+field-shape check and a useless
+`index_chars + aggregateChars > Number.MAX_SAFE_INTEGER`
+guard against the budget; the v1.1.2 contract
+promotes the preflight to the authoritative
+gate that closes any of those gaps. The
+preflight is now anchored on the configured
+budget limits (`max_active_entries`,
+`max_total_chars`, `max_topic_chars`,
+`max_index_chars`) and the
+`ProjectIdentityResolver.strict_existing` resolver,
+and the apply phase re-validates revisions +
+identities + aggregate budget inside the
+transaction so a preflight / apply race can
+never leave a half-applied batch.
+
+### Added
+
+- **`src/budget-governor.ts`** — new
+  `projectBatchBudget(input: { budget, usage, ops })`
+  pure helper. The function projects the
+  active budget after a batch of `insert` /
+  `replace` / `merge` operations and returns
+  a `BatchBudgetResult` (the deterministic
+  `before` / `after` summary) or a structured
+  `BatchBudgetError` (the failure mode code:
+  `max_active_entries`, `max_total_chars`,
+  `max_topic_chars`, `max_index_chars`).
+  Replaces / merges release the existing
+  entry's `char_count` and index size so the
+  net impact is the right invariant. The
+  function is pure; the caller supplies the
+  `before` usage from
+  `SQLiteMemoryStore.getBudgetUsage(...)` and
+  the configured `budget` from the project
+  scope / the global default.
+- **`src/portability/importer.ts`** — new
+  `PreflightPlan` type: a deterministic
+  per-entry decisions list (in import order)
+  plus a `budget` block with `before` /
+  `after` usage, the active budget limits,
+  and the `inserts` / `replacements` /
+  `merges` counts. The preflight returns the
+  plan on success AND on failure (the failure
+  path's `details.preflight` carries the
+  partial plan so the CLI can inspect what
+  had been classified so far). The `ImportPlan`
+  gains an optional `preflight` field so
+  callers can read the plan after `planImport`.
+- **`src/portability/importer.ts`** — the
+  `preflightImport` is now the authoritative
+  gate. Every project-scope entry is routed
+  through `ProjectIdentityResolver.resolve(...,
+  "strict_existing")`; the aggregate budget
+  is computed from
+  `service.store.getBudgetUsage(...)` against
+  the real configured limits
+  (`max_active_entries`, `max_total_chars`,
+  `max_topic_chars`, `max_index_chars`). A
+  bundle that mixes global + project entries
+  / fails secret detection / fails the strict
+  resolver / overshoots any of the budget
+  limits is rejected with a structured
+  `PreflightError` and the partial plan.
+  Failure modes:
+  - `invalid_schema` — missing `body` /
+    invalid enum / etc.
+  - `secret_detected` — secret pattern in
+    `body`.
+  - `sensitivity_denied` —
+    `sensitivity: "restricted"` without
+    `allow_restricted: true` AND an operator
+    capability.
+  - `unauthorized` — capability is missing
+    or invalid.
+  - `identity_conflict` — strict resolver
+    refuses an unbound / conflicting
+    `project_id` / `project_path`.
+  - `aggregate_budget` — the batch would
+    push `active_entries` / `active_chars` /
+    per-topic chars / `index_chars` past the
+    configured limit.
+  - `revision_drift` — `replace` policy
+    against a live row whose revision moved.
+- **`src/portability/importer.ts`** — the
+  `applyImport` re-validates the preflight's
+  assumptions INSIDE the
+  `service.store.transaction(...)`. The
+  re-validation walks the replacements list
+  to re-read the live row's revision (a
+  preflight / apply race that bumped a row's
+  revision throws `revision drift` /
+  `stale_revision` and the whole batch rolls
+  back atomically). The aggregate-budget
+  invariant is also re-checked: the live
+  `getBudgetUsage(...)` is sampled INSIDE
+  the transaction, the preflight's
+  decisions are re-projected against it, and
+  a drift throws an `aggregate budget
+  drifted` error that rolls the batch back.
+  The `import_batches` row is never written
+  on a failed apply (Task 7 #26 will add the
+  persistent lineage surface; this task
+  ships the "don't write a completed batch
+  row on a failed apply" contract).
+
+### New tests
+
+- **`test/release-gate/p3-import-preflight-budget.test.ts`**
+  (NEW, 12 tests) — the authoritative
+  preflight + aggregate budget surface:
+  - Unknown `project_id` at preflight is
+    rejected with `identity_conflict`; 0
+    rows are mutated.
+  - `project_id` / `project_path` conflict
+    at preflight is rejected.
+  - Batch that would push `active_entries`
+    past `max_active_entries` is atomically
+    rejected.
+  - Batch that would push `active_chars`
+    past `max_total_chars` is atomically
+    rejected.
+  - Batch that would push a per-topic char
+    total past `max_topic_chars` is
+    atomically rejected.
+  - Batch that would push `index_chars` past
+    `max_index_chars` is atomically rejected.
+  - Replacements / merges release the
+    existing entry's `char_count` / index
+    size so the budget check is "net
+    impact" not "insert size only".
+  - The `PreflightPlan` carries a
+    deterministic `before` / `after` budget
+    summary.
+  - A preflight / apply race (revision
+    drift) rolls back the entire batch.
+  - A cross-project (malicious re-hashed)
+    bundle is rejected by the strict resolver.
+  - A clean snapshot bundle passes through
+    unchanged.
+  - Smoke: preflight succeeds on a clean
+    global bundle.
+- **`test/cli/import-preflight.test.ts`**
+  (NEW, 3 tests) — the CLI blackbox surface:
+  - `import` rejects an unbound `project_id`
+    with exit 1 + `identity_conflict` on
+    stderr.
+  - `import` applies a clean snapshot bundle
+    with exit 0 + `inserts: 1` on stdout.
+  - `import` rejects a bundle that contains
+    a secret with exit 1 + `secret_detected`
+    on stderr.
+
+### Existing tests updated
+
+- **`test/release-gate/p3-strict-import.test.ts`** —
+  no assertion weakened; the existing
+  preflight + capability + secret detection
+  surface is now stricter (the v1.1.2
+  preflight emits a deterministic
+  `PreflightPlan` and computes the budget
+  against the real configured limits, not
+  `Number.MAX_SAFE_INTEGER`).
+- **`test/portability-import.test.ts`** — the
+  `fail` policy test pins the preflight
+  wording (`import conflict: ...`) so the
+  preflight's structured error path keeps
+  the v1.1.1 PR-4 message intact.
+
+### Test count
+
+- `npm test` (after `npm run build`):
+  **757 passed** / **0 skipped** across
+  **84 test files** (canonical). The
+  v1.1.2 / #24 preflight + apply-time
+  revalidation + aggregate-budget contract
+  adds 15 release-gate / CLI tests (12 in
+  `p3-import-preflight-budget` + 3 in
+  `cli/import-preflight`) and does NOT
+  weaken any existing assertion.
+- `AGENT_RECALL_PROFILE=admin` /
+  `npm test`: **757 passed** / **0
+  skipped** (the admin-profile gate does
+  not break the import path; the v1.1.2
+  fail-closed default rejects privileged
+  imports uniformly).
+- `npm run typecheck` → 0 error.
+- `npm run build` → 0 error.
+- No `package.json` / `package-lock.json`
+  changes (the v1.1.2 contract is enforced
+  at the preflight + apply layer; the
+  runtime path is unchanged).
+
+### Known non-blocking limits
+
+- The CLI `import` command does not surface
+  a `--capability` flag yet. The
+  `restore_trust: true` + `full_history`
+  import path and the
+  `sensitivity: "restricted"` import path
+  require an operator capability; a future
+  release could add a `--capability` flag
+  to the CLI so an operator can pass the
+  token without writing a wrapper script.
+  The v1.1.2 contract documents the
+  programmatic surface (`importMemoryExport(...,
+  { capability: "..." })`) as the canonical
+  path; the CLI change is a small follow-up
+  that does not affect the contract.
+
 ## [1.1.2] — Stage 17 v1.1.2 (Bound project identity on every public path)
 
 The v1.1.1 follow-up roadmap left issue **#21** (the default-unbound

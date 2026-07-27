@@ -71,6 +71,7 @@
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import {
+  type MemoryBudget,
   type MemoryEntry,
   type MemoryScope,
   type Result
@@ -78,6 +79,13 @@ import {
 import { err, ok } from "../domain.js";
 import { detectSecrets } from "../secret-detector.js";
 import { validateRememberInput } from "../write-validator.js";
+import { type BudgetUsage } from "../sqlite-store.js";
+import {
+  projectBatchBudget,
+  type BatchBudgetExceededCode,
+  type BatchOp
+} from "../budget-governor.js";
+import { budgetFor } from "../services/memory-service-helpers.js";
 import type { MemoryService } from "../memory-service.js";
 import { ProjectIdentityResolver } from "../scope-resolver.js";
 import { readManifest, verifyManifest, MANIFEST_FILENAME, type Manifest } from "./manifest.js";
@@ -120,9 +128,72 @@ export type PreflightResult = Result<
   {
     bundle: NormalisedBundle;
     import_batch_id: string;
+    /**
+     * Stage 18 v1.1.2 (issue #24, task 5):
+     * deterministic plan: per-entry decisions
+     * plus the `before` / `after` budget summary
+     * computed from the live budget usage.
+     */
+    preflight: PreflightPlan;
   },
   PreflightError
 >;
+
+/**
+ * Stage 18 v1.1.2 (issue #24, task 5): the
+ * deterministic preflight surface. The plan is
+ * inspectable and reproducible: the same bundle
+ * + the same live store produce the same plan
+ * (the `before` usage is sampled from the
+ * store at preflight time; the `after` is
+ * computed by `projectBatchBudget`). The plan
+ * is also the audit surface for the preflight
+ * (`audit_events` can record the
+ * `before` / `after` summary so a reviewer
+ * later knows what the live budget looked
+ * like at preflight time).
+ */
+export type PreflightPlanDecision =
+  | { kind: "insert"; memory_id: string }
+  | { kind: "replace"; memory_id: string; existing_id: string }
+  | { kind: "merge"; memory_id: string; existing_id: string }
+  | { kind: "skip"; memory_id: string; reason: string }
+  | { kind: "reject"; memory_id: string; reason: string };
+
+export type PreflightPlan = {
+  /**
+   * Per-entry decision, in import order. The
+   * preflight attaches a `reject` decision when
+   * AND only when the entry was the failing one
+   * (the preflight is fail-fast: the first
+   * failing entry's decision is `reject`, every
+   * earlier entry's decision is `insert` /
+   * `replace` / `merge` / `skip`). The CLI can
+   * surface the `before` budget summary even
+   * on a failed preflight.
+   */
+  decisions: PreflightPlanDecision[];
+  budget: {
+    /** The live budget usage captured at preflight time. */
+    before: BudgetUsage;
+    /** The projected budget after the batch (when all ops succeed). */
+    after: BudgetUsage;
+    /** The configured budget limits (project / global). */
+    active_budget: MemoryBudget;
+    /** Net change to `active_chars` (`batch_chars - releases`). */
+    batch_chars: number;
+    /** Sum of `char_count` released by replaces / merges. */
+    releases: number;
+    /** Net change to `active_chars`. */
+    net_chars: number;
+    /** Net change to `index_chars`. */
+    net_index_chars: number;
+    /** Count of inserts / replaces / merges. */
+    inserts: number;
+    replacements: number;
+    merges: number;
+  };
+};
 
 export type ImportPlan = {
   manifest: Manifest;
@@ -149,6 +220,13 @@ export type ImportPlan = {
     | { kind: "merge"; memory_id: string }
     | { kind: "skip"; memory_id: string; reason: string }
   >;
+  /**
+   * Stage 18 v1.1.2 (issue #24, task 5): the
+   * deterministic preflight plan (v1 summary
+   * + per-entry decisions). The apply phase
+   * uses this to re-validate at apply time.
+   */
+  preflight?: PreflightPlan;
 };
 
 export type ImportOptions = {
@@ -404,7 +482,63 @@ export function preflightImport(
   // `resolveMemoryScopeWithStore(this.store, ...)`)
   // so a v1 export that carries the original
   // `project_path` per entry is honoured.
+  //
+  // Stage 18 v1.1.2 (issue #24, task 5): the
+  // preflight now ALSO accumulates per-entry
+  // batch ops (insert / replace / merge / skip)
+  // and projections so the post-validation
+  // aggregate-budget check is computed against
+  // the REAL configured limits (not
+  // `Number.MAX_SAFE_INTEGER`). The plan is
+  // surfaced on both success and failure so the
+  // CLI can inspect the partial state.
   const identityResolver = new ProjectIdentityResolver(service.store, options.actor);
+  // Snapshot the live usage ONCE — the
+  // per-entry loop is read-only against the
+  // store so the `before` value is stable for
+  // the duration of the preflight.
+  const targetScope = scope;
+  const targetProjectId = project_id;
+  const usage = service.store.getBudgetUsage({
+    scope: targetScope,
+    ...(targetProjectId !== undefined ? { project_id: targetProjectId } : {})
+  });
+  const activeBudget = budgetFor(service.store, {
+    scope: targetScope,
+    ...(targetProjectId !== undefined ? { project_id: targetProjectId } : {})
+  });
+  const batchOps: BatchOp[] = [];
+  const decisions: PreflightPlanDecision[] = [];
+  // Build the decisions / ops list as we walk
+  // the bundle. The first failing entry's
+  // decision is `reject`; the preflight returns
+  // `err("...","...", { entry_id, preflight })`
+  // so the CLI can still surface the partial
+  // plan.
+  const failFast = (
+    error: PreflightError,
+    message: string,
+    entryId: string,
+    details: Record<string, unknown> = {}
+  ): PreflightResult => {
+    decisions.push({ kind: "reject", memory_id: entryId, reason: error });
+    const preflight: PreflightPlan = {
+      decisions,
+      budget: {
+        before: usage,
+        after: usage,
+        active_budget: activeBudget,
+        batch_chars: 0,
+        releases: 0,
+        net_chars: 0,
+        net_index_chars: 0,
+        inserts: 0,
+        replacements: 0,
+        merges: 0
+      }
+    };
+    return err(error, message, { entry_id: entryId, preflight, ...details });
+  };
   for (const entry of bundle.entries) {
     // 1. schema / enum / secret. The validator may
     // reject the entry with `invalid_schema` OR
@@ -414,10 +548,11 @@ export function preflightImport(
     const validated = validateRememberInput(entryToRememberInput(entry));
     if (!validated.ok) {
       const preflightError: PreflightError = validated.error;
-      return err(
+      return failFast(
         preflightError,
         `entry ${entry.id} failed ${validated.error}: ${validated.message}`,
-        { entry_id: entry.id, ...(validated.details ?? {}) }
+        entry.id,
+        { ...(validated.details ?? {}) }
       );
     }
     // 2. secret detection (the validator already
@@ -426,10 +561,10 @@ export function preflightImport(
     //    field explicitly).
     const findings = detectSecrets(entry.body, "body");
     if (findings.length > 0) {
-      return err(
+      return failFast(
         "secret_detected",
         `entry ${entry.id} contains a potential secret (categories: ${findings.map((f) => f.category).join(", ")})`,
-        { entry_id: entry.id }
+        entry.id
       );
     }
     // 3. sensitivity policy.
@@ -445,10 +580,10 @@ export function preflightImport(
     // `allow_restricted: true` without a
     // capability is rejected at preflight.
     if (entry.sensitivity === "restricted" && options.allow_restricted !== true) {
-      return err(
+      return failFast(
         "sensitivity_denied",
         `entry ${entry.id} has sensitivity=restricted; pass allow_restricted=true AND an operator capability to import`,
-        { entry_id: entry.id }
+        entry.id
       );
     }
     // 4. project identity. v1.1.2 (issue #21): the
@@ -467,10 +602,10 @@ export function preflightImport(
       const projectId = entry.project_id;
       const projectPath = entry.project_path;
       if (projectId === undefined && projectPath === undefined) {
-        return err(
+        return failFast(
           "invalid_schema",
           `entry ${entry.id} has project scope but no project_id / project_path`,
-          { entry_id: entry.id }
+          entry.id
         );
       }
       const identityResolved = identityResolver.resolve(
@@ -482,11 +617,11 @@ export function preflightImport(
         "strict_existing"
       );
       if (!identityResolved.ok) {
-        return err(
+        return failFast(
           "identity_conflict",
           `entry ${entry.id} targets an unbound / conflicting project: ${identityResolved.message}`,
+          entry.id,
           {
-            entry_id: entry.id,
             ...(projectId !== undefined ? { project_id: projectId } : {}),
             ...(projectPath !== undefined ? { project_path: projectPath } : {})
           }
@@ -497,42 +632,132 @@ export function preflightImport(
     //    for `replace` policy; we preflight the
     //    CAS here so the apply phase never sees
     //    a drift).
-    if (options.conflict === "replace") {
-      const live = service.peekMemoryById(entry.id);
-      if (live !== undefined && live.revision !== entry.revision) {
-        return err(
-          "revision_drift",
-          `entry ${entry.id} revision drift: imported=${entry.revision} existing=${live.revision}`,
-          { entry_id: entry.id }
-        );
-      }
+    const live = service.peekMemoryById(entry.id);
+    if (options.conflict === "replace" && live !== undefined && live.revision !== entry.revision) {
+      return failFast(
+        "revision_drift",
+        `entry ${entry.id} revision drift: imported=${entry.revision} existing=${live.revision}`,
+        entry.id
+      );
+    }
+    // 6. classify the entry into the batch
+    //    op. The preflight is the single
+    //    source of truth for insert/replace/
+    //    merge/skip so the budget check is
+    //    computed against the same
+    //    classification the apply phase uses.
+    if (live === undefined) {
+      batchOps.push({ kind: "insert", entry });
+      decisions.push({ kind: "insert", memory_id: entry.id });
+    } else if (options.conflict === "keep") {
+      decisions.push({ kind: "skip", memory_id: entry.id, reason: "existing entry" });
+    } else if (options.conflict === "replace") {
+      batchOps.push({ kind: "replace", entry, existing: live });
+      decisions.push({ kind: "replace", memory_id: entry.id, existing_id: live.id });
+    } else if (options.conflict === "merge") {
+      batchOps.push({ kind: "merge", entry, existing: live });
+      decisions.push({ kind: "merge", memory_id: entry.id, existing_id: live.id });
+    } else {
+      // fail policy: preflight rejects the
+      // whole batch on the first conflict.
+      // The error message preserves the
+      // v1.1.1 PR-4 wording (`import
+      // conflict: ...`) so the CLI's regex
+      // matcher in `test/portability-import.test.ts`
+      // keeps working.
+      return failFast(
+        "identity_conflict",
+        `import conflict: memory_id=${entry.id} already exists (policy=fail)`,
+        entry.id
+      );
     }
   }
-  // 6. aggregate budget. The check sums the
-  //    per-entry char_count and asks the live
-  //    budget helper whether the target scope
-  //    has room.
-  const targetScope = scope;
-  const targetProjectId = project_id;
-  const aggregateChars = bundle.entries.reduce(
-    (acc, e) => acc + (e.char_count ?? 0),
-    0
-  );
-  const usage = service.store.getBudgetUsage({
-    scope: targetScope,
-    ...(targetProjectId !== undefined ? { project_id: targetProjectId } : {})
+  // 7. aggregate budget. The check sums the
+  //    per-entry char_count / index chars and
+  //    asks the live budget helper whether the
+  //    target scope has room. The check is
+  //    computed against the REAL configured
+  //    limits (the v1.1.2 contract; the v1.1.1
+  //    PR-4 path used `Number.MAX_SAFE_INTEGER`
+  //    as a placeholder for "no limit", which
+  //    was useless).
+  const batchProjection = projectBatchBudget({
+    budget: activeBudget,
+    usage,
+    ops: batchOps
   });
-  if (usage.index_chars + aggregateChars > Number.MAX_SAFE_INTEGER) {
+  if (!batchProjection.ok) {
+    const budgetError = batchProjection.error;
+    const failingEntryId: string = batchOps.length > 0
+      ? batchOps[batchOps.length - 1]!.entry.id
+      : (bundle.entries[0]?.id ?? "unknown");
+    const plan: PreflightPlan = {
+      decisions,
+      budget: {
+        before: usage,
+        after: budgetError.budget_after,
+        active_budget: activeBudget,
+        batch_chars: batchProjection.result.batch_chars,
+        releases: batchProjection.result.releases,
+        net_chars: batchProjection.result.net_chars,
+        net_index_chars: batchProjection.result.net_index_chars,
+        inserts: batchProjection.result.insert_count,
+        replacements: batchProjection.result.replace_count,
+        merges: batchProjection.result.merge_count
+      }
+    };
     return err(
       "aggregate_budget",
-      `aggregate bundle size (${aggregateChars} chars) would overflow the budget index`,
-      { aggregate_chars: aggregateChars, index_chars: usage.index_chars }
+      aggregateBudgetMessage(budgetError.code, budgetError.observed, budgetError.limit, activeBudget, budgetError.budget_after),
+      {
+        entry_id: failingEntryId,
+        preflight: plan,
+        budget_code: budgetError.code,
+        observed: budgetError.observed,
+        limit: budgetError.limit,
+        budget_after: budgetError.budget_after
+      }
     );
   }
+  const plan: PreflightPlan = {
+    decisions,
+    budget: {
+      before: usage,
+      after: batchProjection.result.after,
+      active_budget: activeBudget,
+      batch_chars: batchProjection.result.batch_chars,
+      releases: batchProjection.result.releases,
+      net_chars: batchProjection.result.net_chars,
+      net_index_chars: batchProjection.result.net_index_chars,
+      inserts: batchProjection.result.insert_count,
+      replacements: batchProjection.result.replace_count,
+      merges: batchProjection.result.merge_count
+    }
+  };
   return ok({
     bundle,
-    import_batch_id: newImportBatchId()
+    import_batch_id: newImportBatchId(),
+    preflight: plan
   });
+}
+
+function aggregateBudgetMessage(
+  code: BatchBudgetExceededCode,
+  observed: number,
+  limit: number,
+  budget: MemoryBudget,
+  after: BudgetUsage
+): string {
+  switch (code) {
+    case "max_active_entries":
+      return `aggregate budget exceeded: active_entries ${observed} > max_active_entries ${limit} (max_total_chars=${budget.max_total_chars}, max_index_chars=${budget.max_index_chars})`;
+    case "max_total_chars":
+      return `aggregate budget exceeded: active_chars ${observed} > max_total_chars ${limit} (after aggregate=${after.active_chars})`;
+    case "max_topic_chars":
+      return `aggregate budget exceeded: per-topic chars ${observed} > max_topic_chars ${limit}`;
+    case "max_index_chars":
+      return `aggregate budget exceeded: index_chars ${observed} > max_index_chars ${limit} (after aggregate=${after.index_chars})`;
+  }
 }
 
 /**
@@ -573,7 +798,7 @@ export function planImport(
         : "";
     throw new Error(`preflight failed: ${preflight.error}${where} — ${preflight.message}`);
   }
-  const { bundle, import_batch_id } = preflight.value;
+  const { bundle, import_batch_id, preflight: preflightPlan } = preflight.value;
   const imported = bundle.entries;
   const historyMode: ImportHistoryMode = options.history_mode ?? "snapshot";
   const inserts: MemoryEntry[] = [];
@@ -581,24 +806,58 @@ export function planImport(
   const skipped: MemoryEntry[] = [];
   const decisions: ImportPlan["decisions"] = [];
 
+  // The preflight already classified every
+  // entry (insert / replace / merge / skip).
+  // Iterate in the preflight's order so the
+  // plan's `decisions` array matches the
+  // preflight's `decisions` array (the
+  // `before` / `after` summary is anchored on
+  // the preflight's classification).
+  const decisionById = new Map<string, PreflightPlanDecision>();
+  for (const d of preflightPlan.decisions) {
+    decisionById.set(d.memory_id, d);
+  }
   for (const entry of imported) {
+    const d = decisionById.get(entry.id);
+    if (d === undefined) {
+      // Should not happen: the preflight
+      // walks every entry in `bundle.entries`.
+      // If we get here, the bundle was tampered
+      // with between preflight and plan; the
+      // safe behaviour is to fail closed.
+      throw new Error(`preflight plan is missing entry ${entry.id}`);
+    }
     const existing = service.peekMemoryById(entry.id);
-    if (existing === undefined) {
+    if (d.kind === "insert") {
       inserts.push(entry);
       decisions.push({ kind: "insert", memory_id: entry.id });
       continue;
     }
-    if (options.conflict === "keep") {
+    if (d.kind === "skip") {
       skipped.push(entry);
-      decisions.push({ kind: "skip", memory_id: entry.id, reason: "existing entry" });
+      decisions.push({ kind: "skip", memory_id: entry.id, reason: d.reason });
       continue;
     }
-    if (options.conflict === "replace") {
+    if (d.kind === "replace") {
+      if (existing === undefined) {
+        // Race: the live row disappeared between
+        // preflight and plan. The apply-time
+        // revalidation will catch this; the plan
+        // reclassifies as an insert.
+        inserts.push(entry);
+        decisions.push({ kind: "insert", memory_id: entry.id });
+        continue;
+      }
       replacements.push({ imported: entry, existing });
       decisions.push({ kind: "replace", memory_id: entry.id });
       continue;
     }
-    if (options.conflict === "merge") {
+    if (d.kind === "merge") {
+      if (existing === undefined) {
+        inserts.push(entry);
+        decisions.push({ kind: "insert", memory_id: entry.id });
+        continue;
+      }
       // Merge keeps the live entry's id and revision
       // but takes the higher importance / confidence
       // and the union of tags from the import.
@@ -606,8 +865,11 @@ export function planImport(
       decisions.push({ kind: "merge", memory_id: entry.id });
       continue;
     }
-    // fail
-    throw new Error(`import conflict: memory_id=${entry.id} already exists (policy=fail)`);
+    // The preflight tagged the entry as
+    // `reject` — but the preflight is fail-fast
+    // so we never reach here. The defensive
+    // throw keeps the type narrow.
+    throw new Error(`preflight plan has rejected entry ${entry.id}`);
   }
 
   return {
@@ -621,7 +883,8 @@ export function planImport(
     inserts,
     replacements,
     skipped,
-    decisions
+    decisions,
+    preflight: preflightPlan
   };
 }
 
@@ -657,6 +920,22 @@ function mergeEntries(existing: MemoryEntry, imported: MemoryEntry): MemoryEntry
  * transaction so a failure on entry N rolls back
  * entries 1..N-1. The DB is either fully imported or
  * not touched at all (all-or-nothing).
+ *
+ * Stage 18 v1.1.2 (issue #24, task 5): the apply
+ * re-validates the preflight's assumptions inside
+ * the transaction. The preflight captures the
+ * `(revisions, ids, aggregate budget)` snapshot at
+ * plan time; the apply re-reads the live store
+ * INSIDE the transaction and rejects the whole
+ * batch when any of the assumptions drifted. A
+ * preflight / apply race (a concurrent write
+ * that bumped a row's revision) therefore
+ * triggers an atomic rollback: the live store
+ * is untouched, no `import_batches` row is
+ * committed (Task 7 #26 will add the persistent
+ * lineage surface; this task ships the
+ * "don't write a completed batch row on a
+ * failed apply" contract).
  */
 export function applyImport(
   service: MemoryService,
@@ -675,6 +954,80 @@ export function applyImport(
   // commits on success; any throw inside the work
   // callback rolls back.
   service.store.transaction(() => {
+    // -----------------------------------------------------------------
+    // Stage 18 v1.1.2 (issue #24, task 5): apply-time
+    // revalidation. The preflight captured the
+    // `(revisions, ids, aggregate budget)` snapshot at
+    // plan time; the apply re-reads the live store
+    // INSIDE the transaction and rejects the whole
+    // batch when any of the assumptions drifted.
+    // -----------------------------------------------------------------
+    for (const { imported, existing } of plan.replacements) {
+      // Re-read the live row inside the transaction
+      // so a concurrent write between preflight and
+      // apply is detected here.
+      const liveNow = service.peekMemoryById(existing.id);
+      if (liveNow === undefined) {
+        throw new Error(
+          `replace ${imported.id}: target row disappeared between preflight and apply (concurrent delete?)`
+        );
+      }
+      if (options.conflict === "replace" && liveNow.revision !== imported.revision) {
+        throw new Error(
+          `replace ${imported.id}: revision drift (imported=${imported.revision} existing=${liveNow.revision})`
+        );
+      }
+      if (options.conflict === "merge" && liveNow.revision !== imported.revision) {
+        throw new Error(
+          `merge ${imported.id}: revision drift (imported=${imported.revision} existing=${liveNow.revision})`
+        );
+      }
+    }
+    // Re-validate the aggregate budget invariant.
+    // The preflight computed the projection against
+    // `usage_before`; the apply re-reads the live
+    // usage (which may have changed if a concurrent
+    // write mutated the scope between the preflight
+    // and the apply) and asserts the projection
+    // still holds. The check is in-transaction so
+    // the rollback is atomic.
+    if (plan.preflight !== undefined) {
+      const liveUsage = service.store.getBudgetUsage({
+        scope: plan.scope,
+        ...(plan.project_id !== undefined ? { project_id: plan.project_id } : {})
+      });
+      const reapply = projectBatchBudget({
+        budget: plan.preflight.budget.active_budget,
+        usage: liveUsage,
+        ops: plan.preflight.decisions
+          .filter((d): d is PreflightPlanDecision & { kind: "insert" | "replace" | "merge" } =>
+            d.kind === "insert" || d.kind === "replace" || d.kind === "merge"
+          )
+          .map((d) => {
+            const decision = d as PreflightPlanDecision & { kind: "insert" | "replace" | "merge" };
+            const entry = plan.inserts.find((e) => e.id === decision.memory_id)
+              ?? plan.replacements.find((r) => r.imported.id === decision.memory_id)?.imported;
+            if (entry === undefined) {
+              throw new Error(
+                `apply revalidation cannot resolve entry ${decision.memory_id} from the plan`
+              );
+            }
+            const existing = plan.replacements.find((r) => r.imported.id === decision.memory_id)?.existing;
+            if (decision.kind === "insert") {
+              return { kind: "insert" as const, entry };
+            }
+            if (decision.kind === "replace") {
+              return { kind: "replace" as const, entry, ...(existing !== undefined ? { existing } : {}) };
+            }
+            return { kind: "merge" as const, entry, ...(existing !== undefined ? { existing } : {}) };
+          })
+      });
+      if (!reapply.ok) {
+        throw new Error(
+          `aggregate budget drifted between preflight and apply: ${reapply.error.code} (observed=${reapply.error.observed}, limit=${reapply.error.limit})`
+        );
+      }
+    }
     for (const entry of plan.inserts) {
       const normalised: MemoryEntry = {
         ...entry,
@@ -688,11 +1041,6 @@ export function applyImport(
       applied_ids.push(entry.id);
     }
     for (const { imported, existing } of plan.replacements) {
-      if (imported.revision !== existing.revision && options.conflict === "replace") {
-        throw new Error(
-          `replace ${imported.id}: revision drift (imported=${imported.revision} existing=${existing.revision})`
-        );
-      }
       const normalised: MemoryEntry = {
         ...imported,
         trust_level: restoreTrust ? imported.trust_level ?? "imported" : "imported"
