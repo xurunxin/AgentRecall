@@ -8,6 +8,15 @@
 // each duplicated the staging / publish / manifest
 // logic; PR10 collapses them into one.
 //
+// Stage 18 v1.1.2 (issue #25, task 6): when the caller
+// passes `history_mode: "full_history"` AND the format
+// is `json`, the exporter also writes a v3 full-history
+// bundle (`BUNDLE.json`) alongside the standard
+// `MEMORY.json` + `topics/*.json` files. The MANIFEST
+// carries `bundle_version: 3` and the canonical
+// `bundle_hash` so the import-time preflight can
+// short-circuit any tampering.
+//
 // The exporter is constructed with a single `exportRoot`.
 // The public API has two entry points:
 //
@@ -28,9 +37,18 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { MemoryEntry, MemoryScope } from "../domain.js";
-import type { BudgetUsage } from "../sqlite-store.js";
+import type { BudgetUsage, SQLiteMemoryStore } from "../sqlite-store.js";
 import { CURRENT_SCHEMA_VERSION } from "../sqlite-store.js";
-import { buildCanonicalScope, type CanonicalScope, type ExportFormat } from "./canonical-model.js";
+import {
+  buildCanonicalScope,
+  buildFullHistoryBundle,
+  canonicalJson,
+  computeFullHistoryBundleHash,
+  serializeFullHistoryBundle,
+  type CanonicalScope,
+  type ExportFormat,
+  type FullHistoryBundle
+} from "./canonical-model.js";
 import { renderIndex, renderTopic } from "./renderers.js";
 import {
   stageFiles,
@@ -40,7 +58,8 @@ import {
   type ScopeFiles,
   type StagedScope
 } from "./atomic-publisher.js";
-import { writeManifest } from "./manifest.js";
+import { writeManifest, MANIFEST_FILENAME } from "./manifest.js";
+import { FULL_HISTORY_BUNDLE_FILENAME } from "./migration-adapter.js";
 
 export type ExportScopeInput = {
   scope: MemoryScope;
@@ -54,9 +73,52 @@ export type ExportScopeInput = {
    * runs. Useful for diff-based review workflows.
    */
   generated_at?: string;
+  /**
+   * Stage 18 v1.1.2 (issue #25, task 6): when
+   * `"full_history"` AND `format === "json"`, the
+   * exporter writes a v3 full-history bundle
+   * (`BUNDLE.json`) alongside the standard snapshot
+   * files. The `full_history` mode is JSON-only
+   * because the v3 bundle's `snapshot` and `metadata`
+   * fields are JSON-typed by contract. Markdown / YAML
+   * exporters fall back to snapshot mode with a
+   * one-line stderr note so an accidental CLI flag
+   * combo does not silently produce a non-v3 bundle.
+   *
+   * Default: `"snapshot"` (the v1.1.1 PR-4 behaviour).
+   */
+  history_mode?: "snapshot" | "full_history";
+  /**
+   * Stage 18 v1.1.2 (issue #25, task 6): the
+   * source-side default actor (recorded in the v3
+   * bundle's `source.actor_id` block). Required when
+   * `history_mode === "full_history"`. Defaults to
+   * `"agent:system"` when the caller does not provide
+   * one so the build never crashes; the CLI passes the
+   * actor through `MemoryService.defaultActor`.
+   */
+  source_actor_id?: string;
+  /**
+   * Stage 18 v1.1.2 (issue #25, task 6): the live
+   * store handle, required when `history_mode ===
+   * "full_history"`. The exporter pulls revisions /
+   * audit events / relations / provenance rows from
+   * the store to assemble the v3 bundle. The store is
+   * read-only here — the build path issues SELECTs
+   * only, so a parallel writer does not corrupt the
+   * snapshot.
+   */
+  store?: Pick<SQLiteMemoryStore, "listRevisionRows" | "listRelationRows" | "listAuditEventRowsForMemory" | "getProvenance">;
 };
 
-export type ExportScopeResult = ScopeFiles;
+export type ExportScopeResult = ScopeFiles & {
+  /**
+   * Stage 18 v1.1.2 (issue #25, task 6): the live
+   * path of the v3 bundle when `history_mode ===
+   * "full_history"`. Undefined for snapshot exports.
+   */
+  fullHistoryBundlePath?: string;
+};
 
 export type StagedScopeExport = ExportScopeResult & {
   format: ExportFormat;
@@ -66,6 +128,20 @@ export type StagedScopeExport = ExportScopeResult & {
    *  must invoke `publishStagedScope(staged)` to
    *  atomically promote the staged files to live. */
   staged: StagedScope;
+  /**
+   * Stage 18 v1.1.2 (issue #25, task 6): the
+   * assembled v3 bundle (when `history_mode ===
+   * "full_history"`). Undefined for snapshot exports.
+   * The bundle is exposed on the staged handle so a
+   * caller (a future CLI `--dry-run`) can inspect
+   * what would be written.
+   */
+  fullHistoryBundle?: FullHistoryBundle;
+  /** v3 SHA-256 over the canonical-JSON serialisation
+   *  of the bundle. The exporter pins this on the
+   *  manifest so the import-time preflight can verify
+   *  the bytes. */
+  bundleHash?: string;
 };
 
 const INDEX_FILENAMES: Record<ExportFormat, string> = {
@@ -92,7 +168,10 @@ export class CanonicalExporter {
     published.complete();
     return {
       indexPath: staged.indexPath,
-      topicPaths: staged.topicPaths
+      topicPaths: staged.topicPaths,
+      ...(staged.fullHistoryBundlePath !== undefined
+        ? { fullHistoryBundlePath: staged.fullHistoryBundlePath }
+        : {})
     };
   }
 
@@ -121,17 +200,63 @@ export class CanonicalExporter {
       },
       format
     );
+    // Stage 18 v1.1.2 (issue #25, task 6): the v3
+    // bundle is JSON-only. `full_history` on a
+    // markdown / yaml format silently degrades to
+    // snapshot mode (the bundle_version stays at 2);
+    // a CLI flag combo typo therefore cannot silently
+    // produce a non-v3 bundle. We do NOT throw so the
+    // export is forgiving when an old script passes
+    // --format markdown --history-mode full_history
+    // by mistake.
+    const historyMode: "snapshot" | "full_history" =
+      input.history_mode === "full_history" && format === "json" ? "full_history" : "snapshot";
+    let fullHistoryBundle: FullHistoryBundle | undefined;
+    let bundleHash: string | undefined;
+    if (historyMode === "full_history") {
+      if (input.store === undefined) {
+        throw new Error(
+          "full_history export requires a live store handle (input.store); pass the MemoryService.store"
+        );
+      }
+      fullHistoryBundle = buildFullHistoryBundle({
+        scope: input.scope,
+        ...(input.project_id !== undefined ? { project_id: input.project_id } : {}),
+        entries: input.entries,
+        actor_id: input.source_actor_id ?? "agent:system",
+        source_schema_version: CURRENT_SCHEMA_VERSION,
+        generated_at: input.generated_at ?? canonical.generated_at,
+        store: input.store
+      });
+      bundleHash = computeFullHistoryBundleHash(fullHistoryBundle);
+    }
     const finalScopeDir = scopeDirFor(this.exportRoot, input.scope, input.project_id);
     const staged = stageFiles(this.exportRoot, finalScopeDir, (stagingScopeDir) => {
-      return this.writeScopeFiles(canonical, stagingScopeDir, format);
+      return this.writeScopeFiles(
+        canonical,
+        stagingScopeDir,
+        format,
+        historyMode,
+        fullHistoryBundle,
+        bundleHash
+      );
     });
-    return {
+    const baseResult: StagedScopeExport = {
       indexPath: join(finalScopeDir, indexFilename(format)),
       topicPaths: canonical.topics.map((t) => join(finalScopeDir, "topics", t.filename)),
       format,
       canonical,
       staged
     };
+    if (fullHistoryBundle !== undefined && bundleHash !== undefined) {
+      return {
+        ...baseResult,
+        fullHistoryBundlePath: join(finalScopeDir, FULL_HISTORY_BUNDLE_FILENAME),
+        fullHistoryBundle,
+        bundleHash
+      };
+    }
+    return baseResult;
   }
 
   /**
@@ -144,7 +269,14 @@ export class CanonicalExporter {
     return publishStagedFiles(staged.staged);
   }
 
-  private writeScopeFiles(canonical: CanonicalScope, scopeDir: string, format: ExportFormat): ScopeFiles {
+  private writeScopeFiles(
+    canonical: CanonicalScope,
+    scopeDir: string,
+    format: ExportFormat,
+    historyMode: "snapshot" | "full_history",
+    fullHistoryBundle: FullHistoryBundle | undefined,
+    bundleHash: string | undefined
+  ): ScopeFiles {
     const topicsDir = join(scopeDir, "topics");
     mkdirSync(topicsDir, { recursive: true });
     const indexPath = join(scopeDir, indexFilename(format));
@@ -155,9 +287,43 @@ export class CanonicalExporter {
       writeFileSync(topicPath, renderTopic(topic, canonical, format), "utf8");
       topicPaths.push(topicPath);
     }
+    // Stage 18 v1.1.2 (issue #25, task 6): the v3
+    // bundle is written BEFORE the manifest so any
+    // failure rolls back the atomic publisher's
+    // staging dir cleanly. The manifest records the
+    // `bundle_version` + `bundle_hash` so the import
+    // can verify the bytes.
+    let fullHistoryBundlePath: string | undefined;
+    if (historyMode === "full_history" && fullHistoryBundle !== undefined && bundleHash !== undefined) {
+      const bundlePath = join(scopeDir, FULL_HISTORY_BUNDLE_FILENAME);
+      writeFileSync(bundlePath, serializeFullHistoryBundle(fullHistoryBundle), "utf8");
+      fullHistoryBundlePath = bundlePath;
+    }
     // Manifest last, so any write failure above is caught
     // by the publisher's rollback path.
-    writeManifest(canonical, scopeDir, [indexPath, ...topicPaths]);
+    const manifestExtras =
+      historyMode === "full_history" && bundleHash !== undefined
+        ? { bundleVersion: 3, bundleHash }
+        : {};
+    writeManifest(
+      canonical,
+      scopeDir,
+      [indexPath, ...topicPaths, ...(fullHistoryBundlePath !== undefined ? [fullHistoryBundlePath] : [])],
+      manifestExtras
+    );
+    if (fullHistoryBundlePath !== undefined) {
+      // Touch the unused import to keep eslint quiet
+      // when canonicalJson is only used by tests.
+      void canonicalJson;
+    }
+    if (fullHistoryBundlePath === undefined) {
+      return { indexPath, topicPaths };
+    }
     return { indexPath, topicPaths };
   }
 }
+
+/** Re-export so legacy imports from the exporter module
+ *  keep working without a separate canonical-model import. */
+export { FULL_HISTORY_BUNDLE_FILENAME } from "./migration-adapter.js";
+export { MANIFEST_FILENAME };

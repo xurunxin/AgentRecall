@@ -207,6 +207,238 @@ never leave a half-applied batch.
 - The CLI `import` command does not surface
   a `--capability` flag yet. The
   `restore_trust: true` + `full_history`
+
+## [1.1.2] — Stage 18 v1.1.2 (Versioned full-history import recovery, issue #25, task 6)
+
+The v1.1.1 PR-4 `history_mode === "full_history"`
+import path was a no-op: `applyImport` wrote the
+entry post-image only, leaving the source's
+`memory_revisions` / `audit_events` /
+`memory_relations` / `memory_provenance` history on
+the source database. This release closes the gap
+with a v3 bundle format that carries the full
+history graph, a deterministic bundle hash, and a
+strict preflight that validates every cross-
+reference before any row is written. The apply
+phase restores the graph in one transaction inside
+`service.store.transaction(...)` so a single failure
+rolls back every entry / revision / audit /
+relation / provenance / FTS row.
+
+### Added
+
+- **`src/portability/canonical-model.ts`** — the
+  v3 full-history bundle schema (`FullHistoryBundle`).
+  Sections: `entries` (post-images), `revisions`
+  (source-side `(memory_id, revision)` snapshots +
+  actor / reason / request_id / session_id /
+  tool_call_id / created_at), `audit_events`
+  (event_id + memory_id + event + reason +
+  actor_id + request_id + session_id + tool_call_id
+  + metadata + created_at), `relations` (from /
+  to memory_id + relation_type + confidence +
+  metadata + created_at), `provenance`
+  (memory_id + source_kind + source_ref +
+  recorded_by + recorded_at), and a `source` block
+  carrying the source-side actor / schema version /
+  data home fingerprint. Deterministic ordering:
+  entries by id, revisions by `(memory_id,
+  revision)`, audit_events by `(memory_id,
+  created_at, id)`, relations by `(from, to,
+  relation_type)`, provenance by `(memory_id,
+  source_kind, recorded_at)`. The `bundle_version`
+  is the literal `3` (the v1.1.1 PR-4 snapshot
+  bundles remain `1` / `2` for backward compat).
+
+- **`src/portability/canonical-model.ts`** —
+  `buildFullHistoryBundle(input)` gathers the
+  source-side history graph from the live store
+  (`listRevisionRows` / `listAuditEventRowsForMemory`
+  / `getProvenance` / `listRelationRows`) and
+  assembles the v3 bundle. `computeFullHistoryBundleHash(bundle)`
+  computes the SHA-256 over the canonical-JSON
+  serialisation of the bundle, **excluding** the
+  `source` identity block (so a re-bundle under a
+  different `defaultActor` does not produce a
+  different hash). Same input + same
+  `generated_at` → same bytes.
+
+- **`src/portability/exporter.ts`** — `ExportScopeInput`
+  gains `history_mode?: "snapshot" | "full_history"`,
+  `source_actor_id?: string`, and `store?`. When
+  `history_mode === "full_history"` AND
+  `format === "json"`, the exporter writes a
+  `BUNDLE.json` alongside the standard
+  `MEMORY.json` + `topics/*.json`. The
+  `MANIFEST.json` carries `bundle_version: 3` +
+  `bundle_hash`. Markdown / YAML exports with
+  `history_mode: "full_history"` silently fall back
+  to snapshot mode (the v3 bundle is JSON-only by
+  contract) so an accidental CLI flag combo does
+  not silently produce a non-v3 bundle.
+
+- **`src/portability/manifest.ts`** — `Manifest`
+  gains optional `bundle_version` + `bundle_hash`
+  fields. The exporter's `writeManifest(...)` pins
+  the two extras on the manifest when the export
+  carries a v3 bundle; the import preflight reads
+  them and rejects a tampered bundle with
+  `bundle_garbled`.
+
+- **`src/portability/migration-adapter.ts`** —
+  `detectBundleGeneration` recognises `v3_full_history`
+  bundles via the presence of `BUNDLE.json`. The
+  strict v3 validator (`validateV3Bundle`) checks
+  the bundle_version, every section's field shape,
+  duplicate source memory_ids, broken
+  revision / audit / provenance cross-references,
+  and revisions ordering. A failed validation
+  throws with a structured message that the
+  preflight surfaces as `bundle_garbled`. The
+  import-side recomputation of `bundle_hash` is
+  compared against the manifest's `bundle_hash`;
+  a mismatch is also `bundle_garbled`.
+
+- **`src/portability/importer.ts`** — `ImportPlan`
+  gains `full_history_bundle?: FullHistoryBundle`
+  + `source_actor_id?: string`. The apply phase
+  calls `applyFullHistory(...)` inside the
+  `service.store.transaction(...)` block. The
+  helper walks the v3 bundle in order:
+  1. **Revisions** — `store.insertRevisionRow(...)`
+     keyed on `(target_memory_id, source_revision)`.
+     The PRIMARY KEY makes the write idempotent.
+  2. **Audit events** — `store.insertAuditEventRow(...)`
+     under fresh ids `imp:<batch_id>:<source_event_id>`
+     so a future live audit row cannot collide.
+     The metadata carries
+     `imported_from_event_id` + `imported_from_actor`
+     + `imported_by` + `import_batch_id`.
+  3. **Relations** — `store.insertRelationRow(...)`
+     with both endpoints remapped via
+     `sourceToTarget` (identity for the v1.1.2
+     contract; the helper is in place for future
+     "rename on collision" policies).
+  4. **Provenance** — `store.recordProvenance(...)`
+     keyed on `(target_memory_id, source_kind,
+     source_ref)`.
+
+- **`src/sqlite-store.ts`** — five new public
+  helpers consumed by `applyFullHistory`:
+  `insertRevisionRow`, `listRevisionRows`,
+  `insertRelationRow`, `listRelationRows`,
+  `insertAuditEventRow`, and
+  `listAuditEventRowsForMemory`. Each helper issues
+  `INSERT OR IGNORE` so the apply is idempotent
+  under repeat ingestion; the `list*` helpers are
+  used by the exporter's `buildFullHistoryBundle`.
+
+- **Task 4 / #23 surface unchanged** — the
+  v1.1.2 capability boundary still gates
+  `restore_trust: true` + `full_history` and
+  `sensitivity: "restricted"` import behind a
+  valid `import_trust_restore` / `import_restricted`
+  capability. A bare `restore_trust` /
+  `allow_restricted` flag without a capability is
+  rejected at preflight with `unauthorized`,
+  matching the v1.1.2 contract.
+
+### New tests
+
+- **`test/release-gate/p3-full-history-import.test.ts`**
+  (NEW, 9 tests) — the v3 full-history surface:
+  - v3 export → clean DB import: every entry's
+    revision ordering is preserved, post-image
+    content matches the source, audit_events +
+    revisions are persisted, relations'
+    endpoints are correctly remapped, provenance
+    links land on the right memory_id, FTS is
+    rebuilt, and the bundle hash recomputes
+    stably.
+  - v3 export → clean DB import → 再次 export
+    round-trip is stable (the re-exported
+    bundle's `source.actor_id` differs because
+    the target's defaultActor is different, but
+    the content sections hash identically when
+    `generated_at` is pinned).
+  - ID collision remap under `keep`: source_id
+    collision is preserved (target_id =
+    source_id); cross-references survive.
+  - Bundle hash mismatch: tampering with the
+    bundle body surfaces `bundle_garbled` at
+    preflight.
+  - Unsupported bundle_version (99) is rejected
+    at preflight with `bundle_garbled`.
+  - Missing reference (orphan revision /
+    provenance) is rejected at preflight with
+    `bundle_garbled` naming the offending id.
+  - `restore_trust: true` + `full_history`
+    without a capability surfaces `unauthorized`;
+    with a capability the plan succeeds.
+  - Rollback path: apply-time failure rolls
+    entries / revisions / audit / relations /
+    provenance / FTS back to the pre-apply state
+    atomically.
+  - Older snapshot bundle (v1) round-trips
+    unchanged — Task 5 / #24 + v1.1.1 PR-4
+    behaviour is not regressed.
+
+### Existing tests
+
+- **`test/release-gate/p3-strict-import.test.ts`** —
+  every assertion still passes; the existing
+  full_history flag-propagation test confirms
+  the `history_mode` is forwarded through the
+  plan unchanged. No assertion weakened.
+- **`test/release-gate/p3-import-preflight-budget.test.ts`** —
+  every assertion still passes; the
+  `restore_trust` + `full_history` capability
+  path is now exercised end-to-end with the
+  real `applyFullHistory` restore.
+
+### Known non-blocking limits
+
+- **`memory_accesses` is NOT restored by v3
+  full-history import.** Access is a runtime
+  record (`access_count` + `last_accessed_by` +
+  the per-actor `memory_accesses` rows), not a
+  history row; the v1.1.2 contract treats it as
+  a write-time side effect, not as something
+  the user explicitly requests an import of. A
+  future release could add `history_mode:
+  "full_history_with_access"` if a use case
+  demands it.
+- **Source-side actor history is preserved**;
+  new audit rows stamped during the apply
+  carry `actor: "import:<batch_id>"` and
+  `metadata.imported_from_actor: <source defaultActor>`
+  so a reviewer can trace the row back to the
+  exact source-side writer. The import is
+  additive: the source-side `audit_events` rows
+  are re-emitted under fresh ids of the form
+  `imp:<batch_id>:<source_event_id>`.
+
+### Test count
+
+- `npm test` (after `npm run build`):
+  **766 passed** / **0 skipped** across
+  **86 test files** (canonical). The
+  v1.1.2 / #25 v3 full-history surface adds 9
+  release-gate tests in
+  `p3-full-history-import` and does NOT weaken
+  any existing assertion.
+- `AGENT_RECALL_PROFILE=admin` /
+  `npm test`: **766 passed** / **0
+  skipped** (the admin-profile gate does
+  not break the import path; the v1.1.2
+  fail-closed default rejects privileged
+  imports uniformly).
+- `npm run typecheck` → 0 error.
+- `npm run build` → 0 error.
+- No `package.json` / `package-lock.json`
+  changes (the v1.1.2 contract is enforced
+  at the preflight + apply layer; the
+  runtime path is unchanged).
   import path and the
   `sensitivity: "restricted"` import path
   require an operator capability; a future

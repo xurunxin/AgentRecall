@@ -57,6 +57,25 @@ export type Manifest = {
   entry_count: number;
   topic_count: number;
   files: ManifestFile[];
+  /**
+   * Stage 18 v1.1.2 (issue #25, task 6): the bundle's
+   * wire-format version. `1` is the v1.1.0 snapshot
+   * format; `2` is the v1.1.1 PR-4 history format; `3`
+   * is the v1.1.2 full-history format (this release).
+   * Older manifests that omit the field default to `1`
+   * so the migration-adapter's `detectBundleGeneration`
+   * stays compatible with hand-rolled exports.
+   */
+  bundle_version?: number;
+  /**
+   * Stage 18 v1.1.2 (issue #25, task 6): SHA-256 over
+   * the canonical-JSON serialisation of the bundle
+   * content (excluding the source-side identity block).
+   * The preflight re-computes the hash and compares; a
+   * mismatch surfaces `bundle_garbled`. Only set on v3
+   * bundles.
+   */
+  bundle_hash?: string;
 };
 
 function sha256OfFile(path: string): string {
@@ -70,12 +89,24 @@ function sha256OfFile(path: string): string {
 }
 
 /**
+ * Stage 18 v1.1.2 (issue #25, task 6): the exporter can
+ * pin a `bundle_version` + `bundle_hash` on the manifest
+ * when the export carries a v3 full-history bundle. The
+ * import preflight reads these fields, computes the
+ * expected hash, and rejects a tampered bundle.
+ */
+export type ManifestExtras = {
+  bundleVersion?: number;
+  bundleHash?: string;
+};
+
+/**
  * Build the manifest for an export. Computes the SHA-256
  * of every emitted file and returns a stable object. The
  * caller writes it to `MANIFEST.json` next to the index
  * file.
  */
-export function buildManifest(scope: CanonicalScope, scopeDir: string, files: string[]): Manifest {
+export function buildManifest(scope: CanonicalScope, scopeDir: string, files: string[], extras: ManifestExtras = {}): Manifest {
   const records: ManifestFile[] = files.map((absPath) => {
     const relPath = relative(scopeDir, absPath).replace(/\\/g, "/");
     return {
@@ -84,9 +115,9 @@ export function buildManifest(scope: CanonicalScope, scopeDir: string, files: st
       sha256: sha256OfFile(absPath)
     };
   });
-  return {
+  const baseManifest: Manifest = {
     manifest_version: MANIFEST_VERSION,
-    export_schema_version: scope.export_schema_version,
+    export_schema_version: 1,
     source_schema_version: scope.source_schema_version,
     scope: scope.scope,
     generated_at: scope.generated_at,
@@ -94,6 +125,19 @@ export function buildManifest(scope: CanonicalScope, scopeDir: string, files: st
     topic_count: scope.topics.length,
     files: records
   };
+  // Stage 18 v1.1.2 (issue #25, task 6): the v3
+  // bundle surfaces its `bundle_version` + `bundle_hash`
+  // on the manifest so the import preflight can verify
+  // the bundle without re-reading the BUNDLE.json. The
+  // snapshot mode (no extras) does NOT touch the manifest
+  // — the existing v1.1.1 PR-4 surface is unchanged.
+  if (extras.bundleVersion !== undefined) {
+    baseManifest.bundle_version = extras.bundleVersion;
+  }
+  if (extras.bundleHash !== undefined) {
+    baseManifest.bundle_hash = extras.bundleHash;
+  }
+  return baseManifest;
 }
 
 export function serializeManifest(manifest: Manifest): string {
@@ -105,8 +149,8 @@ export function serializeManifest(manifest: Manifest): string {
  * `MANIFEST.json` next to the index file. Returns the
  * absolute path of the written manifest.
  */
-export function writeManifest(scope: CanonicalScope, scopeDir: string, files: string[]): string {
-  const manifest = buildManifest(scope, scopeDir, files);
+export function writeManifest(scope: CanonicalScope, scopeDir: string, files: string[], extras: ManifestExtras = {}): string {
+  const manifest = buildManifest(scope, scopeDir, files, extras);
   const path = join(scopeDir, MANIFEST_FILENAME);
   writeFileSync(path, serializeManifest(manifest), "utf8");
   return path;

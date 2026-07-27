@@ -257,6 +257,81 @@ The `import` path (CLI `agent-recall import --from <export-root> --scope ...` an
 
 A failed preflight leaves the live store untouched and returns the preflight error in the structured envelope (`error.code` is one of `identity_conflict`, `secret_detected`, `aggregate_budget`, `sensitivity_denied`, `unauthorized`, `revision_drift`, `invalid_schema`, `bundle_garbled`).
 
+### Full-history bundle format (`v3`)
+
+The `history_mode: "full_history"` import path restores the source's complete history graph (entries + revisions + audit events + relations + provenance links) in one transaction. The wire format is the v3 bundle (`BUNDLE.json`):
+
+```json
+{
+  "bundle_version": 3,
+  "source": {
+    "actor_id": "agent:source",
+    "schema_version": 12,
+    "data_home_fingerprint": "<sha256 of <data_home_path>@<schema_version>>"
+  },
+  "scope": { "kind": "global" },
+  "generated_at": "2026-01-03T00:00:00.000Z",
+  "entries": [ /* MemoryEntry post-images, sorted by id */ ],
+  "revisions": [
+    {
+      "revision_id": "rev_<memory_id>_<revision>",
+      "memory_id": "<source memory_id>",
+      "revision": 1,
+      "actor_id": "agent:source",
+      "reason": "created",
+      "request_id": "req_...",
+      "session_id": null,
+      "tool_call_id": null,
+      "created_at": "2026-01-01T00:00:00.000Z",
+      "snapshot": { /* post-image of the entry at this revision */ }
+    }
+  ],
+  "audit_events": [
+    {
+      "event_id": "aud_...",
+      "memory_id": "<source memory_id>",
+      "scope": "global",
+      "project_id": null,
+      "event": "created",
+      "reason": "imported",
+      "actor_id": "agent:source",
+      "request_id": null,
+      "session_id": null,
+      "tool_call_id": null,
+      "metadata": { /* free-form metadata */ },
+      "created_at": "2026-01-01T00:00:00.000Z"
+    }
+  ],
+  "relations": [
+    {
+      "from_memory_id": "<source memory_id>",
+      "to_memory_id": "<source memory_id>",
+      "relation_type": "supersedes",
+      "confidence": 0.9,
+      "metadata": {},
+      "created_at": "2026-01-02T00:00:00.000Z"
+    }
+  ],
+  "provenance": [
+    {
+      "memory_id": "<source memory_id>",
+      "source_kind": "issue",
+      "source_ref": "https://example.com/issues/42",
+      "recorded_by": "agent:source",
+      "recorded_at": 1735776000000
+    }
+  ]
+}
+```
+
+The `MANIFEST.json` for a v3 export carries `bundle_version: 3` and `bundle_hash` (SHA-256 over the canonical-JSON serialisation of the bundle, **excluding** the `source` identity block). The import preflight recomputes the hash and rejects a tampered bundle with `bundle_garbled`. The apply phase replays every section in one transaction; a single failure rolls back every entry / revision / audit / relation / provenance / FTS row.
+
+**Source-side → target-side memory_id remap.** The v1.1.2 contract pins `target_id = source_id` for every section. A future "rename on collision" policy can plug in without touching the apply transaction.
+
+**What is NOT restored.** `memory_accesses` (per-actor access counts / `last_accessed_by`) is a runtime write-time side effect, not a history row; the v3 bundle omits it. The `memory_feedback` table is also runtime state and is similarly omitted. New audit rows stamped during the apply carry `actor: "import:<batch_id>"` and `metadata.imported_from_actor: <source defaultActor>` so a reviewer can trace the row back to the exact source-side writer.
+
+**Older bundles (v1 / v2 snapshot)** continue to work. The migration adapter recognises `bundle_version: 1` / `2` and falls through to the existing snapshot import path; the v3 work does NOT regress that surface.
+
 ## Configuration
 
 The server reads these env vars at runtime (no restart needed; the next

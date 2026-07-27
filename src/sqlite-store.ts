@@ -2447,6 +2447,247 @@ export class SQLiteMemoryStore {
   }
 
   /**
+   * Stage 18 v1.1.2 (issue #25, task 6): import-side
+   * write of a `memory_revisions` row from a v3
+   * full-history bundle. The caller supplies the
+   * (already-remapped) `memory_id` and the full row
+   * shape; the row is keyed on `(memory_id, revision)`
+   * so the import is idempotent under repeat ingestion
+   * (an existing `(memory_id, revision)` row is left in
+   * place via `INSERT OR IGNORE`). The caller is
+   * responsible for passing the `created_at` and
+   * `snapshot_json` it wants preserved; we do NOT
+   * re-serialise the snapshot (the bundle is the source
+   * of truth).
+   *
+   * Intended use: the `applyImport` path inside the
+   * `service.store.transaction(...)` block restores
+   * the source's revision chain when the plan is
+   * `history_mode === "full_history"` AND the bundle's
+   * generation is `v3_full_history`. A failure inside
+   * the transaction rolls back every inserted row.
+   */
+  insertRevisionRow(input: {
+    memory_id: string;
+    revision: number;
+    snapshot_json: string;
+    changed_by: string;
+    request_id: string;
+    change_reason: string | null;
+    created_at: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO memory_revisions
+            (memory_id, revision, snapshot_json, changed_by, request_id, change_reason, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        input.memory_id,
+        input.revision,
+        input.snapshot_json,
+        input.changed_by,
+        input.request_id,
+        input.change_reason,
+        input.created_at
+      );
+  }
+
+  /**
+   * Stage 18 v1.1.2 (issue #25, task 6): return the
+   * ordered `memory_revisions` chain for one memory,
+   * ascending by `revision`. Used by the export-side
+   * `buildFullHistoryBundle` to gather the source-side
+   * revision rows for inclusion in the v3 bundle.
+   */
+  listRevisionRows(memoryId: string): Array<{
+    memory_id: string;
+    revision: number;
+    snapshot_json: string;
+    changed_by: string;
+    request_id: string;
+    change_reason: string | null;
+    created_at: string;
+  }> {
+    return this.db
+      .prepare(
+        `SELECT memory_id, revision, snapshot_json, changed_by, request_id, change_reason, created_at
+           FROM memory_revisions
+          WHERE memory_id = ?
+          ORDER BY revision ASC`
+      )
+      .all(memoryId) as Array<{
+      memory_id: string;
+      revision: number;
+      snapshot_json: string;
+      changed_by: string;
+      request_id: string;
+      change_reason: string | null;
+      created_at: string;
+    }>;
+  }
+
+  /**
+   * Stage 18 v1.1.2 (issue #25, task 6): import-side
+   * write of a `memory_relations` row from a v3
+   * full-history bundle. The PRIMARY KEY
+   * `(from_memory_id, to_memory_id, relation_type)`
+   * makes the write idempotent under repeat ingestion
+   * (`INSERT OR IGNORE`). The caller passes the
+   * (already-remapped) endpoints; we do NOT re-derive
+   * them. The `metadata_json` is the JSON-encoded
+   * metadata the bundle supplied.
+   *
+   * Intended use: the `applyImport` path inside the
+   * `service.store.transaction(...)` block restores
+   * the source's relation graph when the plan is
+   * `history_mode === "full_history"` AND the bundle's
+   * generation is `v3_full_history`.
+   */
+  insertRelationRow(input: {
+    from_memory_id: string;
+    to_memory_id: string;
+    relation_type: string;
+    confidence: number | null;
+    metadata_json: string;
+    created_at: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO memory_relations
+           (from_memory_id, to_memory_id, relation_type, confidence, metadata_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        input.from_memory_id,
+        input.to_memory_id,
+        input.relation_type,
+        input.confidence,
+        input.metadata_json,
+        input.created_at
+      );
+  }
+
+  /**
+   * Stage 18 v1.1.2 (issue #25, task 6): return every
+   * `memory_relations` row, ordered by
+   * `(from_memory_id, to_memory_id, relation_type)` so
+   * the export-side bundle is deterministic. Used by
+   * `buildFullHistoryBundle` to gather the source-side
+   * relation graph for the v3 bundle.
+   */
+  listRelationRows(): Array<{
+    from_memory_id: string;
+    to_memory_id: string;
+    relation_type: string;
+    confidence: number | null;
+    metadata_json: string;
+    created_at: string;
+  }> {
+    return this.db
+      .prepare(
+        `SELECT from_memory_id, to_memory_id, relation_type, confidence, metadata_json, created_at
+           FROM memory_relations
+          ORDER BY from_memory_id ASC, to_memory_id ASC, relation_type ASC`
+      )
+      .all() as Array<{
+      from_memory_id: string;
+      to_memory_id: string;
+      relation_type: string;
+      confidence: number | null;
+      metadata_json: string;
+      created_at: string;
+    }>;
+  }
+
+  /**
+   * Stage 18 v1.1.2 (issue #25, task 6): return the
+   * `audit_events` rows for one memory, ascending by
+   * `created_at`. Used by `buildFullHistoryBundle` to
+   * gather the source-side audit chain for the v3
+   * bundle. The query is bounded to a single memory
+   * so a million-row audit log does not blow the
+   * export memory budget.
+   */
+  listAuditEventRowsForMemory(memoryId: string): Array<{
+    id: string;
+    memory_id: string | null;
+    scope: "global" | "project";
+    project_id: string | null;
+    event: string;
+    reason: string | null;
+    actor: string;
+    metadata_json: string;
+    created_at: string;
+  }> {
+    return this.db
+      .prepare(
+        `SELECT id, memory_id, scope, project_id, event, reason, actor, metadata_json, created_at
+           FROM audit_events
+          WHERE memory_id = ?
+          ORDER BY created_at ASC, id ASC`
+      )
+      .all(memoryId) as Array<{
+      id: string;
+      memory_id: string | null;
+      scope: "global" | "project";
+      project_id: string | null;
+      event: string;
+      reason: string | null;
+      actor: string;
+      metadata_json: string;
+      created_at: string;
+    }>;
+  }
+
+  /**
+   * Stage 18 v1.1.2 (issue #25, task 6): import-side
+   * write of an `audit_events` row from a v3
+   * full-history bundle. The PRIMARY KEY is the row's
+   * `id`; the caller is expected to mint a fresh id
+   * (the bundle's source-side id would collide with
+   * any future live audit row keyed on the same id).
+   * The importer prefixes the source-side id with
+   * `imp:<batch_id>:` so the new id is unique to the
+   * import run.
+   *
+   * The row carries the source's `created_at`,
+   * `event`, `actor`, `reason`, `metadata_json`, and
+   * `scope` / `project_id`. A failure inside the
+   * enclosing transaction rolls back every row
+   * including the entries.
+   */
+  insertAuditEventRow(input: {
+    id: string;
+    memory_id: string | null;
+    scope: "global" | "project";
+    project_id: string | null;
+    event: string;
+    reason: string | null;
+    actor: string;
+    metadata_json: string;
+    created_at: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO audit_events
+            (id, memory_id, scope, project_id, event, reason, actor, metadata_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        input.id,
+        input.memory_id,
+        input.scope,
+        input.project_id,
+        input.event,
+        input.reason,
+        input.actor,
+        input.metadata_json,
+        input.created_at
+      );
+  }
+
+  /**
    * Stage 15 PR-M1-2 (issue #7, spec § 5.4): strict
    * project identity model. A `project_identity` row
    * pins a `project_id` to its `canonical_path`. A

@@ -97,6 +97,8 @@ import {
   type BundleGeneration,
   type NormalisedBundle
 } from "./migration-adapter.js";
+import type { FullHistoryBundle } from "./canonical-model.js";
+import { FULL_HISTORY_BUNDLE_VERSION } from "./canonical-model.js";
 
 export type ConflictPolicy = "keep" | "replace" | "merge" | "fail";
 
@@ -227,6 +229,23 @@ export type ImportPlan = {
    * uses this to re-validate at apply time.
    */
   preflight?: PreflightPlan;
+  /**
+   * Stage 18 v1.1.2 (issue #25, task 6): the v3
+   * full-history bundle, set when the source bundle is
+   * `v3_full_history` AND the plan's history_mode is
+   * `full_history`. The apply phase replays the
+   * revisions / audit events / relations / provenance
+   * in one transaction. Undefined for snapshot bundles.
+   */
+  full_history_bundle?: FullHistoryBundle;
+  /**
+   * Stage 18 v1.1.2 (issue #25, task 6): the source-side
+   * `defaultActor` recorded in the v3 bundle's `source`
+   * block. Recorded on every imported audit event's
+   * `metadata.imported_from_actor` so a reviewer can
+   * trace the row back to the exact source-side writer.
+   */
+  source_actor_id?: string;
 };
 
 export type ImportOptions = {
@@ -884,7 +903,9 @@ export function planImport(
     replacements,
     skipped,
     decisions,
-    preflight: preflightPlan
+    preflight: preflightPlan,
+    ...(bundle.history !== undefined ? { full_history_bundle: bundle.history } : {}),
+    ...(bundle.source_actor_id !== undefined ? { source_actor_id: bundle.source_actor_id } : {})
   };
 }
 
@@ -1126,9 +1147,222 @@ export function applyImport(
       applied += 1;
       applied_ids.push(imported.id);
     }
+    // Stage 18 v1.1.2 (issue #25, task 6): when the
+    // plan is `history_mode === "full_history"` AND the
+    // bundle generation is `v3_full_history`, restore
+    // the source-side revision chain, audit chain,
+    // relation graph, and provenance links in the same
+    // transaction. The apply transaction is the
+    // all-or-nothing boundary; a failure on any of the
+    // inserts rolls back every entry + revision + audit
+    // + relation + provenance row.
+    if (plan.history_mode === "full_history" && plan.full_history_bundle !== undefined) {
+      applyFullHistory(
+        service.store,
+        plan.full_history_bundle,
+        plan.import_batch_id,
+        plan.source_actor_id,
+        options.actor
+      );
+    }
   });
   return { applied, applied_ids, errors: [] };
 }
+
+/**
+ * Stage 18 v1.1.2 (issue #25, task 6): restore the
+ * source-side history graph into the target store.
+ *
+ * The helper MUST be called from inside the apply
+ * transaction (the store-level helpers it uses are
+ * plain INSERTs without their own transaction wrapper,
+ * so a top-level call would lose atomicity). The
+ * source-side `defaultActor` is recorded on every
+ * imported audit event's `metadata.imported_from_actor`
+ * so a reviewer can trace the row back to the exact
+ * source database.
+ *
+ * The apply transaction already wrote a fresh
+ * `created` audit event for each entry
+ * (`writeInsertImportedEntry`); this helper inserts
+ * the source-side audit rows on top so the audit log
+ * shows both the import action AND the original
+ * history. The new audit events use ids of the form
+ * `imp:<batch_id>:<source_event_id>` so a future live
+ * audit row cannot collide with an imported one.
+ */
+function applyFullHistory(
+  store: FullHistoryApplyStore,
+  bundle: FullHistoryBundle,
+  importBatchId: string,
+  sourceActorId: string | undefined,
+  applyActor: string
+): void {
+  if (bundle.bundle_version !== FULL_HISTORY_BUNDLE_VERSION) {
+    throw new Error(
+      `applyFullHistory: expected bundle_version ${FULL_HISTORY_BUNDLE_VERSION}, got ${bundle.bundle_version}`
+    );
+  }
+  const sourceToTarget = buildSourceToTargetIdMap(bundle);
+  // 1. Revisions: post-image snapshots keyed on
+  //    (memory_id, revision). The bundle's snapshot is
+  //    the canonical source-side post-image; we
+  //    re-serialise via JSON.stringify to match the
+  //    SQLite column type. The PRIMARY KEY makes the
+  //    write idempotent.
+  for (const r of bundle.revisions) {
+    const targetId = sourceToTarget.get(r.memory_id);
+    if (targetId === undefined) {
+      // Reference integrity invariant: validated
+      // upstream. Defensive throw to keep the
+      // transaction atomic.
+      throw new Error(
+        `applyFullHistory: revision.memory_id ${r.memory_id} has no target-side mapping`
+      );
+    }
+    const snapshot = JSON.stringify(r.snapshot);
+    store.insertRevisionRow({
+      memory_id: targetId,
+      revision: r.revision,
+      snapshot_json: snapshot,
+      changed_by: r.actor_id,
+      request_id: r.request_id ?? "",
+      change_reason: r.reason,
+      created_at: r.created_at
+    });
+  }
+  // 2. Audit events: imported under fresh ids (the
+  //    source-side id would collide with any future
+  //    live audit row keyed on the same id).
+  for (const a of bundle.audit_events) {
+    const targetMemoryId = a.memory_id === null
+      ? null
+      : sourceToTarget.get(a.memory_id) ?? null;
+    if (a.memory_id !== null && targetMemoryId === null) {
+      throw new Error(
+        `applyFullHistory: audit.memory_id ${a.memory_id} (event ${a.event_id}) has no target-side mapping`
+      );
+    }
+    const newId = `imp:${importBatchId}:${a.event_id}`;
+    const metadata = {
+      ...a.metadata,
+      imported_from_event_id: a.event_id,
+      imported_from_actor: sourceActorId ?? null,
+      imported_by: applyActor,
+      import_batch_id: importBatchId
+    };
+    store.insertAuditEventRow({
+      id: newId,
+      memory_id: targetMemoryId,
+      scope: a.scope,
+      project_id: a.project_id,
+      event: a.event,
+      reason: a.reason,
+      actor: a.actor_id,
+      metadata_json: JSON.stringify(metadata),
+      created_at: a.created_at
+    });
+  }
+  // 3. Relations: remap both endpoints. A relation that
+  //    points to a memory_id outside the imported set
+  //    is left as-is (the v1.1.2 contract does not
+  //    chase cross-scope edges; the source may have
+  //    had a similar dangling edge). The PRIMARY KEY
+  //    makes the write idempotent.
+  for (const r of bundle.relations) {
+    const fromTarget = sourceToTarget.get(r.from_memory_id) ?? r.from_memory_id;
+    const toTarget = sourceToTarget.get(r.to_memory_id) ?? r.to_memory_id;
+    store.insertRelationRow({
+      from_memory_id: fromTarget,
+      to_memory_id: toTarget,
+      relation_type: r.relation_type,
+      confidence: r.confidence,
+      metadata_json: JSON.stringify(r.metadata),
+      created_at: r.created_at
+    });
+  }
+  // 4. Provenance: PRIMARY KEY
+  //    `(memory_id, source_kind, source_ref)` makes the
+  //    write idempotent. The bundle's source_kind is
+  //    re-checked by the SQLite CHECK.
+  for (const p of bundle.provenance) {
+    const targetMemoryId = sourceToTarget.get(p.memory_id);
+    if (targetMemoryId === undefined) {
+      throw new Error(
+        `applyFullHistory: provenance.memory_id ${p.memory_id} has no target-side mapping`
+      );
+    }
+    store.recordProvenance({
+      memory_id: targetMemoryId,
+      source_kind: p.source_kind,
+      source_ref: p.source_ref,
+      recorded_by: p.recorded_by,
+      recorded_at: p.recorded_at
+    });
+  }
+}
+
+/**
+ * Build the source-side → target-side memory_id remap.
+ * For the v1.1.2 contract the map is identity: the
+ * preflight pins target ids equal to source ids (insert
+ * preserves, replace / merge look up by source id).
+ * The function is kept as a separate step so a future
+ * "rename on collision" policy can plug in without
+ * touching the apply transaction.
+ */
+function buildSourceToTargetIdMap(bundle: FullHistoryBundle): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const entry of bundle.entries) {
+    map.set(entry.id, entry.id);
+  }
+  return map;
+}
+
+/**
+ * The minimum store surface `applyFullHistory` needs.
+ * The full `SQLiteMemoryStore` satisfies this; the type
+ * is the explicit boundary so a future refactor that
+ * replaces the store implementation cannot silently
+ * break the apply transaction.
+ */
+export type FullHistoryApplyStore = {
+  insertRevisionRow: (input: {
+    memory_id: string;
+    revision: number;
+    snapshot_json: string;
+    changed_by: string;
+    request_id: string;
+    change_reason: string | null;
+    created_at: string;
+  }) => void;
+  insertAuditEventRow: (input: {
+    id: string;
+    memory_id: string | null;
+    scope: "global" | "project";
+    project_id: string | null;
+    event: string;
+    reason: string | null;
+    actor: string;
+    metadata_json: string;
+    created_at: string;
+  }) => void;
+  insertRelationRow: (input: {
+    from_memory_id: string;
+    to_memory_id: string;
+    relation_type: string;
+    confidence: number | null;
+    metadata_json: string;
+    created_at: string;
+  }) => void;
+  recordProvenance: (input: {
+    memory_id: string;
+    source_kind: "issue" | "pr" | "commit" | "tool_call" | "session" | "import";
+    source_ref: string;
+    recorded_by: string;
+    recorded_at: number;
+  }) => void;
+};
 
 function entryToUpdateInput(entry: MemoryEntry): Parameters<MemoryService["updateMemory"]>[1] {
   return {
