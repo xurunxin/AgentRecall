@@ -101,7 +101,30 @@ export async function runCli(
   const args = parseArgs(argv);
   const dataHomeOverride = typeof args.flags["data-home"] === "string" ? args.flags["data-home"] : undefined;
   const dataHome = dataHomeOverride ?? resolveDataHome(env);
-  const store = new SQLiteMemoryStore(`${dataHome}/memory.sqlite`);
+  // Stage 18 v1.1.2 third follow-up (Critical #2):
+  // wrap the SQLiteMemoryStore construction in
+  // try/catch so a corrupted DB, missing schema,
+  // or similar bootstrap-time failure surfaces
+  // a stable `[internal_error]` code on stderr
+  // (exit 3) instead of the previous unhandled
+  // async-rejection that crashed the CLI
+  // process. The doctor command catches the same
+  // exception inside its handler and re-emits a
+  // `[doctor_failed]` code on stderr (exit 2).
+  // The `runCli` level covers the dispatch table
+  // (`backup`, `migrate`, `admin grant`, ...)
+  // which all open through this code path.
+  let store: SQLiteMemoryStore;
+  try {
+    store = new SQLiteMemoryStore(`${dataHome}/memory.sqlite`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      exitCode: 3,
+      stdout: "",
+      stderr: `[internal_error] failed to open store at ${dataHome}/memory.sqlite: ${message}`
+    };
+  }
   // v1.1.2 (issue #21): construct one identity resolver
   // per CLI invocation. The recordedBy is `user:cli` so
   // any auto-registered identity row carries the
@@ -130,7 +153,14 @@ export async function runCli(
     return {
       exitCode: 3,
       stdout: "",
-      stderr: `unknown command: ${args.command}\n\n${HELP_TEXT}`
+      // Stage 18 v1.1.2 third follow-up (Critical #2):
+      // the unknown-command path surfaces a stable
+      // `usage_error` code in `[code]` form on
+      // stderr so a script can pin the failure mode
+      // without parsing the help text. The help text
+      // is appended below the code so operator-
+      // readable output is unchanged.
+      stderr: `[usage_error] unknown command: ${args.command}\n\n${HELP_TEXT}`
     };
   }
   try {

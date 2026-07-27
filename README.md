@@ -482,7 +482,11 @@ The lifecycle gates:
    `dist/bin/agent-recall.js` + `package.json`).
 3. `Install runtime deps in extracted artifact` — `npm install --omit=dev`
    inside the extracted tree. The archive's `package.json` `files` list
-   ships `dist` + `README.md` + `LICENSE` + `CHANGELOG.md` and does NOT
+   ships `dist` + `README.md` + `LICENSE` + `CHANGELOG.md` (the
+   `LICENSE` file is REQUIRED by both the `release-candidate.yml` and
+   `release.yml` packaging steps; the previous `if [ -f LICENSE ]`
+   optional copy was promoted to a required copy as of v1.1.2 #28
+   third follow-up) and does NOT
    ship `node_modules`; the install step matches the consumer surface.
 4. `Compute candidate release artifact hashes` — call
    `node scripts/compute-artifact-hashes.mjs` on the archive. The script
@@ -525,7 +529,7 @@ mkdir -p "$STAGE"
 cp -R dist "$STAGE/dist"
 cp package.json "$STAGE/package.json"
 cp README.md "$STAGE/README.md"
-[ -f LICENSE ] && cp LICENSE "$STAGE/LICENSE"
+cp LICENSE "$STAGE/LICENSE"
 VERSION=$(node -e 'console.log(require("./package.json").version)')
 tar -czf "agent-recall-${VERSION}-linux-x64.tar.gz" -C "$STAGE" .
 

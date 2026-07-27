@@ -176,7 +176,7 @@ jobs:
           cp package.json "$STAGE/package.json"
            cp README.md "$STAGE/README.md"
            cp CHANGELOG.md "$STAGE/CHANGELOG.md"
-          if [ -f LICENSE ]; then cp LICENSE "$STAGE/LICENSE"; fi
+           cp LICENSE "$STAGE/LICENSE"
           echo "package contents:"
           find "$STAGE" -maxdepth 3 -type f | sort
 

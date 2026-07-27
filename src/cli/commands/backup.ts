@@ -9,6 +9,17 @@ import { runBackup, verifyBackup } from "../../backup.js";
 import { resolveActor } from "../../actor.js";
 import { appendAudit } from "../../services/memory-service-helpers.js";
 
+// Stage 18 v1.1.2 third follow-up (Critical #2):
+// the failure path surfaces a stable
+// `backup_failed` code in `[code]` form on
+// stderr. The stable code mirrors
+// `STABLE_ERROR_CODES.backup_failed` so a script
+// can pin the failure mode without parsing free-form
+// prose. The exit code stays 2 (the existing
+// contract — non-zero so callers can branch; the
+// exact value is out of band for the lifecycle).
+const STABLE_BACKUP_FAILED = "backup_failed";
+
 export function backupCommand(ctx: CliContext): CliResult {
   const keep = Number.parseInt(flagString(ctx.args, "keep") ?? "14", 10);
   const json = flagBool(ctx.args, "json");
@@ -25,7 +36,11 @@ export function backupCommand(ctx: CliContext): CliResult {
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    return { exitCode: 2, stdout: "", stderr: `backup failed: ${message}` };
+    return {
+      exitCode: 2,
+      stdout: "",
+      stderr: `[${STABLE_BACKUP_FAILED}] backup failed: ${message}`
+    };
   }
 }
 

@@ -178,12 +178,12 @@ jobs:
           STAGE="stage-agent-recall-${SUFFIX}"
           rm -rf "$STAGE"
           mkdir -p "$STAGE"
-          cp -R dist "$STAGE/dist"
-          cp package.json "$STAGE/package.json"
-           cp README.md "$STAGE/README.md"
-           cp CHANGELOG.md "$STAGE/CHANGELOG.md"
-          if [ -f LICENSE ]; then cp LICENSE "$STAGE/LICENSE"; fi
-          VERSION="${GITHUB_REF_NAME#rc-}"
+           cp -R dist "$STAGE/dist"
+           cp package.json "$STAGE/package.json"
+            cp README.md "$STAGE/README.md"
+            cp CHANGELOG.md "$STAGE/CHANGELOG.md"
+            cp LICENSE "$STAGE/LICENSE"
+           VERSION="${GITHUB_REF_NAME#rc-}"
           if [ "$VERSION" = "$GITHUB_REF_NAME" ]; then VERSION="1.1.1"; fi
           if [ "$ARCHIVE_TYPE" = "tar" ]; then
             PACKAGE_PATH="agent-recall-${VERSION}-${SUFFIX}.tar.gz"

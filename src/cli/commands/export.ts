@@ -6,6 +6,20 @@ import { join } from "node:path";
 import { ENV_ALLOW_UNBOUND_PROJECT_ID, isUnboundProjectIdAllowed } from "../../scope-resolver.js";
 import type { MemoryScope } from "../../domain.js";
 
+// Stage 18 v1.1.2 third follow-up (review by
+// ora-7, Critical #2): the CLI failure paths
+// surface STABLE machine-readable error codes
+// (the previous follow-up emitted free-form
+// strings only — ora-7 forbade the soft
+// `/invalid|usage|error/i` regex on the
+// stderr assertions). The pattern is
+// `[code] human-readable message`: a script
+// can pin the `[code]` prefix without parsing
+// the prose.
+const STABLE_HISTORY_MODE_FAILED = "invalid_history_mode";
+const STABLE_FORMAT_FAILED = "invalid_format";
+const STABLE_SCOPE_FAILED = "invalid_scope";
+
 export function exportCommand(ctx: CliContext): CliResult {
   const scope = (flagString(ctx.args, "scope") ?? "global") as MemoryScope;
   const projectId = flagString(ctx.args, "project-id");
@@ -14,13 +28,17 @@ export function exportCommand(ctx: CliContext): CliResult {
   const formatRaw = flagString(ctx.args, "format") ?? "markdown";
   const historyMode = flagString(ctx.args, "history-mode") ?? "snapshot";
   if (historyMode !== "snapshot" && historyMode !== "full_history") {
-    return { exitCode: 1, stdout: "", stderr: "export failed: invalid history_mode (expected snapshot or full_history)" };
+    return {
+      exitCode: 1,
+      stdout: "",
+      stderr: `[${STABLE_HISTORY_MODE_FAILED}] export failed: invalid history_mode (expected snapshot or full_history)`
+    };
   }
   if (formatRaw !== "markdown" && formatRaw !== "json" && formatRaw !== "yaml") {
     return {
       exitCode: 1,
       stdout: "",
-      stderr: `usage: agent-recall export --format markdown|json|yaml (got "${formatRaw}")`
+      stderr: `[${STABLE_FORMAT_FAILED}] usage: agent-recall export --format markdown|json|yaml (got "${formatRaw}")`
     };
   }
   const format: ExportFormat = formatRaw;
@@ -45,10 +63,18 @@ export function exportCommand(ctx: CliContext): CliResult {
     const legacyHint = isUnboundProjectIdAllowed()
       ? ""
       : ` (or set ${ENV_ALLOW_UNBOUND_PROJECT_ID}=1 to allow the legacy unbound mode)`;
+    // The resolver returns
+    // `err("invalid_scope", ...)`, which is
+    // the v1.1.2 stable error code from
+    // `STABLE_ERROR_CODES`. The CLI surfaces
+    // the same code on stderr so a script can
+    // pin `[invalid_scope]` instead of parsing
+    // free-form prose.
+    const code = resolved.error === "invalid_scope" ? STABLE_SCOPE_FAILED : resolved.error;
     return {
       exitCode: 1,
       stdout: "",
-      stderr: `${resolved.message}${legacyHint}`
+      stderr: `[${code}] ${resolved.message}${legacyHint}`
     };
   }
   const filters: Record<string, unknown> = { scope: resolved.value.scope, status: "active", limit: 10_000 };

@@ -41,6 +41,21 @@ import type { MemoryScope } from "../../domain.js";
 
 const INSPECT_USAGE = "usage: agent-recall import inspect <batch_id> [--json]";
 
+// Stage 18 v1.1.2 third follow-up (review by
+// ora-7, Critical #2): the CLI failure paths
+// surface STABLE machine-readable error codes
+// in `[code] message` form on stderr. The
+// previous follow-up emitted free-form strings
+// only — ora-7 forbids the soft
+// `/usage|error/i` regex on stderr and pins the
+// exact token.
+const STABLE_USAGE_ERROR = "usage_error";
+const STABLE_INVALID_FORMAT = "invalid_format";
+const STABLE_HISTORY_MODE_FAILED = "invalid_history_mode";
+const STABLE_INVALID_CONFLICT_POLICY = "invalid_conflict_policy";
+const STABLE_MISSING_PROJECT_ID = "missing_project_id";
+const STABLE_NOT_FOUND = "not_found";
+
 export function importCommand(ctx: CliContext): CliResult {
   // Stage 18 v1.1.2 (issue #26, task 7): the
   // `import inspect` subcommand. We branch on the
@@ -58,7 +73,9 @@ export function importCommand(ctx: CliContext): CliResult {
     return {
       exitCode: 1,
       stdout: "",
-      stderr: "usage: agent-recall import --from <export-root> [--scope global|project] [--project-id <id>] [--format json|yaml] [--conflict keep|replace|merge|fail] [--dry-run]\n\n" + INSPECT_USAGE
+      stderr:
+        `[${STABLE_USAGE_ERROR}] usage: agent-recall import --from <export-root> [--scope global|project] [--project-id <id>] [--format json|yaml] [--conflict keep|replace|merge|fail] [--dry-run]\n\n` +
+        INSPECT_USAGE
     };
   }
   const scope = (flagString(ctx.args, "scope") ?? "global") as MemoryScope;
@@ -73,19 +90,23 @@ export function importCommand(ctx: CliContext): CliResult {
     return {
       exitCode: 1,
       stdout: "",
-      stderr: `usage: agent-recall import --format json (yaml is no longer supported; got "${formatRaw}")`
+      stderr: `[${STABLE_INVALID_FORMAT}] usage: agent-recall import --format json (yaml is no longer supported; got "${formatRaw}")`
     };
   }
   const historyMode = flagString(ctx.args, "history-mode") ?? "snapshot";
   if (historyMode !== "snapshot" && historyMode !== "full_history") {
-    return { exitCode: 1, stdout: "", stderr: "import failed: invalid history_mode (expected snapshot or full_history)" };
+    return {
+      exitCode: 1,
+      stdout: "",
+      stderr: `[${STABLE_HISTORY_MODE_FAILED}] import failed: invalid history_mode (expected snapshot or full_history)`
+    };
   }
   const conflictRaw = flagString(ctx.args, "conflict") ?? "keep";
   if (conflictRaw !== "keep" && conflictRaw !== "replace" && conflictRaw !== "merge" && conflictRaw !== "fail") {
     return {
       exitCode: 1,
       stdout: "",
-      stderr: `usage: agent-recall import --conflict keep|replace|merge|fail (got "${conflictRaw}")`
+      stderr: `[${STABLE_INVALID_CONFLICT_POLICY}] usage: agent-recall import --conflict keep|replace|merge|fail (got "${conflictRaw}")`
     };
   }
   const conflict: ConflictPolicy = conflictRaw;
@@ -96,7 +117,7 @@ export function importCommand(ctx: CliContext): CliResult {
     return {
       exitCode: 1,
       stdout: "",
-      stderr: "import --scope project requires --project-id"
+      stderr: `[${STABLE_MISSING_PROJECT_ID}] import --scope project requires --project-id`
     };
   }
 
@@ -188,17 +209,22 @@ function importInspectCommand(ctx: CliContext): CliResult {
     return {
       exitCode: 1,
       stdout: "",
-      stderr: INSPECT_USAGE
+      stderr: `[${STABLE_USAGE_ERROR}] ${INSPECT_USAGE}`
     };
   }
   const json = flagBool(ctx.args, "json") === true;
   const store = new ImportBatchStore(ctx.store);
   const batch = store.inspect(batchId);
   if (batch === undefined) {
+    // Stage 18 v1.1.2 third follow-up
+    // (Critical #2): surface the stable
+    // `not_found` code in `[code]` form on
+    // stderr so a script can pin the failure
+    // mode without scanning prose.
     return {
       exitCode: 1,
       stdout: "",
-      stderr: `import inspect: unknown batch_id ${batchId} (not_found)`
+      stderr: `[${STABLE_NOT_FOUND}] import inspect: unknown batch_id ${batchId}`
     };
   }
   if (json) {

@@ -109,11 +109,33 @@ function main() {
   //    the current value for visibility; the
   //    release workflow's `Strip dev-only
   //    artefacts` step is the runtime enforcer.
+  //    Stage 18 v1.1.2 third follow-up (Important
+  //    #5): the `LICENSE` file is a required
+  //    packaging input — the `release-candidate.yml`
+  //    and `release.yml` packaging steps now
+  //    require the on-disk file (the previous
+  //    `if [ -f LICENSE ]; then cp LICENSE ...`
+  //    optional copy was promoted to a required
+  //    copy). The script asserts BOTH the
+  //    `package.json` `files` array lists
+  //    `LICENSE` AND the on-disk `LICENSE` file
+  //    exists.
   if (Array.isArray(pkg.files)) {
     ok(`package.json files: [${pkg.files.join(", ")}]`);
+    if (!pkg.files.includes("LICENSE")) {
+      fail("package.json files: LICENSE must be in the published files list");
+      return;
+    }
   } else {
     console.log("- package.json files: (not set; release workflow globs the dist/ tree)");
   }
+  const LICENSE_PATH = join(REPO_ROOT, "LICENSE");
+  if (!existsSync(LICENSE_PATH)) {
+    fail(`LICENSE is missing from the repository root; release packaging requires it (run scripts/extract-release-artifact.mjs after adding the file)`);
+    return;
+  }
+  const licenseStats = statSync(LICENSE_PATH);
+  ok(`LICENSE: present (${licenseStats.size} bytes)`);
 
   // 7. The release and candidate workflows must both
   // keep the artifact contract executable. This check is
