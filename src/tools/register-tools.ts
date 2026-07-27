@@ -896,9 +896,16 @@ export function registerMemoryTools(server: MemoryToolServer, service: MemorySer
  * overloaded with administrative tools it should not
  * call. The MCP server starts in the `core` profile
  * by default; the `extended` profile is enabled via
- * the `AGENT_RECALL_PROFILE=extended` env var (or a
- * `--profile=extended` CLI flag, wired at the
- * `bin/agent-recall.ts` entry point).
+ * the `AGENT_RECALL_PROFILE=extended` env var.
+ *
+ * v1.1.2 (issue #22): `registerExtendedTools`
+ * registers the **union** of Core and Extended
+ * (the full non-admin surface). The Extended
+ * profile is the documented "everything except
+ * nothing" superset; a coding agent that opts
+ * in to Extended still needs the Core read /
+ * write tools (e.g. `search_memories`,
+ * `get_memory`, `forget_memory`).
  */
 export const CORE_TOOL_NAMES: readonly MemoryToolName[] = [
   "recall_context",
@@ -934,8 +941,19 @@ export function registerCoreTools(server: MemoryToolServer, service: MemoryServi
 }
 
 export function registerExtendedTools(server: MemoryToolServer, service: MemoryService): void {
+  // v1.1.2 (issue #22): Extended = Core + the
+  // additional memory-semantics + administrative
+  // tools. The previous implementation only
+  // registered `EXTENDED_TOOL_NAMES`, which left
+  // a Core-only server (no `search_memories`, no
+  // `get_memory`) under the "Extended" profile —
+  // an unworkable regression for a coding agent
+  // that opted in. The union is the documented
+  // v1.1.2 contract: "explicit Extended exposes
+  // the documented additional set" *on top of*
+  // the Core surface.
   const handlers = createMemoryToolHandlers(service);
-  for (const name of EXTENDED_TOOL_NAMES) {
+  for (const name of [...CORE_TOOL_NAMES, ...EXTENDED_TOOL_NAMES]) {
     server.registerTool(
       name,
       {

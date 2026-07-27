@@ -40,10 +40,33 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import {
+  CORE_TOOL_NAMES,
+  EXTENDED_TOOL_NAMES
+} from "../../src/tools/register-tools.js";
+import { selectToolProfile } from "../../src/tools/profile.js";
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), "../../..");
 const SERVER_ENTRY = join(REPO_ROOT, "dist", "src", "index.js");
 const HAS_BUILT_ARTIFACT = existsSync(SERVER_ENTRY);
+
+// Stage 17 v1.1.2 (issue #22): the smoke test
+// is profile-aware. The default is `core` (the
+// packaged default); the assertions check the
+// Core tools. When the operator opts in via
+// `AGENT_RECALL_PROFILE=extended`, the full
+// 20-tool surface is asserted instead.
+function readActiveProfile(): "core" | "extended" {
+  const raw = process.env.AGENT_RECALL_PROFILE;
+  try {
+    return selectToolProfile(raw === "" || raw === undefined ? undefined : raw);
+  } catch (error) {
+    throw new Error(
+      `mcp-client-e2e: ${error instanceof Error ? error.message : String(error)}`
+    );
+  }
+}
+const ACTIVE_PROFILE: "core" | "extended" = readActiveProfile();
 
 interface ToolResult {
   content: Array<{ type: string; text: string }>;
@@ -77,6 +100,11 @@ function parseText(result: ToolResult): unknown {
 }
 
 const itMaybe = HAS_BUILT_ARTIFACT ? it : it.skip;
+// Stage 17 v1.1.2 (issue #22): Extended-only
+// smoke assertions. In Core mode (the packaged
+// default) the Extended tools are not registered
+// and the assertions are skipped.
+const itMaybeExt = HAS_BUILT_ARTIFACT && ACTIVE_PROFILE === "extended" ? it : it.skip;
 
 describe("MCP black-box E2E (issue #8 + issue #16)", () => {
   let dataHome: string | undefined;
@@ -112,9 +140,14 @@ describe("MCP black-box E2E (issue #8 + issue #16)", () => {
     // over the full lifecycle, so the hint
     // would falsely trip the leak guard; the
     // env var keeps the test honest.
+    // Stage 17 v1.1.2 (issue #22): pin the
+    // spawned server to the active profile so
+    // the smoke assertions match the tool
+    // list the server registers.
     const env = {
       ...process.env,
       AGENT_RECALL_HOME: dataHome,
+      AGENT_RECALL_PROFILE: ACTIVE_PROFILE,
       AGENT_RECALL_SUPPRESS_MCP_DEPRECATION: "1"
     };
     transport = new StdioClientTransport({
@@ -190,23 +223,18 @@ describe("MCP black-box E2E (issue #8 + issue #16)", () => {
   itMaybe("initialize + listTools + listResources", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const tools = await client.listTools();
-    const names = tools.tools.map((t) => t.name);
-    // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
-    // the four new memory-semantics tools are in
-    // the canonical tool list. The default
-    // `registerMemoryTools` registers every tool
-    // (the `core` / `extended` profile split is
-    // a per-server decision; the smoke here uses
-    // the all-tools registration).
-    expect(names).toContain("remember");
-    expect(names).toContain("update_memory");
-    expect(names).toContain("forget_memory");
-    expect(names).toContain("plan_maintenance");
-    expect(names).toContain("apply_maintenance");
-    expect(names).toContain("record_memory_feedback");
-    expect(names).toContain("record_memory_provenance");
-    expect(names).toContain("explain_memory_provenance");
-    expect(names).toContain("confirm_memory_trust");
+    const names = new Set(tools.tools.map((t) => t.name));
+    // Stage 17 v1.1.2 (issue #22): the
+    // Core-only smoke asserts the 10 Core
+    // tools. The Extended smoke asserts the
+    // 20-tool full surface (Core + Extended).
+    const expected =
+      ACTIVE_PROFILE === "core"
+        ? new Set<string>(CORE_TOOL_NAMES)
+        : new Set<string>([...CORE_TOOL_NAMES, ...EXTENDED_TOOL_NAMES]);
+    for (const name of expected) {
+      expect(names.has(name), `expected tool ${name} in profile ${ACTIVE_PROFILE}`).toBe(true);
+    }
 
     const resources = await client.listResources();
     const uris = resources.resources.map((r) => r.uri);
@@ -358,7 +386,7 @@ describe("MCP black-box E2E (issue #8 + issue #16)", () => {
     expect(data.value.items[0]?.components.lexical_relevance).toBeGreaterThan(0);
   });
 
-  itMaybe("record_memory_feedback appends a row; subsequent recall reflects the actor trust signal", async () => {
+  itMaybeExt("record_memory_feedback appends a row; subsequent recall reflects the actor trust signal (Extended only)", async () => {
     if (client === undefined) throw new Error("client not initialised");
     const r1 = await callTool(client, "remember", {
       scope: "global",

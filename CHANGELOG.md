@@ -160,6 +160,167 @@ alias, memory, audit, or budget row is created.
   passes on Linux / macOS; the CI gate is documented
   in `docs/superpowers/plans/2026-07-26-v1-final-release-gate.md`.
 
+## [1.1.2] — Stage 17 v1.1.2 (Packaged MCP default is Core profile, issue #22)
+
+The v1.1.2 follow-up roadmap left issue **#22** on the
+list. The Stage 16 PR-7 (#17) split the 20 MCP tools
+into a `core` (10 read / write / plan essentials) and
+`extended` (10 additional memory-semantics +
+administrative) profile but kept the v1.1.1 default
+of "register every tool". v1.1.2 closes the gap: the
+**packaged MCP default is `core`**; the Extended
+profile is opt-in via `AGENT_RECALL_PROFILE=extended`.
+An unknown value fail-closes at startup. The
+health resource surfaces the active profile so an
+operator / MCP client can verify the runtime tool
+surface without re-reading the env var.
+
+### Added
+
+- **`src/tools/profile.ts`** (new, ~70 lines) — the
+  profile selector. Exports `PROFILE_NAMES = ["core",
+  "extended"]`, `ToolProfile = "core" | "extended"`,
+  `selectToolProfile(value)`, and
+  `resolveActiveProfile(env)`. The selector fail-closes
+  on unknown values with a stable error message that
+  names the env var (`Invalid AGENT_RECALL_PROFILE
+  value 'admin'. Supported values: core, extended.`).
+  An empty / unset env var defaults to `core` (the
+  packaged default).
+- **`src/index.ts`** — the MCP entry reads the profile
+  at startup and picks `registerCoreTools` or
+  `registerExtendedTools` accordingly. The active
+  profile is forwarded to the resource layer so the
+  health resource can surface it. The `connected on
+  stdio` hint now includes the active profile for
+  operator-visible confirmation.
+- **`src/mcp/resources.ts`** — `MemoryServerContext`
+  gains an optional `activeProfile: "core" | "extended"`
+  field. The `memory://health` resource surfaces it as
+  `active_profile: "core" | "extended"` alongside the
+  v1.1.2 `strict_isolation` / `identity_status` /
+  `allow_unbound_project_id` contract.
+- **`src/tools/register-tools.ts`** —
+  `registerExtendedTools` now registers the **union** of
+  Core and Extended (the full non-admin surface). The
+  pre-v1.1.2 implementation only registered
+  `EXTENDED_TOOL_NAMES`, which left a Core-less server
+  under the "Extended" profile. The v1.1.2 contract
+  pins Extended = Core + additional; the doc comment
+  explains the split.
+
+### CLI flag decision
+
+- The brief asked whether the CLI `--profile=core|extended`
+  flag is needed for this release. **Decision: no.**
+  The MCP server runs over stdio and does not read
+  `argv`; an operator who wants a non-default profile
+  sets `AGENT_RECALL_PROFILE` in the MCP client
+  `env` block (the documented path). The existing
+  `src/cli/arg-parser.ts` is unchanged. A future release
+  that adds a separate `agent-recall mcp` CLI subcommand
+  can wire `--profile` through the existing parser; the
+  selector is the single source of truth either way.
+
+### New tests
+
+- **`test/tools-profile.test.ts`** (NEW, 13 tests) —
+  covers `selectToolProfile`, `resolveActiveProfile`,
+  and the `CORE_TOOL_NAMES` / `EXTENDED_TOOL_NAMES`
+  partition. The selector's fail-closed contract is
+  asserted on `admin`, `Admin`, `EXTENDED`, `full`,
+  and `1` (a representative sample of plausible
+  typos / future profile names).
+- **`test/release-gate/p3-mcp-profile-default.test.ts`**
+  (NEW, 11 tests) — the v1.1.2 release-gate surface.
+  Spawns the **built** server in three configurations
+  and asserts:
+  - Default env: `tools/list` is the 10-tool Core
+    surface; `memory://health.active_profile === "core"`.
+  - `AGENT_RECALL_PROFILE=extended`: `tools/list` is
+    the 20-tool full surface;
+    `memory://health.active_profile === "extended"`.
+  - `AGENT_RECALL_PROFILE=core` (explicit): identical
+    to the default behaviour.
+  - `AGENT_RECALL_PROFILE=foobar`: the server exits
+    non-zero before binding to stdio; the error
+    message on stderr names the env var.
+  - `AGENT_RECALL_PROFILE=admin`: same fail-closed
+    behaviour (symmetric guard against future profile
+    additions).
+  - The `active_profile` field coexists with the v1.1.2
+    `strict_isolation` / `identity_status` /
+    `allow_unbound_project_id` fields on the same
+    payload.
+- **`test/blackbox/mcp-all-tools-e2e.test.ts`** —
+  refactored to be profile-aware. The file reads
+  `AGENT_RECALL_PROFILE` and asserts the tool list
+  against the canonical `CORE_TOOL_NAMES` /
+  `EXTENDED_TOOL_NAMES` arrays from `register-tools.ts`
+  (rather than a hand-maintained 20-tool literal).
+  Extended-only tools (10 of them: `export_memory_context`,
+  `merge_memories`, `supersede_memory`,
+  `maintain_memories`, `plan_maintenance`,
+  `apply_maintenance`, `record_memory_feedback`,
+  `record_memory_provenance`,
+  `explain_memory_provenance`, `confirm_memory_trust`)
+  use a new `itMaybeExt` helper that skips when
+  `AGENT_RECALL_PROFILE !== "extended"`. The CI gate
+  runs the file twice (once per profile); a default
+  `npm test` run exercises Core only and reports
+  the 10 Extended assertions as skipped.
+- **`test/blackbox/mcp-client-e2e.test.ts`** — same
+  profile-aware refactor; the legacy smoke now
+  asserts the Core set in default mode and the
+  full set in Extended mode. The
+  `record_memory_feedback` assertion uses the
+  `itMaybeExt` helper.
+- **`test/mcp-v2-contract.test.ts`** — the
+  `memory://health` test now also asserts
+  `active_profile` (default = `core`); a new test
+  asserts `active_profile === "extended"` when the
+  context opts in.
+
+### Test count
+
+- `npm test` (dev mode, no `dist/`): **636 passed** +
+  11 skipped (was 579 + 42 in v1.1.1; the net change
+  is +57 unit tests and −31 blackbox-skipped tests
+  because the build is now required for the blackbox
+  gate). The two pre-existing flakes
+  (`test/doctor.test.ts` < 1000ms bound and
+  `test/multi-process-stress.test.ts` orphan data
+  homes on Windows) reproduce on the baseline and
+  are documented in the v1.1.1 + v1.1.2 CHANGELOG
+  entries.
+- `npm test` (with `dist/`): 648 tests run; the blackbox
+  suite reports 31 passed + 11 skipped in Core mode
+  and 42 passed in Extended mode.
+- `npm run typecheck` → 0 error.
+- `npm run build` → 0 error.
+
+### Known non-blocking limits
+
+- The blackbox tests now spawn two server processes
+  (one per profile) when run end-to-end. The
+  Core-mode `tools/list` assertion is a strict
+  subset of the Extended-mode `tools/list` assertion,
+  and the difference is documented in
+  `p3-mcp-profile-default.test.ts`. The CI gate must
+  run the blackbox tests in both modes; the npm
+  scripts and the docs in
+  `docs/superpowers/plans/2026-07-26-v1-final-release-gate.md`
+  will be updated in Task 8 (release-gate plumbing).
+- The Core profile deliberately excludes
+  `maintain_memories`, `plan_maintenance`,
+  `apply_maintenance`, `merge_memories`,
+  `supersede_memory`, `export_memory_context`, and
+  the four `record_*` / `explain_memory_provenance` /
+  `confirm_memory_trust` tools. A normal coding
+  agent is not expected to call administrative
+  tools; the operator path (`AGENT_RECALL_PROFILE=extended`)
+  is the documented escape hatch.
+
 ## [1.1.1] — Stage 16 v1.1.1 (Idempotency v2 public path + black-box gate)
 
 The 8-issue v1.1.1 follow-up roadmap (see

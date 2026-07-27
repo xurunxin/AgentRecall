@@ -98,6 +98,8 @@ Most MCP clients support a JSON server entry. Use the built file after `npm run 
 ```
 
 > **Note:** As of stage 1, the `bin` field in `package.json` publishes the CLI as `agent-recall`. MCP server entry is exposed as `agent-recall-mcp` (or via the explicit path `node /path/to/agent-recall/dist/src/index.js`). Existing configs that invoke the bare `agent-recall` command will start a CLI process instead and fail to connect — update them to use `agent-recall-mcp` or the explicit path. The MCP server prints a one-time deprecation notice to stderr unless `AGENT_RECALL_SUPPRESS_MCP_DEPRECATION=1` is set.
+>
+> **Note:** As of v1.1.2, the packaged MCP default is the **Core** profile (10 read / write / plan tools). Set `AGENT_RECALL_PROFILE=extended` in the `env` block to opt in to the additional memory-semantics + administrative tools. The active profile is surfaced on `memory://health` as `active_profile`. See the [Configuration](#configuration) table for the full contract.
 
 If your client supports `cwd`, you can launch through npm:
 
@@ -246,6 +248,7 @@ invalid value falls back to the default with a one-line stderr warning.
 | `AGENT_RECALL_TRUST_SOFT` | `0.1` | Recall `trust_boost` for memories the calling agent recently touched. Must be in `[0, 1]`. |
 | `AGENT_RECALL_SUPPRESS_MCP_DEPRECATION` | unset | Set to `1` to silence the one-time MCP server deprecation notice. |
 | `AGENT_RECALL_ALLOW_UNBOUND_PROJECT_ID` | unset (strict-by-default) | v1.1.2 (issue #21): default-off legacy escape hatch. When set to `1`, a `project_id`-only call without a registered identity is allowed in "unbound" mode (the resolver returns `ok` with `identity_status: "unbound"`). The default strict mode refuses unknown ids at the resolver before any project scope, alias, memory, audit, or budget row is created. The `memory://health` resource surfaces the current mode; the CLI `export` success message prints `[identity_status: unbound — strict isolation disabled]` when the escape hatch is on. |
+| `AGENT_RECALL_PROFILE` | `core` (the packaged default) | v1.1.2 (issue #22): selects the active MCP tool profile. `core` registers the 10 read / write / plan essentials; `extended` adds the 10 memory-semantics + administrative tools (`record_memory_feedback`, `record_memory_provenance`, `explain_memory_provenance`, `confirm_memory_trust`, `maintain_memories`, `plan_maintenance`, `apply_maintenance`, `merge_memories`, `supersede_memory`, `export_memory_context`). Unknown values fail-closed at startup with a non-zero exit and an error message that names this env var. The `memory://health` resource surfaces the active profile as `active_profile`; the verbose stdio hint includes the profile. |
 
 Example multi-agent MCP config:
 

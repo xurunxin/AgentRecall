@@ -528,10 +528,17 @@ describe("release-gate p3-project-identity-strict-mcp (Stage 17 v1.1.2 #21)", ()
       strict_isolation: boolean;
       identity_status: string;
       allow_unbound_project_id: boolean;
+      active_profile: "core" | "extended";
     };
     expect(payload.strict_isolation).toBe(true);
     expect(payload.identity_status).toBe("bound");
     expect(payload.allow_unbound_project_id).toBe(false);
+    // v1.1.2 (issue #22): the health resource
+    // surfaces the active tool profile. The
+    // legacy call (no `activeProfile` on the
+    // context) defaults to `"core"`, which is
+    // also the documented packaged default.
+    expect(payload.active_profile).toBe("core");
     store.close();
   });
 

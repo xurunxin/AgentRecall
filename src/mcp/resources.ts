@@ -33,6 +33,7 @@ import { serverVersion } from "../server-version.js";
 import { listBackups } from "../backup.js";
 import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ProjectIdentityResolver } from "../scope-resolver.js";
+import type { ToolProfile } from "../tools/profile.js";
 
 export interface MemoryServerContext {
   readonly store: SQLiteMemoryStore;
@@ -50,6 +51,19 @@ export interface MemoryServerContext {
    * `identity_status` for the active configuration.
    */
   readonly identityResolver: ProjectIdentityResolver;
+  /**
+   * v1.1.2 (issue #22): the active tool profile the
+   * server was started with (`"core"` or
+   * `"extended"`). Surfaced on the health resource as
+   * `active_profile` so an operator / MCP client can
+   * branch on the runtime tool surface without
+   * re-reading `AGENT_RECALL_PROFILE` from the
+   * environment. Optional for backward compatibility
+   * with callers that pre-date the profile split; the
+   * resource defaults to `"core"` when the field is
+   * absent so the contract stays deterministic.
+   */
+  readonly activeProfile?: ToolProfile;
 }
 
 type Variables = Record<string, string | string[] | undefined>;
@@ -311,6 +325,19 @@ export function registerMemoryResources(server: MemoryResourceServer, ctx: Memor
         // without re-reading the env var.
         identity_status: allowUnbound ? "unbound" : "bound",
         allow_unbound_project_id: allowUnbound,
+        // v1.1.2 (issue #22): the active MCP tool
+        // profile. `"core"` is the packaged default;
+        // `"extended"` is opt-in via
+        // `AGENT_RECALL_PROFILE=extended`. The field
+        // is sourced from the per-server
+        // `activeProfile` context so an MCP client
+        // can verify the runtime tool surface
+        // without re-reading the env var (mirrors
+        // the v1.1.2 `identity_status` contract).
+        // Defaults to `"core"` when the context
+        // omits the field (older test mocks that
+        // pre-date the profile split).
+        active_profile: ctx.activeProfile ?? "core",
         backup: {
           dir: backupDir,
           entry_count: backupEntries.length,

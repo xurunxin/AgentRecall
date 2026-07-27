@@ -427,6 +427,7 @@ describe("MCP resources (spec § 6.3)", () => {
       strict_isolation: boolean;
       identity_status: string;
       allow_unbound_project_id: boolean;
+      active_profile: "core" | "extended";
     };
     expect(payload.status).toBe("ok");
     expect(payload.server_version).toEqual(expect.any(String));
@@ -437,5 +438,29 @@ describe("MCP resources (spec § 6.3)", () => {
     expect(payload.strict_isolation).toBe(true);
     expect(payload.identity_status).toBe("bound");
     expect(payload.allow_unbound_project_id).toBe(false);
+    // v1.1.2 (issue #22): the health resource
+    // surfaces the active tool profile. The
+    // legacy call (no `activeProfile` on the
+    // context) defaults to `"core"`, which is
+    // also the documented packaged default.
+    expect(payload.active_profile).toBe("core");
+  });
+
+  it("memory://health surfaces active_profile=extended when the context opts in (Stage 17 v1.1.2 #22)", async () => {
+    const { server, calls } = captureServer();
+    const service = makeService();
+    registerMemoryResources(server as unknown as Parameters<typeof registerMemoryResources>[0], {
+      store: service.store,
+      dataHome: "/tmp/foo",
+      defaultActor: "agent:test",
+      identityResolver: new ProjectIdentityResolver(service.store, "agent:test"),
+      activeProfile: "extended"
+    });
+    const health = calls.find((c) => c.name === "memory_health");
+    if (health === undefined) throw new Error("memory_health not registered");
+    const out = await health.cb(new URL("memory://health"), {}, undefined);
+    const contents = (out as { contents: Array<{ mimeType: string; text: string }> }).contents;
+    const payload = JSON.parse(contents[0]!.text) as { active_profile: "core" | "extended" };
+    expect(payload.active_profile).toBe("extended");
   });
 });

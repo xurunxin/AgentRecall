@@ -7,8 +7,12 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { MarkdownExporter } from "./markdown-exporter.js";
 import { MemoryService } from "./memory-service.js";
 import { SQLiteMemoryStore } from "./sqlite-store.js";
-import { registerMemoryTools } from "./tools/register-tools.js";
+import {
+  registerCoreTools,
+  registerExtendedTools
+} from "./tools/register-tools.js";
 import { registerMemoryResources } from "./mcp/resources.js";
+import { resolveActiveProfile, type ToolProfile } from "./tools/profile.js";
 import { resolveActor } from "./actor.js";
 import { ProjectIdentityResolver } from "./scope-resolver.js";
 import { serverVersion } from "./server-version.js";
@@ -48,6 +52,15 @@ export async function main(): Promise<void> {
         "Set AGENT_RECALL_SUPPRESS_MCP_DEPRECATION=1 to silence this message."
     );
   }
+  // v1.1.2 (issue #22): resolve the active tool
+  // profile BEFORE constructing the server. The
+  // selector fail-closes on an unknown value
+  // (throws); the catch below surfaces the error
+  // on stderr with the env-var name and exits
+  // with a non-zero code, so the operator sees a
+  // stable startup error rather than a server
+  // that silently half-starts.
+  const activeProfile: ToolProfile = resolveActiveProfile();
   const dataHome = resolveDataHome();
   const service = createService(dataHome);
   const defaultActor = resolveActor(undefined);
@@ -64,12 +77,28 @@ export async function main(): Promise<void> {
     name: serverName(),
     version: serverVersion()
   });
-  registerMemoryTools(server, service);
+  // v1.1.2 (issue #22): the per-profile tool
+  // registration. `core` is the packaged default
+  // (the safe, low-surface option for an
+  // unconfigured server). `extended` adds the
+  // four memory-semantics tools plus the
+  // administrative tools (plan/apply maintenance,
+  // merge, supersede, export, maintain). The
+  // shared `createMemoryToolHandlers` factory is
+  // unchanged; the per-profile gate is the
+  // `registerCoreTools` / `registerExtendedTools`
+  // boundary.
+  if (activeProfile === "core") {
+    registerCoreTools(server, service);
+  } else {
+    registerExtendedTools(server, service);
+  }
   registerMemoryResources(server, {
     store: service.store,
     dataHome,
     defaultActor,
-    identityResolver
+    identityResolver,
+    activeProfile
   });
 
   const transport = new StdioServerTransport();
@@ -82,7 +111,7 @@ export async function main(): Promise<void> {
   // Operators who want the old behaviour opt
   // in via the env var.
   if (process.env.AGENT_RECALL_VERBOSE_STDIO === "1") {
-    console.error(`${serverName()} connected on stdio`);
+    console.error(`${serverName()} connected on stdio (profile=${activeProfile})`);
   }
 }
 
