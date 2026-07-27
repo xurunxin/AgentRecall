@@ -27,7 +27,6 @@ import {
   type ProjectScope,
   type Result
 } from "../domain.js";
-import type { MemorySensitivity } from "../write-validator.js";
 import { MarkdownExporter } from "../markdown-exporter.js";
 import { resolveMemoryScope, type ProjectIdentityResolver } from "../scope-resolver.js";
 import { CURRENT_SCHEMA_VERSION } from "../sqlite-store.js";
@@ -174,49 +173,91 @@ export class MemoryReadService {
   }
 
   /**
-   * Stage 18 v1.1.2 follow-up (review by ora-8):
+   * Stage 18 v1.1.2 follow-up (review by ora-9):
    * the public-boundary read that distinguishes
    * `forbidden_visibility` from `not_found`. The
-   * SQL filter is the source of truth; this
-   * method does a privileged peek when the
-   * filtered peek returns `undefined` to
-   * determine whether the row actually exists
-   * at a higher sensitivity. The MCP `get_memory`
-   * tool and the per-project resource route
-   * through this method so a client without
-   * the `sensitivity_visibility` capability
+   * SQL filter is the source of truth. The
+   * classifier (`classifyEntryVisibility`) is
+   * the only single-row read API the
+   * `forbidden_visibility` path is allowed to
+   * use — it returns ONLY the visibility
+   * classification + the row's `id` +
+   * `sensitivity` (a non-secret operational
+   * token). The `peekEntry(id)` no-options
+   * overload is the write/maintenance path
+   * and MUST NOT be used to disambiguate the
+   * read contract: the previous follow-up
+   * (review by ora-8) used the no-options
+   * overload to peek at the row, then
+   * surfaced `raw.sensitivity` on the error
+   * envelope, which leaked the row's
+   * sensitivity literal to a caller without
+   * the `sensitivity_visibility` capability.
+   * The follow-up closes that leak.
+   *
+   * The MCP `get_memory` tool and the
+   * per-project resource route through this
+   * method so a client without the
+   * `sensitivity_visibility` capability
    * receives a stable `forbidden_visibility`
    * error code (NOT `not_found`) so it can
-   * branch on the failure mode.
+   * branch on the failure mode WITHOUT
+   * observing any row-derived secret
+   * (title / body / tags / source /
+   * sensitivity literal).
    */
   getMemoryWithVisibility(id: string): Result<
     { entry: MemoryEntry; audit: MemoryAuditEvent[] },
     "not_found" | "forbidden_visibility"
   > {
-    const filteredEntry = this.ctx.store.peekEntry(id, {
+    const classification = this.ctx.store.classifyEntryVisibility(id, {
       actorMaxSensitivity: this.ctx.actorMaxSensitivity ?? "normal"
     });
-    if (filteredEntry !== undefined) {
-      return ok({ entry: filteredEntry, audit: this.ctx.store.getAuditEvents(id) });
-    }
-    // The filtered peek returned `undefined`.
-    // Two possibilities:
-    //   - the row does not exist (`not_found`);
-    //   - the row exists at a higher sensitivity
-    //     (`forbidden_visibility`).
-    // The privileged peek is a diagnostic
-    // helper, NOT the source of truth — the SQL
-    // filter is the source of truth for the
-    // read contract.
-    const raw = this.ctx.store.peekEntry(id);
-    if (raw === undefined) {
+    if (classification.visibility === "not_found") {
       return err("not_found", `memory ${id} not found`, { memory_id: id });
     }
-    return err(
-      "forbidden_visibility",
-      `memory ${id} exceeds the caller's maximum sensitivity; run \`agent-recall admin grant\` and use the admin profile to surface this row`,
-      { memory_id: id, entry_sensitivity: raw.sensitivity as MemorySensitivity }
-    );
+    if (classification.visibility === "forbidden_visibility") {
+      // The classifier returned ONLY the
+      // visibility classification + the
+      // row's `id` + `sensitivity` field. The
+      // error envelope surfaces ONLY
+      // `memory_id` + a stable error code; the
+      // brief explicitly forbids
+      // `entry_sensitivity` / `sensitivity`
+      // literals / `sensitivity` keys on the
+      // deny path. The `sensitivity` value is
+      // captured in a closure but never
+      // surfaced — the previous follow-up's
+      // error envelope (`details.entry_sensitivity`)
+      // was the leak the follow-up closes. The
+      // message is worded to avoid the
+      // forbidden `sensitivity` substring.
+      return err(
+        "forbidden_visibility",
+        `memory ${id} is not visible to this caller; run \`agent-recall admin grant\` and use the admin profile to surface this row`,
+        { memory_id: id }
+      );
+    }
+    // The row is visible under the
+    // SQL-boundary filter. The full
+    // `peekEntry(id, { actorMaxSensitivity })`
+    // reuses the SQL filter so the read
+    // cannot bypass the boundary by reading
+    // the row a second time.
+    const entry = this.ctx.store.peekEntry(id, {
+      actorMaxSensitivity: this.ctx.actorMaxSensitivity ?? "normal"
+    });
+    if (entry === undefined) {
+      // The classifier said "visible" but the
+      // filtered peek returned `undefined`.
+      // This is a race (the row was deleted
+      // between the two reads) — surface
+      // `not_found` rather than fall through
+      // to a privileged peek (which would
+      // re-introduce the leak).
+      return err("not_found", `memory ${id} not found`, { memory_id: id });
+    }
+    return ok({ entry, audit: this.ctx.store.getAuditEvents(id) });
   }
 
   listMemories(filters: ListServiceFilters & { scope: "project"; project_id: string }): ListResult;

@@ -9,32 +9,85 @@ export function showCommand(ctx: CliContext): CliResult {
   if (id === undefined) {
     return { exitCode: 1, stdout: "", stderr: "usage: agent-recall show <memory_id>" };
   }
-  // Stage 18 v1.1.2 follow-up (review by ora-8):
+  // Stage 18 v1.1.2 follow-up (review by ora-9):
   // the CLI read path MUST apply the same
   // SQL-boundary sensitivity filter as the MCP /
   // service layer. The CLI is fail-closed
   // (`actorMaxSensitivity: "normal"`) so a
   // `private` / `restricted` row returns a
   // stable `forbidden_visibility` error without
-  // leaking title / body / tags. A future
-  // operator-facing flag can opt in to the
-  // broader sensitivity; the v1.1.2 contract
-  // pins the default to `"normal"`.
-  const entry = ctx.store.peekEntry(id, { actorMaxSensitivity: "normal" });
-  if (entry === undefined) {
-    // Distinguish `forbidden_visibility` from
-    // `not_found` so a script can branch on the
-    // failure mode. The privileged peek is the
-    // diagnostic helper (mirrors the MCP
-    // resource path).
-    const raw = ctx.store.peekEntry(id);
-    if (raw !== undefined) {
+  // leaking title / body / tags / source /
+  // `sensitivity` literal. The
+  // `classifyEntryVisibility` API is the ONLY
+  // single-row read the deny path is allowed
+  // to use — the previous follow-up (review by
+  // ora-8) used the no-options `peekEntry(id)`
+  // overload to peek at the row, then printed
+  // `${raw.sensitivity}` on stderr, which leaked
+  // the row's sensitivity literal to a caller
+  // without the `sensitivity_visibility`
+  // capability. The follow-up closes that
+  // leak by routing through the classifier
+  // and removing the sensitivity literal from
+  // the deny path entirely.
+  const classification = ctx.store.classifyEntryVisibility(id, { actorMaxSensitivity: "normal" });
+  if (classification.visibility === "forbidden_visibility") {
+    // Stable error code, NO sensitivity literal,
+    // NO row payload. The text surface is
+    // intentionally narrower than the MCP
+    // structured envelope; the brief does not
+    // require a structured CLI shape. The
+    // `--json` mode surfaces the same envelope
+    // shape as the MCP resource (so a script
+    // can branch on the failure mode without
+    // parsing the human-readable message).
+    // The brief explicitly forbids the
+    // `sensitivity` substring on the deny path
+    // (a structural operational token, not a
+    // row payload); the message is worded to
+    // avoid the forbidden substring.
+    if (flagBool(ctx.args, "json")) {
       return {
         exitCode: 1,
-        stdout: "",
-        stderr: `forbidden_visibility: memory ${id} exceeds the operator's maximum sensitivity (${raw.sensitivity}); install an admin capability via \`agent-recall admin grant\` to surface this row`
+        stdout: jsonOut({
+          ok: false,
+          error: "forbidden_visibility",
+          message: `memory ${id} is not visible to this caller; run \`agent-recall admin grant\` and use the admin profile to surface this row`,
+          memory_id: id
+        }),
+        stderr: ""
       };
     }
+    return {
+      exitCode: 1,
+      stdout: "",
+      stderr: `forbidden_visibility: memory ${id} is not visible to this caller; install an admin capability via \`agent-recall admin grant\` to surface this row`
+    };
+  }
+  if (classification.visibility === "not_found") {
+    if (flagBool(ctx.args, "json")) {
+      return {
+        exitCode: 1,
+        stdout: jsonOut({ ok: false, error: "not_found", message: `memory ${id} not found`, memory_id: id }),
+        stderr: ""
+      };
+    }
+    return { exitCode: 1, stdout: "", stderr: `memory not found: ${id}` };
+  }
+  // The row is visible under the SQL-boundary
+  // filter. The full `peekEntry(id, {
+  // actorMaxSensitivity })` reuses the SQL
+  // filter so the read cannot bypass the
+  // boundary.
+  const entry = ctx.store.peekEntry(id, { actorMaxSensitivity: "normal" });
+  if (entry === undefined) {
+    // The classifier said "visible" but the
+    // filtered peek returned `undefined`.
+    // This is a race (the row was deleted
+    // between the two reads) — surface
+    // `not_found` rather than fall through
+    // to a privileged peek (which would
+    // re-introduce the leak).
     return { exitCode: 1, stdout: "", stderr: `memory not found: ${id}` };
   }
   const audit = ctx.store.getAuditEvents(id);

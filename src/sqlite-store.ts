@@ -1781,6 +1781,146 @@ export class SQLiteMemoryStore {
    * `recordMemoryAccess(memoryId, actorId)` explicitly after
    * the read.
    */
+  /**
+   * Stage 18 v1.1.2 follow-up (review by ora-9):
+   * the SQL-boundary visibility classifier for the
+   * single-row read path. Returns ONLY the
+   * visibility classification and the row's
+   * `id` + `sensitivity` field — NEVER hydrates
+   * `title` / `body` / `tags` / `source` /
+   * `trust_level` / `project_id` / `scope` / any
+   * other row-derived secret. The caller (the
+   * read service, the MCP resource layer, the
+   * CLI `show` command) is responsible for
+   * translating the classification into the
+   * public contract — the store MUST NOT
+   * surface row content on the
+   * `forbidden_visibility` / `not_found`
+   * branches because the brief explicitly
+   * forbids leaking the seed title / body /
+   * tags / source / `entry_sensitivity` /
+   * `sensitivity` literal to a caller that did
+   * not authorise the read.
+   *
+   * The classifier is the SQL-boundary source
+   * of truth for the read path. A row whose
+   * `sensitivity` exceeds the caller's
+   * `actorMaxSensitivity` is invisible to the
+   * classifier regardless of how the caller
+   * asks for it.
+   *
+   * Returning the visibility classification
+   * (rather than the row itself) closes the
+   * critical leak the previous follow-up
+   * introduced: the previous implementation
+   * called `peekEntry(id)` WITHOUT
+   * `actorMaxSensitivity` to "disambiguate"
+   * `forbidden_visibility` from `not_found`,
+   * which hydrated the entire row including
+   * `title` / `body` / `tags` / `source` /
+   * `sensitivity` and surfaced them on the
+   * error envelope.
+   */
+  classifyEntryVisibility(
+    id: string,
+    options: { actorMaxSensitivity?: "normal" | "private" | "restricted" } = {}
+  ): { visibility: "visible" | "forbidden_visibility" | "not_found"; id: string; sensitivity: "normal" | "private" | "restricted" } {
+    const actorMax = options.actorMaxSensitivity ?? "normal";
+    const order = actorMax === "restricted" ? 3 : actorMax === "private" ? 2 : 1;
+    // The `SELECT id, sensitivity` projection
+    // is the security boundary: only the `id`
+    // and the `sensitivity` column are pulled
+    // off the row. `title` / `body` / `tags` /
+    // `source` are NOT selected, so a
+    // misconfigured caller cannot leak them
+    // through the classifier return value. The
+    // CASE expression applies the
+    // SQL-boundary sensitivity filter (the
+    // same predicate `listEntries` /
+    // `searchEntries` use) so a row that
+    // exceeds the caller's
+    // `actorMaxSensitivity` is invisible —
+    // the row's `sensitivity` field is NOT
+    // surfaced either (the filter rejects the
+    // row before the projection is materialised).
+    const probe = this.db
+      .prepare(
+        `SELECT id, sensitivity FROM memory_entries WHERE id = ? AND ` +
+          `(CASE sensitivity WHEN 'restricted' THEN 3 WHEN 'private' THEN 2 ELSE 1 END) <= ?`
+      )
+      .get(id, order) as { id: string; sensitivity: "normal" | "private" | "restricted" } | undefined;
+    if (probe === undefined) {
+      // The filtered probe returned nothing.
+      // Two possibilities: the row does not
+      // exist (`not_found`), or the row
+      // exists at a higher sensitivity
+      // (`forbidden_visibility`). To
+      // distinguish, the classifier peeks at
+      // the row's `sensitivity` only via a
+      // separate SQL projection that ALSO
+      // applies the sensitivity filter — but
+      // for the inverse predicate (the row
+      // exists AND the sensitivity is above
+      // the actor's max). The projection
+      // selects ONLY the `id` + `sensitivity`
+      // fields; title / body / tags / source
+      // are NEVER pulled. If neither probe
+      // matches, the row does not exist.
+      const elevated = this.db
+        .prepare(
+          `SELECT id, sensitivity FROM memory_entries WHERE id = ? AND ` +
+            `(CASE sensitivity WHEN 'restricted' THEN 3 WHEN 'private' THEN 2 ELSE 1 END) > ?`
+        )
+        .get(id, order) as { id: string; sensitivity: "normal" | "private" | "restricted" } | undefined;
+      if (elevated === undefined) {
+        return { visibility: "not_found", id, sensitivity: "normal" };
+      }
+      // The row exists at a higher sensitivity.
+      // We surface ONLY the operational
+      // `sensitivity` field (a token, not a
+      // row payload) so the caller can build
+      // the structured `forbidden_visibility`
+      // error envelope. The field name is
+      // explicitly `sensitivity_tier` in the
+      // brief (a non-secret operational
+      // token); the implementation returns it
+      // under the `sensitivity` key for
+      // back-compat with the existing
+      // `getMemoryWithVisibility` contract.
+      return { visibility: "forbidden_visibility", id: elevated.id, sensitivity: elevated.sensitivity };
+    }
+    return { visibility: "visible", id: probe.id, sensitivity: probe.sensitivity };
+  }
+
+  /**
+   * Stage 16 v1.1.1 PR-1 (#11): pure read of a memory entry.
+   * No side effects on `memory_accesses` or
+   * `memory_entries.access_count`. Use this from
+   * `get_memory` (read-only tool) and from any path that
+   * must not change canonical access state.
+   *
+   * For paths that legitimately need to record access
+   * (e.g. `recall_context` selecting a memory), call
+   * `getEntry` with an `accessedBy` actor, or call
+   * `recordMemoryAccess(memoryId, actorId)` explicitly after
+   * the read.
+   *
+   * Stage 18 v1.1.2 follow-up (review by ora-9): the
+   * `peekEntry` API is the maintenance / write-path
+   * single-row read. It is documented as the ONLY
+   * single-row read API that hydrates `title` / `body` /
+   * `tags` / `source` — used by the CAS guards in the
+   * write service and the maintenance actions
+   * (`mergePlannedGroup` / `forgetPlannedEntries` /
+   * `mergeDuplicates` / `expireDueMemories` /
+   * `applyPlannedGroupInTransaction`). Read paths that
+   * must enforce the SQL-boundary sensitivity filter
+   * MUST go through `classifyEntryVisibility` + a
+   * filtered `peekEntry(id, { actorMaxSensitivity })`,
+   * NOT through the no-options `peekEntry(id)` overload.
+   * The no-options overload intentionally reads every
+   * row (the CAS guards need to see all rows).
+   */
   peekEntry(id: string): MemoryEntry | undefined;
   peekEntry(
     id: string,

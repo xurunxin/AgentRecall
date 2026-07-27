@@ -444,6 +444,167 @@ describe("release-gate mcp-profile-default (Stage 17 v1.1.2 #22)", () => {
       }
     }
   });
+
+  // Stage 18 v1.1.2 follow-up (review by ora-9):
+  // the per-project single-memory resource
+  // (`memory://project/{project_id}/memory/
+  // {memory_id}`) MUST surface the same
+  // structured `forbidden_visibility` error
+  // envelope as the `get_memory` tool when the
+  // caller is not authorised to see a row at a
+  // higher sensitivity. The text payload
+  // (`r.contents[0].text`) is the canonical
+  // MCP resource representation; the brief
+  // requires the same denylist contract on the
+  // resource text surface (no `secret title` /
+  // `secret body` / `secret` / `entry_sensitivity`
+  // / `sensitivity` literal / `restricted`
+  // literal in the response). The pre-follow-up
+  // implementation surfaced
+  // `entry_sensitivity: raw.sensitivity` on the
+  // resource error envelope; the follow-up
+  // closes that leak by routing the resource
+  // through the classifier.
+  it("memory://project/{id}/memory/{mid} returns forbidden_visibility text payload for a restricted project row under the default fail-closed profile", async () => {
+    if (!HAS_BUILT_ARTIFACT) {
+      throw new Error(
+        "release-gate test requires built artifact: run npm run build before running this suite"
+      );
+    }
+    // The resource layer requires a registered
+    // project. We pre-create the data home,
+    // register the project via
+    // `upsertProjectScope`, and seed a project-
+    // scoped `restricted` row directly via the
+    // store. The Core profile (fail-closed) then
+    // refuses to surface the row.
+    const seedDataHome = mkdtempSync(join(tmpdir(), "lm-rg-profile-sens-res-"));
+    const projectId = `rg-proj-${Date.now()}`;
+    try {
+      const seedStore = new SQLiteMemoryStore(join(seedDataHome, "memory.sqlite"));
+      // Stage 18 v1.1.2 (issue #21): register the
+      // project identity so the resource resolver's
+      // `strict_existing` check accepts the project
+      // id. The strict resolver refuses to surface a
+      // project-scoped resource for an unknown
+      // `project_id` (returns `not_found`). The
+      // resolver queries `project_identities`
+      // (the v1.1.2 source of truth), so we MUST
+      // call both `upsertProjectScope` (the v1.0
+      // budget table) AND `createProjectIdentity`
+      // (the v1.1.2 identity table) — the latter
+      // is what `configureProjectBudget` does
+      // internally on the write path.
+      seedStore.upsertProjectScope({
+        project_id: projectId,
+        display_name: "follow-up resource test",
+        canonical_path: `/tmp/${projectId}`,
+        budget: { max_active_entries: 100, max_total_chars: 100000, max_topic_chars: 1000, max_index_chars: 1000 },
+        created_at: "2026-07-27T00:00:00.000Z",
+        updated_at: "2026-07-27T00:00:00.000Z"
+      });
+      seedStore.createProjectIdentity({
+        project_id: projectId,
+        canonical_path: `/tmp/${projectId}`,
+        created_by: "agent:test",
+        created_at: "2026-07-27T00:00:00.000Z"
+      });
+      seedStore.insertEntry({
+        id: "mem_deny_res_seed",
+        scope: "project",
+        project_id: projectId,
+        type: "fact",
+        topic: "follow-up",
+        title: "secret res title",
+        body: "secret res body",
+        tags: ["secret-res"],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3,
+        status: "active",
+        created_at: "2026-07-27T00:00:00.000Z",
+        updated_at: "2026-07-27T00:00:00.000Z",
+        access_count: 0,
+        supersedes: [],
+        token_estimate: 1,
+        char_count: 2,
+        revision: 1,
+        writer_actor_id: "agent:test",
+        pinned: false,
+        trust_level: "agent_observed",
+        sensitivity: "restricted",
+        tier: "working",
+        metadata: {}
+      });
+      seedStore.close();
+      // Spawn the server against the seeded data
+      // home with the default Core profile (the
+      // admin profile refuses to start without a
+      // capability, which would mask the SQL filter
+      // test).
+      dataHome = seedDataHome;
+      const env: Record<string, string> = {
+        ...(process.env as Record<string, string>),
+        AGENT_RECALL_HOME: seedDataHome,
+        AGENT_RECALL_PROFILE: "", // explicit empty -> Core
+        AGENT_RECALL_SUPPRESS_MCP_DEPRECATION: "1",
+        AGENT_RECALL_VERBOSE_STDIO: "0"
+      };
+      transport = new StdioClientTransport({
+        command: process.execPath,
+        args: [SERVER_ENTRY],
+        env,
+        stderr: "pipe"
+      });
+      client = new Client(
+        { name: "profile-default-sens-res-e2e", version: "1.1.2" },
+        { capabilities: {} }
+      );
+      await client.connect(transport);
+      serverPid = transport.pid ?? undefined;
+      if (client === undefined) throw new Error("client not initialised");
+      // Read the resource. The MCP SDK returns a
+      // `ResourceContents` shape: `{ contents: [{ uri,
+      // mimeType, text }] }`. The text field is the
+      // canonical JSON payload (`JSON.stringify(
+      // payload, null, 2)`).
+      const r = (await client.readResource({
+        uri: `memory://project/${projectId}/memory/mem_deny_res_seed`
+      })) as unknown as ResourceContents;
+      const text = r.contents[0]!.text;
+      expect(text).toContain("forbidden_visibility");
+      // The text payload MUST NOT leak title /
+      // body / tags / source / the `sensitivity`
+      // key / the `restricted` literal / the
+      // `entry_sensitivity` key.
+      expect(text).not.toContain("secret res title");
+      expect(text).not.toContain("secret res body");
+      expect(text).not.toContain("secret-res");
+      expect(text).not.toContain("entry_sensitivity");
+      expect(text).not.toContain("sensitivity");
+      expect(text).not.toContain("restricted");
+      // The structured envelope payload (the same
+      // JSON, parsed) MUST NOT carry
+      // `entry_sensitivity` / `sensitivity` keys.
+      const payload = JSON.parse(text) as {
+        ok?: boolean;
+        error?: string;
+        memory_id?: string;
+        [key: string]: unknown;
+      };
+      expect(payload.ok).toBe(false);
+      expect(payload.error).toBe("forbidden_visibility");
+      expect(payload.memory_id).toBe("mem_deny_res_seed");
+      expect(Object.prototype.hasOwnProperty.call(payload, "entry_sensitivity")).toBe(false);
+      expect(Object.prototype.hasOwnProperty.call(payload, "sensitivity")).toBe(false);
+    } finally {
+      try {
+        rmSync(seedDataHome, { recursive: true, force: true });
+      } catch {
+        // best effort
+      }
+    }
+  });
 });
 
 // ============================================================

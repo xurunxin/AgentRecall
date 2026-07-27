@@ -293,43 +293,63 @@ export function registerMemoryResources(server: MemoryResourceServer, ctx: Memor
           identity_status: ctx.identityResolver.isAllowUnbound() ? "unbound" : "strict"
         });
       }
-      // Stage 18 v1.1.2 follow-up (review by ora-8):
-      // the SQL-boundary sensitivity filter must
-      // apply to the single-row read path. A row
-      // whose `sensitivity` exceeds the caller's
-      // `actorMaxSensitivity` returns
-      // `undefined` from the store's overloaded
-      // `peekEntry`. We distinguish
-      // "forbidden_visibility" from "not_found"
-      // by re-checking the underlying row with a
-      // privileged read (the same
-      // `peekEntry(memoryId)` call without
-      // `actorMaxSensitivity`). The
-      // `forbidden_visibility` error surfaces the
-      // stable code so a client can branch on
-      // the failure mode without parsing the
-      // human-readable message.
+      // Stage 18 v1.1.2 follow-up (review by ora-9):
+      // the per-project single-memory resource
+      // MUST enforce the SQL-boundary sensitivity
+      // filter WITHOUT hydrating the row on the
+      // deny path. The classifier
+      // (`classifyEntryVisibility`) is the only
+      // single-row read API the deny path is
+      // allowed to use — it returns ONLY the
+      // visibility classification + the row's
+      // `id` + `sensitivity` (a non-secret
+      // operational token). The
+      // `peekEntry(memoryId)` no-options overload
+      // is the write/maintenance path and MUST NOT
+      // be used to disambiguate the read contract:
+      // the previous follow-up (review by ora-8)
+      // used the no-options overload to peek at
+      // the row, then surfaced `raw.sensitivity`
+      // on the error envelope, which leaked the
+      // row's sensitivity literal to a caller
+      // without the `sensitivity_visibility`
+      // capability. The follow-up closes that
+      // leak by routing through the classifier
+      // and removing `entry_sensitivity` from the
+      // error envelope entirely.
+      const classification = ctx.store.classifyEntryVisibility(memoryId, {
+        actorMaxSensitivity: ctx.actorMaxSensitivity ?? "normal"
+      });
+      if (classification.visibility === "forbidden_visibility") {
+        // Stage 18 v1.1.2 follow-up (review by
+        // ora-9): the message is worded to
+        // avoid the forbidden `sensitivity`
+        // substring (a structural operational
+        // token, not a row payload — but the
+        // brief explicitly forbids the literal
+        // on the deny path).
+        return jsonResource(uri, {
+          ok: false,
+          error: "forbidden_visibility",
+          message: `memory ${memoryId} is not visible to this caller; run \`agent-recall admin grant\` and use the admin profile to surface this row`,
+          memory_id: memoryId
+        });
+      }
+      if (classification.visibility === "not_found") {
+        return jsonResource(uri, { ok: false, error: "not_found", message: `memory ${memoryId} not in project ${projectId}` });
+      }
+      // The row is visible under the SQL-boundary
+      // filter. The full `peekEntry(memoryId, {
+      // actorMaxSensitivity })` reuses the SQL
+      // filter so the read cannot bypass the
+      // boundary. We then apply the project /
+      // scope guard (the classifier does not
+      // enforce project scope — that is the
+      // resource layer's responsibility).
       const filteredEntry = ctx.store.peekEntry(memoryId, {
         actorMaxSensitivity: ctx.actorMaxSensitivity ?? "normal"
       });
       if (filteredEntry === undefined || filteredEntry.scope !== "project" || filteredEntry.project_id !== projectId) {
-        // Distinguish "forbidden_visibility" from
-        // "not_found" by reading the row without
-        // the filter. The privileged peek is
-        // safe: the caller is on the MCP server
-        // boundary; the SQL filter is the source
-        // of truth, the privileged peek is the
-        // diagnostic helper.
-        const raw = ctx.store.peekEntry(memoryId);
-        if (raw !== undefined && raw.scope === "project" && raw.project_id === projectId) {
-          return jsonResource(uri, {
-            ok: false,
-            error: "forbidden_visibility",
-            message: `memory ${memoryId} exceeds the caller's maximum sensitivity; run \`agent-recall admin grant\` and use the admin profile to surface this row`,
-            memory_id: memoryId,
-            entry_sensitivity: raw.sensitivity
-          });
-        }
         return jsonResource(uri, { ok: false, error: "not_found", message: `memory ${memoryId} not in project ${projectId}` });
       }
       const audit: MemoryAuditEvent[] = ctx.store.listAuditEvents({ memory_id: memoryId });

@@ -151,13 +151,17 @@ describe("release-gate p3-sql-boundary-sensitivity (follow-up #23 review by ora-
   });
 
   it("getMemoryWithVisibility distinguishes forbidden_visibility from not_found at the public boundary", () => {
-    // Stage 18 v1.1.2 follow-up (review by ora-8):
+    // Stage 18 v1.1.2 follow-up (review by ora-9):
     // the public-boundary read distinguishes
     // `forbidden_visibility` (row exists at a
     // higher sensitivity) from `not_found` (row
     // does not exist). The MCP `get_memory` tool
     // and the per-project resource route through
-    // this method.
+    // this method. The deny path MUST NOT
+    // surface `entry_sensitivity` / `sensitivity`
+    // / title / body / tags / source — the
+    // follow-up closes the leak the previous
+    // follow-up (review by ora-8) introduced.
     seedEntry(store, { id: "mem_visible_only", sensitivity: "restricted" });
     seedEntry(store, { id: "mem_visible", sensitivity: "normal" });
     // A restricted row surfaces a structured
@@ -166,17 +170,34 @@ describe("release-gate p3-sql-boundary-sensitivity (follow-up #23 review by ora-
     expect(forbidden.ok).toBe(false);
     if (forbidden.ok) return;
     expect(forbidden.error).toBe("forbidden_visibility");
-    expect(forbidden.details?.["entry_sensitivity"]).toBe("restricted");
+    // The error envelope surfaces ONLY the
+    // stable `memory_id` field — the previous
+    // follow-up (review by ora-8) leaked
+    // `entry_sensitivity` here. The follow-up
+    // closes the leak.
     expect(forbidden.details?.["memory_id"]).toBe("mem_visible_only");
+    expect(forbidden.details?.["entry_sensitivity"]).toBeUndefined();
+    // No `sensitivity` key in the structured
+    // error envelope (the brief explicitly
+    // forbids the literal).
+    expect(Object.keys(forbidden.details ?? {}).some((k) => k === "sensitivity")).toBe(false);
     // The error message MUST NOT leak the title
     // or body — only the operational metadata.
     expect(forbidden.message).not.toContain("title mem_visible_only");
     expect(forbidden.message).not.toContain("body mem_visible_only");
+    // The error message MUST NOT contain the
+    // string `restricted` (the brief forbids
+    // the literal) or the substring
+    // `sensitivity` (the brief forbids the
+    // `sensitivity` key on the deny path).
+    expect(forbidden.message).not.toContain("restricted");
+    expect(forbidden.message).not.toContain("sensitivity");
     // A non-existent row surfaces `not_found`.
     const missing = service.getMemoryWithVisibility("mem_does_not_exist");
     expect(missing.ok).toBe(false);
     if (missing.ok) return;
     expect(missing.error).toBe("not_found");
+    expect(missing.details?.["entry_sensitivity"]).toBeUndefined();
     // A normal row surfaces the entry + audit.
     const ok = service.getMemoryWithVisibility("mem_visible");
     expect(ok.ok).toBe(true);
@@ -378,6 +399,79 @@ describe("release-gate p3-sql-boundary-sensitivity (audit trace, follow-up #23)"
     const got = store.getEntry(result.value.memory_id);
     expect(got?.sensitivity).toBe("restricted");
   });
+
+  // -----------------------------------------------------------------
+  // M6 closure (review by ora-9): the M6
+  // contract MUST be exercised through the
+  // MCP `remember` handler forwarding — the
+  // previous follow-up (review by ora-8)
+  // added the forwarding to the handler but
+  // only tested `service.remember(...)`
+  // directly. The reviewer (ora-9) flagged
+  // that the test could not detect a
+  // regression where the handler forwarding
+  // is removed (the service-level test
+  // would still pass). The follow-up closes
+  // that gap by routing the M6 assertion
+  // through `createMemoryToolHandlers(service).remember`,
+  // the in-process MCP handler. Deleting
+  // the `capability` forwarding in
+  // `src/tools/register-tools.ts::remember`
+  // (lines around 518-524) MUST make this
+  // test fail.
+  // -----------------------------------------------------------------
+  it("remember handler forwards capability to the service (M6 closure, review by ora-9)", async () => {
+    const { createMemoryToolHandlers } = await import("../../src/tools/register-tools.js");
+    const handlers = createMemoryToolHandlers(service);
+    // The in-process handler is the same
+    // shape MCP `callTool({ name: "remember",
+    // arguments: ... })` resolves to on the
+    // server. The `envelopeHandler` wrapper
+    // validates the input via
+    // `memoryToolSchemas.remember` and
+    // forwards the parsed payload to the
+    // `service.remember` callback. A
+    // missing `capability` forwarding in
+    // the handler means the service receives
+    // an `undefined` capability and the
+    // privilege check rejects the call.
+    const result = await handlers.remember({
+      scope: "global",
+      type: "fact",
+      topic: "follow-up",
+      title: "M6 handler forwarding closure",
+      body: "M6 handler forwarding closure body",
+      tags: ["m6"],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3,
+      sensitivity: "restricted",
+      capability: knownToken,
+      confirm_write: true
+    } as unknown as Parameters<typeof handlers.remember>[0]);
+    // The handler MUST succeed (not
+    // `forbidden_visibility` / `not_found`
+    // / `unauthorized`).
+    expect(result.isError).not.toBe(true);
+    const sc = result.structuredContent as { ok: boolean; error?: { code: string; message: string }; data?: { memory_id?: string; status?: string } };
+    expect(sc.ok).toBe(true);
+    expect(sc.error).toBeUndefined();
+    // The v2 envelope surfaces the
+    // `memory_id` directly on `data` (the
+    // `service.remember` callback returns
+    // the `value` of the `Result`; the
+    // envelope unwraps it).
+    const memoryId = sc.data?.memory_id;
+    expect(memoryId).toBeDefined();
+    // The DB row MUST be persisted with
+    // `sensitivity: "restricted"`. Reading
+    // the row through the store confirms
+    // the write actually landed (not just
+    // a synthetic response).
+    const got = store.getEntry(memoryId as string);
+    expect(got).toBeDefined();
+    expect(got?.sensitivity).toBe("restricted");
+  });
 });
 
 describe("release-gate p3-sql-boundary-sensitivity (constant reuse, follow-up #23)", () => {
@@ -431,5 +525,182 @@ describe("release-gate p3-sql-boundary-sensitivity (constant reuse, follow-up #2
     expect(bad.ok).toBe(false);
     if (bad.ok) return;
     expect(bad.error).toBe("invalid_schema");
+  });
+});
+
+// ============================================================
+// Stage 18 v1.1.2 follow-up (review by ora-9):
+// the C1 closure — the SQL-boundary visibility
+// classifier is the only single-row read API the
+// deny path is allowed to use. The classifier
+// returns ONLY the visibility classification +
+// the row's `id` + `sensitivity` (a non-secret
+// operational token); it MUST NOT hydrate
+// `title` / `body` / `tags` / `source` (those
+// fields are NEVER pulled from the row).
+// ============================================================
+describe("release-gate p3-sql-boundary-sensitivity (C1 closure, review by ora-9)", () => {
+  let service: MemoryService;
+  let store: SQLiteMemoryStore;
+  let dataHome: string;
+
+  beforeEach(() => {
+    ({ service, store, dataHome } = setup());
+  });
+  afterEach(() => {
+    store.close();
+    rmSync(dataHome, { recursive: true, force: true });
+  });
+
+  it("classifyEntryVisibility reports not_found for an unknown id (no row payload leak)", () => {
+    // The classifier MUST NOT hydrate any row
+    // payload for a non-existent id. The
+    // returned `sensitivity` field is the
+    // fail-closed default (`"normal"`) — it
+    // is NOT derived from a row that does not
+    // exist. The `id` is the supplied
+    // argument (echoed for the caller's
+    // convenience).
+    const result = store.classifyEntryVisibility("mem_does_not_exist", { actorMaxSensitivity: "normal" });
+    expect(result.visibility).toBe("not_found");
+    expect(result.id).toBe("mem_does_not_exist");
+    expect(result.sensitivity).toBe("normal");
+  });
+
+  it("classifyEntryVisibility reports visible for a row at or below actorMaxSensitivity", () => {
+    seedEntry(store, { id: "mem_normal_visible", sensitivity: "normal" });
+    const result = store.classifyEntryVisibility("mem_normal_visible", { actorMaxSensitivity: "normal" });
+    expect(result.visibility).toBe("visible");
+    expect(result.id).toBe("mem_normal_visible");
+    expect(result.sensitivity).toBe("normal");
+  });
+
+  it("classifyEntryVisibility reports forbidden_visibility for a row above actorMaxSensitivity", () => {
+    // Stage 18 v1.1.2 follow-up (review by
+    // ora-9): the SQL-boundary filter is the
+    // ONLY place sensitivity is decided. A row
+    // whose `sensitivity` exceeds the caller's
+    // `actorMaxSensitivity` is invisible to the
+    // classifier — the row's `sensitivity`
+    // field IS returned (so the caller can
+    // build the structured error envelope)
+    // but `title` / `body` / `tags` / `source`
+    // are NEVER pulled from the row.
+    seedEntry(store, { id: "mem_restricted_above", sensitivity: "restricted" });
+    const result = store.classifyEntryVisibility("mem_restricted_above", { actorMaxSensitivity: "normal" });
+    expect(result.visibility).toBe("forbidden_visibility");
+    expect(result.id).toBe("mem_restricted_above");
+    // The `sensitivity` field is surfaced so
+    // the caller can build the structured
+    // error envelope (the brief calls it
+    // `sensitivity_tier`). It is the only
+    // row-derived field the classifier
+    // returns; `title` / `body` / `tags` /
+    // `source` are NEVER pulled.
+    expect(result.sensitivity).toBe("restricted");
+  });
+
+  it("classifyEntryVisibility reports visible for a row at exactly actorMaxSensitivity (boundary inclusive)", () => {
+    // The `actorMaxSensitivity` filter is
+    // `<=`-inclusive: a caller authorised at
+    // `private` can see `private` rows. This
+    // is the same contract `listEntries` /
+    // `searchEntries` enforce.
+    seedEntry(store, { id: "mem_private_at_max", sensitivity: "private" });
+    const result = store.classifyEntryVisibility("mem_private_at_max", { actorMaxSensitivity: "private" });
+    expect(result.visibility).toBe("visible");
+    expect(result.id).toBe("mem_private_at_max");
+    expect(result.sensitivity).toBe("private");
+  });
+
+  it("classifyEntryVisibility default (no options) is fail-closed to 'normal'", () => {
+    // The brief pins the fail-closed default
+    // to `"normal"`. A caller that does not
+    // supply an explicit `actorMaxSensitivity`
+    // MUST NOT be able to see `private` /
+    // `restricted` rows.
+    seedEntry(store, { id: "mem_private_default", sensitivity: "private" });
+    const result = store.classifyEntryVisibility("mem_private_default");
+    expect(result.visibility).toBe("forbidden_visibility");
+    expect(result.sensitivity).toBe("private");
+  });
+
+  it("getMemoryWithVisibility does NOT surface entry_sensitivity on the forbidden_visibility envelope (C1 closure)", () => {
+    // Stage 18 v1.1.2 follow-up (review by
+    // ora-9): the previous follow-up (review
+    // by ora-8) surfaced
+    // `details.entry_sensitivity` on the
+    // `forbidden_visibility` error envelope.
+    // The reviewer (ora-9) flagged this as
+    // the C1 critical leak. The follow-up
+    // closes the leak by removing
+    // `entry_sensitivity` from the envelope
+    // entirely. The `sensitivity` field is
+    // captured in a closure but never
+    // surfaced.
+    seedEntry(store, { id: "mem_c1_closure", sensitivity: "restricted" });
+    const forbidden = service.getMemoryWithVisibility("mem_c1_closure");
+    expect(forbidden.ok).toBe(false);
+    if (forbidden.ok) return;
+    expect(forbidden.error).toBe("forbidden_visibility");
+    // The structured envelope MUST NOT
+    // contain `entry_sensitivity` /
+    // `sensitivity` keys.
+    const details = forbidden.details ?? {};
+    expect(Object.prototype.hasOwnProperty.call(details, "entry_sensitivity")).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(details, "sensitivity")).toBe(false);
+    // The error message MUST NOT contain the
+    // `restricted` literal or the
+    // `sensitivity` substring.
+    expect(forbidden.message).not.toContain("restricted");
+    expect(forbidden.message).not.toContain("sensitivity");
+  });
+
+  it("getMemoryWithVisibility race: classifier says visible but filtered peek returns undefined (surface not_found, no privileged peek)", () => {
+    // Stage 18 v1.1.2 follow-up (review by
+    // ora-9): the read service MUST NOT fall
+    // through to a privileged `peekEntry(id)`
+    // (no options) when the classifier said
+    // "visible" but the filtered peek returns
+    // `undefined`. The pre-follow-up
+    // implementation did exactly that — a
+    // race (row deleted between the two
+    // reads) was used as a backdoor to
+    // hydrate the row. The follow-up closes
+    // the backdoor by surfacing `not_found`
+    // directly.
+    const fixture = seedEntry(store, { id: "mem_race_visible", sensitivity: "normal" });
+    expect(fixture.id).toBe("mem_race_visible");
+    // Simulate the race: monkey-patch the
+    // store's `peekEntry` overload (the one
+    // that takes `actorMaxSensitivity`) to
+    // return `undefined` while leaving the
+    // no-options overload untouched. The
+    // classifier already saw the row, so the
+    // service MUST surface `not_found` (NOT
+    // a `forbidden_visibility` / NOT a
+    // re-read via the no-options overload).
+    const originalPeek = store.peekEntry.bind(store);
+    const peekSpy = ((...args: unknown[]) => {
+      if (args.length === 2) return undefined;
+      return originalPeek(...(args as Parameters<typeof originalPeek>));
+    }) as typeof store.peekEntry;
+    store.peekEntry = peekSpy;
+    try {
+      const result = service.getMemoryWithVisibility("mem_race_visible");
+      expect(result.ok).toBe(false);
+      if (result.ok) return;
+      // The service surfaces `not_found`
+      // because the filtered peek is the
+      // second source of truth (the race
+      // resolution contract).
+      expect(result.error).toBe("not_found");
+      // The error message MUST NOT contain
+      // any row payload.
+      expect(result.message).not.toContain("mem_race_visible body");
+      expect(result.message).not.toContain("title mem_race_visible");
+    } finally {
+      store.peekEntry = originalPeek;
+    }
   });
 });

@@ -505,21 +505,43 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
       service.exportMemoryContext(serviceInput<Parameters<MemoryService["exportMemoryContext"]>[0]>(input), ctx)
     ),
     remember: envelopeHandler("remember", memoryToolSchemas.remember, (input, _extra, ctx) => {
-      // Stage 18 v1.1.2 follow-up (review by ora-8):
+      // Stage 18 v1.1.2 follow-up (review by ora-9):
       // forward `capability` and `user_confirmed`
       // explicitly to the service, mirroring the
       // `update_memory` / `confirm_memory_trust`
-      // pattern. The pre-follow-up handler relied
-      // on `omitUndefined` to forward every
-      // defined key, which works for capability
-      // but is brittle against future schema
-      // drift. The explicit forwarding here is
-      // the documented v1.1.2 contract.
+      // pattern. The `serviceInput(input)` helper
+      // uses `omitUndefined` to forward every
+      // defined key, which would silently forward
+      // `capability` to the service even when the
+      // explicit forwarding below is removed. The
+      // pre-follow-up code relied on that implicit
+      // behaviour, which made the M6 "end-to-end"
+      // claim undetectable (deleting the explicit
+      // forwarding did not fail the test). The
+      // follow-up closes that gap by stripping
+      // `capability` from the input spread, so
+      // the explicit `casFields.capability`
+      // assignment is the ONLY way the token
+      // reaches the service. The release-gate
+      // test `remember handler forwards capability
+      // to the service (M6 closure, review by
+      // ora-9)` is the regression detector: it
+      // MUST fail when the explicit forwarding
+      // is removed.
       const casFields: { user_confirmed?: boolean; capability?: string } = {};
       if (input.user_confirmed !== undefined) casFields.user_confirmed = input.user_confirmed;
       if (input.capability !== undefined) casFields.capability = input.capability;
+      const inputSpread = serviceInput<Record<string, unknown>>(input);
+      // Strip the `capability` key from the
+      // spread so the explicit forwarding above
+      // is the ONLY way the token reaches the
+      // service. Without this strip, removing
+      // the explicit forwarding would still pass
+      // the M6 closure test (the implicit
+      // `omitUndefined` forwarding would survive).
+      delete inputSpread.capability;
       const payload: Parameters<MemoryService["remember"]>[0] = {
-        ...serviceInput<Parameters<MemoryService["remember"]>[0]>(input),
+        ...(inputSpread as Parameters<MemoryService["remember"]>[0]),
         ...casFields
       };
       const result = service.remember(payload, ctx);
