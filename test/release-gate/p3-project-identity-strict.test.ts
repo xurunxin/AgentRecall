@@ -275,12 +275,22 @@ describe("release-gate p3-project-identity-strict (Stage 17 v1.1.2 #21)", () => 
     // `read_write_no_migrate` so the schema is
     // unchanged; `runMigrations()` walks the
     // chain v11 -> v12 (which runs the backfill)
-    // and then `getUserVersion()` returns 12.
+    // -> v13 (which adds the durable
+    // `import_batches` lineage table from
+    // task 7 / issue #26). The final
+    // `user_version` is `13` (the
+    // `CURRENT_SCHEMA_VERSION` constant on the
+    // store). The intermediate `12` is the v12
+    // backfill milestone the test originally
+    // asserted; the assertion is widened to the
+    // latest version so a future schema bump
+    // does not silently re-break this regression
+    // guard.
     const reopened = new SQLiteMemoryStore(v11Path);
     try {
       const result = reopened.runMigrations();
-      expect(result.to).toBe(12);
-      expect(reopened.getUserVersion()).toBe(12);
+      expect(result.to).toBeGreaterThanOrEqual(13);
+      expect(reopened.getUserVersion()).toBeGreaterThanOrEqual(13);
       const identity = reopened.getProjectIdentity("backfilled");
       expect(identity).toBeDefined();
       expect(identity?.canonical_path).toBe("/tmp/backfilled");

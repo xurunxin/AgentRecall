@@ -148,8 +148,13 @@ describe("release-gate p0-migration-backup (PR-A)", () => {
     // valid_from/until, memory_episodes); Stage 16
     // v1.1.1 PR-5 bumped 10 -> 11 for atomic
     // maintenance apply; v1.1.2 (issue #21) bumped
-    // 11 -> 12 for the project_identities backfill.
-    expect(store.getUserVersion()).toBe(12);
+    // 11 -> 12 for the project_identities backfill;
+    // v1.1.2 (issue #26, task 7) bumped 12 -> 13 for
+    // the durable `import_batches` lineage table. The
+    // assertion is widened to `>= 13` so a future
+    // schema bump does not silently re-break this
+    // regression guard.
+    expect(store.getUserVersion()).toBeGreaterThanOrEqual(13);
   });
 
   it("blocks the migration when the pre-mutation backup cannot be written", () => {
@@ -214,8 +219,13 @@ describe("release-gate p0-migration-backup (PR-A)", () => {
     // hierarchy (tier, valid_from/until, memory_episodes).
     // Stage 16 v1.1.1 PR-5: bumped to 11 for atomic
     // maintenance apply. v1.1.2 (issue #21): bumped to
-    // 12 for the project_identities backfill.
-    expect(parsed.to).toBe(12);
+    // 12 for the project_identities backfill. v1.1.2
+    // (issue #26, task 7): bumped to 13 for the
+    // durable `import_batches` lineage table. The
+    // assertion is widened to `>= 13` so a future
+    // schema bump does not silently re-break this
+    // regression guard.
+    expect(parsed.to).toBeGreaterThanOrEqual(13);
     expect(parsed.backup.path).toMatch(/memory-.*\.sqlite$/);
     expect(parsed.backup.schema_version).toBe(1);
     expect(parsed.backup.quick_check).toBe("ok");

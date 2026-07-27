@@ -382,7 +382,7 @@ describe("MCP resources (spec § 6.3)", () => {
     return new MemoryService(store, undefined, "agent:test", dataHome);
   }
 
-  it("registers all 5 resources", () => {
+  it("registers all 6 resources (5 stable + the durable import lineage from task 7 / issue #26)", () => {
     const { server, calls } = captureServer();
     const service = makeService();
     registerMemoryResources(server as unknown as Parameters<typeof registerMemoryResources>[0], {
@@ -396,13 +396,18 @@ describe("MCP resources (spec § 6.3)", () => {
       "memory_project_summary",
       "memory_project_memory",
       "memory_global_summary",
-      "memory_health"
+      "memory_health",
+      "memory_import_batch"
     ]);
     expect(calls[0]?.uriOrTemplate).toBe("memory://projects");
     expect(calls[1]?.uriOrTemplate).toBeInstanceOf(ResourceTemplate);
     expect(calls[2]?.uriOrTemplate).toBeInstanceOf(ResourceTemplate);
     expect(calls[3]?.uriOrTemplate).toBe("memory://global/summary");
     expect(calls[4]?.uriOrTemplate).toBe("memory://health");
+    // Stage 18 v1.1.2 (issue #26, task 7): the
+    // durable import batch lineage resource is
+    // a templated URI keyed on `{batch_id}`.
+    expect(calls[5]?.uriOrTemplate).toBeInstanceOf(ResourceTemplate);
   });
 
   it("memory://health returns a JSON payload with server_version + schema_version", async () => {

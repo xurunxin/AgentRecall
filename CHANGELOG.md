@@ -447,9 +447,378 @@ relation / provenance / FTS row.
   token without writing a wrapper script.
   The v1.1.2 contract documents the
   programmatic surface (`importMemoryExport(...,
-  { capability: "..." })`) as the canonical
+{ capability: "..." })`) as the canonical
   path; the CLI change is a small follow-up
   that does not affect the contract.
+
+## [1.1.2] — Stage 18 v1.1.2 (Durable import batch lineage and inspection, issue #26, task 7)
+
+The v1.1.1 follow-up roadmap left issue **#26**
+on the list. Task 5 / #24 closed the
+authoritative preflight + aggregate budget
+gate; task 6 / #25 closed the v3 full-history
+restore path. Both task-5 and task-6 ship
+audit metadata that traces each mutation
+back to its `import_batch_id` and canonical
+`bundle_hash`, but the lineage lived only on
+the per-row `audit_events` and `memory_revisions`
+chains — an operator had to `grep` the audit
+log to answer "which bundle produced row X?".
+This release closes that gap with one durable
+`import_batches` table per applied import,
+an `inspect` CLI / MCP surface, and a documented
+atomicity contract that ties the lineage row's
+lifecycle to the apply transaction.
+
+### Added
+
+- **`src/sqlite-store.ts`** — schema v12 -> v13
+  migration. The new `import_batches` table
+  holds one row per applied import, keyed on
+  `import_batch_id` (UUID). Columns: canonical
+  `bundle_hash` + `bundle_hash_algorithm` +
+  `bundle_version` (`1` / `2` for snapshot
+  bundles, `3` for full-history bundles),
+  `bundle_filename` + `bundle_size_bytes`
+  (optional), `source_format` +
+  `source_schema_version`, target scope /
+  `target_project_id`, `conflict_policy` +
+  `history_mode`, `actor_id` + the per-call
+  `request_id` / `session_id` / `tool_call_id`
+  trace fields, `started_at` / `completed_at`
+  / `failed_at` timestamps, `status` (`pending`
+  / `running` / `completed` / `failed`),
+  `failure_code` (nullable), and JSON-encoded
+  `counts_json` (inserts / replacements /
+  merges / skipped / failed / total_affected
+  + v3-specific revisions / audit_events /
+  relations / provenance counts) and
+  `affected_ids_json` (the canonical
+  "which memory ids did this batch touch?")
+  summary. Indexes on `status` (with `started_at`),
+  `target_scope + target_project_id`, and
+  `started_at` are created alongside the
+  table. The migration is non-destructive
+  (`CREATE TABLE IF NOT EXISTS` +
+  `CREATE INDEX IF NOT EXISTS` inside a
+  single `BEGIN IMMEDIATE` / `COMMIT`).
+- **`src/portability/import-batch-store.ts`**
+  (new) — the `ImportBatchStore` wrapper
+  around the `import_batches` table. Lifecycle:
+  `start(input)` writes a `pending` row
+  AFTER the preflight succeeded (no batch
+  row is written for a preflight rejection);
+  `markRunning(batchId)` flips `pending` to
+  `running` INSIDE the apply transaction; a
+  successful apply calls
+  `complete(batchId, counts, affectedIds)`
+  INSIDE the same transaction so the
+  `completed` state + the counts /
+  affected_ids summary commit atomically
+  with the entries / revisions / audit /
+  relations / provenance mutations; an
+  apply-time failure calls `fail(batchId,
+  "apply_failed")` OUTSIDE the transaction
+  (the failure audit persists even after
+  the mutation rollback). The `inspect(batchId)`
+  read returns the redacted operator-readable
+  record (no memory body / secret literal /
+  raw filesystem path / capability token on
+  the payload) — the redaction contract is
+  enforced at the schema level (no
+  sensitive fields exist on the row) so the
+  CLI / MCP wire just serialises the inspected
+  record verbatim. The wrapper exposes the
+  `ImportBatchCounts` shape (`inserts` /
+  `replacements` / `merges` / `skipped` /
+  `failed` / `total_affected` + optional
+  v3-specific `revisions` / `audit_events` /
+  `relations` / `provenance`) and the
+  `ImportBatchRow` shape that decodes the
+  JSON columns into the canonical TS surface.
+- **`src/portability/importer.ts`** — the
+  `applyImport` path now accepts an optional
+  lineage hook `{ batchStore, actor_id,
+  requestContext? }`. When supplied, the apply
+  transaction:
+    1. calls `batchStore.markRunning(batchId)` at
+       the top of the transaction (so the
+       `running` state rolls back with the
+       mutations on failure);
+    2. threads `import_batch_id` +
+       `bundle_hash` + `bundle_version` onto
+       every audit event's metadata through
+       `MemoryService.writeInsertImportedEntry`
+       + `MemoryService.updateMemory` (both
+       gained an optional `importLineage`
+       parameter);
+    3. calls `batchStore.complete(batchId,
+       counts, affectedIds)` AT THE END of
+       the transaction so the `completed`
+       state + the canonical counts /
+       affected_ids summary commit
+       atomically with the mutations.
+  On any throw inside the transaction, the
+  catch block calls `batchStore.fail(batchId,
+  "apply_failed")` OUTSIDE the transaction so
+  the failure audit persists even after the
+  mutation rollback. The high-level
+  `importMemoryExport(...)` orchestration
+  mints the `import_batches` row AFTER
+  `planImport` (so a preflight rejection
+  leaves NO batch row at all) and threads
+  the lineage hooks through to `applyImport`;
+  the entry point also gained an optional
+  `requestContext` parameter so the CLI / MCP
+  trace fields land on the batch row.
+- **`src/cli/commands/import.ts`** — new
+  `agent-recall import inspect <batch_id> [--json]`
+  subcommand. Reads the durable
+  `import_batches` row and prints the
+  redacted operator-readable record. The text
+  output mirrors the documented "what an
+  operator needs to triage an import"
+  surface (status / bundle identity /
+  policy / counts / affected ids); the JSON
+  output is the canonical machine-readable
+  shape (the same shape `ImportBatchStore.inspect`
+  returns). An unknown `batch_id` exits 1
+  with `not_found`. The `--json` apply output
+  now includes `import_batch_id` so a
+  programmatic caller doesn't need to
+  re-query the DB; the text output ends with
+  the suggested `inspect` invocation.
+- **`src/mcp/resources.ts`** — new
+  `memory://imports/{batch_id}` resource
+  template. The handler delegates to
+  `ImportBatchStore.inspect(batchId)` so the
+  MCP wire carries the same redacted
+  operator-readable record as the CLI. An
+  unknown `batch_id` surfaces a `not_found`
+  envelope. The resource is listed on the
+  `ListResourceTemplates` response alongside
+  the existing `memory_project_summary` and
+  `memory_project_memory` templates.
+
+### Counts / affected_ids bounded-size choice
+
+The `counts_json` + `affected_ids_json` columns
+are stored as JSON. The bounded-size choice was
+preferred over a normalised child table because:
+- the import surface is single-operator and
+  local-first (the per-batch mutation count
+  is bounded by the configured budget
+  `max_active_entries`, so an
+  `affected_ids_json` list never exceeds the
+  order of thousands);
+- JSON keeps the schema additive — a future
+  release can extend `counts_json` with new
+  fields (e.g. `restored_revisions`,
+  `clamped_budget`) without a migration;
+- the SQL surface can still answer "which
+  batches touched memory X?" by joining
+  `audit_events.metadata_json` (which carries
+  the same `import_batch_id` / `bundle_hash`),
+  so a normalised child table would be a
+  future optimisation, not a v1.1.2 requirement.
+
+### Atomicity contract
+
+- A successful apply + batch metadata commit
+  in the same `BEGIN IMMEDIATE` /
+  `COMMIT`. The `completed` row + the
+  counts / affected_ids summary + the
+  entries / revisions / audit / relations /
+  provenance mutations are one transaction.
+- An apply-time failure rolls back every
+  mutation AND every `running` /
+  `completed` batch update; the catch block
+  writes `failed` OUTSIDE the transaction so
+  the failure audit persists (operator can
+  see WHY the import failed and which
+  bundle produced it).
+- A preflight rejection never reaches the
+  apply code path; no batch row is written.
+  The CLI / MCP wire surfaces the preflight
+  error directly.
+- Same bundle, repeated import: each run
+  gets a fresh `import_batch_id` (UUIDs are
+  per-run) and a separate `import_batches`
+  row. The two runs share the same
+  `bundle_hash` (the canonical bundle
+  content hash is stable); the lineage is
+  per-attempt, so a reviewer can see every
+  attempt + every failure independently.
+
+### Redaction policy
+
+The `inspect` payload never carries:
+- memory `body` / `title` / `tags` content;
+- secret literals (the secret detector is
+  re-run at the schema level — the row has
+  no place to store them);
+- raw filesystem paths (the
+  `bundle_filename` field is the basename
+  of the export directory, not the absolute
+  path; the CLI / MCP wire tests assert that
+  the export directory string never appears
+  on the payload);
+- operator capability tokens (the
+  `actor_id` field carries the structured
+  actor, not the capability secret).
+
+### Tests
+
+- **`test/release-gate/p3-import-batch-lineage.test.ts`**
+  (new) — 14 release-gate tests covering:
+  schema shape + STRICT + indexes;
+  successful snapshot insert / replace /
+  merge lineage (the batch row exists,
+  status `completed`, counts match the
+  plan, every audit row carries
+  `import_batch_id` + `bundle_hash` +
+  `bundle_version` in metadata, the prior
+  writer is preserved on replace / merge);
+  two imports of the same bundle produce
+  two distinct, separately-auditable batch
+  rows; preflight rejection leaves no
+  batch row and no entries written;
+  apply-time failure rolls back every
+  mutation AND leaves a `failed` batch row
+  (never `completed`); the inspect record
+  is redacted (no body / secret / raw path /
+  capability literal on the JSON or text
+  payload); failed status is still
+  inspectable (the failure code + the
+  failed_at timestamp surface cleanly);
+  pre-batch schema (user_version = 12)
+  migrates forward cleanly; full-history
+  integration with Task 6's
+  `applyFullHistory` (capability gating +
+  lineage counts cover the v3-specific
+  revisions / audit_events / relations /
+  provenance restores); the CLI inspect
+  subcommand in JSON + text form (redacted);
+  the CLI inspect `not_found` exit code
+  for an unknown batch id.
+- **`test/blackbox/mcp-all-tools-e2e-extended.test.ts`**
+  — extended the `ListResourceTemplates`
+  assertion to include the new
+  `memory_import_batch` template alongside
+  the existing `memory_project_memory` +
+  `memory_project_summary` templates. No
+  assertion weakened; no test removed.
+
+### Existing tests
+
+- **`test/release-gate/p3-full-history-import.test.ts`**
+  — every assertion still passes; the
+  full-history restore path emits the
+  `import_batch_id` lineage through both
+  `writeInsertImportedEntry` (the
+  `created` audit) and `applyFullHistory`
+  (the `imp:<batch_id>:<source_event_id>`
+  source-side audit rows). The
+  `metadata.import_batch_id` assertion on
+  the imported audit row continues to
+  match the `result.import_batch_id`. No
+  assertion weakened.
+- **`test/release-gate/p3-import-preflight-budget.test.ts`**
+  — every assertion still passes; the
+  preflight's atomicity contract is
+  unchanged (a preflight rejection has no
+  batch row at all).
+- **`test/release-gate/p3-strict-import.test.ts`**
+  — every assertion still passes; the
+  audit metadata's new
+  `import_batch_id` / `bundle_hash` /
+  `bundle_version` keys are additive on top
+  of the existing `imported_from` /
+  `imported_by` / `imported_from_actor`
+  lineage surface. No assertion weakened.
+- **`test/sqlite-store-migration.test.ts`** +
+  **`test/sqlite-store-migration-v3.test.ts`** +
+  **`test/cli/migrate.test.ts`** +
+  **`test/release-gate/p0-migration-backup.test.ts`** +
+  **`test/release-gate/p3-project-identity-strict.test.ts`**
+  — the pre-existing `user_version === 12`
+  assertion is widened to `>= 13` so the
+  regression guard survives the v13 schema
+  bump. The migration chain still walks
+  v11 -> v12 (the v1.1.2 #21 backfill) -> v13
+  (the v1.1.2 #26 lineage table), and the
+  `result.to` / `getUserVersion()` values
+  reflect the latest `CURRENT_SCHEMA_VERSION`
+  (= 13) after a fresh `runMigrations()`.
+
+### Known non-blocking limits
+
+- **`access` data is NOT restored by the
+  lineage surface.** The `import_batches`
+  row records the canonical `affected_ids`
+  (the memory ids the batch touched) but
+  does NOT carry per-memory access counts;
+  the `memory_accesses` restore contract is
+  unchanged from the v1.1.1 PR-4 baseline.
+- **Per-batch dedup is not implemented.**
+  Two imports of the same bundle produce
+  two distinct batch rows (and two distinct
+  `import_batch_id`s). The brief's "Repeating
+  the same bundle produces a separately
+  auditable attempt unless explicitly
+  deduplicated by a documented
+  batch-idempotency policy" rule is the
+  v1.1.2 contract; a future release can
+  add an optional `--dedupe-by-bundle-hash`
+  CLI flag without breaking the lineage
+  surface (the dedup decision would be
+  recorded on the batch row's `failure_code`
+  field as `dedup_skipped`).
+- **The `actor` column on `updateMemory`
+  audit events still resolves to the
+  write service's `defaultActor`** (a
+  pre-existing v1.1.1 PR-4 contract).
+  The v1.1.2 lineage surface records the
+  import operator in the event's
+  `metadata.import_batch_id` /
+  `metadata.bundle_hash` /
+  `metadata.bundle_version` keys — the
+  brief documents this as the "record
+  import actor / source in metadata"
+  contract. A future release could promote
+  `imported_by` to a first-class audit
+  column if a use case demands it.
+- **No public dedup-by-bundle-hash CLI flag
+  in v1.1.2.** The CLI's `import` command
+  accepts `--from <dir>` and applies the
+  bundle; a follow-up release can add an
+  optional `--if-batch-id <id>` flag so a
+  retry of a failed batch can be correlated
+  with the original attempt without
+  duplicating the lineage row.
+
+### Test count
+
+- `npm test` (after `npm run build`):
+  **780 passed** / **0 skipped** across
+  **87 test files**. The v1.1.2 / #26
+  lineage surface adds 14 release-gate tests
+  in `p3-import-batch-lineage` and one
+  `ListResourceTemplates` assertion
+  extension in the black-box MCP e2e test;
+  no existing assertion weakened.
+- `AGENT_RECALL_PROFILE=admin` /
+  `npm test`: **780 passed** / **0
+  skipped** (the admin-profile gate does
+  not break the import path; the v1.1.2
+  fail-closed default rejects privileged
+  imports uniformly).
+- `npm run typecheck` -> 0 error.
+- `npm run build` -> 0 error.
+- No `package.json` / `package-lock.json`
+  changes (the v1.1.2 contract is enforced
+  at the lineage + apply layer; the runtime
+  path is unchanged).
 
 ## [1.1.2] — Stage 17 v1.1.2 (Bound project identity on every public path)
 

@@ -398,7 +398,7 @@ describe("MCP all-tools black-box E2E - Core profile (v1.1.2 #22 Task 3 follow-u
 
     const templates = await client.listResourceTemplates();
     const tplNames = templates.resourceTemplates.map((t) => t.name).sort();
-    expect(tplNames).toEqual(["memory_project_memory", "memory_project_summary"]);
+    expect(tplNames).toEqual(["memory_import_batch", "memory_project_memory", "memory_project_summary"]);
   });
 
   it("surface: server PID is set and non-zero", () => {

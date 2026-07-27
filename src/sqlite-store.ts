@@ -123,8 +123,16 @@ export type SearchFilters = EntryFilters & {
  * archival × 0.7) and `valid_from` / `valid_until`
  * (entries past their `valid_until` decay, entries
  * not yet at `valid_from` are excluded from recall).
+ * v12 (Stage 18 v1.1.2 issue #21): the strict project
+ * identity backfill from `project_scopes`.
+ * v13 (Stage 18 v1.1.2 issue #26, task 7): the durable
+ * `import_batches` lineage surface. Every applied import
+ * writes one row in `pending` -> (`running` ->
+ * `completed`) or (`failed`) state; the `ImportBatchStore`
+ * is the public API for the row's lifecycle and the
+ * redacted `inspect(...)` read.
  */
-export const CURRENT_SCHEMA_VERSION = 12;
+export const CURRENT_SCHEMA_VERSION = 13;
 
 /**
  * Stage 12 PR9: thrown by `updateEntryWithRevision` when
@@ -908,6 +916,10 @@ export class SQLiteMemoryStore {
       this.migrate_v11_to_v12();
       return;
     }
+    if (version === 13) {
+      this.migrate_v12_to_v13();
+      return;
+    }
     throw new Error(`No migration registered for schema version ${version}`);
   }
 
@@ -1635,6 +1647,87 @@ export class SQLiteMemoryStore {
         });
       }
       this.db.exec("PRAGMA user_version = 12");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * Stage 18 v1.1.2 (issue #26, task 7): v12 -> v13
+   * schema migration. Introduces the durable
+   * `import_batches` table that records every applied
+   * import as one row keyed on `import_batch_id`. The
+   * table is the persistent lineage surface — the
+   * `ImportBatchStore` (src/portability/import-batch-store.ts)
+   * wraps the table with the `start` / `markRunning` /
+   * `complete` / `fail` / `inspect` lifecycle. The
+   * `bundle_hash` is the canonical hash the
+   * `preflightImport` computed; the `bundle_version`
+   * is `1` / `2` for snapshot bundles and `3` for
+   * full-history bundles. The `actor_id` /
+   * `request_id` / `session_id` / `tool_call_id`
+   * columns mirror the `RequestContext` shape so a
+   * reviewer can correlate the batch row with the
+   * MCP session that produced it.
+   *
+   * Counts / affected ids live in JSON columns
+   * (`counts_json` / `affected_ids_json`) with a
+   * documented bounded size (see
+   * `task-7-report.md`). The choice keeps the schema
+   * additive (no second child table to migrate) and
+   * matches the CLI's text+JSON inspect output. A
+   * normalised child table would be a future
+   * optimisation if a release ever needs SQL
+   * "which batches touched memory X?" queries
+   * without parsing JSON.
+   *
+   * Migration is fully transactional. A pre-batch
+   * database gains the table + indexes + version
+   * marker in one BEGIN IMMEDIATE / COMMIT; a
+   * already-on-v13 database is a no-op (the
+   * `CREATE TABLE IF NOT EXISTS` + `CREATE INDEX IF
+   * NOT EXISTS` are idempotent).
+   */
+  private migrate_v12_to_v13(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS import_batches (
+          import_batch_id TEXT PRIMARY KEY,
+          bundle_hash TEXT NOT NULL,
+          bundle_hash_algorithm TEXT NOT NULL DEFAULT 'SHA-256',
+          bundle_version INTEGER NOT NULL,
+          bundle_filename TEXT,
+          bundle_size_bytes INTEGER,
+          source_format TEXT NOT NULL,
+          source_schema_version INTEGER NOT NULL,
+          target_scope TEXT NOT NULL CHECK (target_scope IN ('global','project')),
+          target_project_id TEXT,
+          conflict_policy TEXT NOT NULL CHECK (conflict_policy IN ('keep','replace','merge','fail')),
+          history_mode TEXT NOT NULL CHECK (history_mode IN ('snapshot','full_history')),
+          actor_id TEXT NOT NULL,
+          request_id TEXT,
+          session_id TEXT,
+          tool_call_id TEXT,
+          started_at TEXT NOT NULL,
+          completed_at TEXT,
+          failed_at TEXT,
+          status TEXT NOT NULL CHECK (status IN ('pending','running','completed','failed')),
+          failure_code TEXT,
+          counts_json TEXT NOT NULL DEFAULT '{}',
+          affected_ids_json TEXT NOT NULL DEFAULT '[]'
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS import_batches_status_idx
+          ON import_batches(status, started_at);
+        CREATE INDEX IF NOT EXISTS import_batches_project_idx
+          ON import_batches(target_scope, target_project_id);
+        CREATE INDEX IF NOT EXISTS import_batches_started_idx
+          ON import_batches(started_at);
+      `);
+      this.db.exec("PRAGMA user_version = 13");
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -2381,6 +2474,232 @@ export class SQLiteMemoryStore {
       )
       .run(now);
     return Number(result.changes ?? 0);
+  }
+
+  /**
+   * Stage 18 v1.1.2 (issue #26, task 7): durable
+   * `import_batches` lineage — the import-side
+   * equivalent of `maintenance_plans`. Every applied
+   * import writes one row keyed on `import_batch_id`.
+   * The row carries the canonical `bundle_hash` +
+   * `bundle_version` (so a reviewer can re-derive
+   * the exact bundle), the target scope / project
+   * identity, the conflict + history policies, the
+   * request-context trace fields, and a JSON-encoded
+   * counts / affected_ids summary.
+   *
+   * The store helpers are intentionally narrow —
+   * `insertImportBatchRow` writes the initial
+   * `pending` row, `updateImportBatchRow` /
+   * `markImportBatchRunning` /
+   * `markImportBatchCompleted` /
+   * `markImportBatchFailed` advance the lifecycle,
+   * and `getImportBatchRow` is the operator-readable
+   * read. The `ImportBatchStore` (see
+   * src/portability/import-batch-store.ts) wraps
+   * these methods with the documented atomicity
+   * contract.
+   */
+  insertImportBatchRow(input: {
+    import_batch_id: string;
+    bundle_hash: string;
+    bundle_hash_algorithm: string;
+    bundle_version: number;
+    bundle_filename: string | null;
+    bundle_size_bytes: number | null;
+    source_format: string;
+    source_schema_version: number;
+    target_scope: "global" | "project";
+    target_project_id: string | null;
+    conflict_policy: "keep" | "replace" | "merge" | "fail";
+    history_mode: "snapshot" | "full_history";
+    actor_id: string;
+    request_id: string | null;
+    session_id: string | null;
+    tool_call_id: string | null;
+    started_at: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO import_batches (
+          import_batch_id, bundle_hash, bundle_hash_algorithm,
+          bundle_version, bundle_filename, bundle_size_bytes,
+          source_format, source_schema_version,
+          target_scope, target_project_id,
+          conflict_policy, history_mode,
+          actor_id, request_id, session_id, tool_call_id,
+          started_at, status
+         ) VALUES (
+           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending'
+         )`
+      )
+      .run(
+        input.import_batch_id,
+        input.bundle_hash,
+        input.bundle_hash_algorithm,
+        input.bundle_version,
+        input.bundle_filename,
+        input.bundle_size_bytes,
+        input.source_format,
+        input.source_schema_version,
+        input.target_scope,
+        input.target_project_id,
+        input.conflict_policy,
+        input.history_mode,
+        input.actor_id,
+        input.request_id,
+        input.session_id,
+        input.tool_call_id,
+        input.started_at
+      );
+  }
+
+  /**
+   * Stage 18 v1.1.2 (issue #26, task 7): flip an
+   * `import_batches` row from `pending` to `running`
+   * and stamp `started_at` on the same row. Called
+   * from inside the apply transaction so the running
+   * transition rolls back with the mutations on a
+   * failure (the row stays in `pending`, ready for
+   * the post-transaction `markImportBatchFailed`
+   * call).
+   */
+  markImportBatchRunning(batchId: string, startedAt: string): void {
+    this.db
+      .prepare(
+        `UPDATE import_batches
+            SET status = 'running',
+                started_at = ?
+          WHERE import_batch_id = ? AND status = 'pending'`
+      )
+      .run(startedAt, batchId);
+  }
+
+  /**
+   * Stage 18 v1.1.2 (issue #26, task 7): flip an
+   * `import_batches` row from `running` to
+   * `completed` and persist the canonical
+   * counts + affected_ids summary. Called from
+   * inside the apply transaction so the completed
+   * row + the entries / revisions / audit /
+   * relations / provenance mutations commit
+   * atomically.
+   */
+  markImportBatchCompleted(
+    batchId: string,
+    completedAt: string,
+    countsJson: string,
+    affectedIdsJson: string
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE import_batches
+            SET status = 'completed',
+                completed_at = ?,
+                counts_json = ?,
+                affected_ids_json = ?
+          WHERE import_batch_id = ? AND status = 'running'`
+      )
+      .run(completedAt, countsJson, affectedIdsJson, batchId);
+  }
+
+  /**
+   * Stage 18 v1.1.2 (issue #26, task 7): flip an
+   * `import_batches` row to `failed` and stamp the
+   * failure code + `failed_at` timestamp. Called
+   * OUTSIDE the apply transaction (the failure
+   * audit must persist even when the mutations
+   * rolled back). The transition is idempotent: a
+   * row already in `failed` (e.g. the apply path
+   * re-ran after a retry) is left alone.
+   */
+  markImportBatchFailed(batchId: string, failedAt: string, failureCode: string): void {
+    this.db
+      .prepare(
+        `UPDATE import_batches
+            SET status = 'failed',
+                failed_at = ?,
+                failure_code = ?
+          WHERE import_batch_id = ? AND status IN ('pending','running')`
+      )
+      .run(failedAt, failureCode, batchId);
+  }
+
+  /**
+   * Stage 18 v1.1.2 (issue #26, task 7): the
+   * operator-readable read. Returns the durable
+   * `import_batches` row verbatim — the
+   * `ImportBatchStore.inspect(...)` wraps this with
+   * the redaction contract (no body / secret / path
+   * leakage) before exposing it on the CLI / MCP
+   * resource.
+   */
+  getImportBatchRow(batchId: string): {
+    import_batch_id: string;
+    bundle_hash: string;
+    bundle_hash_algorithm: string;
+    bundle_version: number;
+    bundle_filename: string | null;
+    bundle_size_bytes: number | null;
+    source_format: string;
+    source_schema_version: number;
+    target_scope: "global" | "project";
+    target_project_id: string | null;
+    conflict_policy: "keep" | "replace" | "merge" | "fail";
+    history_mode: "snapshot" | "full_history";
+    actor_id: string;
+    request_id: string | null;
+    session_id: string | null;
+    tool_call_id: string | null;
+    started_at: string;
+    completed_at: string | null;
+    failed_at: string | null;
+    status: "pending" | "running" | "completed" | "failed";
+    failure_code: string | null;
+    counts_json: string;
+    affected_ids_json: string;
+  } | undefined {
+    return this.db
+      .prepare(
+        `SELECT import_batch_id, bundle_hash, bundle_hash_algorithm,
+                bundle_version, bundle_filename, bundle_size_bytes,
+                source_format, source_schema_version,
+                target_scope, target_project_id,
+                conflict_policy, history_mode,
+                actor_id, request_id, session_id, tool_call_id,
+                started_at, completed_at, failed_at,
+                status, failure_code,
+                counts_json, affected_ids_json
+           FROM import_batches
+          WHERE import_batch_id = ?`
+      )
+      .get(batchId) as
+      | {
+          import_batch_id: string;
+          bundle_hash: string;
+          bundle_hash_algorithm: string;
+          bundle_version: number;
+          bundle_filename: string | null;
+          bundle_size_bytes: number | null;
+          source_format: string;
+          source_schema_version: number;
+          target_scope: "global" | "project";
+          target_project_id: string | null;
+          conflict_policy: "keep" | "replace" | "merge" | "fail";
+          history_mode: "snapshot" | "full_history";
+          actor_id: string;
+          request_id: string | null;
+          session_id: string | null;
+          tool_call_id: string | null;
+          started_at: string;
+          completed_at: string | null;
+          failed_at: string | null;
+          status: "pending" | "running" | "completed" | "failed";
+          failure_code: string | null;
+          counts_json: string;
+          affected_ids_json: string;
+        }
+      | undefined;
   }
 
   /**

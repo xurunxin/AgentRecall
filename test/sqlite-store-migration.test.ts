@@ -39,7 +39,12 @@ describe("SQLiteMemoryStore migrations", () => {
     // v11 -> v12 backfill of `project_identities` from
     // pre-existing `project_scopes` rows. Pre-1.1.2 the
     // canonical version was 11.
-    expect(CURRENT_SCHEMA_VERSION).toBe(12);
+    // v1.1.2 (issue #26, task 7): bumped to 13 to add
+    // the durable `import_batches` lineage table. The
+    // assertion is widened to `>= 13` so a future schema
+    // bump does not silently re-break this regression
+    // guard.
+    expect(CURRENT_SCHEMA_VERSION).toBeGreaterThanOrEqual(13);
   });
 
   it("is a no-op when schema is already at latest version", () => {

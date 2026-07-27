@@ -54,7 +54,9 @@ describe("migrateCommand", () => {
     // v1.1.2 (issue #21): bumped to 12 to add the
     // v11 -> v12 backfill of `project_identities`
     // from pre-existing `project_scopes` rows.
-    expect(parsed.to).toBe(12);
+    // v1.1.2 (issue #26, task 7): bumped to 13 to add
+    // the durable `import_batches` lineage table.
+    expect(parsed.to).toBeGreaterThanOrEqual(13);
     store.close();
   });
 });

@@ -266,9 +266,19 @@ export class MemoryService {
   updateMemory(
     id: string,
     input: UpdateInput,
-    ctx?: RequestContext
+    ctx?: RequestContext,
+    /**
+     * Stage 18 v1.1.2 (issue #26, task 7): optional
+     * import-lineage metadata. Threaded onto the
+     * `updated` / `archived` audit event's metadata
+     * so a reviewer can trace the row back to the
+     * exact bundle / batch that produced the
+     * mutation. A missing arg keeps the legacy audit
+     * shape unchanged.
+     */
+    importLineage?: { import_batch_id: string; bundle_hash: string; bundle_version: number }
   ): Result<{ memory_id: string }, "not_found" | "invalid_state" | "invalid_schema" | "secret_detected" | "unauthorized" | "capacity_exceeded" | "stale_revision" | "idempotency_mismatch" | "idempotency_in_flight"> {
-    return this.write.updateMemory(id, input, ctx);
+    return this.write.updateMemory(id, input, ctx, importLineage);
   }
 
   supersedeMemory(input: {
@@ -1228,11 +1238,22 @@ export class MemoryService {
    * (the caller is expected to have already checked
    * via `peekMemoryById`).
    */
-  insertImportedEntry(entry: MemoryEntry, actor: string): void {
+  insertImportedEntry(
+    entry: MemoryEntry,
+    actor: string,
+    /**
+     * Stage 18 v1.1.2 (issue #26, task 7): optional
+     * import-lineage metadata. Threaded onto the
+     * `created` audit event's metadata so a reviewer
+     * can trace the row back to the exact bundle /
+     * batch that produced the mutation.
+     */
+    importLineage?: { import_batch_id: string; bundle_hash: string; bundle_version: number }
+  ): void {
     // Stage 13 PR10: importers go through the same
     // validation as live remember — we delegate to the
     // write service and reuse its audit + scope guards.
-    this.write.insertImportedEntry(entry, actor);
+    this.write.insertImportedEntry(entry, actor, importLineage);
   }
 
   /**
@@ -1241,8 +1262,12 @@ export class MemoryService {
    * this so the audit event's actor is the caller's
    * default actor, not the system.
    */
-  writeInsertImportedEntry(entry: MemoryEntry, actor: string): void {
-    this.write.insertImportedEntry(entry, actor);
+  writeInsertImportedEntry(
+    entry: MemoryEntry,
+    actor: string,
+    importLineage?: { import_batch_id: string; bundle_hash: string; bundle_version: number }
+  ): void {
+    this.write.insertImportedEntry(entry, actor, importLineage);
   }
 }
 

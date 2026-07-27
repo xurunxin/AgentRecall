@@ -68,7 +68,7 @@
 // mutating the live store. This is the safe default
 // for the CLI.
 
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
   type MemoryBudget,
@@ -99,6 +99,11 @@ import {
 } from "./migration-adapter.js";
 import type { FullHistoryBundle } from "./canonical-model.js";
 import { FULL_HISTORY_BUNDLE_VERSION } from "./canonical-model.js";
+import {
+  ImportBatchStore,
+  type ImportBatchCounts
+} from "./import-batch-store.js";
+import type { RequestContext } from "../request-context.js";
 
 export type ConflictPolicy = "keep" | "replace" | "merge" | "fail";
 
@@ -246,6 +251,32 @@ export type ImportPlan = {
    * trace the row back to the exact source-side writer.
    */
   source_actor_id?: string;
+  /**
+   * Stage 18 v1.1.2 (issue #26, task 7): the lineage
+   * surface for the `import_batches` table. The apply
+   * phase threads these fields onto every mutation
+   * writer's audit metadata so a reviewer can re-derive
+   * the exact bundle hash + version from the row. The
+   * plan is the canonical source of these fields; the
+   * `ImportBatchStore.start(...)` call uses them
+   * verbatim when minting the `pending` row.
+   *
+   * `bundle_version` is the wire-format version:
+   * `1` for v1.1.0 snapshot bundles, `2` for v1.1.1+
+   * snapshot bundles, `3` for v3 full-history bundles.
+   * `bundle_filename` is the basename of the export
+   * scope directory (e.g. `global` or `projects/<id>`).
+   * `bundle_size_bytes` is the cumulative byte size of
+   * the bundle's tracked files (0 when the export
+   * directory is unreadable).
+   */
+  lineage: {
+    bundle_version: number;
+    bundle_filename: string | null;
+    bundle_size_bytes: number | null;
+    source_format: string;
+    source_schema_version: number;
+  };
 };
 
 export type ImportOptions = {
@@ -905,7 +936,8 @@ export function planImport(
     decisions,
     preflight: preflightPlan,
     ...(bundle.history !== undefined ? { full_history_bundle: bundle.history } : {}),
-    ...(bundle.source_actor_id !== undefined ? { source_actor_id: bundle.source_actor_id } : {})
+    ...(bundle.source_actor_id !== undefined ? { source_actor_id: bundle.source_actor_id } : {}),
+    lineage: computeLineageMetadata(bundle, exportScopeDir, format)
   };
 }
 
@@ -1035,7 +1067,40 @@ function mergeEntries(existing: MemoryEntry, imported: MemoryEntry): MemoryEntry
 export function applyImport(
   service: MemoryService,
   plan: ImportPlan,
-  options: ImportOptions
+  options: ImportOptions,
+  /**
+   * Stage 18 v1.1.2 (issue #26, task 7): the
+   * optional lineage hooks. When supplied, the
+   * apply phase threads the `import_batch_id` +
+   * `bundle_hash` + `bundle_version` onto every
+   * mutation writer's audit metadata, advances
+   * the `import_batches` row from `pending` to
+   * `running` then `completed` inside the apply
+   * transaction (so the `completed` state commits
+   * atomically with the mutations), and writes
+   * `failed` OUTSIDE the transaction when the
+   * apply throws (so the failure audit persists
+   * even when every mutation rolled back).
+   *
+   * The `batchStore` MUST be the same instance
+   * that wrote the initial `pending` row via
+   * `start(...)` (the row's primary key is the
+   * `import_batch_id`, so the store is stateless
+   * — the only requirement is that the `start`
+   * call ran before the apply transaction).
+   *
+   * When `lineage` is undefined the apply path
+   * behaves exactly as before Task 7: the
+   * mutations still run, but no `import_batches`
+   * row is written and no audit metadata carries
+   * the batch id (backward compatibility for the
+   * legacy programmatic callers).
+   */
+  lineage?: {
+    batchStore: ImportBatchStore;
+    actor_id: string;
+    requestContext?: RequestContext;
+  }
 ): { applied: number; applied_ids: string[]; errors: string[] } {
   if (options.dry_run) {
     return { applied: 0, applied_ids: [], errors: [] };
@@ -1043,130 +1108,239 @@ export function applyImport(
   let applied = 0;
   const applied_ids: string[] = [];
   const restoreTrust = options.restore_trust === true && plan.history_mode === "full_history";
+  // The lineage payload threaded onto every
+  // mutation writer's audit metadata. The shape is
+  // the documented `import_batch_id` / `bundle_hash`
+  // / `bundle_version` tuple (see
+  // `src/services/memory-write-service.ts`). The
+  // lineage is built once outside the transaction so
+  // the writer methods don't allocate per-row.
+  const auditLineage = lineage === undefined
+    ? undefined
+    : {
+        import_batch_id: plan.import_batch_id,
+        bundle_hash: plan.bundle_hash,
+        bundle_version: plan.lineage.bundle_version
+      };
   // We perform the entire apply in a single
   // transaction. The store's `transaction` helper
   // opens a `BEGIN IMMEDIATE`, runs the work, and
   // commits on success; any throw inside the work
-  // callback rolls back.
-  service.store.transaction(() => {
-    // -----------------------------------------------------------------
-    // Stage 18 v1.1.2 (issue #24, task 5): apply-time
-    // revalidation. The preflight captured the
-    // `(revisions, ids, aggregate budget)` snapshot at
-    // plan time; the apply re-reads the live store
-    // INSIDE the transaction and rejects the whole
-    // batch when any of the assumptions drifted.
-    // -----------------------------------------------------------------
-    for (const { imported, existing } of plan.replacements) {
-      // Re-read the live row inside the transaction
-      // so a concurrent write between preflight and
-      // apply is detected here.
-      const liveNow = service.peekMemoryById(existing.id);
-      if (liveNow === undefined) {
-        throw new Error(
-          `replace ${imported.id}: target row disappeared between preflight and apply (concurrent delete?)`
+  // callback rolls back. The `batchStore` lifecycle
+  // hooks (`markRunning` / `complete`) are inside
+  // the transaction so they commit atomically with
+  // the mutations; the `fail` call is outside the
+  // transaction in the catch block so the failure
+  // audit persists even after rollback.
+  try {
+    service.store.transaction(() => {
+      // Stage 18 v1.1.2 (issue #26, task 7):
+      // advance the `import_batches` row from
+      // `pending` to `running` at the top of the
+      // transaction. A concurrent writer that
+      // already advanced this batch (no supported
+      // v1.1.2 path, but defensive) sees the WHERE
+      // predicate `status = 'pending'` and the
+      // UPDATE is a no-op.
+      if (lineage !== undefined) {
+        lineage.batchStore.markRunning(plan.import_batch_id);
+      }
+      // -----------------------------------------------------------------
+      // Stage 18 v1.1.2 (issue #24, task 5): apply-time
+      // revalidation. The preflight captured the
+      // `(revisions, ids, aggregate budget)` snapshot at
+      // plan time; the apply re-reads the live store
+      // INSIDE the transaction and rejects the whole
+      // batch when any of the assumptions drifted.
+      // -----------------------------------------------------------------
+      for (const { imported, existing } of plan.replacements) {
+        // Re-read the live row inside the transaction
+        // so a concurrent write between preflight and
+        // apply is detected here.
+        const liveNow = service.peekMemoryById(existing.id);
+        if (liveNow === undefined) {
+          throw new Error(
+            `replace ${imported.id}: target row disappeared between preflight and apply (concurrent delete?)`
+          );
+        }
+        if (options.conflict === "replace" && liveNow.revision !== imported.revision) {
+          throw new Error(
+            `replace ${imported.id}: revision drift (imported=${imported.revision} existing=${liveNow.revision})`
+          );
+        }
+        if (options.conflict === "merge" && liveNow.revision !== imported.revision) {
+          throw new Error(
+            `merge ${imported.id}: revision drift (imported=${imported.revision} existing=${liveNow.revision})`
+          );
+        }
+      }
+      // Re-validate the aggregate budget invariant.
+      // The preflight computed the projection against
+      // `usage_before`; the apply re-reads the live
+      // usage (which may have changed if a concurrent
+      // write mutated the scope between the preflight
+      // and the apply) and asserts the projection
+      // still holds. The check is in-transaction so
+      // the rollback is atomic.
+      if (plan.preflight !== undefined) {
+        const liveUsage = service.store.getBudgetUsage({
+          scope: plan.scope,
+          ...(plan.project_id !== undefined ? { project_id: plan.project_id } : {})
+        });
+        const reapply = projectBatchBudget({
+          budget: plan.preflight.budget.active_budget,
+          usage: liveUsage,
+          ops: plan.preflight.decisions
+            .filter((d): d is PreflightPlanDecision & { kind: "insert" | "replace" | "merge" } =>
+              d.kind === "insert" || d.kind === "replace" || d.kind === "merge"
+            )
+            .map((d) => {
+              const decision = d as PreflightPlanDecision & { kind: "insert" | "replace" | "merge" };
+              const entry = plan.inserts.find((e) => e.id === decision.memory_id)
+                ?? plan.replacements.find((r) => r.imported.id === decision.memory_id)?.imported;
+              if (entry === undefined) {
+                throw new Error(
+                  `apply revalidation cannot resolve entry ${decision.memory_id} from the plan`
+                );
+              }
+              const existing = plan.replacements.find((r) => r.imported.id === decision.memory_id)?.existing;
+              if (decision.kind === "insert") {
+                return { kind: "insert" as const, entry };
+              }
+              if (decision.kind === "replace") {
+                return { kind: "replace" as const, entry, ...(existing !== undefined ? { existing } : {}) };
+              }
+              return { kind: "merge" as const, entry, ...(existing !== undefined ? { existing } : {}) };
+            })
+        });
+        if (!reapply.ok) {
+          throw new Error(
+            `aggregate budget drifted between preflight and apply: ${reapply.error.code} (observed=${reapply.error.observed}, limit=${reapply.error.limit})`
+          );
+        }
+      }
+      for (const entry of plan.inserts) {
+        const normalised: MemoryEntry = {
+          ...entry,
+          // Force `trust_level` to "imported" unless
+          // the explicit trusted-bundle mechanism is
+          // in play.
+          trust_level: restoreTrust ? entry.trust_level ?? "imported" : "imported"
+        };
+        service.writeInsertImportedEntry(normalised, options.actor, auditLineage);
+        applied += 1;
+        applied_ids.push(entry.id);
+      }
+      for (const { imported, existing } of plan.replacements) {
+        const normalised: MemoryEntry = {
+          ...imported,
+          trust_level: restoreTrust ? imported.trust_level ?? "imported" : "imported"
+        };
+        const result = service.updateMemory(
+          existing.id,
+          entryToUpdateInput(normalised),
+          lineage?.requestContext,
+          auditLineage
+        );
+        if (!result.ok) {
+          throw new Error(`update ${imported.id}: ${result.error}`);
+        }
+        applied += 1;
+        applied_ids.push(imported.id);
+      }
+      // Stage 18 v1.1.2 (issue #25, task 6): when the
+      // plan is `history_mode === "full_history"` AND the
+      // bundle generation is `v3_full_history`, restore
+      // the source-side revision chain, audit chain,
+      // relation graph, and provenance links in the same
+      // transaction. The apply transaction is the
+      // all-or-nothing boundary; a failure on any of the
+      // inserts rolls back every entry + revision + audit
+      // + relation + provenance row.
+      if (plan.history_mode === "full_history" && plan.full_history_bundle !== undefined) {
+        applyFullHistory(
+          service.store,
+          plan.full_history_bundle,
+          plan.import_batch_id,
+          plan.source_actor_id,
+          options.actor
         );
       }
-      if (options.conflict === "replace" && liveNow.revision !== imported.revision) {
-        throw new Error(
-          `replace ${imported.id}: revision drift (imported=${imported.revision} existing=${liveNow.revision})`
-        );
+      // Stage 18 v1.1.2 (issue #26, task 7): advance
+      // the `import_batches` row from `running` to
+      // `completed` AT THE END of the transaction so
+      // the `completed` state + the counts / affected
+      // ids summary commit atomically with the
+      // mutations. A throw anywhere above rolls back
+      // both the mutations AND the `completed` update
+      // (the row stays in `pending`); the catch
+      // block below writes `failed` outside the
+      // transaction.
+      if (lineage !== undefined) {
+        const counts: ImportBatchCounts = summariseCountsFromPlan(plan);
+        lineage.batchStore.complete(plan.import_batch_id, counts, applied_ids);
       }
-      if (options.conflict === "merge" && liveNow.revision !== imported.revision) {
-        throw new Error(
-          `merge ${imported.id}: revision drift (imported=${imported.revision} existing=${liveNow.revision})`
-        );
-      }
+    });
+  } catch (e) {
+    if (lineage !== undefined) {
+      // Outside the transaction. The mutations + the
+      // `running` / `completed` updates have already
+      // rolled back; we persist the failure audit so
+      // the operator can see why the import failed
+      // and which bundle produced it.
+      lineage.batchStore.fail(plan.import_batch_id, "apply_failed");
     }
-    // Re-validate the aggregate budget invariant.
-    // The preflight computed the projection against
-    // `usage_before`; the apply re-reads the live
-    // usage (which may have changed if a concurrent
-    // write mutated the scope between the preflight
-    // and the apply) and asserts the projection
-    // still holds. The check is in-transaction so
-    // the rollback is atomic.
-    if (plan.preflight !== undefined) {
-      const liveUsage = service.store.getBudgetUsage({
-        scope: plan.scope,
-        ...(plan.project_id !== undefined ? { project_id: plan.project_id } : {})
-      });
-      const reapply = projectBatchBudget({
-        budget: plan.preflight.budget.active_budget,
-        usage: liveUsage,
-        ops: plan.preflight.decisions
-          .filter((d): d is PreflightPlanDecision & { kind: "insert" | "replace" | "merge" } =>
-            d.kind === "insert" || d.kind === "replace" || d.kind === "merge"
-          )
-          .map((d) => {
-            const decision = d as PreflightPlanDecision & { kind: "insert" | "replace" | "merge" };
-            const entry = plan.inserts.find((e) => e.id === decision.memory_id)
-              ?? plan.replacements.find((r) => r.imported.id === decision.memory_id)?.imported;
-            if (entry === undefined) {
-              throw new Error(
-                `apply revalidation cannot resolve entry ${decision.memory_id} from the plan`
-              );
-            }
-            const existing = plan.replacements.find((r) => r.imported.id === decision.memory_id)?.existing;
-            if (decision.kind === "insert") {
-              return { kind: "insert" as const, entry };
-            }
-            if (decision.kind === "replace") {
-              return { kind: "replace" as const, entry, ...(existing !== undefined ? { existing } : {}) };
-            }
-            return { kind: "merge" as const, entry, ...(existing !== undefined ? { existing } : {}) };
-          })
-      });
-      if (!reapply.ok) {
-        throw new Error(
-          `aggregate budget drifted between preflight and apply: ${reapply.error.code} (observed=${reapply.error.observed}, limit=${reapply.error.limit})`
-        );
-      }
-    }
-    for (const entry of plan.inserts) {
-      const normalised: MemoryEntry = {
-        ...entry,
-        // Force `trust_level` to "imported" unless
-        // the explicit trusted-bundle mechanism is
-        // in play.
-        trust_level: restoreTrust ? entry.trust_level ?? "imported" : "imported"
-      };
-      service.writeInsertImportedEntry(normalised, options.actor);
-      applied += 1;
-      applied_ids.push(entry.id);
-    }
-    for (const { imported, existing } of plan.replacements) {
-      const normalised: MemoryEntry = {
-        ...imported,
-        trust_level: restoreTrust ? imported.trust_level ?? "imported" : "imported"
-      };
-      const result = service.updateMemory(existing.id, entryToUpdateInput(normalised));
-      if (!result.ok) {
-        throw new Error(`update ${imported.id}: ${result.error}`);
-      }
-      applied += 1;
-      applied_ids.push(imported.id);
-    }
-    // Stage 18 v1.1.2 (issue #25, task 6): when the
-    // plan is `history_mode === "full_history"` AND the
-    // bundle generation is `v3_full_history`, restore
-    // the source-side revision chain, audit chain,
-    // relation graph, and provenance links in the same
-    // transaction. The apply transaction is the
-    // all-or-nothing boundary; a failure on any of the
-    // inserts rolls back every entry + revision + audit
-    // + relation + provenance row.
-    if (plan.history_mode === "full_history" && plan.full_history_bundle !== undefined) {
-      applyFullHistory(
-        service.store,
-        plan.full_history_bundle,
-        plan.import_batch_id,
-        plan.source_actor_id,
-        options.actor
-      );
-    }
-  });
+    throw e;
+  }
   return { applied, applied_ids, errors: [] };
+}
+
+/**
+ * Stage 18 v1.1.2 (issue #26, task 7): the durable
+ * `import_batches.counts_json` summary. The function
+ * walks the plan's `decisions` array (the canonical
+ * preflight classification) to count inserts /
+ * replacements / merges / skips. For v3 full-history
+ * bundles the counts also include the source-side
+ * revisions / audit_events / relations / provenance
+ * rows the `applyFullHistory` helper restored.
+ */
+function summariseCountsFromPlan(plan: ImportPlan): ImportBatchCounts {
+  let inserts = 0;
+  let replacements = 0;
+  let merges = 0;
+  let skipped = 0;
+  for (const decision of plan.decisions) {
+    switch (decision.kind) {
+      case "insert":
+        inserts += 1;
+        break;
+      case "replace":
+        replacements += 1;
+        break;
+      case "merge":
+        merges += 1;
+        break;
+      case "skip":
+        skipped += 1;
+        break;
+    }
+  }
+  const counts: ImportBatchCounts = {
+    inserts,
+    replacements,
+    merges,
+    skipped,
+    failed: 0,
+    total_affected: inserts + replacements + merges
+  };
+  if (plan.full_history_bundle !== undefined) {
+    counts.revisions = plan.full_history_bundle.revisions.length;
+    counts.audit_events = plan.full_history_bundle.audit_events.length;
+    counts.relations = plan.full_history_bundle.relations.length;
+    counts.provenance = plan.full_history_bundle.provenance.length;
+  }
+  return counts;
 }
 
 /**
@@ -1379,6 +1553,131 @@ function entryToUpdateInput(entry: MemoryEntry): Parameters<MemoryService["updat
 }
 
 /**
+ * Stage 18 v1.1.2 (issue #26, task 7): the
+ * `ImportPlan.lineage` derivation. The function reads
+ * the bundle generation + manifest + on-disk file
+ * sizes to produce the durable lineage fields the
+ * `import_batches` row stores. The mapping:
+ *
+ *   - `v3_full_history` -> `bundle_version = 3`
+ *   - `v2_history`      -> `bundle_version = 2`
+ *   - `v1_canonical`    -> `bundle_version = 1`
+ *   - `v0_raw`          -> `bundle_version = 0`
+ *
+ * The filename is the basename of the export scope
+ * directory (e.g. `global` or `projects/<project_id>`);
+ * the size is the cumulative byte size of the bundle's
+ * tracked files (`MANIFEST.json` + per-topic files +
+ * `BUNDLE.json` for v3). A missing / unreadable
+ * directory returns `null` for both fields; the
+ * `ImportBatchStore.start(...)` call tolerates `null`
+ * because the brief marks them as optional.
+ */
+function computeLineageMetadata(
+  bundle: NormalisedBundle,
+  exportScopeDir: string,
+  format: ImportFormat
+): ImportPlan["lineage"] {
+  const version = mapGenerationToBundleVersion(bundle.generation);
+  const filename = computeBundleFilename(exportScopeDir, bundle.generation);
+  const size = computeBundleSizeBytes(exportScopeDir, bundle.generation, format);
+  return {
+    bundle_version: version,
+    bundle_filename: filename,
+    bundle_size_bytes: size,
+    source_format: format,
+    source_schema_version: bundle.manifest.source_schema_version
+  };
+}
+
+function mapGenerationToBundleVersion(generation: BundleGeneration): number {
+  switch (generation) {
+    case "v3_full_history":
+      return 3;
+    case "v2_history":
+      return 2;
+    case "v1_canonical":
+      return 1;
+    case "v0_raw":
+      // Legacy bundles pre-date the version concept;
+      // surface them as `0` so a reviewer can spot
+      // the legacy generation without confusing them
+      // with a v1 canonical bundle.
+      return 0;
+  }
+}
+
+function computeBundleFilename(exportScopeDir: string, generation: BundleGeneration): string | null {
+  // For v3 bundles the canonical file is `BUNDLE.json`;
+  // for v0/v1/v2 it's the topic files + `MANIFEST.json`.
+  // We surface the basename of the export directory
+  // (e.g. `global` or `projects/<id>`) so an operator
+  // can correlate the lineage row with the export they
+  // ran. A missing directory returns `null` so the
+  // `import_batches` row stays `NULL` rather than
+  // being filled with a placeholder string.
+  if (!existsSync(exportScopeDir)) return null;
+  const basename = exportScopeDir.replace(/[\\/]+$/, "").split(/[\\/]/).pop();
+  if (typeof basename !== "string" || basename.length === 0) {
+    void generation;
+    return null;
+  }
+  return basename;
+}
+
+function computeBundleSizeBytes(
+  exportScopeDir: string,
+  generation: BundleGeneration,
+  format: ImportFormat
+): number | null {
+  if (!existsSync(exportScopeDir)) return null;
+  let total = 0;
+  let counted = 0;
+  const manifestPath = join(exportScopeDir, MANIFEST_FILENAME);
+  if (existsSync(manifestPath)) {
+    try {
+      total += statSync(manifestPath).size;
+      counted += 1;
+    } catch {
+      /* swallow — the lineage is best-effort */
+    }
+  }
+  if (generation === "v3_full_history") {
+    const bundlePath = join(exportScopeDir, "BUNDLE.json");
+    if (existsSync(bundlePath)) {
+      try {
+        total += statSync(bundlePath).size;
+        counted += 1;
+      } catch {
+        /* swallow */
+      }
+    }
+  } else {
+    // v0/v1/v2 snapshot bundles carry per-topic files
+    // under `topics/`. Read the directory and sum.
+    const topicsDir = join(exportScopeDir, "topics");
+    if (existsSync(topicsDir)) {
+      try {
+        const names = readdirSync(topicsDir);
+        for (const name of names) {
+          if (!name.endsWith(`.${format}`)) continue;
+          const filePath = join(topicsDir, name);
+          try {
+            total += statSync(filePath).size;
+            counted += 1;
+          } catch {
+            /* swallow */
+          }
+        }
+      } catch {
+        /* swallow */
+      }
+    }
+  }
+  return counted > 0 ? total : null;
+}
+
+/**
  * Stage 16 v1.1.1 PR-4 (issue #13): `MemoryEntry` carries
  * rows-only fields (id, revision, status, audit, ...)
  * that the `validateRememberInput` Zod schema does not
@@ -1467,11 +1766,59 @@ export function importMemoryExport(
   scope: MemoryScope,
   project_id: string | undefined,
   format: ImportFormat,
-  options: ImportOptions
+  options: ImportOptions,
+  /**
+   * Stage 18 v1.1.2 (issue #26, task 7): the
+   * optional MCP / CLI per-call request context.
+   * The `actor_id` / `request_id` / `session_id` /
+   * `tool_call_id` fields are mixed onto the
+   * `import_batches` row at `start` time so a
+   * reviewer can correlate the batch with the MCP
+   * session / CLI invocation that produced it. The
+   * field is optional: a programmatic caller that
+   * does not carry an MCP context can omit it; the
+   * lineage row keeps the `actor_id` from
+   * `options.actor` and leaves the trace fields
+   * `NULL`.
+   */
+  requestContext?: RequestContext
 ): ImportResult {
   const started = Date.now();
   const plan = planImport(service, exportScopeDir, scope, project_id, format, options);
-  const apply = applyImport(service, plan, options);
+  // Stage 18 v1.1.2 (issue #26, task 7): mint the
+  // `import_batches` lineage row AFTER the preflight
+  // succeeded. The apply path advances the row to
+  // `running` -> `completed` (in-transaction) or
+  // `failed` (post-transaction). When a
+  // `requestContext` is supplied, the trace fields
+  // are recorded on the row so the inspector can
+  // correlate the batch with the MCP session.
+  const batchStore = new ImportBatchStore(service.store);
+  const actorId = options.actor;
+  const targetProjectId = plan.project_id;
+  batchStore.start({
+    import_batch_id: plan.import_batch_id,
+    bundle_hash: plan.bundle_hash,
+    bundle_hash_algorithm: "SHA-256",
+    bundle_version: plan.lineage.bundle_version,
+    bundle_filename: plan.lineage.bundle_filename,
+    bundle_size_bytes: plan.lineage.bundle_size_bytes,
+    source_format: plan.lineage.source_format,
+    source_schema_version: plan.lineage.source_schema_version,
+    target_scope: plan.scope,
+    target_project_id: targetProjectId ?? null,
+    conflict_policy: options.conflict,
+    history_mode: plan.history_mode,
+    actor_id: actorId,
+    request_id: requestContext?.request_id ?? null,
+    session_id: requestContext?.session_id ?? null,
+    tool_call_id: requestContext?.tool_call_id ?? null
+  });
+  const apply = applyImport(service, plan, options, {
+    batchStore,
+    actor_id: actorId,
+    ...(requestContext !== undefined ? { requestContext } : {})
+  });
   return {
     applied:
       options.dry_run

@@ -43,8 +43,13 @@ describe("SQLiteMemoryStore v2 -> v3 migration", () => {
     // v1.1.2 (issue #21): bumped to 12 to add the
     // v11 -> v12 backfill of `project_identities` from
     // pre-existing `project_scopes` rows. The full
-    // chain now walks v2->...->v12.
-    expect(CURRENT_SCHEMA_VERSION).toBe(12);
+    // chain walks v2->...->v12.
+    // v1.1.2 (issue #26, task 7): bumped to 13 to add
+    // the durable `import_batches` lineage table. The
+    // assertion is widened to `>= 13` so a future
+    // schema bump does not silently re-break this
+    // regression guard.
+    expect(CURRENT_SCHEMA_VERSION).toBeGreaterThanOrEqual(13);
   });
 
   it("migrates a v2 database to v3, preserving existing rows", () => {

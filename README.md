@@ -253,9 +253,34 @@ The `import` path (CLI `agent-recall import --from <export-root> --scope ...` an
 - **Project identity** — every project-scope entry is routed through `ProjectIdentityResolver.resolve(..., "strict_existing")`. A `project_id` that has not been registered surfaces `identity_conflict`; a `project_path` that aliases to a different id also surfaces `identity_conflict`. The v1.1.2 strict-by-default contract is enforced (no silent identity creation from a `project_id`-only input).
 - **Sensitivity / trust authorization** — a `restore_trust: true` + `full_history` import OR a bundle that contains `sensitivity: "restricted"` rows requires an operator capability. The bare `restore_trust` / `allow_restricted` flag without a capability is rejected at preflight with `unauthorized`. The capability is installed via `agent-recall admin grant` (see [ADR-0001](docs/adr/0001-local-admin-capability-boundary.md)) and passed to the import via the `capability` option. The CLI does NOT silently `restore_trust`; the `restore_trust` + `full_history` import is the only way to re-claim a `user_confirmed` tier, and it must be paired with a valid `import_trust_restore` capability.
 - **Aggregate budget** — the batch is checked against the configured `max_active_entries`, `max_total_chars`, `max_topic_chars`, and `max_index_chars` (the v1.1.1 PR-4 placeholder against `Number.MAX_SAFE_INTEGER` was useless; the v1.1.2 contract pins the check on the real configured limits). Replacements / merges release the existing entry's `char_count` and index size, so the budget is computed against the **net** impact (the preflight emits a deterministic `before` / `after` summary on the `PreflightPlan`).
-- **Apply-time revalidation** — the `applyImport` step re-reads the live store INSIDE the transaction. A preflight / apply race (a concurrent write that bumped a row's revision, or a budget drift between preflight and apply) rolls the entire batch back atomically. The `import_batches` row is never written on a failed apply (Task 7 #26 will add the persistent lineage surface; the v1.1.2 contract ships the "no completed batch row on a failed apply" rule).
+- **Apply-time revalidation** — the `applyImport` step re-reads the live store INSIDE the transaction. A preflight / apply race (a concurrent write that bumped a row's revision, or a budget drift between preflight and apply) rolls the entire batch back atomically. The `import_batches` row's `completed` state and the canonical counts / affected_ids summary commit atomically with the mutations; a failed apply writes `failed` OUTSIDE the transaction so the failure audit persists without leaving a `completed` row behind.
 
 A failed preflight leaves the live store untouched and returns the preflight error in the structured envelope (`error.code` is one of `identity_conflict`, `secret_detected`, `aggregate_budget`, `sensitivity_denied`, `unauthorized`, `revision_drift`, `invalid_schema`, `bundle_garbled`).
+
+### Import Batch Lineage
+
+Every applied import writes one row in the durable `import_batches` table (schema v13). The row carries the canonical `bundle_hash` + `bundle_version` (1/2 for snapshot bundles, 3 for full-history), the target scope / project identity, the conflict + history policies, the operator actor + the per-call `request_id` / `session_id` / `tool_call_id` trace fields, the started / completed / failed timestamps, the `status` (`pending` -> `running` -> (`completed` | `failed`)), the `failure_code` (nullable), and a JSON-encoded `counts_json` (inserts / replacements / merges / skipped / failed / total_affected + the v3-specific `revisions` / `audit_events` / `relations` / `provenance`) and `affected_ids_json` summary. Every audit / revision / relation / provenance row stamped by the apply carries `metadata.import_batch_id` + `metadata.bundle_hash` + `metadata.bundle_version` so a reviewer can re-derive the lineage from any single row.
+
+The atomicity contract:
+
+- A successful apply + the batch metadata commit in the same `BEGIN IMMEDIATE` / `COMMIT`.
+- An apply-time failure rolls back every mutation AND every `running` / `completed` batch update; `fail(batchId, "apply_failed")` is called OUTSIDE the transaction so the failure audit persists.
+- A preflight rejection has NO batch row at all (the row is minted AFTER preflight succeeds).
+- Two imports of the same bundle produce two distinct batch rows (one per attempt); the `bundle_hash` is stable so the lineage is comparable across runs.
+
+Inspect the batch via the CLI or the MCP resource:
+
+```bash
+# JSON output (machine-readable; safe to feed into jq)
+agent-recall import inspect <batch_id> --json
+
+# Text output (human-readable; structured "status / bundle / policy / counts" view)
+agent-recall import inspect <batch_id>
+```
+
+The MCP wire carries the same redacted record on the `memory://imports/{batch_id}` resource template; `ListResourceTemplates` exposes the `memory_import_batch` template alongside `memory_project_summary` and `memory_project_memory`.
+
+The inspect payload is redacted at the schema level: no memory body / title / tags / source / raw filesystem path / secret literal / operator capability token is stored on the `import_batches` row. The CLI / MCP wire serialises the inspected record verbatim. The release-gate tests assert that the export directory string, the seed memory body, and the `sk-...` secret literal all stay out of both the JSON and the text payloads.
 
 ### Full-history bundle format (`v3`)
 

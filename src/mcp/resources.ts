@@ -33,6 +33,7 @@ import { serverVersion } from "../server-version.js";
 import { listBackups } from "../backup.js";
 import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ProjectIdentityResolver } from "../scope-resolver.js";
+import { ImportBatchStore } from "../portability/import-batch-store.js";
 import type { ToolProfile } from "../tools/profile.js";
 import type { CapabilityStore } from "../admin/capability.js";
 
@@ -459,6 +460,41 @@ export function registerMemoryResources(server: MemoryResourceServer, ctx: Memor
         },
         generated_at: new Date().toISOString()
       });
+    }
+  );
+
+  // 6. memory://imports/{batch_id} (template)
+  // Stage 18 v1.1.2 (issue #26, task 7): the
+  // durable import lineage surface. The resource
+  // mirrors the CLI `agent-recall import inspect`
+  // surface — the same redacted operator-readable
+  // record, surfaced through the MCP wire so an MCP
+  // client can inspect a batch without shelling out
+  // to the CLI. An unknown `batch_id` surfaces a
+  // `not_found` envelope (the inspect contract is
+  // identical to the CLI / `ImportBatchStore.inspect`).
+  server.registerResource(
+    "memory_import_batch",
+    new ResourceTemplate("memory://imports/{batch_id}", { list: undefined }),
+    {
+      description: "Durable lineage for a single import: bundle hash, version, scope, conflict + history policies, actor, timestamps, status, counts, and affected memory ids. Redacted (no body / secret / path / capability leakage).",
+      mimeType: "application/json"
+    },
+    (uri: URL, variables: Variables) => {
+      const batchId = pickVariable(variables, "batch_id");
+      if (batchId === undefined || batchId.length === 0) {
+        return jsonResource(uri, { ok: false, error: "not_found", message: "missing batch_id" });
+      }
+      const store = new ImportBatchStore(ctx.store);
+      const batch = store.inspect(batchId);
+      if (batch === undefined) {
+        return jsonResource(uri, {
+          ok: false,
+          error: "not_found",
+          message: `unknown batch_id ${batchId}`
+        });
+      }
+      return jsonResource(uri, batch);
     }
   );
 }

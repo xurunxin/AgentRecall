@@ -247,8 +247,21 @@ export class MemoryWriteService {
    * entry). The function still emits the standard
    * `created` audit event so the actor chain stays
    * intact.
+   *
+   * Stage 18 v1.1.2 (issue #26, task 7): the optional
+   * `importLineage` argument threads the batch_id +
+   * canonical bundle hash onto the audit event's
+   * metadata so a reviewer can trace the row back to
+   * the exact bundle / batch that produced it. The
+   * keys (`import_batch_id`, `bundle_hash`) are the
+   * documented lineage surface — see
+   * `test/release-gate/p3-import-batch-lineage.test.ts`.
    */
-  insertImportedEntry(entry: MemoryEntry, actor: string): void {
+  insertImportedEntry(
+    entry: MemoryEntry,
+    actor: string,
+    importLineage?: { import_batch_id: string; bundle_hash: string; bundle_version: number }
+  ): void {
     this.ctx.store.insertEntry(entry);
     appendAudit(this.ctx.store, actor, {
       memory_id: entry.id,
@@ -262,7 +275,14 @@ export class MemoryWriteService {
         importance: entry.importance,
         confidence: entry.confidence,
         imported_from: "export",
-        source_revision: entry.revision
+        source_revision: entry.revision,
+        ...(importLineage !== undefined
+          ? {
+              import_batch_id: importLineage.import_batch_id,
+              bundle_hash: importLineage.bundle_hash,
+              bundle_version: importLineage.bundle_version
+            }
+          : {})
       }
     });
   }
@@ -414,7 +434,18 @@ export class MemoryWriteService {
   updateMemory(
     id: string,
     input: UpdateInput,
-    ctx?: RequestContext
+    ctx?: RequestContext,
+    /**
+     * Stage 18 v1.1.2 (issue #26, task 7): optional
+     * import-lineage metadata threaded onto the
+     * `updated` / `archived` audit event. The keys
+     * (`import_batch_id`, `bundle_hash`,
+     * `bundle_version`) are the documented lineage
+     * surface; a missing arg keeps the legacy audit
+     * shape (no lineage keys on the metadata) so a
+     * non-import `updateMemory` call is unchanged.
+     */
+    importLineage?: { import_batch_id: string; bundle_hash: string; bundle_version: number }
   ): Result<{ memory_id: string }, UpdateError> {
     // Stage 16 v1.1.1 PR-3 (#10): every public mutation
     // uses the v2 reservation in the same transaction
@@ -552,7 +583,16 @@ export class MemoryWriteService {
           scope: current.scope,
           ...(current.project_id !== undefined ? { project_id: current.project_id } : {}),
           event,
-          metadata: { fields: Object.keys(validated.value).sort() }
+          metadata: {
+            fields: Object.keys(validated.value).sort(),
+            ...(importLineage !== undefined
+              ? {
+                  import_batch_id: importLineage.import_batch_id,
+                  bundle_hash: importLineage.bundle_hash,
+                  bundle_version: importLineage.bundle_version
+                }
+              : {})
+          }
         }, ctx);
         return ok({ memory_id: id });
       }
@@ -562,7 +602,16 @@ export class MemoryWriteService {
         scope: current.scope,
         ...(current.project_id !== undefined ? { project_id: current.project_id } : {}),
         event,
-        metadata: { fields: Object.keys(validated.value).sort() }
+        metadata: {
+          fields: Object.keys(validated.value).sort(),
+          ...(importLineage !== undefined
+            ? {
+                import_batch_id: importLineage.import_batch_id,
+                bundle_hash: importLineage.bundle_hash,
+                bundle_version: importLineage.bundle_version
+              }
+            : {})
+        }
       }, ctx);
       return ok({ memory_id: id });
     };
