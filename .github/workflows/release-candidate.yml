@@ -3,6 +3,8 @@ name: Link v1.1.3 native sub-issues
 on:
   push:
     branches: ["rc-link-v1.1.3-subissues"]
+  pull_request:
+    branches: ["main"]
 
 permissions:
   contents: read
@@ -23,11 +25,7 @@ jobs:
             const childNumbers = [31, 32, 33, 34, 35, 36, 37, 38];
 
             for (const childNumber of childNumbers) {
-              const child = await github.rest.issues.get({
-                owner,
-                repo,
-                issue_number: childNumber,
-              });
+              const child = await github.rest.issues.get({ owner, repo, issue_number: childNumber });
               try {
                 await github.request(
                   'POST /repos/{owner}/{repo}/issues/{issue_number}/sub_issues',
