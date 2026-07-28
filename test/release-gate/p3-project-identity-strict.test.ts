@@ -434,14 +434,14 @@ describe("release-gate p3-project-identity-strict (Stage 17 v1.1.2 #21)", () => 
     // caller submitting `c:\\repos\\phoenix` hit
     // the same row. The test runs on every
     // platform; on POSIX the two paths are
-    // distinct, so the second call returns a
-    // different (unbound) identity and the test
-    // asserts the resolver's `aliasKey` is
-    // case-folded on Windows only. The alias is
-    // created by routing the registration through
-    // the strict resolver (the v1.1.2 path), not
-    // by `upsertProjectScope` (which only writes
-    // `project_scopes`).
+    // distinct, so the second call creates a
+    // SECOND alias (a worktree-style alias sharing
+    // the same project_id).
+    //
+    // v1.1.3 GATE-01 (issue #31): the registrations
+    // now use the `"register"` mode — `strict_existing`
+    // is a pure read and refuses to mutate. The alias
+    // creation contract is unchanged.
     const IS_WINDOWS = process.platform === "win32";
     const freshDataHome = mkdtempSync(join(tmpdir(), "lm-rg-case-"));
     const freshStore = new SQLiteMemoryStore(join(freshDataHome, "memory.sqlite"));
@@ -454,7 +454,7 @@ describe("release-gate p3-project-identity-strict (Stage 17 v1.1.2 #21)", () => 
       // key.
       const r1 = resolver.resolve(
         { scope: "project", project_id: "phoenix", project_path: pathUpper },
-        "strict_existing"
+        "register"
       );
       expect(r1.ok).toBe(true);
       // Second registration: on Windows, the alias
@@ -465,7 +465,7 @@ describe("release-gate p3-project-identity-strict (Stage 17 v1.1.2 #21)", () => 
       // sharing the same project_id).
       const r2 = resolver.resolve(
         { scope: "project", project_id: "phoenix", project_path: pathLower },
-        "strict_existing"
+        "register"
       );
       expect(r2.ok).toBe(true);
       const aliasKey = IS_WINDOWS ? pathUpper.toLowerCase() : pathUpper;

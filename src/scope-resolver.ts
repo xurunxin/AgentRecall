@@ -73,7 +73,7 @@ export type ScopeInput = {
   project_path?: string;
 };
 
-export type IdentityStatus = "bound" | "unbound";
+export type IdentityStatus = "bound" | "unbound" | "absent";
 
 export type ResolvedScope = {
   scope: MemoryScope;
@@ -290,15 +290,19 @@ export class ProjectIdentityResolver {
       return ok({ scope: "global" });
     }
     if (input.project_path) {
-      // Path-supplied calls always go through the
-      // store-aware path. `register` may create an
-      // identity; `lookup` and `strict_existing` never
-      // create one (the canonicalisation step is
-      // best-effort and falls back to the raw path).
+      // Path-supplied calls go through the store-aware path.
+      // `register` may create an identity; `lookup` and
+      // `strict_existing` never create one (the
+      // canonicalisation step is best-effort and falls back to
+      // the raw path). v1.1.3 GATE-01 (issue #31): the `mode`
+      // is forwarded to the helper so the upsert path is
+      // gated by `mode === "register"`. `lookup` mode still
+      // uses the store-less tail for backward compatibility
+      // with the v1.1.0 contract.
       if (mode === "lookup") {
-        return resolveMemoryScopeWithStore(input, undefined, this.recordedBy);
+        return resolveMemoryScopeWithStore(input, undefined, this.recordedBy, mode);
       }
-      return resolveMemoryScopeWithStore(input, this.store, this.recordedBy);
+      return resolveMemoryScopeWithStore(input, this.store, this.recordedBy, mode);
     }
     if (input.project_id !== undefined) {
       // v1.1.2 (issue #21): strict-by-default. A
@@ -343,7 +347,15 @@ export class ProjectIdentityResolver {
 export function resolveMemoryScopeWithStore(
   input: ScopeInput,
   store: SQLiteMemoryStore | undefined,
-  recordedBy: string
+  recordedBy: string,
+  // v1.1.3 GATE-01 (issue #31): the resolution mode now
+  // gates the mutating path inside the helper. Pre-#31 the
+  // helper always upserted identity + alias; `lookup` and
+  // `strict_existing` callers therefore inherited an
+  // implicit side effect. The default preserves the legacy
+  // (`"register"`) behaviour for any caller that has not
+  // been updated yet.
+  mode: IdentityResolutionMode = "register"
 ): Result<ResolvedScope, ResolveError> {
   if (input.scope !== "global" && input.scope !== "project") {
     return err("invalid_scope", "scope must be global or project");
@@ -370,7 +382,20 @@ export function resolveMemoryScopeWithStore(
       // alias (a symlink, a worktree, a different
       // branch path), not a new canonical path.
       const aliasRow = store.getProjectAliasByPath(aliasKey(project_path));
-      if (aliasRow !== undefined && aliasRow.project_id !== requestedId) {
+      // v1.1.3 GATE-01 (issue #31): the alias-conflict
+      // check applies ONLY when the caller supplied an
+      // explicit `project_id`. A path-only call resolves
+      // through the alias table itself; the alias table
+      // is the canonical "this path belongs to project X"
+      // mapping. Rejecting a path-only lookup because its
+      // DERIVED id (from the canonical path) does not
+      // match the alias's project_id is a category error
+      // — the alias IS the answer for a path-only call.
+      if (
+        input.project_id !== undefined &&
+        aliasRow !== undefined &&
+        aliasRow.project_id !== requestedId
+      ) {
         return err(
           "project_identity_conflict",
           `alias ${project_path} is already bound to project_id=${aliasRow.project_id}, not ${requestedId}`,
@@ -381,6 +406,64 @@ export function resolveMemoryScopeWithStore(
           }
         );
       }
+      const existingIdentity = store.getProjectIdentity(requestedId);
+      // v1.1.3 GATE-01 (issue #31): `lookup` and
+      // `strict_existing` callers must NOT mutate
+      // identity / alias tables. The store-aware path
+      // upserts ONLY when `mode === "register"`.
+      if (mode !== "register") {
+        // For path-only inputs in lookup / strict_existing
+        // mode, also consult the alias table. The alias
+        // table is the canonical "this path belongs to
+        // project X" mapping for path-supplied calls; the
+        // identity row holds the *first* registered
+        // canonical path. Without this, the case-folding
+        // contract from Stage 15 PR-M1-2 silently breaks.
+        const aliasKeyedPath = aliasKey(project_path);
+        const aliasRowForMode = store.getProjectAliasByPath(aliasKeyedPath);
+        if (aliasRowForMode !== undefined) {
+          const aliasedIdentity = store.getProjectIdentity(aliasRowForMode.project_id);
+          if (aliasedIdentity !== undefined) {
+            return ok({
+              scope: "project",
+              project_id: aliasRowForMode.project_id,
+              project_path: aliasedIdentity.canonical_path,
+              display_name: basename(aliasedIdentity.canonical_path),
+              identity_status: "bound"
+            });
+          }
+        }
+        if (existingIdentity === undefined) {
+          if (mode === "strict_existing") {
+            return err(
+              "project_identity_conflict",
+              `path ${project_path} is not registered to any project identity`,
+              { alias: project_path, requested_project_id: requestedId }
+            );
+          }
+          // `lookup` mode is best-effort: return ok with
+          // the canonical path and an explicit
+          // `identity_status: "absent"` so the caller
+          // knows the binding is not registered.
+          return ok({
+            scope: "project",
+            project_id: requestedId,
+            project_path,
+            display_name: basename(project_path),
+            identity_status: "absent"
+          });
+        }
+        // Known identity: return its canonical path and
+        // mark the binding as `bound`. No writes.
+        return ok({
+          scope: "project",
+          project_id: requestedId,
+          project_path: existingIdentity.canonical_path,
+          display_name: basename(existingIdentity.canonical_path),
+          identity_status: "bound"
+        });
+      }
+      // mode === "register": existing behaviour, isolated.
       const identityUpsert = upsertProjectIdentity(store, requestedId, project_path, recordedBy);
       // The canonical path is either the one we
       // just registered (no prior identity) or the
@@ -409,7 +492,8 @@ export function resolveMemoryScopeWithStore(
         scope: "project",
         project_id: requestedId,
         project_path: canonicalForAlias,
-        display_name: basename(canonicalForAlias)
+        display_name: basename(canonicalForAlias),
+        identity_status: existingIdentity === undefined ? "bound" : "bound"
       });
     }
     return ok({
