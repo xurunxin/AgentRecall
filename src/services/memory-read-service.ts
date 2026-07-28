@@ -16,6 +16,7 @@ import {
   rankCleanupCandidates,
   type CandidateAction
 } from "../budget-governor.js";
+import type { ToolProfile } from "../tools/profile.js";
 import {
   nowIso,
   err,
@@ -130,6 +131,18 @@ export type ReadContext = {
    * capability check passes.
    */
   actorMaxSensitivity?: "normal" | "private" | "restricted";
+  /**
+   * v1.1.3 GATE-02 (issue #32): the active
+   * tool profile. The read service consults
+   * this for diagnostics (the per-row
+   * `actor_max_sensitivity` SQL filter is
+   * already gated on `actorMaxSensitivity`
+   * above; `activeProfile` is recorded on
+   * the audit row for forensic review).
+   * Defaults to `"core"` for legacy test
+   * fixtures that pre-date the v1.1.3 split.
+   */
+  activeProfile?: ToolProfile;
 };
 
 export class MemoryReadService {

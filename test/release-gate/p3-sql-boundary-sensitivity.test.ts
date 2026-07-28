@@ -232,7 +232,15 @@ describe("release-gate p3-sql-boundary-sensitivity (follow-up #23 review by ora-
         undefined,
         "agent:test",
         capDataHome,
-        inMemStore as unknown as ConstructorParameters<typeof MemoryService>[4]
+        inMemStore as unknown as ConstructorParameters<typeof MemoryService>[4],
+        // v1.1.3 GATE-02 (issue #32): the
+        // admin-profile lift only happens
+        // when BOTH the profile is "admin"
+        // AND a capability is loaded. This
+        // test exercises the admin path; the
+        // Core-with-cap surface stays at
+        // "normal" (the contract pinning).
+        "admin"
       );
       const entry: MemoryEntry = {
         id: "mem_admin_visible",

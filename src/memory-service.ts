@@ -43,6 +43,7 @@ import { CURRENT_SCHEMA_VERSION } from "./sqlite-store.js";
 import { type RememberInput, type UpdateInput } from "./write-validator.js";
 import { buildRequestContext, type RequestContext } from "./request-context.js";
 import { CapabilityStore } from "./admin/capability.js";
+import type { ToolProfile } from "./tools/profile.js";
 
 // Re-export the public types from the read service so the
 // existing `import { ListResult, ... } from "../memory-service"`
@@ -104,6 +105,18 @@ export class MemoryService {
    * fail-closed.
    */
   private readonly capabilityStore: CapabilityStore | undefined;
+  /**
+   * v1.1.3 GATE-02 (issue #32): the active
+   * tool profile. Threaded into the read
+   * service context so the SQL-boundary
+   * sensitivity filter only lifts to
+   * `"restricted"` when `(activeProfile ===
+   * "admin" && capability loaded)`. Core /
+   * Extended processes NEVER inherit Admin
+   * visibility merely because `admin.cap`
+   * exists in their data home.
+   */
+  private readonly activeProfile: ToolProfile;
 
   constructor(
     store: SQLiteMemoryStore,
@@ -128,7 +141,18 @@ export class MemoryService {
      * `undefined` is fail-closed — privileged
      * writes are rejected.
      */
-    capabilityStore?: CapabilityStore
+    capabilityStore?: CapabilityStore,
+    /**
+     * v1.1.3 GATE-02 (issue #32): the active
+     * tool profile. Defaults to `"core"` so
+     * legacy call sites (test fixtures,
+     * programmatic callers) compile unchanged.
+     * The MCP server entry resolves the profile
+     * via `resolveActiveProfile()` and threads
+     * it through; the CLI default keeps the
+     * existing fail-closed behaviour.
+     */
+    activeProfile: ToolProfile = "core"
   ) {
     const resolveActorFn = (override?: string) => resolveActor(override ?? undefined, process.env);
     const resolveExporterFn = (): MarkdownExporter =>
@@ -144,19 +168,29 @@ export class MemoryService {
     const identityResolver = new ProjectIdentityResolver(store, defaultActor);
 
     this.capabilityStore = capabilityStore;
+    this.activeProfile = activeProfile;
+    // v1.1.3 GATE-02 (issue #32): the
+    // SQL-boundary sensitivity filter is now
+    // gated on BOTH the loaded capability AND
+    // the active profile. Only the
+    // Admin-profile process with a valid
+    // capability lifts to `"restricted"`; Core
+    // / Extended processes stay at `"normal"`
+    // regardless of the on-disk capability.
+    // The `memory://health.active_profile`
+    // resource surfaces the active profile +
+    // capability state so a reviewer can
+    // verify the contract without re-reading
+    // the env vars.
+    const visibilityLifted =
+      activeProfile === "admin" && capabilityStore?.hasCapability() === true;
     this.read = new MemoryReadService({
       store,
       defaultActor,
       identityResolver,
       resolveExporter: resolveExporterFn,
-      // Stage 18 v1.1.2 (issue #23, ADR-0001): the
-      // SQL-boundary sensitivity filter. When a
-      // capability is loaded into the service, the
-      // read service is allowed to surface
-      // `private` and `restricted` rows; without
-      // a capability the fail-closed default
-      // (`"normal"`) hides them.
-      actorMaxSensitivity: capabilityStore?.hasCapability() === true ? "restricted" : "normal"
+      actorMaxSensitivity: visibilityLifted ? "restricted" : "normal",
+      activeProfile
     });
     this.write = new MemoryWriteService({
       store,
