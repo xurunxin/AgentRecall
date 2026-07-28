@@ -158,6 +158,31 @@ function adminStatus(ctx: CliContext): CliResult {
       stderr: ""
     };
   }
+  if (status.kind === "drift") {
+    // v1.1.3 GATE-02 (issue #32): surface the
+    // load-time drift to the operator. The
+    // status envelope NEVER includes the
+    // token bytes; only the stable drift
+    // reason code. The CLI's exit code is 0
+    // because `status` is informational (the
+    // v1.1.2 contract); a future lane could
+    // wire `--strict` to surface a non-zero
+    // exit on drift.
+    const driftLabel = describeDriftReason(status.drift_reason);
+    return {
+      exitCode: 0,
+      stdout: [
+        head("# admin status"),
+        "",
+        `  path:         ${status.path}`,
+        `  state:        drift`,
+        `  drift_reason: ${status.drift_reason}`,
+        "",
+        driftLabel
+      ].join("\n") + "\n",
+      stderr: ""
+    };
+  }
   return {
     exitCode: 0,
     stdout: [
@@ -172,6 +197,31 @@ function adminStatus(ctx: CliContext): CliResult {
     ].join("\n") + "\n",
     stderr: ""
   };
+}
+
+/**
+ * v1.1.3 GATE-02 (issue #32): the human-readable
+ * explanation for a load-time drift. The CLI's
+ * `admin status` command surfaces this string so
+ * the operator can recover without reading the
+ * docs. The stable code (`permission_drift` /
+ * `acl_drift` / `symlink` / `unsupported_owner`)
+ * is also surfaced on the `drift_reason` line so
+ * downstream automation can branch on it.
+ */
+function describeDriftReason(reason: string): string {
+  switch (reason) {
+    case "permission_drift":
+      return "  the on-disk file does not satisfy the owner-only permission contract. re-run `agent-recall admin grant`.";
+    case "acl_drift":
+      return "  the on-disk file's Windows ACL grants access to a non-owner principal. re-run `agent-recall admin grant`.";
+    case "symlink":
+      return "  the on-disk file is a symlink; the canonical capability path must be a regular file owned by the operator. re-run `agent-recall admin grant`.";
+    case "unsupported_owner":
+      return "  the on-disk file is owned by a different uid; only the operator's uid may own the canonical capability file. re-run `agent-recall admin grant` from the operator account.";
+    default:
+      return `  drift reason: ${reason}. re-run \`agent-recall admin grant\`.`;
+  }
 }
 
 function adminHelp(ctx: CliContext): CliResult {
@@ -221,5 +271,7 @@ export function describeDenialReason(reason: AuthorizationDenialReason): string 
       return "the capability store is unavailable; check the data home and file permissions";
     case "unsupported_capability_type":
       return "the requested capability type is not recognised";
+    case "profile_mismatch":
+      return "this capability type requires the Admin profile; the active profile does not match";
   }
 }

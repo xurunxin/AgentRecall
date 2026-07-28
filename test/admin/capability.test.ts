@@ -155,6 +155,11 @@ describe("CapabilityStore (Stage 18 v1.1.2 #23, ADR-0001)", () => {
   it("a fresh store constructed after a previous grant loads the on-disk token", () => {
     const store1 = new CapabilityStore(dataHome, { persistent: true });
     store1.grant({ label: "load-test" });
+    // The previous `grant()` set the POSIX mode
+    // / Windows ACL correctly, so the fresh
+    // store's load-time permission validation
+    // passes without the `skipPermissionCheck`
+    // escape hatch.
     const store2 = new CapabilityStore(dataHome, { persistent: true });
     expect(store2.hasCapability()).toBe(true);
   });
@@ -162,7 +167,19 @@ describe("CapabilityStore (Stage 18 v1.1.2 #23, ADR-0001)", () => {
   it("a malformed on-disk file is treated as missing (fail closed)", () => {
     const fs = require("node:fs") as typeof import("node:fs");
     fs.writeFileSync(join(dataHome, CAPABILITY_FILENAME), "not-json", { mode: 0o600 });
-    const store = new CapabilityStore(dataHome, { persistent: true });
+    // v1.1.3 GATE-02 (issue #32): the load-time
+    // permission validation runs BEFORE the JSON
+    // parse. The unit tests that write files
+    // directly via `writeFileSync({mode: 0o600})`
+    // bypass the canonical `grant()` ACL path, so
+    // the ACL probe would surface drift on
+    // Windows. The `skipPermissionCheck` option
+    // is the documented escape hatch for unit
+    // tests; production callers MUST NOT use it.
+    const store = new CapabilityStore(dataHome, {
+      persistent: true,
+      skipPermissionCheck: true
+    });
     expect(store.hasCapability()).toBe(false);
   });
 
@@ -173,7 +190,10 @@ describe("CapabilityStore (Stage 18 v1.1.2 #23, ADR-0001)", () => {
       JSON.stringify({ token: "not-hex", created_at: new Date().toISOString() }),
       { mode: 0o600 }
     );
-    const store = new CapabilityStore(dataHome, { persistent: true });
+    const store = new CapabilityStore(dataHome, {
+      persistent: true,
+      skipPermissionCheck: true
+    });
     expect(store.hasCapability()).toBe(false);
   });
 });
