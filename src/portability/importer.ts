@@ -142,6 +142,14 @@ export type PreflightResult = Result<
      * computed from the live budget usage.
      */
     preflight: PreflightPlan;
+    /**
+     * v1.1.3 GATE-01 (issue #31): the deduped
+     * `(project_id, project_path)` pairs the bundle
+     * touches. The apply phase re-resolves each
+     * pair inside the apply transaction and throws
+     * `identity_drift` on any observed mismatch.
+     */
+    scopes: Array<{ project_id: string; project_path: string }>;
   },
   PreflightError
 >;
@@ -243,14 +251,29 @@ export type ImportPlan = {
    * in one transaction. Undefined for snapshot bundles.
    */
   full_history_bundle?: FullHistoryBundle;
-  /**
-   * Stage 18 v1.1.2 (issue #25, task 6): the source-side
+/**
+   * Stage 18 v1.1.2 (issue #26, task 7): the source-side
    * `defaultActor` recorded in the v3 bundle's `source`
    * block. Recorded on every imported audit event's
    * `metadata.imported_from_actor` so a reviewer can
    * trace the row back to the exact source-side writer.
    */
   source_actor_id?: string;
+  /**
+   * v1.1.3 GATE-01 (issue #31): the per-scope identity
+   * fingerprints the apply phase re-validates against
+   * `ProjectIdentityResolver.resolve(...,
+   * "strict_existing")` inside the apply transaction.
+   * Populated by `preflightImport` (deduped, in the
+   * order the bundle first mentions the scope). The
+   * apply transaction re-resolves each triple and
+   * throws `identity_drift` if any observed
+   * `canonical_path` differs from the captured value
+   * OR the identity is now absent. See the
+   * IDENTITY-CARVE-OUT note in `applyImport` for the
+   * v1.1.2 → v1.1.3 history of this revalidation.
+   */
+  scopes?: Array<{ project_id: string; project_path: string }>;
   /**
    * Stage 18 v1.1.2 (issue #26, task 7): the lineage
    * surface for the `import_batches` table. The apply
@@ -559,6 +582,16 @@ export function preflightImport(
   });
   const batchOps: BatchOp[] = [];
   const decisions: PreflightPlanDecision[] = [];
+  // v1.1.3 GATE-01 (issue #31): the deduped
+  // `(project_id, project_path)` pairs the bundle
+  // touches. We populate it from each project-scoped
+  // entry's identity check; the apply transaction
+  // re-validates the list. The list is intentionally
+  // deduped via a key so an export with many entries
+  // on the same project does not multiply the
+  // revalidation cost.
+  const scopes: Array<{ project_id: string; project_path: string }> = [];
+  const scopeKeys = new Set<string>();
   // Build the decisions / ops list as we walk
   // the bundle. The first failing entry's
   // decision is `reject`; the preflight returns
@@ -677,6 +710,31 @@ export function preflightImport(
           }
         );
       }
+      // v1.1.3 GATE-01 (issue #31): record the
+      // successfully-resolved binding for the apply
+      // revalidation. The apply transaction
+      // re-resolves the same triple and rejects the
+      // batch on any drift. The preflight already
+      // mapped an unknown / conflicting identity to
+      // `identity_conflict` above, so the values
+      // captured here are guaranteed to be `bound` at
+      // preflight time.
+      if (
+        projectId !== undefined &&
+        identityResolved.ok &&
+        identityResolved.value.project_id !== undefined &&
+        identityResolved.value.project_path !== undefined
+      ) {
+        const capturedPath = identityResolved.value.project_path;
+        const scopeKey = `${identityResolved.value.project_id}\u0000${capturedPath}`;
+        if (!scopeKeys.has(scopeKey)) {
+          scopeKeys.add(scopeKey);
+          scopes.push({
+            project_id: identityResolved.value.project_id,
+            project_path: capturedPath
+          });
+        }
+      }
     }
     // 5. id / revision conflict (only meaningful
     //    for `replace` policy; we preflight the
@@ -787,7 +845,8 @@ export function preflightImport(
   return ok({
     bundle,
     import_batch_id: newImportBatchId(),
-    preflight: plan
+    preflight: plan,
+    scopes
   });
 }
 
@@ -848,7 +907,7 @@ export function planImport(
         : "";
     throw new Error(`preflight failed: ${preflight.error}${where} — ${preflight.message}`);
   }
-  const { bundle, import_batch_id, preflight: preflightPlan } = preflight.value;
+  const { bundle, import_batch_id, preflight: preflightPlan, scopes } = preflight.value;
   const imported = bundle.entries;
   const historyMode: ImportHistoryMode = options.history_mode ?? "snapshot";
   const inserts: MemoryEntry[] = [];
@@ -935,6 +994,7 @@ export function planImport(
     skipped,
     decisions,
     preflight: preflightPlan,
+    ...(scopes.length > 0 ? { scopes } : {}),
     ...(bundle.history !== undefined ? { full_history_bundle: bundle.history } : {}),
     ...(bundle.source_actor_id !== undefined ? { source_actor_id: bundle.source_actor_id } : {}),
     lineage: computeLineageMetadata(bundle, exportScopeDir, format)
@@ -963,9 +1023,9 @@ function mergeEntries(existing: MemoryEntry, imported: MemoryEntry): MemoryEntry
  * ----------------------------------------------------------------
  * The task-5 brief required: "Revalidate revisions,
  * identity, and aggregate assumptions inside the
- * apply transaction." This implementation revalidates
- * **revisions** + **aggregate budget** inside the
- * transaction but DELIBERATELY does NOT re-call
+ * apply transaction." The v1.1.2 implementation
+ * revalidated **revisions** + **aggregate budget** inside
+ * the transaction but DELIBERATELY did NOT re-call
  * `ProjectIdentityResolver.resolve(..., "strict_existing")`
  * inside the transaction. Rationale (closure path (b) of
  * the v1.1.2 review):
@@ -1017,20 +1077,46 @@ function mergeEntries(existing: MemoryEntry, imported: MemoryEntry): MemoryEntry
  *     "Implementation references" sub-section links
  *     here.
  *
- * MAINTENANCE NOTE: if a future release adds an
- * in-band identity delete / rename path (e.g. an
- * `import` of an identity bundle, or a `forget`
- * that targets a `project_id`), this carve-out must
- * be re-evaluated. The two-race-surface split
- * (revisions + budget re-checked; identity pinned
- * at preflight) only holds while the apply path
- * cannot observe an identity change between
- * preflight and apply. If that invariant changes,
- * route the apply transaction through
- * `ProjectIdentityResolver.resolve(...,
- * "strict_existing")` for every project-scope
- * `plan.inserts` and `plan.replacements[*].existing`
- * entry and re-roll the preflight-vs-apply surface.
+ * ----------------------------------------------------------------
+ * v1.1.3 GATE-01 (issue #31): the carve-out is CLOSED.
+ * ----------------------------------------------------------------
+ * The pre-flight mode gating in `scope-resolver.ts` now
+ * guarantees `lookup` and `strict_existing` calls never
+ * upsert identity / alias rows; `register` is the only
+ * mutator. That, combined with the fact that the apply
+ * path never calls `register` mode, means the only
+ * legitimate way an identity binding can drift between
+ * preflight and apply is the out-of-band
+ * `configureProjectBudget` path (which exists in v1.1.x).
+ *
+ * The apply transaction now carries a third revalidation
+ * step (the "Identity revalidation" block below) that
+ * re-resolves every `(project_id, project_path)` triple
+ * in `plan.scopes` via
+ * `ProjectIdentityResolver.resolve(..., "strict_existing")`.
+ * A drifted or missing binding throws `identity_drift`
+ * (a new `ResolveError` member) and rolls back the
+ * entire batch. The order is deliberately after the
+ * budget re-check (a missing identity is a stronger
+ * signal than a drifted budget).
+ *
+ * See:
+ *   - `docs/superpowers/specs/2026-07-28-v1.1.3-gate-01-identity-design.md`
+ *     — the v1.1.3 GATE-01 design spec (issue #31).
+ *   - `docs/adr/0004-identity-resolution-modes.md` — the
+ *     v1.1.3 ADR that documents the three modes + the
+ *     canonical registration path.
+ *
+ * MAINTENANCE NOTE: if a future release changes the
+ * `strict_existing` contract (e.g. removes the
+ * "absent → conflict" mapping or adds a "soft-warm"
+ * alias for an unknown path), the apply-time identity
+ * revalidation here MUST be revisited. The check
+ * assumes that a successful preflight `strict_existing`
+ * call implies the identity is `bound` AND that the
+ * apply-time `strict_existing` call returns the same
+ * envelope; any change to either assumption can let
+ * drift slip through the revalidation.
  *
  * Stage 16 v1.1.1 PR-4 (issue #13): every applied entry
  * is forced to `trust_level: "imported"` unless the
@@ -1216,6 +1302,83 @@ export function applyImport(
         if (!reapply.ok) {
           throw new Error(
             `aggregate budget drifted between preflight and apply: ${reapply.error.code} (observed=${reapply.error.observed}, limit=${reapply.error.limit})`
+          );
+        }
+      }
+      // -----------------------------------------------------------------
+      // v1.1.3 GATE-01 (issue #31): apply-time IDENTITY
+      // revalidation. Closes the v1.1.2 IDENTITY-CARVE-OUT
+      // (see the comment block above `applyImport`): every
+      // `(project_id, project_path)` triple the bundle
+      // touches must still resolve to the same canonical
+      // path at apply time. Drifted or missing bindings
+      // throw `identity_drift` and roll the batch back.
+      //
+      // The preflight populated `plan.scopes` from every
+      // project-scoped entry's identity check; the apply
+      // transaction re-resolves each triple via
+      // `ProjectIdentityResolver.resolve(...,
+      // "strict_existing")`. A non-ok resolver response
+      // (identity now absent) OR an observed
+      // `canonical_path` that differs from the captured
+      // value records the scope as `drift`. The order is
+      // deliberately after the budget re-check: a missing
+      // identity at revalidation time is a stronger signal
+      // than a drifted budget.
+      //
+      // The revalidation runs INSIDE the apply transaction
+      // so a thrown `identity_drift` rolls back every
+      // entry / revision / audit / relation / provenance
+      // row + the `running` / `completed` batch
+      // transitions atomically. The post-transaction
+      // catch block writes `apply_failed` to the batch
+      // row (the lineage is preserved even on a rolled-back
+      // apply).
+      // -----------------------------------------------------------------
+      if (plan.scopes !== undefined && plan.scopes.length > 0) {
+        const applyResolver = new ProjectIdentityResolver(service.store, options.actor);
+        const drift: Array<{
+          project_id: string;
+          expected_path: string;
+          observed_path: string | "absent";
+        }> = [];
+        for (const scope of plan.scopes) {
+          const observed = applyResolver.resolve(
+            { scope: "project", project_id: scope.project_id, project_path: scope.project_path },
+            "strict_existing"
+          );
+          if (!observed.ok) {
+            drift.push({
+              project_id: scope.project_id,
+              expected_path: scope.project_path,
+              observed_path: "absent"
+            });
+            continue;
+          }
+          const observedPath = observed.value.project_path;
+          if (observedPath !== scope.project_path) {
+            drift.push({
+              project_id: scope.project_id,
+              expected_path: scope.project_path,
+              observed_path: observedPath ?? "absent"
+            });
+          }
+        }
+        if (drift.length > 0) {
+          // The error message includes the
+          // stable `identity_drift` reason code so
+          // the test surface (and the future
+          // importMemoryExport wrapper) can branch
+          // on it without parsing the free-form
+          // drift description.
+          const driftSummary = drift
+            .map(
+              (d) =>
+                `${d.project_id}: expected=${d.expected_path} observed=${d.observed_path}`
+            )
+            .join("; ");
+          throw new Error(
+            `identity_drift: identity binding drifted between preflight and apply (${drift.length} scope(s)): ${driftSummary}`
           );
         }
       }

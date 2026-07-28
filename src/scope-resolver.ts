@@ -96,7 +96,7 @@ export type ResolvedScope = {
   identity_status?: IdentityStatus;
 };
 
-export type ResolveError = "invalid_scope" | "project_identity_conflict" | "invalid_alias";
+export type ResolveError = "invalid_scope" | "project_identity_conflict" | "invalid_alias" | "identity_drift";
 
 /**
  * v1.1.2 (issue #21): default-off legacy escape hatch.
