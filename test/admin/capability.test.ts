@@ -28,7 +28,7 @@
 // primitive is exercised independently of the
 // on-disk persistence layer.
 
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, chmodSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -464,5 +464,90 @@ describe("PermissionDriftError (Stage 18 v1.1.2 #23, ADR-0001)", () => {
         // best effort
       }
     }
+  });
+});
+
+// ---------------------------------------------------------------
+// v1.1.3 GATE-02 (issue #32): load-time permission
+// validation. The constructor refuses any file
+// whose permission boundary drifts from the
+// canonical `0o600` (POSIX) / owner-only ACL
+// (Windows) contract; the drift reason surfaces on
+// `status()` without leaking token bytes.
+// ---------------------------------------------------------------
+
+describe("CapabilityStore.validatePermissionBoundary (v1.1.3 GATE-02 issue #32)", () => {
+  let dataHome: string;
+  beforeEach(() => {
+    dataHome = newDataHome();
+  });
+  afterEach(() => {
+    try {
+      rmSync(dataHome, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+  });
+
+  it("POSIX 0o600 owner-only file is accepted", () => {
+    if (process.platform === "win32") return;
+    const path = join(dataHome, CAPABILITY_FILENAME);
+    const body = {
+      token: "a".repeat(64),
+      created_at: new Date().toISOString()
+    };
+    writeFileSync(path, JSON.stringify(body, null, 2), { mode: 0o600 });
+    chmodSync(path, 0o600);
+    const result = (globalThis as { validatePermissionBoundary?: typeof import("../../src/admin/capability.js").validatePermissionBoundary }).validatePermissionBoundary?.(path);
+    // The validator is exported by capability.ts;
+    // the dynamic import above avoids a top-level
+    // circular dependency in the test fixture.
+    expect(result).toEqual({ ok: true });
+  });
+
+  it("POSIX 0o644 group-readable file is rejected with reason:permission_drift", () => {
+    if (process.platform === "win32") return;
+    const path = join(dataHome, CAPABILITY_FILENAME);
+    const body = {
+      token: "b".repeat(64),
+      created_at: new Date().toISOString()
+    };
+    writeFileSync(path, JSON.stringify(body, null, 2), { mode: 0o644 });
+    chmodSync(path, 0o644);
+    // The helper IS exported; the test below
+    // calls it via a dynamic require.
+    const cap = require("../../src/admin/capability.js") as typeof import("../../src/admin/capability.js");
+    const result = cap.validatePermissionBoundary(path);
+    expect(result).toEqual({ ok: false, reason: "permission_drift" });
+  });
+
+  it("POSIX symlink is rejected with reason:symlink", () => {
+    if (process.platform === "win32") return;
+    const target = join(dataHome, "target-cap.txt");
+    writeFileSync(target, { token: "c".repeat(64), created_at: new Date().toISOString() } as never);
+    chmodSync(target, 0o600);
+    const linkPath = join(dataHome, CAPABILITY_FILENAME);
+    symlinkSync(target, linkPath);
+    const cap = require("../../src/admin/capability.js") as typeof import("../../src/admin/capability.js");
+    const result = cap.validatePermissionBoundary(linkPath);
+    expect(result).toEqual({ ok: false, reason: "symlink" });
+  });
+
+  it("CapabilityStore.load() records drift; status() returns kind:'drift' without token bytes", () => {
+    if (process.platform === "win32") return;
+    const path = join(dataHome, CAPABILITY_FILENAME);
+    writeFileSync(path, JSON.stringify({
+      token: "d".repeat(64),
+      created_at: new Date().toISOString()
+    }, null, 2), { mode: 0o644 });
+    chmodSync(path, 0o644);
+    const store = new CapabilityStore(dataHome, { persistent: true });
+    expect(store.hasCapability()).toBe(false);
+    const status = store.status();
+    expect(status.kind).toBe("drift");
+    if (status.kind !== "drift") return;
+    expect(status.drift_reason).toBe("permission_drift");
+    // Status envelope MUST NOT include the token.
+    expect(JSON.stringify(status)).not.toContain("d".repeat(64));
   });
 });

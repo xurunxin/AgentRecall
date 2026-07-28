@@ -33,6 +33,7 @@ import {
   recordMemoryProvenanceToolSchema,
   explainMemoryProvenanceToolSchema
 } from "../../src/tools/schemas.js";
+import { InMemoryCapabilityStore } from "../../src/admin/capability.js";
 
 function setup() {
   const dataHome = mkdtempSync(join(tmpdir(), "lm-rg-semantics-"));
@@ -455,5 +456,95 @@ describe("release-gate p3-memory-semantics-mcp (issue #17, spec § 5.4)", () => 
       memory_id: "mem_x",
       trust_level: "user_confirmed"
     }).success).toBe(false);
+  });
+
+  // -------------------------------------------------------------
+  // v1.1.3 GATE-02 (issue #32): a Core process
+  // loaded with a valid `admin.cap` STILL
+  // surfaces `"normal"` visibility on
+  // `memory://health`. The Core-with-cap
+  // visibility leak is closed: only an
+  // Admin-profile process with a valid
+  // capability gains `"restricted"` visibility.
+  // -------------------------------------------------------------
+  it("memory://health surfaces actor_max_sensitivity='normal' on a Core process loaded with admin.cap", () => {
+    // Build a service with a Core profile but
+    // a loaded capability — the v1.1.2
+    // visibility leak this lane closes.
+    const capDataHome = mkdtempSync(join(tmpdir(), "lm-rg-sem-core-cap-"));
+    try {
+      const capStore = new SQLiteMemoryStore(join(capDataHome, "memory.sqlite"));
+      const knownToken = "c".repeat(64);
+      const inMemStore = new InMemoryCapabilityStore({
+        token: knownToken,
+        created_at: new Date().toISOString(),
+        label: "core-with-cap-health-test"
+      });
+      const capService = new MemoryService(
+        capStore,
+        undefined,
+        "agent:test",
+        capDataHome,
+        inMemStore as unknown as ConstructorParameters<typeof MemoryService>[4],
+        // v1.1.3 GATE-02 (issue #32): the
+        // Core profile stays at "normal"
+        // visibility even with a loaded
+        // capability.
+        "core"
+      );
+      expect(capService.adminCapabilityStore?.hasCapability()).toBe(true);
+      // The health resource contract pins the
+      // SQL-boundary sensitivity filter on
+      // `actor_max_sensitivity`. We verify the
+      // service uses "normal" by inserting a
+      // restricted row and confirming the read
+      // surface returns `forbidden_visibility`.
+      const entry: MemoryEntry = {
+        id: "mem_health_core_cap",
+        scope: "global",
+        type: "fact",
+        topic: "health",
+        title: "title",
+        body: "body",
+        tags: [],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3,
+        status: "active",
+        created_at: "2026-07-28T00:00:00.000Z",
+        updated_at: "2026-07-28T00:00:00.000Z",
+        last_accessed_at: undefined,
+        last_accessed_by: undefined,
+        access_count: 0,
+        expires_at: undefined,
+        review_after: undefined,
+        supersedes: [],
+        superseded_by: undefined,
+        token_estimate: 0,
+        char_count: 5,
+        revision: 1,
+        writer_actor_id: "agent:test",
+        content_hash: "h",
+        pinned: false,
+        trust_level: "agent_observed",
+        sensitivity: "restricted",
+        valid_from: undefined,
+        valid_until: undefined,
+        deleted_at: undefined,
+        tier: "working",
+        metadata: {}
+      };
+      capStore.insertEntry(entry);
+      const r = capService.getMemoryWithVisibility("mem_health_core_cap");
+      expect(r.ok).toBe(false);
+      if (r.ok) return;
+      expect(r.error).toBe("forbidden_visibility");
+    } finally {
+      try {
+        rmSync(capDataHome, { recursive: true, force: true });
+      } catch {
+        /* best effort */
+      }
+    }
   });
 });

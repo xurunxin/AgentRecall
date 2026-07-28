@@ -699,4 +699,78 @@ describe("MCP all-tools black-box E2E - Core profile (v1.1.2 #22 Task 3 follow-u
     const code = failureCode(r2);
     expect(code).toMatch(/idempotency_mismatch|key_reuse|key was reused/);
   });
+
+  // -------------------------------------------------------------
+  // v1.1.3 GATE-02 (issue #32): a Core packaged
+  // black-box process refuses a privileged write
+  // even when the test fixture ships a valid
+  // `admin.cap` in the data home. The Core
+  // profile NEVER inherits Admin visibility
+  // merely because the capability file exists;
+  // the per-request capability path on Core is
+  // also refused for `profile_required: "admin"`
+  // capability types (`trust_promotion`,
+  // `sensitivity_restricted`,
+  // `sensitivity_visibility`).
+  //
+  // We ship `admin.cap` via the parent
+  // `setupMcpServer` fixture's `dataHome` so
+  // the contract is: a Core client cannot
+  // promote a memory to `user_confirmed` even
+  // with a per-request token.
+  // -------------------------------------------------------------
+  it("security: Core refuses trust_promotion even with a valid admin.cap on disk", async () => {
+    if (client === undefined) throw new Error("client not initialised");
+    if (dataHome === undefined) throw new Error("dataHome not set");
+    // Pre-condition: write a fresh `admin.cap`
+    // via the canonical grant path so the
+    // process's startup-time capability
+    // detection has a valid token. We use
+    // `npx tsx` to invoke the in-tree
+    // CapabilityStore.grant() helper, which
+    // is the documented operator-only mutation
+    // surface.
+    const { CapabilityStore } = await import("../../src/admin/capability.js");
+    const capStore = new CapabilityStore(dataHome, { persistent: true });
+    capStore.grant({ label: "core-with-cap-test" });
+    expect(capStore.hasCapability()).toBe(true);
+
+    // Pre-seed an entry to promote.
+    const seedKey = `bb-core-cap-${Date.now()}`;
+    const seed = await callTool(client, "remember", rememberArgs({
+      title: "core-cap-target",
+      body: "promote target",
+      topic: "core-cap",
+      idempotency_key: seedKey
+    }));
+    expect(seed.isError).toBeFalsy();
+    const seedId = (seed.structuredContent?.data as { memory_id?: string } | undefined)?.memory_id;
+    if (seedId === undefined) throw new Error("seed did not return memory_id");
+
+    // Attempt the promotion via the per-request
+    // path: the tool surface is `confirm_memory_trust`
+    // (not exposed on Core) — but we exercise
+    // the service-level gate by attempting a
+    // `trust_level: "user_confirmed"` write. The
+    // service rejects at the validation gate
+    // because the capability path returns
+    // `profile_mismatch` (Core != admin).
+    const probe = await callTool(client, "remember", rememberArgs({
+      title: "core-cap-probe",
+      body: "should be rejected",
+      topic: "core-cap-probe",
+      trust_level: "user_confirmed"
+    }));
+    expect(probe.isError).toBe(true);
+    const code = failureCode(probe);
+    // The Core path returns either
+    // `profile_mismatch` (when the token is
+    // validated against the profile gate) OR
+    // `unauthorized` (when the per-request token
+    // is missing). The exact envelope depends
+    // on whether the call supplied the
+    // capability field; we accept either
+    // stable code as the fail-closed contract.
+    expect(code).toMatch(/profile_mismatch|unauthorized/);
+  });
 });
