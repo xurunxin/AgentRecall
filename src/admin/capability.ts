@@ -88,6 +88,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { join } from "node:path";
 
 import type { RequestContext } from "../request-context.js";
+import type { ToolProfile } from "../tools/profile.js";
 
 /**
  * Canonical capability file name. Lives under
@@ -591,10 +592,40 @@ export class CapabilityStore {
    * service boundary (the service records
    * the decision), not here, so the store
    * is a pure authorization primitive.
+   *
+   * v1.1.3 GATE-02 (issue #32): the
+   * per-request path is now gated on the
+   * active profile. Types with
+   * `profile_required: "admin"` refuse
+   * per-request authorization on a
+   * non-Admin profile. The Admin-profile
+   * process authorizes every type via the
+   * in-memory capability token. The
+   * per-request path on Core / Extended is
+   * restricted to types without
+   * `profile_required` (the import and
+   * per-request capability paths).
    */
-  authorize(input: AuthorizationRequest): AuthorizationDecision {
+  authorize(
+    input: AuthorizationRequest,
+    profile?: ToolProfile
+  ): AuthorizationDecision {
     if (!(CAPABILITY_TYPES as readonly string[]).includes(input.capability_type)) {
       return { ok: false, reason: "unsupported_capability_type" };
+    }
+    // v1.1.3 GATE-02 (issue #32): profile
+    // gate. Types with `profile_required:
+    // "admin"` refuse per-request
+    // authorization on a non-Admin profile.
+    // The Admin profile authorizes every
+    // type via the in-memory capability
+    // token.
+    const descriptor = getCapabilityTypeDescriptor(input.capability_type);
+    if (
+      descriptor?.profile_required === "admin" &&
+      profile !== "admin"
+    ) {
+      return { ok: false, reason: "profile_mismatch" };
     }
     const candidate = sanitizeCapability(input.capability);
     if (candidate === undefined) {
@@ -667,9 +698,23 @@ export class InMemoryCapabilityStore {
     return out;
   }
 
-  authorize(input: AuthorizationRequest): AuthorizationDecision {
+  authorize(input: AuthorizationRequest, profile?: ToolProfile): AuthorizationDecision {
     if (!(CAPABILITY_TYPES as readonly string[]).includes(input.capability_type)) {
       return { ok: false, reason: "unsupported_capability_type" };
+    }
+    // v1.1.3 GATE-02 (issue #32): profile
+    // gate. Types with `profile_required:
+    // "admin"` refuse per-request
+    // authorization on a non-Admin profile.
+    // The Admin profile authorizes every
+    // type via the in-memory capability
+    // token.
+    const descriptor = getCapabilityTypeDescriptor(input.capability_type);
+    if (
+      descriptor?.profile_required === "admin" &&
+      profile !== "admin"
+    ) {
+      return { ok: false, reason: "profile_mismatch" };
     }
     const candidate = sanitizeCapability(input.capability);
     if (candidate === undefined) {

@@ -226,7 +226,14 @@ describe("release-gate p3-memory-semantics-mcp (issue #17, spec § 5.4)", () => 
         // / `getPath()` surface, so the cast is
         // a no-op at runtime. The service
         // consults only the duck-typed methods.
-        inMemStore as unknown as ConstructorParameters<typeof MemoryService>[4]
+        inMemStore as unknown as ConstructorParameters<typeof MemoryService>[4],
+        // v1.1.3 GATE-02 (issue #32): the
+        // trust_promotion capability type
+        // requires the Admin profile. This
+        // test exercises the per-request
+        // capability path under an Admin
+        // profile.
+        "admin"
       );
       const r = capService.remember(
         baseRemember({

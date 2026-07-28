@@ -513,7 +513,7 @@ describe("constant-time token comparison (v1.1.3 GATE-02 issue #32)", () => {
       capability: wrongToken,
       capability_type: "trust_promotion",
       requestContext: ctxForTest()
-    });
+    }, "admin");
     expect(decision.ok).toBe(false);
     if (decision.ok) return;
     expect(decision.reason).toBe("token_mismatch");

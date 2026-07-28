@@ -197,6 +197,13 @@ export class MemoryService {
       defaultActor,
       identityResolver,
       ...(capabilityStore !== undefined ? { capabilityStore } : {}),
+      // v1.1.3 GATE-02 (issue #32): thread the
+      // active profile so the write service's
+      // `authorize(...)` call can gate
+      // `profile_required: "admin"` capability
+      // types against the per-process
+      // profile.
+      activeProfile,
       configureProjectBudget: (project_id, budget, canonical_path, display_name) =>
         this.configureProjectBudget(project_id, budget, canonical_path, display_name)
     });
@@ -579,15 +586,29 @@ export class MemoryService {
     // `session_id` / `tool_call_id` when
     // available, falling back to a fresh UUID
     // when the caller did not supply a context.
-    const decision = this.capabilityStore.authorize({
-      capability: input.capability,
-      capability_type: "trust_promotion",
-      requestContext: ctx ?? buildRequestContext({
-        ...(input.actor_id !== undefined ? { actor_override: input.actor_id } : {}),
-        client_name: "memory-service",
-        request_id: randomUUID()
-      })
-    });
+    const decision = this.capabilityStore.authorize(
+      {
+        capability: input.capability,
+        capability_type: "trust_promotion",
+        requestContext: ctx ?? buildRequestContext({
+          ...(input.actor_id !== undefined ? { actor_override: input.actor_id } : {}),
+          client_name: "memory-service",
+          request_id: randomUUID()
+        })
+      },
+      // v1.1.3 GATE-02 (issue #32): thread
+      // the active profile so the
+      // `trust_promotion` capability type
+      // (which carries
+      // `profile_required: "admin"`) is
+      // evaluated against the per-process
+      // profile. Legacy test fixtures that
+      // omit `activeProfile` default to
+      // `"core"` and the per-request path
+      // returns `profile_mismatch` (the
+      // fail-closed contract).
+      this.activeProfile
+    );
     if (!decision.ok) {
       const reason = decision.reason;
       appendAudit(this.store, this.defaultActor, {

@@ -218,7 +218,7 @@ describe("CapabilityStore.authorize (Stage 18 v1.1.2 #23, ADR-0001)", () => {
       capability: "0".repeat(64),
       capability_type: "trust_promotion",
       requestContext: ctx
-    });
+    }, "admin");
     expect(decision.ok).toBe(false);
     if (decision.ok) return;
     expect(decision.reason).toBe("capability_missing");
@@ -231,7 +231,7 @@ describe("CapabilityStore.authorize (Stage 18 v1.1.2 #23, ADR-0001)", () => {
       capability: "0".repeat(64),
       capability_type: "trust_promotion",
       requestContext: ctx
-    });
+    }, "admin");
     expect(decision.ok).toBe(false);
     if (decision.ok) return;
     expect(decision.reason).toBe("token_mismatch");
@@ -244,7 +244,7 @@ describe("CapabilityStore.authorize (Stage 18 v1.1.2 #23, ADR-0001)", () => {
       capability: "not-hex",
       capability_type: "trust_promotion",
       requestContext: ctx
-    });
+    }, "admin");
     expect(decision.ok).toBe(false);
     if (decision.ok) return;
     expect(decision.reason).toBe("capability_malformed");
@@ -257,7 +257,7 @@ describe("CapabilityStore.authorize (Stage 18 v1.1.2 #23, ADR-0001)", () => {
       capability: "abcd",
       capability_type: "trust_promotion",
       requestContext: ctx
-    });
+    }, "admin");
     expect(decision.ok).toBe(false);
     if (decision.ok) return;
     expect(decision.reason).toBe("capability_malformed");
@@ -274,7 +274,7 @@ describe("CapabilityStore.authorize (Stage 18 v1.1.2 #23, ADR-0001)", () => {
       // truth.
       capability_type: "made_up_capability" as never,
       requestContext: ctx
-    });
+    }, "admin");
     expect(decision.ok).toBe(false);
     if (decision.ok) return;
     expect(decision.reason).toBe("unsupported_capability_type");
@@ -294,7 +294,7 @@ describe("CapabilityStore.authorize (Stage 18 v1.1.2 #23, ADR-0001)", () => {
       capability: onDiskJson.token,
       capability_type: "trust_promotion",
       requestContext: ctx
-    });
+    }, "admin");
     expect(decision.ok).toBe(true);
   });
 
@@ -312,11 +312,14 @@ describe("CapabilityStore.authorize (Stage 18 v1.1.2 #23, ADR-0001)", () => {
       "import_restricted",
       "sensitivity_visibility"
     ] as const) {
-      const decision = store.authorize({
-        capability: onDiskJson.token,
-        capability_type: cap,
-        requestContext: ctx
-      });
+      const decision = store.authorize(
+        {
+          capability: onDiskJson.token,
+          capability_type: cap,
+          requestContext: ctx
+        },
+        "admin"
+      );
       expect(decision.ok, `expected ${cap} to be granted`).toBe(true);
     }
   });
@@ -349,7 +352,7 @@ describe("InMemoryCapabilityStore (Stage 18 v1.1.2 #23, ADR-0001)", () => {
       capability: knownToken,
       capability_type: "trust_promotion",
       requestContext: ctx
-    });
+    }, "admin");
     expect(decision.ok).toBe(true);
   });
 

@@ -40,6 +40,7 @@ import {
   runWithIdempotentMutation,
   tryReplayOnly
 } from "./idempotency.js";
+import type { ToolProfile } from "../tools/profile.js";
 import {
   activeEntriesFor,
   appendAudit,
@@ -109,7 +110,19 @@ export type WriteContext = {
    * write. The default (when this is omitted) is a
    * fail-closed store that always denies.
    */
-  capabilityStore?: CapabilityStore | { authorize(input: AuthorizationRequest): AuthorizationDecision };
+  capabilityStore?: CapabilityStore | { authorize(input: AuthorizationRequest, profile?: ToolProfile): AuthorizationDecision };
+  /**
+   * v1.1.3 GATE-02 (issue #32): the active
+   * tool profile. The write service
+   * threads the profile through to every
+   * `authorize(...)` call so the
+   * `profile_required: "admin"` gate is
+   * evaluated against the ACTIVE profile
+   * (not a process-wide constant). Legacy
+   * call sites that omit the field
+   * default to `"core"` (fail-closed).
+   */
+  activeProfile?: ToolProfile;
   /** Returns the configured project scope (or creates one with default budget). */
   configureProjectBudget: (
     project_id: string,
@@ -152,11 +165,24 @@ export class MemoryWriteService {
         capability_type: capabilityType
       };
     }
-    const decision = store.authorize({
-      capability,
-      capability_type: capabilityType,
-      requestContext: ctx ?? buildEmptyRequestContext()
-    });
+    const decision = store.authorize(
+      {
+        capability,
+        capability_type: capabilityType,
+        requestContext: ctx ?? buildEmptyRequestContext()
+      },
+      // v1.1.3 GATE-02 (issue #32): thread
+      // the active profile through the
+      // authorization gate. The capability
+      // type's `profile_required` flag is
+      // evaluated against THIS profile
+      // (the per-process active profile,
+      // NOT a constant). Legacy call sites
+      // without `activeProfile` default to
+      // `"core"` so the fail-closed contract
+      // is preserved.
+      this.ctx.activeProfile ?? "core"
+    );
     if (decision.ok) return { ok: true };
     return {
       ok: false,
