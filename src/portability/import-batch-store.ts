@@ -102,6 +102,40 @@ export type ImportBatchCounts = {
 };
 
 /**
+ * v1.1.3 GATE-01 (issue #31): the audit metadata
+ * envelope recorded on every applied batch. The apply
+ * phase threads a per-batch summary (currently the
+ * identity-revalidation outcome; future lanes may add
+ * more keys without breaking the shape). The shape is
+ * additive: every key is optional and a missing key
+ * means "not applicable / not recorded".
+ */
+export type ImportBatchAuditMetadata = {
+  /**
+   * The identity-revalidation result captured by
+   * `applyImport`'s in-transaction re-validation
+   * step (see `src/portability/importer.ts`). A
+   * clean apply records `outcome: "ok"` with an
+   * empty conflicts array; a forced-drift apply
+   * records `outcome: "drift"` BEFORE the rollback
+   * (the metadata is attached via the
+   * `complete(...)` call's `auditMetadata`
+   * argument; a failed apply that throws before
+   * `complete(...)` is reached never records this
+   * key — the failure audit lives in the
+   * `failure_code` column).
+   */
+  identity_revalidation?: {
+    outcome: "ok" | "drift";
+    conflicts: Array<{
+      project_id: string;
+      expected_path: string;
+      observed_path: string | "absent";
+    }>;
+  };
+};
+
+/**
  * The redacted operator-readable record. The
  * `ImportBatchStore.inspect(...)` read returns this
  * shape (never the raw `import_batches` row): the
@@ -135,6 +169,15 @@ export type ImportBatchRow = {
   failure_code: string | null;
   counts: ImportBatchCounts;
   affected_ids: string[];
+  /**
+   * v1.1.3 GATE-01 (issue #31): the decoded
+   * audit-metadata envelope. The default `{}`
+   * decodes to an empty object so the
+   * `inspect(...)` contract stays backwards
+   * compatible (the field is optional on the
+   * type and empty `{}` decodes cleanly).
+   */
+  audit_metadata: ImportBatchAuditMetadata;
 };
 
 const DEFAULT_COUNTS: ImportBatchCounts = {
@@ -224,14 +267,40 @@ export class ImportBatchStore {
    * can grep the JSON for any memory id without
    * round-tripping through the import's per-entry
    * metadata.
+   *
+   * v1.1.3 GATE-01 (issue #31): the optional
+   * `auditMetadata` argument is JSON-encoded into
+   * `audit_metadata_json`. The current caller
+   * (`applyImport`) threads the identity
+   * revalidation outcome; future lanes may add
+   * more keys without breaking the shape. A
+   * missing / undefined `auditMetadata` defaults
+   * to `{}` so the legacy callers (and tests
+   * that exercise the basic lifecycle without
+   * audit metadata) keep working unchanged.
    */
-  complete(batchId: string, counts: ImportBatchCounts, affectedIds: string[]): void {
+  complete(
+    batchId: string,
+    counts: ImportBatchCounts,
+    affectedIds: string[],
+    /**
+     * v1.1.3 GATE-01 (issue #31): the audit
+     * metadata envelope recorded on the
+     * `completed` row. When the apply transaction
+     * records an identity-revalidation outcome,
+     * the metadata surfaces it; an empty object
+     * is the default.
+     */
+    auditMetadata?: ImportBatchAuditMetadata
+  ): void {
     const normalised = normaliseCounts(counts);
+    const metadataJson = JSON.stringify(auditMetadata ?? {});
     this.store.markImportBatchCompleted(
       batchId,
       nowIso(),
       JSON.stringify(normalised),
-      JSON.stringify(affectedIds)
+      JSON.stringify(affectedIds),
+      metadataJson
     );
   }
 
@@ -243,9 +312,18 @@ export class ImportBatchStore {
    * idempotent: a row already in `failed` is left
    * alone (no further status change is needed; a retry
    * would mint a new `import_batch_id`).
+   *
+   * v1.1.3 GATE-01 (issue #31): the optional
+   * `auditMetadata` is recorded on the `failed` row
+   * so a reviewer can see WHY the apply refused
+   * (the identity drift envelope, for example). The
+   * metadata persists even when the mutations rolled
+   * back — it lives on the `failed` row, which is
+   * the canonical failure surface.
    */
-  fail(batchId: string, failureCode: string): void {
-    this.store.markImportBatchFailed(batchId, nowIso(), failureCode);
+  fail(batchId: string, failureCode: string, auditMetadata?: ImportBatchAuditMetadata): void {
+    const metadataJson = auditMetadata === undefined ? undefined : JSON.stringify(auditMetadata);
+    this.store.markImportBatchFailed(batchId, nowIso(), failureCode, metadataJson);
   }
 
   /**
@@ -265,6 +343,14 @@ export class ImportBatchStore {
     if (row === undefined) return undefined;
     const counts = parseCounts(row.counts_json);
     const affectedIds = parseAffectedIds(row.affected_ids_json);
+    // v1.1.3 GATE-01 (issue #31): decode the
+    // `audit_metadata_json` column. The column
+    // defaults to `'{}'` (set by the schema +
+    // `addColumnIfMissing`), so a missing /
+    // malformed payload decodes to an empty
+    // envelope — never to a `null` field on the
+    // inspect record.
+    const auditMetadata = parseAuditMetadata(row.audit_metadata_json ?? "{}");
     return {
       import_batch_id: row.import_batch_id,
       bundle_hash: row.bundle_hash,
@@ -288,7 +374,8 @@ export class ImportBatchStore {
       status: row.status,
       failure_code: row.failure_code,
       counts,
-      affected_ids: affectedIds
+      affected_ids: affectedIds,
+      audit_metadata: auditMetadata
     };
   }
 }
@@ -350,5 +437,69 @@ function parseAffectedIds(json: string): string[] {
     return parsed.filter((v): v is string => typeof v === "string");
   } catch {
     return [];
+  }
+}
+
+/**
+ * v1.1.3 GATE-01 (issue #31): decode the
+ * `audit_metadata_json` column. The decoder is
+ * deliberately permissive: a missing / malformed
+ * payload decodes to `{}` so the `inspect(...)`
+ * contract stays backwards compatible (the field
+ * is on the record but empty when nothing was
+ * recorded). A present-but-malformed payload
+ * silently decodes to an empty envelope so a
+ * downstream consumer doesn't crash on the legacy
+ * rows that pre-date this lane.
+ */
+function parseAuditMetadata(json: string): ImportBatchAuditMetadata {
+  if (json.trim().length === 0) return {};
+  try {
+    const parsed = JSON.parse(json) as unknown;
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    const record = parsed as Record<string, unknown>;
+    const irCandidate = record["identity_revalidation"];
+    if (
+      irCandidate === undefined ||
+      irCandidate === null ||
+      typeof irCandidate !== "object" ||
+      Array.isArray(irCandidate)
+    ) {
+      return {};
+    }
+    const ir = irCandidate as Record<string, unknown>;
+    const outcome = ir["outcome"];
+    if (outcome !== "ok" && outcome !== "drift") return {};
+    const conflictsRaw = ir["conflicts"];
+    if (!Array.isArray(conflictsRaw)) {
+      return { identity_revalidation: { outcome, conflicts: [] } };
+    }
+    type Conflict = {
+      project_id: string;
+      expected_path: string;
+      observed_path: string | "absent";
+    };
+    const conflicts: Conflict[] = [];
+    for (const conflict of conflictsRaw) {
+      if (conflict === null || typeof conflict !== "object" || Array.isArray(conflict)) continue;
+      const c = conflict as Record<string, unknown>;
+      if (
+        typeof c["project_id"] !== "string" ||
+        typeof c["expected_path"] !== "string" ||
+        (typeof c["observed_path"] !== "string" && c["observed_path"] !== "absent")
+      ) {
+        continue;
+      }
+      conflicts.push({
+        project_id: c["project_id"],
+        expected_path: c["expected_path"],
+        observed_path: c["observed_path"]
+      });
+    }
+    return { identity_revalidation: { outcome, conflicts } };
+  } catch {
+    return {};
   }
 }

@@ -284,6 +284,14 @@ describe("release-gate p3-import-batch-lineage (Stage 18 v1.1.2 #26 task 7)", ()
       // No memory body / secret literal on the metadata.
       expect(JSON.stringify(meta)).not.toMatch(/alpha body/);
     }
+    // v1.1.3 GATE-01 (issue #31): the
+    // `audit_metadata.identity_revalidation` key
+    // surfaces the apply-time revalidation outcome
+    // on the `completed` row. A clean apply records
+    // `outcome: "ok"` with an empty conflicts array.
+    expect(batch?.audit_metadata.identity_revalidation).toBeDefined();
+    expect(batch?.audit_metadata.identity_revalidation?.outcome).toBe("ok");
+    expect(batch?.audit_metadata.identity_revalidation?.conflicts).toEqual([]);
   });
 
   // -------------------------------------------------------------
@@ -878,6 +886,142 @@ describe("release-gate p3-import-batch-lineage (Stage 18 v1.1.2 #26 task 7)", ()
     );
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toMatch(/not_found|unknown/i);
+  });
+
+  // -------------------------------------------------------------
+  // 14. v1.1.3 GATE-01 (issue #31): the
+  //     `audit_metadata.identity_revalidation` key surfaces
+  //     `outcome: "drift"` on a forced-drift apply. The
+  //     spy on `store.getProjectIdentity` makes the apply
+  //     transaction's identity revalidation see a
+  //     different `canonical_path`; the apply throws
+  //     `identity_drift`, rolls back the entries, and
+  //     records the drift envelope on the `failed` row.
+  // -------------------------------------------------------------
+  it("forced-drift apply records audit_metadata.identity_revalidation.outcome === 'drift' on the failed row", async () => {
+    const { vi } = await import("vitest");
+    const projectId = "drift-lineage-id";
+    const projectPath = "/tmp/drift-lineage";
+    // Register the same identity on both sides so
+    // the preflight sees a `bound` binding.
+    source.service.configureProjectBudget(
+      projectId,
+      { max_active_entries: 100, max_total_chars: 100_000, max_topic_chars: 30_000, max_index_chars: 25_000 },
+      projectPath,
+      "Drift Lineage"
+    );
+    target.service.configureProjectBudget(
+      projectId,
+      { max_active_entries: 100, max_total_chars: 100_000, max_topic_chars: 30_000, max_index_chars: 25_000 },
+      projectPath,
+      "Drift Lineage"
+    );
+    const seeded = source.service.remember({
+      scope: "project",
+      project_id: projectId,
+      project_path: projectPath,
+      type: "fact",
+      topic: "drift",
+      title: "drift title",
+      body: "drift body",
+      tags: ["drift"],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    });
+    if (!seeded.ok) throw new Error(`seed failed: ${seeded.error}`);
+
+    const live = source.store.listEntries({
+      scope: "project",
+      project_id: projectId,
+      status: "active"
+    });
+    const exportRoot = mkdtempSync(join(tmpdir(), "lm-rg-lineage-drift-export-"));
+    new CanonicalExporter(exportRoot).exportScope({
+      scope: "project",
+      project_id: projectId,
+      entries: live,
+      budgetStatus: `${live.length} active`,
+      format: "json",
+      generated_at: "2026-07-28T00:00:00.000Z"
+    });
+    const exportScopeDir = join(exportRoot, "projects", projectId);
+
+    // Plan first (no drift yet). The preflight sees
+    // a `bound` identity on the target.
+    const plan = planImport(target.service, exportScopeDir, "project", projectId, "json", {
+      conflict: "keep",
+      dry_run: true,
+      actor: "agent:importer"
+    });
+    expect(plan.inserts.length).toBeGreaterThan(0);
+
+    // Spy: every call to `getProjectIdentity` from
+    // now on returns a row with a different
+    // `canonical_path`. The preflight has already
+    // captured the un-drifted value into
+    // `plan.scopes`; the apply revalidation sees the
+    // drift and throws.
+    const original = target.store.getProjectIdentity.bind(target.store);
+    const spy = vi
+      .spyOn(target.store, "getProjectIdentity")
+      .mockImplementation((id: string) => {
+        const real = original(id);
+        if (real === undefined) return undefined;
+        return { ...real, canonical_path: "/tmp/drifted-lineage-path" };
+      });
+
+    // Mint the pending batch row so the apply's
+    // in-transaction `markRunning` / catch-block
+    // `fail(...)` writes land somewhere.
+    const batchStore = new ImportBatchStore(target.store);
+    batchStore.start({
+      import_batch_id: plan.import_batch_id,
+      bundle_hash: plan.bundle_hash,
+      bundle_hash_algorithm: "SHA-256",
+      bundle_version: plan.lineage.bundle_version,
+      bundle_filename: plan.lineage.bundle_filename,
+      bundle_size_bytes: plan.lineage.bundle_size_bytes,
+      source_format: plan.lineage.source_format,
+      source_schema_version: plan.lineage.source_schema_version,
+      target_scope: plan.scope,
+      target_project_id: plan.project_id ?? null,
+      conflict_policy: "keep",
+      history_mode: plan.history_mode,
+      actor_id: "agent:importer"
+    });
+
+    try {
+      let caught: Error | undefined = undefined;
+      try {
+        applyImport(
+          target.service,
+          plan,
+          { conflict: "keep", dry_run: false, actor: "agent:importer" },
+          { batchStore, actor_id: "agent:importer" }
+        );
+      } catch (e) {
+        caught = e as Error;
+      }
+      expect(caught).toBeDefined();
+      expect(caught?.message).toMatch(/identity_drift/);
+    } finally {
+      spy.mockRestore();
+    }
+
+    // The failed batch row carries the drift envelope.
+    const inspectStore = new ImportBatchStore(target.store);
+    const batch = inspectStore.inspect(plan.import_batch_id);
+    expect(batch?.status).toBe("failed");
+    expect(batch?.audit_metadata.identity_revalidation).toBeDefined();
+    expect(batch?.audit_metadata.identity_revalidation?.outcome).toBe("drift");
+    const conflicts = batch?.audit_metadata.identity_revalidation?.conflicts ?? [];
+    expect(conflicts.length).toBeGreaterThan(0);
+    expect(conflicts[0]).toMatchObject({
+      project_id: projectId,
+      expected_path: projectPath,
+      observed_path: "/tmp/drifted-lineage-path"
+    });
   });
 });
 

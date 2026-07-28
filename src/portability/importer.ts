@@ -101,6 +101,7 @@ import type { FullHistoryBundle } from "./canonical-model.js";
 import { FULL_HISTORY_BUNDLE_VERSION } from "./canonical-model.js";
 import {
   ImportBatchStore,
+  type ImportBatchAuditMetadata,
   type ImportBatchCounts
 } from "./import-batch-store.js";
 import type { RequestContext } from "../request-context.js";
@@ -1218,6 +1219,25 @@ export function applyImport(
   // the mutations; the `fail` call is outside the
   // transaction in the catch block so the failure
   // audit persists even after rollback.
+  // v1.1.3 GATE-01 (issue #31): the
+  // identity-revalidation outcome captured during
+  // the apply transaction. On success it carries
+  // `{ outcome: "ok", conflicts: [] }` and is
+  // threaded onto the `complete(...)` call; on
+  // drift it carries `{ outcome: "drift", conflicts }`
+  // and is threaded onto the catch-block
+  // `fail(...)` call so the failure row carries
+  // the envelope for forensic review. The closure
+  // lives outside the `try` so the catch block can
+  // read it after the transaction rolls back. The
+  // initial value is `{ outcome: "ok", conflicts: [] }`
+  // because an apply that has no project scopes
+  // (the global-scope fast-path) trivially passes
+  // the revalidation step — recording it as
+  // `"ok"` is the honest signal.
+  let revalidationOutcome: ImportBatchAuditMetadata = {
+    identity_revalidation: { outcome: "ok", conflicts: [] }
+  };
   try {
     service.store.transaction(() => {
       // Stage 18 v1.1.2 (issue #26, task 7):
@@ -1377,10 +1397,29 @@ export function applyImport(
                 `${d.project_id}: expected=${d.expected_path} observed=${d.observed_path}`
             )
             .join("; ");
+          // v1.1.3 GATE-01 (issue #31): record the
+          // drift envelope on the closure variable
+          // so the catch-block `fail(...)` call
+          // persists it on the failed row. A
+          // reviewer can grep the `failed` row for
+          // `audit_metadata.identity_revalidation`
+          // to see WHY the apply refused (without
+          // parsing the free-form error message).
+          revalidationOutcome = {
+            identity_revalidation: { outcome: "drift", conflicts: drift }
+          };
           throw new Error(
             `identity_drift: identity binding drifted between preflight and apply (${drift.length} scope(s)): ${driftSummary}`
           );
         }
+        // v1.1.3 GATE-01 (issue #31): the
+        // non-drift path records `outcome: "ok"`
+        // so a reviewer can confirm the revalidation
+        // step ran (vs. an empty `{}` metadata that
+        // would mean "not recorded").
+        revalidationOutcome = {
+          identity_revalidation: { outcome: "ok", conflicts: [] }
+        };
       }
       for (const entry of plan.inserts) {
         const normalised: MemoryEntry = {
@@ -1441,7 +1480,19 @@ export function applyImport(
       // transaction.
       if (lineage !== undefined) {
         const counts: ImportBatchCounts = summariseCountsFromPlan(plan);
-        lineage.batchStore.complete(plan.import_batch_id, counts, applied_ids);
+        // v1.1.3 GATE-01 (issue #31): the
+        // identity-revalidation outcome captured
+        // above threads onto the `complete(...)`
+        // call. The `completed` row carries the
+        // audit metadata; an inspector can read it
+        // via `inspect(...)` without parsing the
+        // error path.
+        lineage.batchStore.complete(
+          plan.import_batch_id,
+          counts,
+          applied_ids,
+          revalidationOutcome
+        );
       }
     });
   } catch (e) {
@@ -1450,8 +1501,14 @@ export function applyImport(
       // `running` / `completed` updates have already
       // rolled back; we persist the failure audit so
       // the operator can see why the import failed
-      // and which bundle produced it.
-      lineage.batchStore.fail(plan.import_batch_id, "apply_failed");
+      // and which bundle produced it. The
+      // `revalidationOutcome` closure variable
+      // carries the identity-revalidation envelope
+      // when the throw was an `identity_drift`
+      // (other failure modes carry an empty
+      // envelope — the legacy `apply_failed`
+      // failure_code is unchanged for them).
+      lineage.batchStore.fail(plan.import_batch_id, "apply_failed", revalidationOutcome);
     }
     throw e;
   }
