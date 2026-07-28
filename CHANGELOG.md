@@ -86,14 +86,21 @@ for the full design.
 
 ### Tests
 
-- **`test/release-gate/v113-identity-side-effect-free.test.ts`** (NEW, 9 tests):
-  lookup zero-writes (4 sub-cases: project_id-only /
-    path-only / id+path / unknown path); strict_existing
-    zero-writes (4 sub-cases: same matrix + the
-    `project_identity_conflict` envelope); register-only
-    mutation (happy path + id+path mismatch); cross-platform
-    determinism (Windows case-folded alias + POSIX
-    case-sensitive preservation).
+- **`test/release-gate/v113-identity-side-effect-free.test.ts`**
+  (NEW, 18 tests): lookup zero-writes (4 sub-cases:
+  project_id-only / path-only / id+path / id+path-mismatch);
+  strict_existing zero-writes (4 sub-cases: same matrix +
+  the `project_identity_conflict` envelope); register-only
+  mutation (happy path + id+path mismatch); cross-platform
+  determinism (Windows case-folded alias + POSIX
+  case-sensitive preservation); preflight side-effect free
+  (4 tests capturing BEFORE / AFTER row counts on
+  `project_identities` / `project_aliases_new` /
+  `project_scopes` / `memory_entries` / `memory_revisions` /
+  `audit_events` / `memory_relations` / `memory_provenance`
+  after a rejected preflight); concurrent preflight / apply
+  drift (2 tests using `vi.spyOn(store, "getProjectIdentity")`
+  to force drift + assert zero mutation on the drift path).
 - **`test/release-gate/p1-atomic-import.test.ts`** (extended):
   new `identity_drift` test that forces a resolver override
   mid-apply via a `vi.spyOn(store, "getProjectIdentity")` and
@@ -106,6 +113,22 @@ for the full design.
   new forced-drift test that asserts
   `outcome === "drift"` on the failed batch row with the
   drift envelope attached.
+- **`test/release-gate/p3-import-preflight-budget.test.ts`**
+  (extended): new preflight-side-effect-free test that
+  captures BEFORE / AFTER row counts on the eight
+  project-related + content-related tables after a
+  rejected preflight.
+- **`test/portability-import.test.ts`** (extended): the
+  `fail` policy test now also asserts that a preflight
+  rejection leaves zero rows across the eight canonical
+  tables (project_identities / project_aliases_new /
+  project_scopes / memory_entries / memory_revisions /
+  audit_events / memory_relations / memory_provenance).
+- **`test/release-gate/p3-project-identity-strict.test.ts`**
+  (extended): the `configureProjectBudget registers the
+  identity` test + the `import preflight rejects an
+  unbound project_id per entry` test surface the
+  strict-by-default contract.
 
 ### Known non-blocking limits
 
