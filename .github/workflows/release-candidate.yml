@@ -24,9 +24,17 @@ jobs:
             const parentNumber = 30;
             const childNumbers = [31, 32, 33, 34, 35, 36, 37, 38];
 
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: parentNumber,
+              body: `Native Sub-issues linker started: ${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+            });
+
+            const diagnostics = [];
             for (const childNumber of childNumbers) {
-              const child = await github.rest.issues.get({ owner, repo, issue_number: childNumber });
               try {
+                const child = await github.rest.issues.get({ owner, repo, issue_number: childNumber });
                 await github.request(
                   'POST /repos/{owner}/{repo}/issues/{issue_number}/sub_issues',
                   {
@@ -40,36 +48,43 @@ jobs:
                     },
                   },
                 );
+                diagnostics.push(`#${childNumber}: linked`);
               } catch (error) {
-                if (error.status !== 409 && error.status !== 422) throw error;
+                diagnostics.push(`#${childNumber}: status=${error.status ?? 'unknown'} message=${error.message}`);
               }
             }
 
-            const linked = await github.request(
-              'GET /repos/{owner}/{repo}/issues/{issue_number}/sub_issues',
-              {
-                owner,
-                repo,
-                issue_number: parentNumber,
-                per_page: 100,
-                headers: {
-                  accept: 'application/vnd.github+json',
-                  'X-GitHub-Api-Version': '2026-03-10',
+            let linkedNumbers = [];
+            try {
+              const linked = await github.request(
+                'GET /repos/{owner}/{repo}/issues/{issue_number}/sub_issues',
+                {
+                  owner,
+                  repo,
+                  issue_number: parentNumber,
+                  per_page: 100,
+                  headers: {
+                    accept: 'application/vnd.github+json',
+                    'X-GitHub-Api-Version': '2026-03-10',
+                  },
                 },
-              },
-            );
-            const linkedNumbers = new Set(linked.data.map((issue) => issue.number));
-            const missing = childNumbers.filter((number) => !linkedNumbers.has(number));
-            if (missing.length > 0) {
-              core.setFailed(`Native sub-issue verification failed; missing: ${missing.join(', ')}`);
-              return;
+              );
+              linkedNumbers = linked.data.map((issue) => issue.number);
+            } catch (error) {
+              diagnostics.push(`GET sub_issues: status=${error.status ?? 'unknown'} message=${error.message}`);
             }
 
+            const missing = childNumbers.filter((number) => !linkedNumbers.includes(number));
             await github.rest.issues.createComment({
               owner,
               repo,
               issue_number: parentNumber,
               body:
-                `Native GitHub Sub-issues linked and verified: ${childNumbers.map((n) => `#${n}`).join(', ')}.\n\n` +
-                `Verification workflow: ${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+                `Native Sub-issues linker diagnostics:\n\n${diagnostics.map((line) => `- ${line}`).join('\n')}\n\n` +
+                `Verified linked issues: ${linkedNumbers.map((n) => `#${n}`).join(', ') || '(none)'}.\n` +
+                `Missing: ${missing.map((n) => `#${n}`).join(', ') || '(none)'}.`,
             });
+
+            if (missing.length > 0) {
+              core.setFailed(`Native sub-issue verification failed; missing: ${missing.join(', ')}`);
+            }
