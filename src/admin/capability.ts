@@ -1215,10 +1215,12 @@ export const _INTERNAL = {
   // single source of truth.
   TOKEN_PATTERN: CAPABILITY_TOKEN_SHAPE,
   // The file mode the POSIX path enforces.
-  POSIX_MODE: CAPABILITY_FILE_MODE,
-  // The Windows ACL permission the ACL
-  // helper grants the current user.
-  WINDOWS_RIGHTS: "(R,W)"
+  POSIX_MODE: CAPABILITY_FILE_MODE
+  // The `_INTERNAL.WINDOWS_RIGHTS` constant
+  // was removed in v1.1.3 GATE-02: the value
+  // was stale (it claimed `(R,W)` while the
+  // grant actually issues `(F)`), and the
+  // constant was never referenced by tests.
 };
 
 // Suppress an unused-imports warning for

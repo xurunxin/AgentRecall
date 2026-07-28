@@ -42,7 +42,7 @@ import type { BudgetUsage, EntryFilters, SearchFilters, SQLiteMemoryStore } from
 import { CURRENT_SCHEMA_VERSION } from "./sqlite-store.js";
 import { type RememberInput, type UpdateInput } from "./write-validator.js";
 import { buildRequestContext, type RequestContext } from "./request-context.js";
-import { CapabilityStore } from "./admin/capability.js";
+import { CapabilityStore, InMemoryCapabilityStore } from "./admin/capability.js";
 import type { ToolProfile } from "./tools/profile.js";
 
 // Re-export the public types from the read service so the
@@ -104,7 +104,7 @@ export class MemoryService {
    * the store is absent, all privileged writes are
    * fail-closed.
    */
-  private readonly capabilityStore: CapabilityStore | undefined;
+  private readonly capabilityStore: CapabilityStore | InMemoryCapabilityStore | undefined;
   /**
    * v1.1.3 GATE-02 (issue #32): the active
    * tool profile. Threaded into the read
@@ -140,8 +140,19 @@ export class MemoryService {
      * for the admin commands. The default
      * `undefined` is fail-closed — privileged
      * writes are rejected.
+     *
+     * v1.1.3 GATE-02 (issue #32): the parameter
+     * type is widened to accept either the
+     * persistent `CapabilityStore` (production)
+     * OR the test-only `InMemoryCapabilityStore`
+     * (which has the same `authorize(...)` /
+     * `hasCapability()` / `getPath()` surface).
+     * The runtime consults only the duck-typed
+     * methods so both are valid capability
+     * sources for tests; production callers
+     * always pass a `CapabilityStore`.
      */
-    capabilityStore?: CapabilityStore,
+    capabilityStore?: CapabilityStore | InMemoryCapabilityStore,
     /**
      * v1.1.3 GATE-02 (issue #32): the active
      * tool profile. Defaults to `"core"` so
@@ -226,8 +237,16 @@ export class MemoryService {
   }
 
   /** Stage 18 v1.1.2 (issue #23, ADR-0001): the
-   *  capability store backing this service. */
-  get adminCapabilityStore(): CapabilityStore | undefined {
+   *  capability store backing this service.
+   *
+   *  v1.1.3 GATE-02 (issue #32): the return type
+   *  is widened to include `InMemoryCapabilityStore`
+   *  so test fixtures that pass an in-memory store
+   *  get the same accessor return shape as
+   *  production callers passing a `CapabilityStore`.
+   *  The duck-typed surface (`hasCapability` /
+   *  `getPath` / `authorize`) is identical. */
+  get adminCapabilityStore(): CapabilityStore | InMemoryCapabilityStore | undefined {
     return this.capabilityStore;
   }
 

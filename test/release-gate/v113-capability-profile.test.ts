@@ -236,7 +236,13 @@ describe("activeProfile-scoped visibility (v1.1.3 GATE-02 issue #32)", () => {
       undefined,
       "agent:test",
       dataHome,
-      capabilityStore as never,
+      // v1.1.3 GATE-02 (issue #32): the
+      // MemoryService constructor accepts
+      // either a persistent `CapabilityStore`
+      // (production) or the test-only
+      // `InMemoryCapabilityStore` (which has
+      // the same duck-typed surface).
+      capabilityStore,
       profile
     );
     return service;
