@@ -5,6 +5,124 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [1.1.3] — v1.1.3 GATE-02: profile-scoped admin capability + capability-file permission validation (issue #32)
+
+Issue **#32** tightens the v1.1.2 admin
+boundary. Two v1.1.2 gaps are closed:
+
+the Core-with-cap visibility leak and the
+JSON-only permission validation. The
+contract is: only the Admin-profile process
+with a valid capability gains `"restricted"`
+visibility; a load-time `permission_drift` /
+`acl_drift` / `symlink` / `unsupported_owner`
+surfaces on `status()` without leaking token
+bytes. The per-request capability path is
+preserved as the canonical Core / Extended
+authorization surface for capability types
+without `profile_required`.
+
+### Changed
+
+- `MemoryService` constructor gains an
+  optional `activeProfile: ToolProfile`
+  parameter at position 6 (after
+  `capabilityStore`). Defaults to `"core"`
+  so legacy call sites compile unchanged.
+  The active profile is threaded into the
+  read + write service contexts.
+- `actorMaxSensitivity` is now derived as
+  `(activeProfile === "admin" &&
+  capabilityStore.hasCapability()) ?
+  "restricted" : "normal"`. A Core /
+  Extended process with a valid `admin.cap`
+  in its data home stays at `"normal"`
+  (the v1.1.2 visibility leak is closed).
+- `CapabilityStore` runs a load-time
+  permission validation BEFORE the JSON
+  parse. POSIX: `mode & 0o077 === 0` +
+  owner check + symlink rejection. Windows:
+  an `icacls` ACL probe refuses any
+  non-system non-owner principal
+  (BUILTIN\\Users, Authenticated Users,
+  Everyone, etc.). A drift sets the
+  in-memory token to empty; `status()`
+  surfaces `{kind: "drift", drift_reason,
+  path}` without leaking token bytes.
+
+### Added
+
+- New exported helper
+  `validatePermissionBoundary(path)` for
+  unit-test consumption.
+- `CapabilityStatus` gains
+  `kind: "drift"` + `drift_reason:
+  PermissionDriftReason`. The drift reason
+  is one of `permission_drift` /
+  `acl_drift` / `symlink` /
+  `unsupported_owner`; the underlying `fs`
+  error stays in the log.
+- `CapabilityStore.authorize(input,
+  profile?)` accepts an optional profile.
+  Types with `profile_required: "admin"`
+  (`trust_promotion`,
+  `sensitivity_restricted`,
+  `sensitivity_visibility`) refuse
+  per-request authorization on Core /
+  Extended with
+  `reason: "profile_mismatch"`. Types
+  without `profile_required`
+  (`import_trust_restore`,
+  `import_restricted`) work on every
+  profile.
+- New `AuthorizationDenialReason` member:
+  `"profile_mismatch"`. The CLI's
+  `describeDenialReason` + `admin status`
+  surface stable human-readable
+  remediation messages for every drift
+  reason + every denial reason.
+- `docs/adr/0005-profile-scoped-admin-capability.md`
+  documents the per-profile contract, the
+  load-time permission validation rules,
+  and the v1.1.2 gaps this PR closes.
+- `docs/guides/operator-capability.md`
+  documents the operator-facing grant /
+  status / revoke / forensic flow, the
+  permission requirements, and the
+  per-request authorization recipe.
+
+### Tests
+
+- `test/release-gate/v113-capability-profile.test.ts`
+  (NEW, 16 tests): mode-contract, profile-scoped
+  visibility, per-request authorization,
+  drift surface, constant-time comparison,
+  revoke + restart semantics.
+- `test/admin/capability.test.ts`
+  (extended, +4 tests): the new
+  `validatePermissionBoundary` + the
+  drift envelope surface.
+- `test/release-gate/p3-memory-semantics-mcp.test.ts`
+  (extended, +1 test): a Core process loaded
+  with `admin.cap` STILL surfaces
+  `"normal"` visibility on
+  `memory://health`.
+- `test/blackbox/mcp-all-tools-e2e-core.test.ts`
+  (extended, +1 test): the Core packaged
+  black-box refuses a privileged write even
+  with `admin.cap` on disk.
+
+### Known non-blocking limits
+
+- None. The v1.1.3 / #32 lane closes the
+  Core-with-cap visibility leak AND the
+  JSON-only permission validation gap. The
+  next lane (v1.1.3 GATE-03, sensitivity
+  boundary path) will reference the
+  `profile_required` registry from this
+  lane to enforce the per-row visibility
+  contract at the SQL-boundary filter.
+
 ## [1.1.2] — Stage 18 v1.1.2 release candidate gate (#27, Task 8)
 
 ### Added
