@@ -296,12 +296,16 @@ export class ProjectIdentityResolver {
       // canonicalisation step is best-effort and falls back to
       // the raw path). v1.1.3 GATE-01 (issue #31): the `mode`
       // is forwarded to the helper so the upsert path is
-      // gated by `mode === "register"`. `lookup` mode still
-      // uses the store-less tail for backward compatibility
-      // with the v1.1.0 contract.
-      if (mode === "lookup") {
-        return resolveMemoryScopeWithStore(input, undefined, this.recordedBy, mode);
-      }
+      // gated by `mode === "register"`.
+      // v1.1.3 GATE-01 (issue #31) review fix: lookup mode
+      // for path-supplied calls now ALSO uses the store-aware
+      // path so the lookupIdentity helper can consult the
+      // alias + identity tables and surface
+      // `identity_status: "absent"` for an unknown binding.
+      // The legacy store-less tail was the v1.1.0 contract
+      // (returns ok without `identity_status`); the v1.1.3
+      // contract is "lookup must surface the absent envelope
+      // so the caller can branch on it".
       return resolveMemoryScopeWithStore(input, this.store, this.recordedBy, mode);
     }
     if (input.project_id !== undefined) {
@@ -317,6 +321,29 @@ export class ProjectIdentityResolver {
       // created new project namespaces on first use
       // — that is the default-unbound fallback this
       // task closes.
+      //
+      // v1.1.3 GATE-01 (issue #31): lookup mode returns
+      // `identity_status: "absent"` for an unknown
+      // project_id (vs. invalid_scope). The strict_existing
+      // mode keeps the invalid_scope contract (the v1.1.2
+      // strict-by-default surface).
+      if (mode === "lookup") {
+        const identity = this.store.getProjectIdentity(input.project_id);
+        if (identity === undefined) {
+          return ok({
+            scope: "project",
+            project_id: input.project_id,
+            identity_status: "absent"
+          });
+        }
+        return ok({
+          scope: "project",
+          project_id: input.project_id,
+          project_path: identity.canonical_path,
+          display_name: basename(identity.canonical_path),
+          identity_status: "bound"
+        });
+      }
       const identity = this.store.getProjectIdentity(input.project_id);
       if (identity !== undefined) {
         return ok({
@@ -378,7 +405,14 @@ function lookupIdentity(
   // case-folding contract from Stage 15 PR-M1-2 silently
   // breaks (the alias key is the only place the
   // case-folded lookup hits).
-  if (aliasRow !== undefined) {
+  //
+  // v1.1.3 GATE-01 (issue #31) review fix: an alias that
+  // points to a DIFFERENT project_id than the requested id
+  // surfaces as `identity_status: "absent"` in lookup mode
+  // (best-effort read) rather than as a "bound" envelope
+  // (which would mislead the caller into thinking the
+  // requested id is the bound one).
+  if (aliasRow !== undefined && aliasRow.project_id === requestedId) {
     const aliasedIdentity = store.getProjectIdentity(aliasRow.project_id);
     if (aliasedIdentity !== undefined) {
       return ok({
@@ -399,6 +433,9 @@ function lookupIdentity(
       identity_status: "absent"
     });
   }
+  // Alias mismatch or no alias: the requested id IS
+  // registered, so surface it as bound (the caller asked
+  // for `requestedId` and we found a matching identity).
   return ok({
     scope: "project",
     project_id: requestedId,
@@ -542,11 +579,15 @@ export function resolveMemoryScopeWithStore(
     // Identity / alias lookups shared across all three
     // mode branches. The alias-conflict check applies
     // ONLY when the caller supplied an explicit
-    // `project_id` (a path-only call resolves through
-    // the alias table itself; the alias IS the answer
-    // for a path-only call).
+    // `project_id` AND the mode is strict_existing /
+    // register. `lookup` is a best-effort read: an
+    // alias that points to a different project_id is
+    // surfaced as `identity_status: "absent"` (the
+    // caller can re-resolve via strict_existing if it
+    // needs the conflict surface).
     const aliasRow = store.getProjectAliasByPath(aliasKey(project_path));
     if (
+      mode !== "lookup" &&
       input.project_id !== undefined &&
       aliasRow !== undefined &&
       aliasRow.project_id !== requestedId

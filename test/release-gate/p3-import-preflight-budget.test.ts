@@ -987,4 +987,65 @@ describe("release-gate p3-import-preflight-budget (Stage 18 v1.1.2 #24 task 5)",
     );
     expect(preflight.ok).toBe(true);
   });
+
+  // -------------------------------------------------------------
+  // v1.1.3 GATE-01 (issue #31): preflight side-effect
+  // free on the canonical eight project-related +
+  // content-related tables. A rejected preflight MUST
+  // NOT touch any of:
+  //   project_identities, project_aliases_new,
+  //   project_scopes, memory_entries,
+  //   memory_revisions, audit_events,
+  //   memory_relations, memory_provenance.
+  // The `import_batches` table is excluded because the
+  // preflight never mints a batch row (the lineage
+  // surface is apply-only).
+  // -------------------------------------------------------------
+  function preflightTableSnapshot(store: SQLiteMemoryStore): Record<string, number> {
+    const tables = [
+      "project_identities",
+      "project_aliases_new",
+      "project_scopes",
+      "memory_entries",
+      "memory_revisions",
+      "audit_events",
+      "memory_relations",
+      "memory_provenance"
+    ];
+    const h = store.backupHandle();
+    const out: Record<string, number> = {};
+    for (const t of tables) {
+      const row = h.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number };
+      out[t] = row.n;
+    }
+    return out;
+  }
+
+  it("preflight rejection leaves zero rows across the eight project + content tables", () => {
+    // Build a bundle whose entry targets an unknown
+    // project_id. The preflight refuses with
+    // `identity_conflict`; the rejection must not
+    // touch any of the eight tables.
+    const exportDir = mkdtempSync(join(tmpdir(), "lm-rg-preflight-snap-"));
+    const entry = baseEntry({
+      id: "mem_preflight_snap",
+      scope: "project",
+      project_id: "snap-unknown-proj",
+      project_path: undefined,
+      body: "x",
+      char_count: 1
+    });
+    writeBundle(exportDir, [entry], { scope: "project/snap-unknown-proj" });
+
+    const before = preflightTableSnapshot(store);
+    expect(() =>
+      planImport(service, exportDir, "project", "snap-unknown-proj", "json", {
+        conflict: "keep",
+        dry_run: false,
+        actor: "agent:rg"
+      })
+    ).toThrow(/identity_conflict/);
+    const after = preflightTableSnapshot(store);
+    expect(after).toEqual(before);
+  });
 });

@@ -256,6 +256,97 @@ describe("Import (spec § 6.7)", () => {
     expect(target.peekMemoryById(id)?.title).toBe("Target");
   });
 
+  it("v1.1.3 GATE-01 (#31): preflight rejection leaves zero rows across the eight project + content tables", () => {
+    // The preflight failure path MUST be zero-write. The
+    // contract pins the row counts across the canonical
+    // eight tables (project_identities +
+    // project_aliases_new + project_scopes + memory_entries
+    // + memory_revisions + audit_events + memory_relations
+    // + memory_provenance). The `import_batches` table is
+    // excluded because the preflight never mints a batch
+    // row (the lineage surface is apply-only).
+    const tables = [
+      "project_identities",
+      "project_aliases_new",
+      "project_scopes",
+      "memory_entries",
+      "memory_revisions",
+      "audit_events",
+      "memory_relations",
+      "memory_provenance"
+    ];
+    const h = target.store.backupHandle();
+    const before: Record<string, number> = {};
+    for (const t of tables) {
+      const row = h.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number };
+      before[t] = row.n;
+    }
+    // Seed a source entry that targets a known
+    // project on the SOURCE (so the source can write
+    // it) but is missing on the TARGET (so the
+    // preflight refuses with `identity_conflict`).
+    // This exercises the preflight rejection path
+    // without going through the source-side
+    // `remember` validation gate.
+    const projectId = "fail-zero-rows-known-proj";
+    const projectPath = "/tmp/fail-zero-rows-known-proj";
+    source.configureProjectBudget(projectId, {
+      max_active_entries: 100,
+      max_total_chars: 1_000_000,
+      max_topic_chars: 100_000,
+      max_index_chars: 100_000
+    }, projectPath, "Fail Zero Rows");
+    insertAndGetId({
+      scope: "project",
+      project_id: projectId,
+      project_path: projectPath,
+      type: "lesson",
+      topic: "alpha",
+      title: "Source",
+      body: "Source body",
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3
+    });
+    // Export the project-scope entry (not the
+    // global-only exportSource helper).
+    const projectEntries = sourceStore.listEntries({
+      scope: "project",
+      project_id: projectId,
+      status: "active"
+    });
+    new CanonicalExporter(exportRoot).exportScope({
+      scope: "project",
+      project_id: projectId,
+      format: "json",
+      entries: projectEntries,
+      budgetStatus: "1 active",
+      generated_at: "2026-07-28T00:00:00.000Z"
+    });
+    // Invoke the import targeting a DIFFERENT
+    // (unregistered) project_id so the preflight
+    // refuses with `identity_conflict`.
+    expect(() =>
+      importMemoryExport(
+        target,
+        join(exportRoot, "projects", projectId),
+        "project",
+        "fail-zero-rows-different-proj",
+        "json",
+        { conflict: "fail", dry_run: false, actor: "agent:test" }
+      )
+    ).toThrow(/identity_conflict/);
+    // The preflight rejection is zero-write across all
+    // eight canonical tables.
+    const after: Record<string, number> = {};
+    for (const t of tables) {
+      const row = h.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number };
+      after[t] = row.n;
+    }
+    expect(after).toEqual(before);
+  });
+
   it("manifest hash mismatch refuses the import", () => {
     insertAndGetId({
       scope: "global",
