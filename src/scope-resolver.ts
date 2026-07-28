@@ -73,7 +73,7 @@ export type ScopeInput = {
   project_path?: string;
 };
 
-export type IdentityStatus = "bound" | "unbound";
+export type IdentityStatus = "bound" | "unbound" | "absent";
 
 export type ResolvedScope = {
   scope: MemoryScope;
@@ -96,7 +96,7 @@ export type ResolvedScope = {
   identity_status?: IdentityStatus;
 };
 
-export type ResolveError = "invalid_scope" | "project_identity_conflict" | "invalid_alias";
+export type ResolveError = "invalid_scope" | "project_identity_conflict" | "invalid_alias" | "identity_drift";
 
 /**
  * v1.1.2 (issue #21): default-off legacy escape hatch.
@@ -290,15 +290,23 @@ export class ProjectIdentityResolver {
       return ok({ scope: "global" });
     }
     if (input.project_path) {
-      // Path-supplied calls always go through the
-      // store-aware path. `register` may create an
-      // identity; `lookup` and `strict_existing` never
-      // create one (the canonicalisation step is
-      // best-effort and falls back to the raw path).
-      if (mode === "lookup") {
-        return resolveMemoryScopeWithStore(input, undefined, this.recordedBy);
-      }
-      return resolveMemoryScopeWithStore(input, this.store, this.recordedBy);
+      // Path-supplied calls go through the store-aware path.
+      // `register` may create an identity; `lookup` and
+      // `strict_existing` never create one (the
+      // canonicalisation step is best-effort and falls back to
+      // the raw path). v1.1.3 GATE-01 (issue #31): the `mode`
+      // is forwarded to the helper so the upsert path is
+      // gated by `mode === "register"`.
+      // v1.1.3 GATE-01 (issue #31) review fix: lookup mode
+      // for path-supplied calls now ALSO uses the store-aware
+      // path so the lookupIdentity helper can consult the
+      // alias + identity tables and surface
+      // `identity_status: "absent"` for an unknown binding.
+      // The legacy store-less tail was the v1.1.0 contract
+      // (returns ok without `identity_status`); the v1.1.3
+      // contract is "lookup must surface the absent envelope
+      // so the caller can branch on it".
+      return resolveMemoryScopeWithStore(input, this.store, this.recordedBy, mode);
     }
     if (input.project_id !== undefined) {
       // v1.1.2 (issue #21): strict-by-default. A
@@ -313,6 +321,29 @@ export class ProjectIdentityResolver {
       // created new project namespaces on first use
       // — that is the default-unbound fallback this
       // task closes.
+      //
+      // v1.1.3 GATE-01 (issue #31): lookup mode returns
+      // `identity_status: "absent"` for an unknown
+      // project_id (vs. invalid_scope). The strict_existing
+      // mode keeps the invalid_scope contract (the v1.1.2
+      // strict-by-default surface).
+      if (mode === "lookup") {
+        const identity = this.store.getProjectIdentity(input.project_id);
+        if (identity === undefined) {
+          return ok({
+            scope: "project",
+            project_id: input.project_id,
+            identity_status: "absent"
+          });
+        }
+        return ok({
+          scope: "project",
+          project_id: input.project_id,
+          project_path: identity.canonical_path,
+          display_name: basename(identity.canonical_path),
+          identity_status: "bound"
+        });
+      }
       const identity = this.store.getProjectIdentity(input.project_id);
       if (identity !== undefined) {
         return ok({
@@ -340,10 +371,182 @@ export class ProjectIdentityResolver {
   }
 }
 
+// ---------------------------------------------------------------
+// v1.1.3 GATE-01 (issue #31): the three mode-branch helpers.
+// `resolveMemoryScopeWithStore` dispatches to one of these
+// after the shared pre-checks (global short-circuit,
+// project_id / project_path normalisation, the
+// caller-supplied `project_id` alias-conflict check).
+// Splitting the branches keeps each helper small (~25-40
+// lines) and the public function slim (~70 lines).
+// ---------------------------------------------------------------
+
+type ProjectIdentityRow = NonNullable<ReturnType<SQLiteMemoryStore["getProjectIdentity"]>>;
+type ProjectAliasRow = NonNullable<ReturnType<SQLiteMemoryStore["getProjectAliasByPath"]>>;
+
+/**
+ * Pure-read path for `mode === "lookup"`. Returns the
+ * resolved identity (via the alias table OR the identity
+ * table), or — when nothing matches — an
+ * `identity_status: "absent"` envelope so the caller
+ * knows the binding is not registered. NEVER writes.
+ */
+function lookupIdentity(
+  store: SQLiteMemoryStore,
+  requestedId: string,
+  project_path: string,
+  aliasRow: ProjectAliasRow | undefined,
+  existingIdentity: ProjectIdentityRow | undefined
+): Result<ResolvedScope, ResolveError> {
+  // The alias table is the canonical "this path belongs
+  // to project X" mapping for path-supplied calls; the
+  // identity row holds the *first* registered canonical
+  // path. Without consulting the alias first, the
+  // case-folding contract from Stage 15 PR-M1-2 silently
+  // breaks (the alias key is the only place the
+  // case-folded lookup hits).
+  //
+  // v1.1.3 GATE-01 (issue #31) review fix: an alias that
+  // points to a DIFFERENT project_id than the requested id
+  // surfaces as `identity_status: "absent"` in lookup mode
+  // (best-effort read) rather than as a "bound" envelope
+  // (which would mislead the caller into thinking the
+  // requested id is the bound one).
+  if (aliasRow !== undefined && aliasRow.project_id === requestedId) {
+    const aliasedIdentity = store.getProjectIdentity(aliasRow.project_id);
+    if (aliasedIdentity !== undefined) {
+      return ok({
+        scope: "project",
+        project_id: aliasRow.project_id,
+        project_path: aliasedIdentity.canonical_path,
+        display_name: basename(aliasedIdentity.canonical_path),
+        identity_status: "bound"
+      });
+    }
+  }
+  if (existingIdentity === undefined) {
+    return ok({
+      scope: "project",
+      project_id: requestedId,
+      project_path,
+      display_name: basename(project_path),
+      identity_status: "absent"
+    });
+  }
+  // Alias mismatch or no alias: the requested id IS
+  // registered, so surface it as bound (the caller asked
+  // for `requestedId` and we found a matching identity).
+  return ok({
+    scope: "project",
+    project_id: requestedId,
+    project_path: existingIdentity.canonical_path,
+    display_name: basename(existingIdentity.canonical_path),
+    identity_status: "bound"
+  });
+}
+
+/**
+ * Pure-read path for `mode === "strict_existing"`. Same
+ * shape as `lookupIdentity` but an unknown binding is
+ * mapped to `project_identity_conflict` instead of the
+ * `absent` envelope — strict mode refuses un-registered
+ * paths. NEVER writes.
+ */
+function strictExistingIdentity(
+  store: SQLiteMemoryStore,
+  requestedId: string,
+  project_path: string,
+  aliasRow: ProjectAliasRow | undefined,
+  existingIdentity: ProjectIdentityRow | undefined
+): Result<ResolvedScope, ResolveError> {
+  if (aliasRow !== undefined) {
+    const aliasedIdentity = store.getProjectIdentity(aliasRow.project_id);
+    if (aliasedIdentity !== undefined) {
+      return ok({
+        scope: "project",
+        project_id: aliasRow.project_id,
+        project_path: aliasedIdentity.canonical_path,
+        display_name: basename(aliasedIdentity.canonical_path),
+        identity_status: "bound"
+      });
+    }
+  }
+  if (existingIdentity === undefined) {
+    return err(
+      "project_identity_conflict",
+      `path ${project_path} is not registered to any project identity`,
+      { alias: project_path, requested_project_id: requestedId }
+    );
+  }
+  return ok({
+    scope: "project",
+    project_id: requestedId,
+    project_path: existingIdentity.canonical_path,
+    display_name: basename(existingIdentity.canonical_path),
+    identity_status: "bound"
+  });
+}
+
+/**
+ * The ONLY mutating path. `mode === "register"` upserts
+ * the identity (idempotent on `project_id`), registers
+ * the path alias if missing, and registers a worktree
+ * alias when the path shares a `git rev-parse` head with
+ * the canonical repo. Idempotent on `(project_id,
+ * canonical_path)` per the v1.1.0 contract.
+ */
+function registerIdentity(
+  store: SQLiteMemoryStore,
+  requestedId: string,
+  project_path: string,
+  recordedBy: string,
+  aliasRow: ProjectAliasRow | undefined,
+  existingIdentity: ProjectIdentityRow | undefined
+): Result<ResolvedScope, ResolveError> {
+  const identityUpsert = upsertProjectIdentity(store, requestedId, project_path, recordedBy);
+  // The canonical path is either the one we just
+  // registered (no prior identity) or the existing
+  // identity's path. Use it for the alias row so
+  // worktree-aliases always point back to the canonical
+  // repo.
+  const canonicalForAlias = identityUpsert.canonical_path;
+  if (aliasRow === undefined) {
+    registerAlias(store, aliasKey(project_path), requestedId, canonicalForAlias, "path", recordedBy);
+  }
+  // Worktree handling: if the path is a separate
+  // worktree that shares a git head with the identity,
+  // record the worktree alias. The comparison is
+  // `gitHeadFor(project_path) === gitHeadFor(identity.canonical_path)`.
+  const head = gitHeadFor(project_path);
+  if (head !== undefined && canonicalForAlias !== project_path) {
+    const identityHead = gitHeadFor(canonicalForAlias);
+    if (identityHead !== undefined && identityHead === head) {
+      registerAlias(store, aliasKey(project_path), requestedId, canonicalForAlias, "worktree", recordedBy);
+    }
+  }
+  // The resolver returns the canonical path, not the
+  // caller's raw path.
+  return ok({
+    scope: "project",
+    project_id: requestedId,
+    project_path: canonicalForAlias,
+    display_name: basename(canonicalForAlias),
+    identity_status: "bound"
+  });
+}
+
 export function resolveMemoryScopeWithStore(
   input: ScopeInput,
   store: SQLiteMemoryStore | undefined,
-  recordedBy: string
+  recordedBy: string,
+  // v1.1.3 GATE-01 (issue #31): the resolution mode now
+  // gates the mutating path inside the helper. Pre-#31 the
+  // helper always upserted identity + alias; `lookup` and
+  // `strict_existing` callers therefore inherited an
+  // implicit side effect. The default preserves the legacy
+  // (`"register"`) behaviour for any caller that has not
+  // been updated yet.
+  mode: IdentityResolutionMode = "register"
 ): Result<ResolvedScope, ResolveError> {
   if (input.scope !== "global" && input.scope !== "project") {
     return err("invalid_scope", "scope must be global or project");
@@ -360,64 +563,54 @@ export function resolveMemoryScopeWithStore(
     if (requestedId === undefined) {
       return err("invalid_scope", "project_id must contain letters or numbers");
     }
-    if (store !== undefined) {
-      // Identity lookup: caller-provided `project_id`
-      // against the existing identity row. The
-      // identity's `canonical_path` is set on the
-      // first register and stays immutable; a
-      // subsequent call with the same `project_id`
-      // and a *different* `project_path` adds a new
-      // alias (a symlink, a worktree, a different
-      // branch path), not a new canonical path.
-      const aliasRow = store.getProjectAliasByPath(aliasKey(project_path));
-      if (aliasRow !== undefined && aliasRow.project_id !== requestedId) {
-        return err(
-          "project_identity_conflict",
-          `alias ${project_path} is already bound to project_id=${aliasRow.project_id}, not ${requestedId}`,
-          {
-            alias: project_path,
-            existing_project_id: aliasRow.project_id,
-            requested_project_id: requestedId
-          }
-        );
-      }
-      const identityUpsert = upsertProjectIdentity(store, requestedId, project_path, recordedBy);
-      // The canonical path is either the one we
-      // just registered (no prior identity) or the
-      // existing identity's path. Use it for the
-      // alias row so worktree-aliases always point
-      // back to the canonical repo.
-      const canonicalForAlias = identityUpsert.canonical_path;
-      if (aliasRow === undefined) {
-        registerAlias(store, aliasKey(project_path), requestedId, canonicalForAlias, "path", recordedBy);
-      }
-      // Worktree handling: if the path is a separate
-      // worktree that shares a git head with the
-      // identity, record the worktree alias. The
-      // comparison is `gitHeadFor(project_path) ===
-      // gitHeadFor(identity.canonical_path)`.
-      const head = gitHeadFor(project_path);
-      if (head !== undefined && canonicalForAlias !== project_path) {
-        const identityHead = gitHeadFor(canonicalForAlias);
-        if (identityHead !== undefined && identityHead === head) {
-          registerAlias(store, aliasKey(project_path), requestedId, canonicalForAlias, "worktree", recordedBy);
-        }
-      }
-      // The resolver returns the canonical path, not
-      // the caller's raw path.
+    if (store === undefined) {
+      // Legacy store-less tail: best-effort derivation
+      // with no store consultation. Kept for the
+      // test surface that exercises `resolveMemoryScope`
+      // without an attached store; production callers
+      // always pass `this.store`.
       return ok({
         scope: "project",
         project_id: requestedId,
-        project_path: canonicalForAlias,
-        display_name: basename(canonicalForAlias)
+        project_path,
+        display_name: basename(project_path)
       });
     }
-    return ok({
-      scope: "project",
-      project_id: requestedId,
-      project_path,
-      display_name: basename(project_path)
-    });
+    // Identity / alias lookups shared across all three
+    // mode branches. The alias-conflict check applies
+    // ONLY when the caller supplied an explicit
+    // `project_id` AND the mode is strict_existing /
+    // register. `lookup` is a best-effort read: an
+    // alias that points to a different project_id is
+    // surfaced as `identity_status: "absent"` (the
+    // caller can re-resolve via strict_existing if it
+    // needs the conflict surface).
+    const aliasRow = store.getProjectAliasByPath(aliasKey(project_path));
+    if (
+      mode !== "lookup" &&
+      input.project_id !== undefined &&
+      aliasRow !== undefined &&
+      aliasRow.project_id !== requestedId
+    ) {
+      return err(
+        "project_identity_conflict",
+        `alias ${project_path} is already bound to project_id=${aliasRow.project_id}, not ${requestedId}`,
+        {
+          alias: project_path,
+          existing_project_id: aliasRow.project_id,
+          requested_project_id: requestedId
+        }
+      );
+    }
+    const existingIdentity = store.getProjectIdentity(requestedId);
+    if (mode === "register") {
+      return registerIdentity(store, requestedId, project_path, recordedBy, aliasRow, existingIdentity);
+    }
+    if (mode === "strict_existing") {
+      return strictExistingIdentity(store, requestedId, project_path, aliasRow, existingIdentity);
+    }
+    // mode === "lookup"
+    return lookupIdentity(store, requestedId, project_path, aliasRow, existingIdentity);
   }
   if (input.project_id !== undefined) {
     const project_id = normalizeProjectId(input.project_id);

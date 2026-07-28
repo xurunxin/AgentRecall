@@ -1717,7 +1717,8 @@ export class SQLiteMemoryStore {
           status TEXT NOT NULL CHECK (status IN ('pending','running','completed','failed')),
           failure_code TEXT,
           counts_json TEXT NOT NULL DEFAULT '{}',
-          affected_ids_json TEXT NOT NULL DEFAULT '[]'
+          affected_ids_json TEXT NOT NULL DEFAULT '[]',
+          audit_metadata_json TEXT NOT NULL DEFAULT '{}'
         ) STRICT;
 
         CREATE INDEX IF NOT EXISTS import_batches_status_idx
@@ -1727,6 +1728,22 @@ export class SQLiteMemoryStore {
         CREATE INDEX IF NOT EXISTS import_batches_started_idx
           ON import_batches(started_at);
       `);
+      // v1.1.3 GATE-01 (issue #31): additive
+      // `audit_metadata_json` column for existing v13
+      // databases that pre-date the column. The
+      // CREATE TABLE block above already includes the
+      // column for fresh installs; the
+      // `addColumnIfMissing` call covers databases
+      // that were opened at v13 before the column
+      // existed. The `user_version` stays at 13 (this
+      // lane does not introduce a schema migration —
+      // the column is purely additive and the existing
+      // v13 contract is sufficient).
+      this.addColumnIfMissing(
+        "import_batches",
+        "audit_metadata_json",
+        "TEXT NOT NULL DEFAULT '{}'"
+      );
       this.db.exec("PRAGMA user_version = 13");
       this.db.exec("COMMIT");
     } catch (error) {
@@ -2589,18 +2606,31 @@ export class SQLiteMemoryStore {
     batchId: string,
     completedAt: string,
     countsJson: string,
-    affectedIdsJson: string
+    affectedIdsJson: string,
+    /**
+     * v1.1.3 GATE-01 (issue #31): the optional
+     * audit metadata JSON. Defaults to `{}` when
+     * the caller passes `undefined` so existing
+     * test surface (and any future caller that
+     * does not produce audit metadata) keeps
+     * working without any change. The column is
+     * `NOT NULL DEFAULT '{}'` so an UPDATE that
+     * omits it is a no-op.
+     */
+    auditMetadataJson?: string
   ): void {
+    const metadataJson = auditMetadataJson ?? "{}";
     this.db
       .prepare(
         `UPDATE import_batches
             SET status = 'completed',
                 completed_at = ?,
                 counts_json = ?,
-                affected_ids_json = ?
+                affected_ids_json = ?,
+                audit_metadata_json = ?
           WHERE import_batch_id = ? AND status = 'running'`
       )
-      .run(completedAt, countsJson, affectedIdsJson, batchId);
+      .run(completedAt, countsJson, affectedIdsJson, metadataJson, batchId);
   }
 
   /**
@@ -2613,16 +2643,45 @@ export class SQLiteMemoryStore {
    * row already in `failed` (e.g. the apply path
    * re-ran after a retry) is left alone.
    */
-  markImportBatchFailed(batchId: string, failedAt: string, failureCode: string): void {
+  markImportBatchFailed(
+    batchId: string,
+    failedAt: string,
+    failureCode: string,
+    /**
+     * v1.1.3 GATE-01 (issue #31): the optional
+     * audit metadata JSON. When the apply
+     * transaction throws on identity drift, the
+     * catch block records the drift envelope on
+     * the `failed` row so a reviewer can see WHY
+     * the apply refused (without parsing the
+     * free-form error message). Defaults to
+     * `null` (= no metadata update) so legacy
+     * callers keep their row shape.
+     */
+    auditMetadataJson?: string
+  ): void {
+    if (auditMetadataJson === undefined) {
+      this.db
+        .prepare(
+          `UPDATE import_batches
+              SET status = 'failed',
+                  failed_at = ?,
+                  failure_code = ?
+            WHERE import_batch_id = ? AND status IN ('pending','running')`
+        )
+        .run(failedAt, failureCode, batchId);
+      return;
+    }
     this.db
       .prepare(
         `UPDATE import_batches
             SET status = 'failed',
                 failed_at = ?,
-                failure_code = ?
+                failure_code = ?,
+                audit_metadata_json = ?
           WHERE import_batch_id = ? AND status IN ('pending','running')`
       )
-      .run(failedAt, failureCode, batchId);
+      .run(failedAt, failureCode, auditMetadataJson, batchId);
   }
 
   /**
@@ -2658,6 +2717,7 @@ export class SQLiteMemoryStore {
     failure_code: string | null;
     counts_json: string;
     affected_ids_json: string;
+    audit_metadata_json: string;
   } | undefined {
     return this.db
       .prepare(
@@ -2669,7 +2729,8 @@ export class SQLiteMemoryStore {
                 actor_id, request_id, session_id, tool_call_id,
                 started_at, completed_at, failed_at,
                 status, failure_code,
-                counts_json, affected_ids_json
+                counts_json, affected_ids_json,
+                audit_metadata_json
            FROM import_batches
           WHERE import_batch_id = ?`
       )
@@ -2698,6 +2759,7 @@ export class SQLiteMemoryStore {
           failure_code: string | null;
           counts_json: string;
           affected_ids_json: string;
+          audit_metadata_json: string;
         }
       | undefined;
   }

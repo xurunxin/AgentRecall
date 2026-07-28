@@ -5,6 +5,140 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [1.1.3] — v1.1.3 GATE-01: side-effect-free project identity resolution (issue #31)
+
+Issue **#31** closes the v1.1.2 IDENTITY-CARVE-OUT that
+documented why `applyImport` revalidated revisions + aggregate
+budget inside the apply transaction but deliberately did NOT
+re-call `ProjectIdentityResolver.resolve(..., "strict_existing")`
+inside the transaction. The carve-out was a closed-out
+deliberate decision (closure path (b) of the v1.1.2 / #24
+review by `ora-2`); issue #31 closes it because the v1.1.3
+mode gating on `resolveMemoryScopeWithStore` removes the
+implicit identity / alias side effect that motivated the
+carve-out. See `docs/adr/0004-identity-resolution-modes.md`
+for the full design.
+
+### Changed
+
+- **`ProjectIdentityResolver.resolve(..., mode)`** now
+  actually respects the `mode` argument. `lookup` and
+  `strict_existing` produce **zero database writes** on
+  success and failure; `register` is the only mode allowed
+  to insert into `project_identities` /
+  `project_aliases_new`. The pre-#31 behaviour (silent
+  upsert on every path-supplied call regardless of mode) is
+  gone.
+- **`resolveMemoryScopeWithStore(input, store, recordedBy)`**
+  gained a required `mode: IdentityResolutionMode` parameter
+  (defaulting to `"register"` for backwards compatibility
+  with any un-updated caller). The helper is refactored into
+  three private mode-branch helpers
+  (`lookupIdentity` / `strictExistingIdentity` /
+  `registerIdentity`) so the public function is a thin
+  dispatcher and each branch is independently inspectable.
+  Behaviour is identical for `"register"` mode; the `"lookup"`
+  and `"strict_existing"` branches are the contract change.
+- **`preflightImport`** is now provably side-effect free: an
+  unknown `project_id` / `project_path` leaves zero rows in
+  any project-related table. The preflight populates
+  `plan.scopes` from every project-scoped entry's strict
+  resolver call (deduped via a `(project_id, project_path)`
+  key) so the apply transaction has the canonical binding
+  pairs to re-validate.
+- **`applyImport`** revalidates the identity binding alongside
+  revisions + aggregate-budget checks, all in one
+  transaction. Identity drift between preflight and apply
+  throws `identity_drift` and rolls back the entire batch
+  (entries + revisions + audit + relations + provenance + the
+  `running` / `completed` batch row transitions). The drift
+  envelope is recorded on the failed batch row's
+  `audit_metadata_json` column for forensic review.
+
+### Added
+
+- New `ResolveError` member: `"identity_drift"` (raised only
+  from the apply transaction; the preflight surfaces the
+  legacy `identity_conflict` envelope unchanged).
+- **`ImportBatchRow.audit_metadata.identity_revalidation`**
+  records the revalidation outcome on every applied batch:
+  `{ outcome: "ok" | "drift", conflicts: Array<{project_id,
+  expected_path, observed_path | "absent"}> }`. Surfaced via
+  the `ImportBatchStore.inspect(...)` read AND the
+  `memory://imports/{batch_id}` MCP resource. The additive
+  `audit_metadata_json TEXT NOT NULL DEFAULT '{}'` column on
+  `import_batches` is covered by `addColumnIfMissing` for
+  pre-existing v13 databases; the `user_version` stays at
+  13 (this lane is purely additive; the v1.1.2 schema v13
+  is sufficient).
+- **`docs/adr/0004-identity-resolution-modes.md`** documents
+  the three modes, the canonical registration path, the
+  apply-time revalidation contract, and the v1.1.2 carve-out
+  this PR closes.
+- **`docs/guides/identity-resolution.md`** is the
+  operator-facing guide: how to register a project via the
+  CLI / write service, the three-mode contract in plain
+  language, the legacy escape hatch
+  (`AGENT_RECALL_ALLOW_UNBOUND_PROJECT_ID=1`) and when it is
+  appropriate, and a forensic recipe for tracing forced-drift
+  apply failures via the `audit_metadata.identity_revalidation`
+  envelope.
+
+### Tests
+
+- **`test/release-gate/v113-identity-side-effect-free.test.ts`**
+  (NEW, 18 tests): lookup zero-writes (4 sub-cases:
+  project_id-only / path-only / id+path / id+path-mismatch);
+  strict_existing zero-writes (4 sub-cases: same matrix +
+  the `project_identity_conflict` envelope); register-only
+  mutation (happy path + id+path mismatch); cross-platform
+  determinism (Windows case-folded alias + POSIX
+  case-sensitive preservation); preflight side-effect free
+  (4 tests capturing BEFORE / AFTER row counts on
+  `project_identities` / `project_aliases_new` /
+  `project_scopes` / `memory_entries` / `memory_revisions` /
+  `audit_events` / `memory_relations` / `memory_provenance`
+  after a rejected preflight); concurrent preflight / apply
+  drift (2 tests using `vi.spyOn(store, "getProjectIdentity")`
+  to force drift + assert zero mutation on the drift path).
+- **`test/release-gate/p1-atomic-import.test.ts`** (extended):
+  new `identity_drift` test that forces a resolver override
+  mid-apply via a `vi.spyOn(store, "getProjectIdentity")` and
+  asserts the whole batch rolls back atomically (zero rows
+  in memory_entries / memory_revisions / audit_events /
+  memory_relations / memory_provenance / import_batches).
+- **`test/release-gate/p3-import-batch-lineage.test.ts`** (extended):
+  new `audit_metadata.identity_revalidation.outcome === "ok"`
+  assertion on the existing successful-snapshot test PLUS a
+  new forced-drift test that asserts
+  `outcome === "drift"` on the failed batch row with the
+  drift envelope attached.
+- **`test/release-gate/p3-import-preflight-budget.test.ts`**
+  (extended): new preflight-side-effect-free test that
+  captures BEFORE / AFTER row counts on the eight
+  project-related + content-related tables after a
+  rejected preflight.
+- **`test/portability-import.test.ts`** (extended): the
+  `fail` policy test now also asserts that a preflight
+  rejection leaves zero rows across the eight canonical
+  tables (project_identities / project_aliases_new /
+  project_scopes / memory_entries / memory_revisions /
+  audit_events / memory_relations / memory_provenance).
+- **`test/release-gate/p3-project-identity-strict.test.ts`**
+  (extended): the `configureProjectBudget registers the
+  identity` test + the `import preflight rejects an
+  unbound project_id per entry` test surface the
+  strict-by-default contract.
+
+### Known non-blocking limits
+
+- None. The v1.1.3 / #31 lane closes the v1.1.2
+  IDENTITY-CARVE-OUT. The next lane (v1.1.3 GATE-02) will
+  open new work on the sensitivity-boundary surface
+  (issue #33); the ADR + operator guide will land first so
+  the lane-2 contract references the same `register` /
+  `strict_existing` / `lookup` language.
+
 ## [1.1.2] — Stage 18 v1.1.2 release candidate gate (#27, Task 8)
 
 ### Added
