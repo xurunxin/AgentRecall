@@ -751,26 +751,29 @@ describe("MCP all-tools black-box E2E - Core profile (v1.1.2 #22 Task 3 follow-u
     // path: the tool surface is `confirm_memory_trust`
     // (not exposed on Core) — but we exercise
     // the service-level gate by attempting a
-    // `trust_level: "user_confirmed"` write. The
-    // service rejects at the validation gate
-    // because the capability path returns
+    // `trust_level: "user_confirmed"` write with
+    // the schema-required `user_confirmed: true`
+    // flag. The schema accepts (the flag is
+    // present); the service-level auth gate then
+    // fires and the capability check returns
     // `profile_mismatch` (Core != admin).
     const probe = await callTool(client, "remember", rememberArgs({
       title: "core-cap-probe",
       body: "should be rejected",
       topic: "core-cap-probe",
-      trust_level: "user_confirmed"
+      trust_level: "user_confirmed",
+      user_confirmed: true,
+      capability: "c".repeat(64)
     }));
     expect(probe.isError).toBe(true);
     const code = failureCode(probe);
-    // The Core path returns either
-    // `profile_mismatch` (when the token is
-    // validated against the profile gate) OR
-    // `unauthorized` (when the per-request token
-    // is missing). The exact envelope depends
-    // on whether the call supplied the
-    // capability field; we accept either
-    // stable code as the fail-closed contract.
+    // The Core path returns `profile_mismatch`
+    // (the capability type carries
+    // `profile_required: "admin"` and the
+    // active profile is Core). We accept
+    // `unauthorized` as a fallback (older
+    // envelope that some downstream paths
+    // still emit before the profile gate).
     expect(code).toMatch(/profile_mismatch|unauthorized/);
   });
 });

@@ -835,20 +835,24 @@ describe("MCP all-tools black-box E2E - Extended profile (v1.1.2 #22 Task 3 foll
     expect(v.links.some((l) => l.source_kind === "commit")).toBe(true);
   });
 
-  it("semantics: confirm_memory_trust promotes the seed memory to user_confirmed (with capability)", async () => {
+  it("semantics: confirm_memory_trust rejects on Extended with a per-request token (v1.1.3 GATE-02)", async () => {
     if (client === undefined) throw new Error("client not initialised");
-    // Stage 18 v1.1.2 (issue #23, ADR-0001): the
-    // `confirm_memory_trust` tool now requires an
-    // operator capability. The `beforeAll` hook
-    // pre-installs a valid capability; the test
-    // passes the matching token on the request.
+    // v1.1.3 GATE-02 (issue #32): the
+    // `trust_promotion` capability type carries
+    // `profile_required: "admin"`. The per-request
+    // token path on Extended returns
+    // `profile_mismatch`. The Extended surface
+    // CANNOT promote a memory to
+    // `user_confirmed` via a per-request token;
+    // only the Admin-profile process can.
+    //
+    // The `beforeAll` hook pre-installs a valid
+    // capability (the v1.1.2 surface preserved the
+    // capability file on disk for backward
+    // compatibility). The Extended process loads
+    // the file at startup, but `trust_promotion`
+    // requires the Admin profile.
     const { CapabilityStore } = await import("../../src/admin/capability.js");
-    // `persistent: true` so the on-disk file
-    // is read on construction. The `status()`
-    // surface never returns the raw token; the
-    // test reads it from the file directly
-    // (the canonical CLI / blackbox side
-    // channel).
     const capStore = new CapabilityStore(dataHome!, { persistent: true });
     const onDisk = capStore.status();
     expect(onDisk.kind).toBe("granted");
@@ -860,9 +864,17 @@ describe("MCP all-tools black-box E2E - Extended profile (v1.1.2 #22 Task 3 foll
       trust_level: "user_confirmed",
       user_confirmed: true,
       capability: onDiskJson.token,
-      reason: "blackbox smoke"
+      reason: "extended-per-request-reject"
     });
-    expect(r.isError).toBeFalsy();
+    expect(r.isError).toBe(true);
+    const code = failureCode(r);
+    // The exact envelope: `profile_mismatch` when
+    // the per-request capability is rejected by
+    // the profile gate; `unauthorized` when the
+    // auth path short-circuits before the profile
+    // check. Either is a valid fail-closed
+    // contract on Extended.
+    expect(code).toMatch(/profile_mismatch|unauthorized/);
   });
 
   // ----------------------------------------------------------
