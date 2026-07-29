@@ -119,6 +119,16 @@ export class MemoryService {
    */
   private readonly activeProfile: ToolProfile;
 
+  /**
+   * v1.1.3 GATE-03 (issue #33): the canonical
+   * authorization decision. Held as a private
+   * field so the public façade methods
+   * (`explainProvenance`, `recordProvenance`,
+   * etc.) can consult it without re-deriving
+   * the ceiling on every call.
+   */
+  private readonly authorization!: AuthorizationDecision;
+
   constructor(
     store: SQLiteMemoryStore,
     private readonly exporter?: MarkdownExporter,
@@ -211,6 +221,7 @@ export class MemoryService {
       },
       { kind: "read", restrictedAllowed: false }
     );
+    this.authorization = authorization;
     this.read = new MemoryReadService({
       store,
       defaultActor,
@@ -516,11 +527,22 @@ export class MemoryService {
    * `explain_memory_provenance` MCP tool renders.
    */
   explainProvenance(memory_id: string): ProvenanceExplanation | { ok: false; error: "not_found" } {
-    const entry = this.store.peekEntry(memory_id);
+    // v1.1.3 GATE-03 (issue #33): the
+    // explanation surface is filtered at the
+    // SQL boundary. The peekEntry threads the
+    // canonical authorization decision (the
+    // same decision the read service uses), so
+    // a Core / Extended caller asking for the
+    // provenance of a restricted row sees
+    // `not_found` — the response never leaks
+    // the row's existence or any link
+    // metadata.
+    const ceiling = this.authorization.max_sensitivity;
+    const entry = this.store.peekEntry(memory_id, { actorMaxSensitivity: ceiling });
     if (entry === undefined) {
       return { ok: false, error: "not_found" };
     }
-    return explainProvenance(this.store, memory_id);
+    return explainProvenance(this.store, memory_id, { authorization: this.authorization });
   }
 
   /**
