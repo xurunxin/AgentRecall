@@ -182,24 +182,34 @@ export class MemoryReadService {
   }
 
   /**
-   * v1.1.3 GATE-03 (issue #33): the
-   * unrestricted single-row read used by the
-   * write / maintenance paths. The no-options
-   * `peekEntry(id)` overload on the store is
-   * intentionally unrestricted (the CAS
-   * guards need to see every row); this
-   * accessor exists so callers can express
-   * "I am an internal authorized path" without
-   * reaching into the store directly.
+   * v1.1.3 GATE-03 (issue #33): the unrestricted
+   * single-row read used by the write / maintenance
+   * paths. The no-options `peekEntry(id)` overload
+   * on the store is intentionally unrestricted (the
+   * CAS guards need to see every row); this
+   * accessor exists so callers can express "I am an
+   * internal authorized path" without reaching into
+   * the store directly.
    *
-   * The write / maintenance services gate this
-   * on their own authorization: an Admin
-   * profile with a loaded capability may call
-   * it unconditionally; a Core / Extended
-   * service must consult its own decision
-   * before invoking this method.
+   * v1.1.3 GATE-03 review fix (blocking issue 1):
+   * the method is now `private` — the public
+   * surface must not expose an unrestricted
+   * single-row read. The write + maintenance
+   * services access the store directly
+   * (`this.ctx.store.peekEntry(id)` in the write
+   * service) when they need an internal
+   * unrestricted read, and gate the call on their
+   * own authorization decision. A Core / Extended
+   * service must consult its own decision before
+   * accessing the store directly; the read
+   * service does NOT provide a public bypass.
+   *
+   * The method is kept for binary compatibility
+   * with any in-process callers that already
+   * received a reference; it is `private` so
+   * external callers cannot reach it.
    */
-  peekEntryUnrestricted(id: string): import("../domain.js").MemoryEntry | undefined {
+  private peekEntryUnrestricted(id: string): import("../domain.js").MemoryEntry | undefined {
     return this.ctx.store.peekEntry(id);
   }
 
