@@ -225,11 +225,11 @@ export class MarkdownExporter {
     };
   }
 
-  /**
+/**
    * Atomically promote a previously-staged scope to
    * live. The returned handle's `complete()` cleans up
-   * the staging + backup dirs; `rollback()` restores
-   * the previous live export.
+   * the staging + backup dirs; `rollback()` restores the
+   * previous live export.
    */
   publishStagedScope(staged: StagedScopeExport): PublishedScopeExport {
     return this.inner.publishStagedScope({
@@ -258,3 +258,13 @@ export class MarkdownExporter {
     });
   }
 }
+
+/**
+ * v1.1.3 GATE-03 (issue #33): the stable
+ * error code surfaced when a MarkdownExporter
+ * caller asks for a restricted export without
+ * the authorization to see restricted rows.
+ * Callers can branch on this code (the CLI
+ * maps it to exit 1).
+ */
+export const FORBIDDEN_VISIBILITY = "forbidden_visibility" as const;

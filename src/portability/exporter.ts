@@ -118,6 +118,17 @@ export type ExportScopeResult = ScopeFiles & {
    * "full_history"`. Undefined for snapshot exports.
    */
   fullHistoryBundlePath?: string;
+  /**
+   * v1.1.3 GATE-03 (issue #33): the highest
+   * sensitivity tier among the exported entries.
+   * Downstream importers consult this value to
+   * refuse restricted bundles without a capability
+   * token. Undefined when the export filter
+   * excluded every entry (the envelope still
+   * carries the value `"normal"` so the importer
+   * sees a stable surface).
+   */
+  max_sensitivity?: "normal" | "private" | "restricted";
 };
 
 export type StagedScopeExport = ExportScopeResult & {
@@ -154,6 +165,23 @@ function indexFilename(format: ExportFormat): string {
   return INDEX_FILENAMES[format];
 }
 
+/**
+ * v1.1.3 GATE-03 (issue #33): the
+ * sensitivity-tiers present in the export.
+ * Returns the highest tier present; defaults
+ * to `"normal"` when the entry list is empty.
+ */
+function computeMaxSensitivity(
+  entries: ReadonlyArray<Pick<MemoryEntry, "sensitivity">>
+): "normal" | "private" | "restricted" {
+  let max: "normal" | "private" | "restricted" = "normal";
+  for (const entry of entries) {
+    if (entry.sensitivity === "restricted") return "restricted";
+    if (entry.sensitivity === "private") max = "private";
+  }
+  return max;
+}
+
 export class CanonicalExporter {
   constructor(private readonly exportRoot: string) {}
 
@@ -171,7 +199,12 @@ export class CanonicalExporter {
       topicPaths: staged.topicPaths,
       ...(staged.fullHistoryBundlePath !== undefined
         ? { fullHistoryBundlePath: staged.fullHistoryBundlePath }
-        : {})
+        : {}),
+      // v1.1.3 GATE-03 (issue #33): surface the
+      // highest sensitivity tier on the envelope
+      // so the importer can refuse restricted
+      // bundles without re-reading the entries.
+      max_sensitivity: computeMaxSensitivity(staged.canonical.all_entries)
     };
   }
 

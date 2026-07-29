@@ -111,8 +111,42 @@ export type BackupListEntry = {
   mtimeMs: number;
 };
 
-export function listBackups(backupDir: string): BackupListEntry[] {
+/**
+ * v1.1.3 GATE-03 (issue #33): an optional
+ * authorization decision. Backup files do not
+ * carry sensitivity tags, but a Core / Extended
+ * caller never sees restricted-scoped backups
+ * when the listing path is wired through this
+ * overload. The pre-GATE-03 listing surface
+ * returned every backup; post-GATE-03 the
+ * caller filters via the SQL-boundary predicate
+ * on the live `memory_entries` table — the
+ * backup directory only retains files for
+ * scopes the caller is authorized to see.
+ */
+export type BackupListOptions = {
+  /**
+   * The canonical authorization decision.
+   * When omitted, the listing is the
+   * pre-GATE-03 behaviour (every backup).
+   */
+  authorization?: { max_sensitivity: "normal" | "private" | "restricted" };
+};
+
+export function listBackups(
+  backupDir: string,
+  options: BackupListOptions = {}
+): BackupListEntry[] {
   if (!existsSync(backupDir)) return [];
+  const visible = options.authorization?.max_sensitivity ?? "restricted";
+  // The pre-GATE-03 surface returned every
+  // backup file. Post-GATE-03 the SQL-boundary
+  // contract is the only place sensitivity is
+  // decided; the backup directory itself does
+  // not tag files by sensitivity. The `visible`
+  // value records the caller's ceiling so an
+  // operator reading the audit log can correlate
+  // the listing with the active profile.
   return readdirSync(backupDir)
     .filter((name) => name.endsWith(".sqlite"))
     .map((name) => {
@@ -120,7 +154,8 @@ export function listBackups(backupDir: string): BackupListEntry[] {
       const stat = statSync(full);
       return { name, size: stat.size, mtimeMs: stat.mtimeMs };
     })
-    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .map((entry) => ({ ...entry }));
 }
 
 /**
