@@ -39,7 +39,19 @@ export function resolveDataHome(env: NodeJS.ProcessEnv = process.env): string {
 
 export function createService(
   dataHome = resolveDataHome(),
-  options: { capabilityStore?: CapabilityStore } = {}
+  options: { capabilityStore?: CapabilityStore } = {},
+  /**
+   * v1.1.3 GATE-02 (issue #32): the active
+   * tool profile. Defaults to `"core"` so
+   * legacy call sites (test fixtures that
+   * exercise the MCP service without an
+   * `AGENT_RECALL_PROFILE` env var) compile
+   * unchanged. The MCP server entry resolves
+   * the profile via `resolveActiveProfile()`
+   * and threads it through; the CLI keeps
+   * the existing fail-closed behaviour.
+   */
+  activeProfile: ToolProfile = "core"
 ): MemoryService {
   const store = new SQLiteMemoryStore(join(dataHome, "memory.sqlite"));
   const exporter = new MarkdownExporter(join(dataHome, "exports"));
@@ -50,7 +62,8 @@ export function createService(
     exporter,
     resolveActor(undefined),
     dataHome,
-    options.capabilityStore
+    options.capabilityStore,
+    activeProfile
   );
 }
 
@@ -91,7 +104,7 @@ export async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  const service = createService(dataHome, { capabilityStore });
+  const service = createService(dataHome, { capabilityStore }, activeProfile);
   const defaultActor = resolveActor(undefined);
   // v1.1.2 (issue #21): construct one identity
   // resolver per MCP process and share it with the
@@ -135,16 +148,23 @@ export async function main(): Promise<void> {
     identityResolver,
     activeProfile,
     capabilityStore,
-    // Stage 18 v1.1.2 follow-up (review by
-    // ora-8): the per-project single-memory
-    // resource (`memory://project/{id}/memory/
-    // {mid}`) MUST consult the same
-    // SQL-boundary sensitivity filter the
-    // service layer uses. With a loaded
-    // capability the resource layer raises the
-    // value to `"restricted"`; without one it
-    // stays at `"normal"` (fail-closed).
-    actorMaxSensitivity: capabilityStore.hasCapability() === true ? "restricted" : "normal"
+    // v1.1.3 GATE-02 (issue #32): the
+    // SQL-boundary sensitivity filter is now
+    // gated on BOTH the active profile AND
+    // the loaded capability. Only the
+    // Admin-profile process with a valid
+    // capability lifts to `"restricted"`; a
+    // Core / Extended process with a valid
+    // `admin.cap` on disk still sees
+    // `"normal"` (fail-closed by profile).
+    // The contract pins the rule on the
+    // resource layer too so a per-project
+    // single-memory resource cannot leak a
+    // restricted row to a Core client.
+    actorMaxSensitivity:
+      activeProfile === "admin" && capabilityStore.hasCapability() === true
+        ? "restricted"
+        : "normal"
   });
 
   const transport = new StdioServerTransport();

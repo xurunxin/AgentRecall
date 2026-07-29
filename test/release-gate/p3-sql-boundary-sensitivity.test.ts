@@ -72,7 +72,16 @@ function setupWithCapability() {
     undefined,
     "agent:test",
     dataHome,
-    inMemStore as unknown as ConstructorParameters<typeof MemoryService>[4]
+    inMemStore as unknown as ConstructorParameters<typeof MemoryService>[4],
+    // v1.1.3 GATE-02 (issue #32): the
+    // trust_promotion + sensitivity_restricted
+    // capability types require the Admin profile.
+    // The default constructor is fail-closed for
+    // these types on Core / Extended; this helper
+    // opts into the Admin profile so the
+    // happy-path tests can exercise the per-request
+    // capability token.
+    "admin"
   );
   return { service, store, dataHome, knownToken };
 }
@@ -232,7 +241,14 @@ describe("release-gate p3-sql-boundary-sensitivity (follow-up #23 review by ora-
         undefined,
         "agent:test",
         capDataHome,
-        inMemStore as unknown as ConstructorParameters<typeof MemoryService>[4]
+        inMemStore as unknown as ConstructorParameters<typeof MemoryService>[4],
+        // v1.1.3 GATE-02 (issue #32): the
+        // trust_promotion + sensitivity_restricted
+        // capability types require the Admin
+        // profile. This test exercises the
+        // admin path; the Core-with-cap surface
+        // stays at "normal" (the contract pinning).
+        "admin"
       );
       const entry: MemoryEntry = {
         id: "mem_admin_visible",

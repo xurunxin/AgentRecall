@@ -28,7 +28,7 @@
 // primitive is exercised independently of the
 // on-disk persistence layer.
 
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, chmodSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -155,6 +155,11 @@ describe("CapabilityStore (Stage 18 v1.1.2 #23, ADR-0001)", () => {
   it("a fresh store constructed after a previous grant loads the on-disk token", () => {
     const store1 = new CapabilityStore(dataHome, { persistent: true });
     store1.grant({ label: "load-test" });
+    // The previous `grant()` set the POSIX mode
+    // / Windows ACL correctly, so the fresh
+    // store's load-time permission validation
+    // passes without the `skipPermissionCheck`
+    // escape hatch.
     const store2 = new CapabilityStore(dataHome, { persistent: true });
     expect(store2.hasCapability()).toBe(true);
   });
@@ -162,7 +167,19 @@ describe("CapabilityStore (Stage 18 v1.1.2 #23, ADR-0001)", () => {
   it("a malformed on-disk file is treated as missing (fail closed)", () => {
     const fs = require("node:fs") as typeof import("node:fs");
     fs.writeFileSync(join(dataHome, CAPABILITY_FILENAME), "not-json", { mode: 0o600 });
-    const store = new CapabilityStore(dataHome, { persistent: true });
+    // v1.1.3 GATE-02 (issue #32): the load-time
+    // permission validation runs BEFORE the JSON
+    // parse. The unit tests that write files
+    // directly via `writeFileSync({mode: 0o600})`
+    // bypass the canonical `grant()` ACL path, so
+    // the ACL probe would surface drift on
+    // Windows. The `skipPermissionCheck` option
+    // is the documented escape hatch for unit
+    // tests; production callers MUST NOT use it.
+    const store = new CapabilityStore(dataHome, {
+      persistent: true,
+      skipPermissionCheck: true
+    });
     expect(store.hasCapability()).toBe(false);
   });
 
@@ -173,7 +190,10 @@ describe("CapabilityStore (Stage 18 v1.1.2 #23, ADR-0001)", () => {
       JSON.stringify({ token: "not-hex", created_at: new Date().toISOString() }),
       { mode: 0o600 }
     );
-    const store = new CapabilityStore(dataHome, { persistent: true });
+    const store = new CapabilityStore(dataHome, {
+      persistent: true,
+      skipPermissionCheck: true
+    });
     expect(store.hasCapability()).toBe(false);
   });
 });
@@ -198,7 +218,7 @@ describe("CapabilityStore.authorize (Stage 18 v1.1.2 #23, ADR-0001)", () => {
       capability: "0".repeat(64),
       capability_type: "trust_promotion",
       requestContext: ctx
-    });
+    }, "admin");
     expect(decision.ok).toBe(false);
     if (decision.ok) return;
     expect(decision.reason).toBe("capability_missing");
@@ -211,7 +231,7 @@ describe("CapabilityStore.authorize (Stage 18 v1.1.2 #23, ADR-0001)", () => {
       capability: "0".repeat(64),
       capability_type: "trust_promotion",
       requestContext: ctx
-    });
+    }, "admin");
     expect(decision.ok).toBe(false);
     if (decision.ok) return;
     expect(decision.reason).toBe("token_mismatch");
@@ -224,7 +244,7 @@ describe("CapabilityStore.authorize (Stage 18 v1.1.2 #23, ADR-0001)", () => {
       capability: "not-hex",
       capability_type: "trust_promotion",
       requestContext: ctx
-    });
+    }, "admin");
     expect(decision.ok).toBe(false);
     if (decision.ok) return;
     expect(decision.reason).toBe("capability_malformed");
@@ -237,7 +257,7 @@ describe("CapabilityStore.authorize (Stage 18 v1.1.2 #23, ADR-0001)", () => {
       capability: "abcd",
       capability_type: "trust_promotion",
       requestContext: ctx
-    });
+    }, "admin");
     expect(decision.ok).toBe(false);
     if (decision.ok) return;
     expect(decision.reason).toBe("capability_malformed");
@@ -254,7 +274,7 @@ describe("CapabilityStore.authorize (Stage 18 v1.1.2 #23, ADR-0001)", () => {
       // truth.
       capability_type: "made_up_capability" as never,
       requestContext: ctx
-    });
+    }, "admin");
     expect(decision.ok).toBe(false);
     if (decision.ok) return;
     expect(decision.reason).toBe("unsupported_capability_type");
@@ -274,7 +294,7 @@ describe("CapabilityStore.authorize (Stage 18 v1.1.2 #23, ADR-0001)", () => {
       capability: onDiskJson.token,
       capability_type: "trust_promotion",
       requestContext: ctx
-    });
+    }, "admin");
     expect(decision.ok).toBe(true);
   });
 
@@ -292,11 +312,14 @@ describe("CapabilityStore.authorize (Stage 18 v1.1.2 #23, ADR-0001)", () => {
       "import_restricted",
       "sensitivity_visibility"
     ] as const) {
-      const decision = store.authorize({
-        capability: onDiskJson.token,
-        capability_type: cap,
-        requestContext: ctx
-      });
+      const decision = store.authorize(
+        {
+          capability: onDiskJson.token,
+          capability_type: cap,
+          requestContext: ctx
+        },
+        "admin"
+      );
       expect(decision.ok, `expected ${cap} to be granted`).toBe(true);
     }
   });
@@ -329,7 +352,7 @@ describe("InMemoryCapabilityStore (Stage 18 v1.1.2 #23, ADR-0001)", () => {
       capability: knownToken,
       capability_type: "trust_promotion",
       requestContext: ctx
-    });
+    }, "admin");
     expect(decision.ok).toBe(true);
   });
 
@@ -441,5 +464,90 @@ describe("PermissionDriftError (Stage 18 v1.1.2 #23, ADR-0001)", () => {
         // best effort
       }
     }
+  });
+});
+
+// ---------------------------------------------------------------
+// v1.1.3 GATE-02 (issue #32): load-time permission
+// validation. The constructor refuses any file
+// whose permission boundary drifts from the
+// canonical `0o600` (POSIX) / owner-only ACL
+// (Windows) contract; the drift reason surfaces on
+// `status()` without leaking token bytes.
+// ---------------------------------------------------------------
+
+describe("CapabilityStore.validatePermissionBoundary (v1.1.3 GATE-02 issue #32)", () => {
+  let dataHome: string;
+  beforeEach(() => {
+    dataHome = newDataHome();
+  });
+  afterEach(() => {
+    try {
+      rmSync(dataHome, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+  });
+
+  it("POSIX 0o600 owner-only file is accepted", () => {
+    if (process.platform === "win32") return;
+    const path = join(dataHome, CAPABILITY_FILENAME);
+    const body = {
+      token: "a".repeat(64),
+      created_at: new Date().toISOString()
+    };
+    writeFileSync(path, JSON.stringify(body, null, 2), { mode: 0o600 });
+    chmodSync(path, 0o600);
+    const result = (globalThis as { validatePermissionBoundary?: typeof import("../../src/admin/capability.js").validatePermissionBoundary }).validatePermissionBoundary?.(path);
+    // The validator is exported by capability.ts;
+    // the dynamic import above avoids a top-level
+    // circular dependency in the test fixture.
+    expect(result).toEqual({ ok: true });
+  });
+
+  it("POSIX 0o644 group-readable file is rejected with reason:permission_drift", () => {
+    if (process.platform === "win32") return;
+    const path = join(dataHome, CAPABILITY_FILENAME);
+    const body = {
+      token: "b".repeat(64),
+      created_at: new Date().toISOString()
+    };
+    writeFileSync(path, JSON.stringify(body, null, 2), { mode: 0o644 });
+    chmodSync(path, 0o644);
+    // The helper IS exported; the test below
+    // calls it via a dynamic require.
+    const cap = require("../../src/admin/capability.js") as typeof import("../../src/admin/capability.js");
+    const result = cap.validatePermissionBoundary(path);
+    expect(result).toEqual({ ok: false, reason: "permission_drift" });
+  });
+
+  it("POSIX symlink is rejected with reason:symlink", () => {
+    if (process.platform === "win32") return;
+    const target = join(dataHome, "target-cap.txt");
+    writeFileSync(target, { token: "c".repeat(64), created_at: new Date().toISOString() } as never);
+    chmodSync(target, 0o600);
+    const linkPath = join(dataHome, CAPABILITY_FILENAME);
+    symlinkSync(target, linkPath);
+    const cap = require("../../src/admin/capability.js") as typeof import("../../src/admin/capability.js");
+    const result = cap.validatePermissionBoundary(linkPath);
+    expect(result).toEqual({ ok: false, reason: "symlink" });
+  });
+
+  it("CapabilityStore.load() records drift; status() returns kind:'drift' without token bytes", () => {
+    if (process.platform === "win32") return;
+    const path = join(dataHome, CAPABILITY_FILENAME);
+    writeFileSync(path, JSON.stringify({
+      token: "d".repeat(64),
+      created_at: new Date().toISOString()
+    }, null, 2), { mode: 0o644 });
+    chmodSync(path, 0o644);
+    const store = new CapabilityStore(dataHome, { persistent: true });
+    expect(store.hasCapability()).toBe(false);
+    const status = store.status();
+    expect(status.kind).toBe("drift");
+    if (status.kind !== "drift") return;
+    expect(status.drift_reason).toBe("permission_drift");
+    // Status envelope MUST NOT include the token.
+    expect(JSON.stringify(status)).not.toContain("d".repeat(64));
   });
 });

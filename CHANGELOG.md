@@ -5,7 +5,7 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
-## [1.1.3] — v1.1.3 GATE-01: side-effect-free project identity resolution (issue #31)
+## [1.1.3] — v1.1.3 GATE-01 + GATE-02: side-effect-free identity resolution + profile-scoped admin capability (issues #31, #32)
 
 Issue **#31** closes the v1.1.2 IDENTITY-CARVE-OUT that
 documented why `applyImport` revalidated revisions + aggregate
@@ -18,6 +18,19 @@ mode gating on `resolveMemoryScopeWithStore` removes the
 implicit identity / alias side effect that motivated the
 carve-out. See `docs/adr/0004-identity-resolution-modes.md`
 for the full design.
+
+Issue **#32** tightens the v1.1.2 admin boundary. Two
+v1.1.2 gaps are closed: the Core-with-cap visibility leak
+and the JSON-only permission validation. The contract is:
+only the Admin-profile process with a valid capability
+gains `"restricted"` visibility; a load-time
+`permission_drift` / `acl_drift` / `symlink` /
+`unsupported_owner` surfaces on `status()` without leaking
+token bytes. The per-request capability path is preserved
+as the canonical Core / Extended authorization surface for
+capability types without `profile_required`. See
+`docs/adr/0005-profile-scoped-admin-capability.md` for the
+full design.
 
 ### Changed
 
@@ -54,6 +67,24 @@ for the full design.
   `running` / `completed` batch row transitions). The drift
   envelope is recorded on the failed batch row's
   `audit_metadata_json` column for forensic review.
+- **`MemoryService` constructor** gains an optional
+  `activeProfile: ToolProfile` parameter at position 6 (after
+  `capabilityStore`). Defaults to `"core"` so legacy call sites
+  compile unchanged. The active profile is threaded into the
+  read + write service contexts.
+- **`actorMaxSensitivity`** is now derived as
+  `(activeProfile === "admin" && capabilityStore.hasCapability())
+  ? "restricted" : "normal"`. A Core / Extended process with a
+  valid `admin.cap` in its data home stays at `"normal"` (the
+  v1.1.2 visibility leak is closed).
+- **`CapabilityStore`** runs a load-time permission validation
+  BEFORE the JSON parse. POSIX: `mode & 0o077 === 0` + owner
+  check + symlink rejection. Windows: an `icacls` ACL probe
+  refuses any non-system non-owner principal
+  (BUILTIN\\Users, Authenticated Users, Everyone, etc.). A
+  drift sets the in-memory token to empty; `status()` surfaces
+  `{kind: "drift", drift_reason, path}` without leaking token
+  bytes.
 
 ### Added
 
@@ -74,7 +105,7 @@ for the full design.
 - **`docs/adr/0004-identity-resolution-modes.md`** documents
   the three modes, the canonical registration path, the
   apply-time revalidation contract, and the v1.1.2 carve-out
-  this PR closes.
+  this lane closes.
 - **`docs/guides/identity-resolution.md`** is the
   operator-facing guide: how to register a project via the
   CLI / write service, the three-mode contract in plain
@@ -83,8 +114,36 @@ for the full design.
   appropriate, and a forensic recipe for tracing forced-drift
   apply failures via the `audit_metadata.identity_revalidation`
   envelope.
+- New exported helper **`validatePermissionBoundary(path)`** for
+  unit-test consumption.
+- **`CapabilityStatus`** gains `kind: "drift"` + `drift_reason:
+  PermissionDriftReason`. The drift reason is one of
+  `permission_drift` / `acl_drift` / `symlink` /
+  `unsupported_owner`; the underlying `fs` error stays in the
+  log.
+- **`CapabilityStore.authorize(input, profile?)`** accepts an
+  optional profile. Types with `profile_required: "admin"`
+  (`trust_promotion`, `sensitivity_restricted`,
+  `sensitivity_visibility`) refuse per-request authorization
+  on Core / Extended with `reason: "profile_mismatch"`.
+  Types without `profile_required` (`import_trust_restore`,
+  `import_restricted`) work on every profile.
+- New **`AuthorizationDenialReason`** member:
+  `"profile_mismatch"`. The CLI's `describeDenialReason` +
+  `admin status` surface stable human-readable remediation
+  messages for every drift reason + every denial reason.
+- **`docs/adr/0005-profile-scoped-admin-capability.md`**
+  documents the per-profile contract, the load-time
+  permission validation rules, and the v1.1.2 gaps this lane
+  closes.
+- **`docs/guides/operator-capability.md`** documents the
+  operator-facing grant / status / revoke / forensic flow,
+  the permission requirements, and the per-request
+  authorization recipe.
 
 ### Tests
+
+#### v1.1.3 GATE-01 (issue #31)
 
 - **`test/release-gate/v113-identity-side-effect-free.test.ts`**
   (NEW, 18 tests): lookup zero-writes (4 sub-cases:
@@ -110,9 +169,8 @@ for the full design.
 - **`test/release-gate/p3-import-batch-lineage.test.ts`** (extended):
   new `audit_metadata.identity_revalidation.outcome === "ok"`
   assertion on the existing successful-snapshot test PLUS a
-  new forced-drift test that asserts
-  `outcome === "drift"` on the failed batch row with the
-  drift envelope attached.
+  new forced-drift test that asserts `outcome === "drift"`
+  on the failed batch row with the drift envelope attached.
 - **`test/release-gate/p3-import-preflight-budget.test.ts`**
   (extended): new preflight-side-effect-free test that
   captures BEFORE / AFTER row counts on the eight
@@ -130,14 +188,39 @@ for the full design.
   unbound project_id per entry` test surface the
   strict-by-default contract.
 
+#### v1.1.3 GATE-02 (issue #32)
+
+- **`test/release-gate/v113-capability-profile.test.ts`**
+  (NEW, 16 tests): mode-contract, profile-scoped visibility,
+  per-request authorization, drift surface, constant-time
+  comparison, revoke + restart semantics.
+- **`test/admin/capability.test.ts`** (extended, +4 tests):
+  the new `validatePermissionBoundary` + the drift envelope
+  surface.
+- **`test/release-gate/p3-memory-semantics-mcp.test.ts`**
+  (extended, +1 test): a Core process loaded with
+  `admin.cap` STILL surfaces `"normal"` visibility on
+  `memory://health`.
+- **`test/blackbox/mcp-all-tools-e2e-core.test.ts`** (extended,
+  +1 test): the Core packaged black-box refuses a privileged
+  write even with `admin.cap` on disk.
+
 ### Known non-blocking limits
 
-- None. The v1.1.3 / #31 lane closes the v1.1.2
-  IDENTITY-CARVE-OUT. The next lane (v1.1.3 GATE-02) will
-  open new work on the sensitivity-boundary surface
-  (issue #33); the ADR + operator guide will land first so
-  the lane-2 contract references the same `register` /
-  `strict_existing` / `lookup` language.
+- None. The v1.1.3 / #31 + #32 lanes close the v1.1.2
+  IDENTITY-CARVE-OUT, the Core-with-cap visibility leak, and
+  the JSON-only permission validation gap. The next lane
+  (v1.1.3 GATE-03, sensitivity boundary path) will reference
+  the `profile_required` registry from #32 to enforce the
+  per-row visibility contract at the SQL-boundary filter, and
+  the apply-time identity revalidation from #31 to gate every
+  cross-project read and write.
+- **Combined `## [1.1.3]` header** — issue #31 and #32 both
+  open a `## [1.1.3]` section at the head of the unreleased
+  block. The sections have been manually combined under one
+  header during the merge of `feat/v1.1.3-gate-01-identity`
+  + `feat/v1.1.3-gate-02-capability` so the publication
+  record stays one entry per release.
 
 ## [1.1.2] — Stage 18 v1.1.2 release candidate gate (#27, Task 8)
 

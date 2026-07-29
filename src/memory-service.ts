@@ -42,7 +42,8 @@ import type { BudgetUsage, EntryFilters, SearchFilters, SQLiteMemoryStore } from
 import { CURRENT_SCHEMA_VERSION } from "./sqlite-store.js";
 import { type RememberInput, type UpdateInput } from "./write-validator.js";
 import { buildRequestContext, type RequestContext } from "./request-context.js";
-import { CapabilityStore } from "./admin/capability.js";
+import { CapabilityStore, InMemoryCapabilityStore } from "./admin/capability.js";
+import type { ToolProfile } from "./tools/profile.js";
 
 // Re-export the public types from the read service so the
 // existing `import { ListResult, ... } from "../memory-service"`
@@ -103,7 +104,19 @@ export class MemoryService {
    * the store is absent, all privileged writes are
    * fail-closed.
    */
-  private readonly capabilityStore: CapabilityStore | undefined;
+  private readonly capabilityStore: CapabilityStore | InMemoryCapabilityStore | undefined;
+  /**
+   * v1.1.3 GATE-02 (issue #32): the active
+   * tool profile. Threaded into the read
+   * service context so the SQL-boundary
+   * sensitivity filter only lifts to
+   * `"restricted"` when `(activeProfile ===
+   * "admin" && capability loaded)`. Core /
+   * Extended processes NEVER inherit Admin
+   * visibility merely because `admin.cap`
+   * exists in their data home.
+   */
+  private readonly activeProfile: ToolProfile;
 
   constructor(
     store: SQLiteMemoryStore,
@@ -127,8 +140,30 @@ export class MemoryService {
      * for the admin commands. The default
      * `undefined` is fail-closed — privileged
      * writes are rejected.
+     *
+     * v1.1.3 GATE-02 (issue #32): the parameter
+     * type is widened to accept either the
+     * persistent `CapabilityStore` (production)
+     * OR the test-only `InMemoryCapabilityStore`
+     * (which has the same `authorize(...)` /
+     * `hasCapability()` / `getPath()` surface).
+     * The runtime consults only the duck-typed
+     * methods so both are valid capability
+     * sources for tests; production callers
+     * always pass a `CapabilityStore`.
      */
-    capabilityStore?: CapabilityStore
+    capabilityStore?: CapabilityStore | InMemoryCapabilityStore,
+    /**
+     * v1.1.3 GATE-02 (issue #32): the active
+     * tool profile. Defaults to `"core"` so
+     * legacy call sites (test fixtures,
+     * programmatic callers) compile unchanged.
+     * The MCP server entry resolves the profile
+     * via `resolveActiveProfile()` and threads
+     * it through; the CLI default keeps the
+     * existing fail-closed behaviour.
+     */
+    activeProfile: ToolProfile = "core"
   ) {
     const resolveActorFn = (override?: string) => resolveActor(override ?? undefined, process.env);
     const resolveExporterFn = (): MarkdownExporter =>
@@ -144,25 +179,42 @@ export class MemoryService {
     const identityResolver = new ProjectIdentityResolver(store, defaultActor);
 
     this.capabilityStore = capabilityStore;
+    this.activeProfile = activeProfile;
+    // v1.1.3 GATE-02 (issue #32): the
+    // SQL-boundary sensitivity filter is now
+    // gated on BOTH the loaded capability AND
+    // the active profile. Only the
+    // Admin-profile process with a valid
+    // capability lifts to `"restricted"`; Core
+    // / Extended processes stay at `"normal"`
+    // regardless of the on-disk capability.
+    // The `memory://health.active_profile`
+    // resource surfaces the active profile +
+    // capability state so a reviewer can
+    // verify the contract without re-reading
+    // the env vars.
+    const visibilityLifted =
+      activeProfile === "admin" && capabilityStore?.hasCapability() === true;
     this.read = new MemoryReadService({
       store,
       defaultActor,
       identityResolver,
       resolveExporter: resolveExporterFn,
-      // Stage 18 v1.1.2 (issue #23, ADR-0001): the
-      // SQL-boundary sensitivity filter. When a
-      // capability is loaded into the service, the
-      // read service is allowed to surface
-      // `private` and `restricted` rows; without
-      // a capability the fail-closed default
-      // (`"normal"`) hides them.
-      actorMaxSensitivity: capabilityStore?.hasCapability() === true ? "restricted" : "normal"
+      actorMaxSensitivity: visibilityLifted ? "restricted" : "normal",
+      activeProfile
     });
     this.write = new MemoryWriteService({
       store,
       defaultActor,
       identityResolver,
       ...(capabilityStore !== undefined ? { capabilityStore } : {}),
+      // v1.1.3 GATE-02 (issue #32): thread the
+      // active profile so the write service's
+      // `authorize(...)` call can gate
+      // `profile_required: "admin"` capability
+      // types against the per-process
+      // profile.
+      activeProfile,
       configureProjectBudget: (project_id, budget, canonical_path, display_name) =>
         this.configureProjectBudget(project_id, budget, canonical_path, display_name)
     });
@@ -185,8 +237,16 @@ export class MemoryService {
   }
 
   /** Stage 18 v1.1.2 (issue #23, ADR-0001): the
-   *  capability store backing this service. */
-  get adminCapabilityStore(): CapabilityStore | undefined {
+   *  capability store backing this service.
+   *
+   *  v1.1.3 GATE-02 (issue #32): the return type
+   *  is widened to include `InMemoryCapabilityStore`
+   *  so test fixtures that pass an in-memory store
+   *  get the same accessor return shape as
+   *  production callers passing a `CapabilityStore`.
+   *  The duck-typed surface (`hasCapability` /
+   *  `getPath` / `authorize`) is identical. */
+  get adminCapabilityStore(): CapabilityStore | InMemoryCapabilityStore | undefined {
     return this.capabilityStore;
   }
 
@@ -545,15 +605,29 @@ export class MemoryService {
     // `session_id` / `tool_call_id` when
     // available, falling back to a fresh UUID
     // when the caller did not supply a context.
-    const decision = this.capabilityStore.authorize({
-      capability: input.capability,
-      capability_type: "trust_promotion",
-      requestContext: ctx ?? buildRequestContext({
-        ...(input.actor_id !== undefined ? { actor_override: input.actor_id } : {}),
-        client_name: "memory-service",
-        request_id: randomUUID()
-      })
-    });
+    const decision = this.capabilityStore.authorize(
+      {
+        capability: input.capability,
+        capability_type: "trust_promotion",
+        requestContext: ctx ?? buildRequestContext({
+          ...(input.actor_id !== undefined ? { actor_override: input.actor_id } : {}),
+          client_name: "memory-service",
+          request_id: randomUUID()
+        })
+      },
+      // v1.1.3 GATE-02 (issue #32): thread
+      // the active profile so the
+      // `trust_promotion` capability type
+      // (which carries
+      // `profile_required: "admin"`) is
+      // evaluated against the per-process
+      // profile. Legacy test fixtures that
+      // omit `activeProfile` default to
+      // `"core"` and the per-request path
+      // returns `profile_mismatch` (the
+      // fail-closed contract).
+      this.activeProfile
+    );
     if (!decision.ok) {
       const reason = decision.reason;
       appendAudit(this.store, this.defaultActor, {
