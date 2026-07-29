@@ -653,9 +653,9 @@ describe("release-gate p3-release-immutability (Stage 18 #29, Task 10)", () => {
     assert.match(readme, /issue-19-evidence-comment/);
   });
 
-  it("package.json / src/server-version.ts agree on 1.1.2", () => {
+  it("package.json / src/server-version.ts agree on 1.1.3", () => {
     const pkg = JSON.parse(read(packageJsonPath)) as { version: string; private: boolean };
-    assert.equal(pkg.version, "1.1.2");
+    assert.equal(pkg.version, "1.1.3");
     assert.equal(pkg.private, true);
     // The server-version module must read the same
     // value (it walks up looking for a package.json
@@ -682,8 +682,8 @@ describe("release-gate p3-release-immutability (Stage 18 #29, Task 10)", () => {
     try {
       assert.equal(
         result.stdout.trim(),
-        "1.1.2",
-        `serverVersion() must return 1.1.2; got '${result.stdout.trim()}'; stderr='${result.stderr}'`
+        "1.1.3",
+        `serverVersion() must return 1.1.3; got '${result.stdout.trim()}'; stderr='${result.stderr}'`
       );
     } finally {
       try {
@@ -694,14 +694,25 @@ describe("release-gate p3-release-immutability (Stage 18 #29, Task 10)", () => {
     }
   });
 
-  it("p0-cleanup and p0-release-v1 version assertions are updated to 1.1.2 (no || true, no relaxation)", () => {
+  it("p0-cleanup and p0-release-v1 version assertions are updated to 1.1.3 (no || true, no relaxation)", () => {
+    // v1.1.3 GATE-07 (issue #37): the v1.1.3 patch
+    // release over v1.1.2. Both p0-cleanup and p0-release-v1
+    // now lock on the v1.1.3 version; the test description
+    // + assertions track the v1.1.3 bump (the v1.1.2-era
+    // assertions are now `.toBe("1.1.3")`). The
+    // `no || true, no relaxation` invariant is preserved —
+    // a future maintainer who weakens the assertion (e.g.
+    // `.toBe("1.1.3" || "1.1.2")`) is caught by the
+    // `doesNotMatch(/\|\|\s*true/)` line.
     const cleanup = read(join(repoRoot, "test", "release-gate", "p0-cleanup.test.ts"));
     const releaseV1 = read(join(repoRoot, "test", "release-gate", "p0-release-v1.test.ts"));
-    assert.match(cleanup, /1\.1\.2/);
-    assert.match(cleanup, /\.toBe\("1\.1\.2"\)/);
+    assert.match(cleanup, /1\.1\.3/);
+    assert.match(cleanup, /\.toBe\("1\.1\.3"\)/);
+    assert.doesNotMatch(cleanup, /\.toBe\("1\.1\.2"\)/);
     assert.doesNotMatch(cleanup, /\.toBe\("1\.1\.1"\)/);
     assert.doesNotMatch(cleanup, /\|\|\s*true/);
-    assert.match(releaseV1, /\.toBe\("1\.1\.2"\)/);
+    assert.match(releaseV1, /\.toBe\("1\.1\.3"\)/);
+    assert.doesNotMatch(releaseV1, /\.toBe\("1\.1\.2"\)/);
     assert.doesNotMatch(releaseV1, /\.toBe\("1\.1\.1"\)/);
     assert.doesNotMatch(releaseV1, /\|\|\s*true/);
   });

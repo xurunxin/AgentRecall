@@ -496,6 +496,144 @@ critical test skip is a release-blocking event.
   unhandled-rejection / uncaught-exception / exit
   handlers.
 
+## [1.1.3] — v1.1.3 GATE-07: documentation aligned to verified behaviour (issue #37)
+
+The v1.1.3 release is a docs-only lane: every behaviour
+change (#31 / #32 / #33 / #34 / #36) already landed in
+Phase A + B; this lane aligns the operator-facing
+documentation with the verified contract. The
+behaviour is fixed; only the docs move.
+
+### Changed
+
+- **`README.md` rewrite** — every v1.1.3 contract
+  surface is documented with the canonical platform
+  vocabulary (`linux-x64` / `darwin-x64` /
+  `win32-x64`); the v1.1.2-era `windows-x64` token is
+  gone. The canonical entry paths are surfaced
+  everywhere:
+  `dist/src/index.js` for the MCP server +
+  `dist/bin/agent-recall.js` for the CLI; the
+  v1.1.2-era `node dist/index.js` (no `src/` prefix)
+  is gone. The badge URL points at
+  `xurunxin/AgentRecall` (the v1.1.3 home); the
+  v1.1.2-era `xurx/agent-recall` repo URL is gone.
+- **`package.json` + `package-lock.json`** — bumped
+  from `1.1.2` to `1.1.3`. The v1.1.3 release is the
+  canonical patch over v1.1.2; the lock file mirrors
+  the manifest. No dependency change.
+- **`src/cli/index.ts`** — added the canonical
+  `version` subcommand + a `--version` / `-v` flag
+  early-return. The arg-parser already mapped `-v` →
+  `flags.version`; without this early-return the flag
+  fell through to the default `help` command. The
+  dispatch table also gains a `version` entry that
+  prints `serverVersion()`. `HELP_TEXT` documents
+  both the subcommand and the flag. The early-return
+  runs BEFORE the store is constructed so `--version`
+  works on a machine without an existing data home.
+
+### Added
+
+- **`## Installation` section** in README — the
+  canonical-platform artefact + `sha256 -c` verify +
+  extract + `npm install --omit=dev` + run recipe.
+  The archive name embeds the canonical platform
+  token (`linux-x64` / `darwin-x64` / `win32-x64`).
+- **`## Upgrade / Rollback` section** in README —
+  v1.1.2 → v1.1.3 (schema-preserving; the v1.1.2
+  schema v13 is sufficient) + the rollback recipe
+  (restore the v1.1.2 `dist/` from a known-good
+  backup; no data migration needed).
+- **`## Project Identity` section** in README — the
+  three resolution modes (`lookup` /
+  `strict_existing` / `register`), the canonical
+  registration path, the legacy escape hatch
+  (`AGENT_RECALL_ALLOW_UNBOUND_PROJECT_ID=1`), and
+  the cross-link to
+  `docs/adr/0004-identity-resolution-modes.md` +
+  `docs/guides/identity-resolution.md`.
+- **`## Capabilities` section** in README — the
+  profile-scoped visibility contract, the load-time
+  permission validation, the per-request capability
+  path, and the cross-link to
+  `docs/adr/0005-profile-scoped-admin-capability.md` +
+  `docs/guides/operator-capability.md`.
+- **`## Sensitivity` section** in README — the 3×3
+  visibility matrix (3 profiles × 3 sensitivity
+  levels: `normal` / `private` / `restricted`), the
+  single canonical `AuthorizationDecision`, the
+  `FORBIDDEN_VISIBILITY` envelope, and the cross-link
+  to `docs/adr/0006-one-sensitivity-policy.md` +
+  `docs/guides/sensitivity-matrix.md`.
+- **`## Tools (per-profile tool lists)` section** in
+  README — Core (10) / Extended (20) / Admin (20,
+  gated by a valid operator capability).
+- **`## MCP vs CLI` section** in README — the
+  v1.1.3 binary split: `agent-recall-mcp`
+  (`dist/src/index.js`) + `agent-recall`
+  (`dist/bin/agent-recall.js`).
+- **`examples/README.md`** — documents that the
+  `examples/` directory is intentionally empty in
+  v1.1.3; operator-facing examples live in
+  `docs/guides/release-publication.md` and the
+  lifecycle E2E in
+  `test/blackbox/packaged-install.test.ts`. A future
+  release that ships user-facing examples must import
+  from the v1.1.3 entry points.
+- **`test/release-gate/v113-documentation.test.ts`**
+  (NEW, 27 tests across 8 describe blocks) — the
+  documentation contract: canonical entry paths,
+  v1.1.3 ADR cross-links (0004 / 0005 / 0006 / 0007
+  / 0008), canonical platform vocabulary, no
+  v1.1.2-era behavioural claims, badge URL, operator
+  guide cross-links, `## Installation` +
+  `## Upgrade / Rollback` sections.
+- **`test/release-gate/v113-distribution-contract.test.ts`**
+  (NEW, 9 tests across 5 describe blocks) — the
+  distribution contract: `package.json` `files`
+  array, `LICENSE` presence, `dist/src/index.js` +
+  `dist/bin/agent-recall.js` post-build,
+  `src/server-version.ts` resolves to `1.1.3`, the
+  CLI `agent-recall --version` outputs `1.1.3`.
+
+### Tests
+
+- **`v113-documentation.test.ts`** — the suite is
+  RED against the v1.1.2 README (xurx/agent-recall
+  badge, no `## Installation` section, no
+  `## Upgrade / Rollback` section, no v1.1.3 ADR
+  cross-links, the legacy `node dist/index.js` line).
+  The suite is GREEN against the rewritten README.
+- **`v113-distribution-contract.test.ts`** — the
+  suite is RED against v1.1.2 (package.json is
+  `1.1.2`, CLI has no `--version`, `dist/` is empty
+  before build). The suite builds `dist/` in
+  `beforeAll` and is GREEN against v1.1.3.
+- **`p0-cleanup.test.ts` + `p0-release-v1.test.ts` +
+  `p3-release-immutability.test.ts`** — the version
+  assertions track the v1.1.3 bump; the meta-test
+  that pins the cleanup / release-v1 version
+  assertions now pins `1.1.3` instead of `1.1.2`.
+  The `no || true, no relaxation` invariant is
+  preserved.
+
+### Known non-blocking limits
+
+- **`p3-extracted-artifact-lifecycle.test.ts`** has
+  one pre-existing failure unrelated to GATE-07:
+  the suite asserts
+  `release-artifact-hashes-` (with a trailing dash)
+  in `release-candidate.yml`, but the workflow uses
+  `release-artifact-hashes.json` (no trailing dash
+  before `.json`). The regex was tightened in
+  Phase A and the workflow was never patched; the
+  failure is the regression signal for a follow-up
+  to either soften the regex or update the workflow
+  to use the suffixed filename (matching
+  `release.yml`'s `release-artifact-hashes-${SUFFIX}.json`).
+  The fix is outside the GATE-07 docs lane.
+
 ## [1.1.2] — Stage 18 v1.1.2 release candidate gate (#27, Task 8)
 
 ### Added

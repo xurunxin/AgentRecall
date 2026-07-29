@@ -27,6 +27,7 @@ import {
 } from "../services/auth-context.js";
 import { resolveActiveProfile, type ToolProfile } from "../tools/profile.js";
 import { CapabilityStore } from "../admin/capability.js";
+import { serverVersion } from "../server-version.js";
 
 export type CliContext = {
   dataHome: string;
@@ -81,6 +82,7 @@ export const HELP_TEXT = `agent-recall — local memory CLI
 
 Usage:
   agent-recall <command> [options]
+  agent-recall --version      # print server version and exit
 
 Commands:
   list       List memories (default scope: global)
@@ -94,10 +96,12 @@ Commands:
   restore    Restore from a verified backup
   migrate    Run schema migrations
   admin      Manage the operator capability (grant / status / revoke)
+  version    Print the server version (also: --version / -v)
   help       Show this help
 
 Global flags:
   --data-home <path>   Override AGENT_RECALL_HOME / LOCAL_MEMORY_MCP_HOME
+  --version / -v       Print server version and exit
   --json               Output machine-readable JSON
   --no-color           Disable ANSI color
   --color=always|never Override color detection
@@ -107,6 +111,14 @@ type CommandHandler = (ctx: CliContext) => CliResult | Promise<CliResult>;
 
 const dispatch: Record<string, CommandHandler> = {
   help: () => ({ exitCode: 0, stdout: HELP_TEXT, stderr: "" }),
+  // v1.1.3 GATE-07 (issue #37): the canonical
+  // `version` subcommand. The single source of truth
+  // is `src/server-version.ts` (the same value the
+  // MCP handshake + every `meta.server_version`
+  // field surface). `agent-recall --version` /
+  // `agent-recall -v` resolve here too (see the
+  // early-return in `runCli` below).
+  version: () => ({ exitCode: 0, stdout: serverVersion(), stderr: "" }),
   list: listCommand,
   show: showCommand,
   search: searchCommand,
@@ -125,6 +137,18 @@ export async function runCli(
   env: NodeJS.ProcessEnv = process.env
 ): Promise<CliResult> {
   const args = parseArgs(argv);
+  // v1.1.3 GATE-07 (issue #37): handle the bare
+  // `--version` / `-v` flag before any store /
+  // capability / data-home work. The arg-parser
+  // maps `-v` to `flags.version`; without this
+  // early-return the flag would fall through to the
+  // default `help` command and never print the
+  // version. We return BEFORE constructing the
+  // SQLiteMemoryStore so `--version` works on a
+  // machine without an existing data home.
+  if (args.flags["version"] === true) {
+    return { exitCode: 0, stdout: serverVersion(), stderr: "" };
+  }
   const dataHomeOverride = typeof args.flags["data-home"] === "string" ? args.flags["data-home"] : undefined;
   const dataHome = dataHomeOverride ?? resolveDataHome(env);
   // v1.1.3 GATE-03 (issue #33): the CLI derives

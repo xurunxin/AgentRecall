@@ -141,7 +141,7 @@ Re-enable the test (or remove the skip) and re-push.
 ### "scripts/verify-release-evidence.mjs failed"
 
 The aggregated `release-evidence.json` did not pass
-the v1.1.2 contract. Open the artefact in the
+the v1.1.3 contract. Open the artefact in the
 release-aggregate job, locate the field that the
 verifier complained about, and triage.
 
