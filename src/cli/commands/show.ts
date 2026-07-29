@@ -30,7 +30,7 @@ export function showCommand(ctx: CliContext): CliResult {
   // leak by routing through the classifier
   // and removing the sensitivity literal from
   // the deny path entirely.
-  const classification = ctx.store.classifyEntryVisibility(id, { actorMaxSensitivity: "normal" });
+  const classification = ctx.store.classifyEntryVisibility(id, { actorMaxSensitivity: ctx.actorMaxSensitivity });
   if (classification.visibility === "forbidden_visibility") {
     // Stable error code, NO sensitivity literal,
     // NO row payload. The text surface is
@@ -79,7 +79,7 @@ export function showCommand(ctx: CliContext): CliResult {
   // actorMaxSensitivity })` reuses the SQL
   // filter so the read cannot bypass the
   // boundary.
-  const entry = ctx.store.peekEntry(id, { actorMaxSensitivity: "normal" });
+  const entry = ctx.store.peekEntry(id, { actorMaxSensitivity: ctx.actorMaxSensitivity });
   if (entry === undefined) {
     // The classifier said "visible" but the
     // filtered peek returned `undefined`.

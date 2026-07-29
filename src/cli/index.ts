@@ -20,6 +20,13 @@ import { showCommand } from "./commands/show.js";
 import { parseArgs, type ParsedArgs } from "./arg-parser.js";
 import { buildRequestContext, type RequestContext } from "../request-context.js";
 import { randomUUID } from "node:crypto";
+import {
+  resolveAuthorization,
+  type AuthorizationDecision,
+  type SensitivityLevel
+} from "../services/auth-context.js";
+import { resolveActiveProfile, type ToolProfile } from "../tools/profile.js";
+import { CapabilityStore } from "../admin/capability.js";
 
 export type CliContext = {
   dataHome: string;
@@ -47,6 +54,25 @@ export type CliContext = {
    * trail.
    */
   ctx: RequestContext;
+  /**
+   * v1.1.3 GATE-03 (issue #33): the canonical
+   * authorization decision. The CLI derives this
+   * from `AGENT_RECALL_PROFILE` and the loaded
+   * capability once per invocation; every
+   * command consults it before reading or
+   * exporting entries. Defaults to the
+   * fail-closed decision (`max_sensitivity:
+   * "normal"`) so legacy callers stay
+   * compatible.
+   */
+  authorization: AuthorizationDecision;
+  /**
+   * v1.1.3 GATE-03 (issue #33): the derived
+   * `max_sensitivity` string, kept for
+   * backward compatibility with CLI commands
+   * that pre-date the v1.1.3 split.
+   */
+  actorMaxSensitivity: SensitivityLevel;
 };
 
 export type CliResult = { exitCode: 0 | 1 | 2 | 3; stdout: string; stderr: string };
@@ -101,6 +127,25 @@ export async function runCli(
   const args = parseArgs(argv);
   const dataHomeOverride = typeof args.flags["data-home"] === "string" ? args.flags["data-home"] : undefined;
   const dataHome = dataHomeOverride ?? resolveDataHome(env);
+  // v1.1.3 GATE-03 (issue #33): the CLI derives
+  // the canonical authorization decision once per
+  // invocation. The active profile comes from
+  // `AGENT_RECALL_PROFILE` (resolved through
+  // `resolveActiveProfile` so unknown values fail
+  // closed); the capability comes from the
+  // `admin.cap` file when one is installed.
+  // The decision is the single source of truth
+  // for every command; the legacy
+  // `actorMaxSensitivity` string is kept as a
+  // derived helper for callers that pre-date
+  // the v1.1.3 split.
+  const activeProfile: ToolProfile = resolveActiveProfile(env);
+  const capabilityStore = new CapabilityStore(dataHome, { persistent: true });
+  const hasCapability = capabilityStore.hasCapability();
+  const authorization: AuthorizationDecision = resolveAuthorization(
+    { activeProfile, hasCapability },
+    { kind: "read", restrictedAllowed: false }
+  );
   // Stage 18 v1.1.2 third follow-up (Critical #2):
   // wrap the SQLiteMemoryStore construction in
   // try/catch so a corrupted DB, missing schema,
@@ -164,7 +209,15 @@ export async function runCli(
     };
   }
   try {
-    const result = await handler({ dataHome, args, store, identityResolver, ctx });
+    const result = await handler({
+      dataHome,
+      args,
+      store,
+      identityResolver,
+      ctx,
+      authorization,
+      actorMaxSensitivity: authorization.max_sensitivity
+    });
     store.close();
     return result;
   } catch (error) {

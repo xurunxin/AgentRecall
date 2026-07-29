@@ -17,6 +17,7 @@ import { resolveActor } from "./actor.js";
 import { ProjectIdentityResolver } from "./scope-resolver.js";
 import { serverVersion } from "./server-version.js";
 import { CapabilityStore } from "./admin/capability.js";
+import { resolveAuthorization } from "./services/auth-context.js";
 
 export function serverName(): string {
   return "agent-recall";
@@ -148,19 +149,23 @@ export async function main(): Promise<void> {
     identityResolver,
     activeProfile,
     capabilityStore,
-    // v1.1.3 GATE-02 (issue #32): the
-    // SQL-boundary sensitivity filter is now
-    // gated on BOTH the active profile AND
-    // the loaded capability. Only the
-    // Admin-profile process with a valid
-    // capability lifts to `"restricted"`; a
-    // Core / Extended process with a valid
-    // `admin.cap` on disk still sees
-    // `"normal"` (fail-closed by profile).
-    // The contract pins the rule on the
-    // resource layer too so a per-project
-    // single-memory resource cannot leak a
-    // restricted row to a Core client.
+    // v1.1.3 GATE-03 (issue #33): the
+    // canonical authorization decision
+    // replaces the v1.1.2 derived string.
+    // `resolveAuthorization(...)` is the
+    // single source of truth; the resource
+    // layer consults it for every templated
+    // resource. The legacy
+    // `actorMaxSensitivity` string is kept
+    // as a derived helper so pre-GATE-03
+    // callers stay compatible.
+    authorization: resolveAuthorization(
+      {
+        activeProfile,
+        hasCapability: capabilityStore.hasCapability() === true
+      },
+      { kind: "read", restrictedAllowed: false }
+    ),
     actorMaxSensitivity:
       activeProfile === "admin" && capabilityStore.hasCapability() === true
         ? "restricted"

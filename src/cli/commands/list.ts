@@ -16,7 +16,7 @@ export function listCommand(ctx: CliContext): CliResult {
   const updatedSince = flagString(ctx.args, "updated-since");
   const updatedUntil = flagString(ctx.args, "updated-until");
 
-  const filters: Record<string, unknown> = { scope, status, limit, offset };
+  const filters: Record<string, unknown> = { scope, status, limit, offset, actor_max_sensitivity: ctx.actorMaxSensitivity };
   if (projectId !== undefined) filters.project_id = projectId;
   if (actor !== undefined) filters.actor = actor;
   if (since !== undefined) filters.since = since;

@@ -36,6 +36,7 @@ import { ProjectIdentityResolver } from "../scope-resolver.js";
 import { ImportBatchStore } from "../portability/import-batch-store.js";
 import type { ToolProfile } from "../tools/profile.js";
 import type { CapabilityStore } from "../admin/capability.js";
+import type { AuthorizationDecision } from "../services/auth-context.js";
 
 export interface MemoryServerContext {
   readonly store: SQLiteMemoryStore;
@@ -97,6 +98,17 @@ export interface MemoryServerContext {
    * the v1.1.2 follow-up).
    */
   readonly actorMaxSensitivity?: "normal" | "private" | "restricted";
+  /**
+   * v1.1.3 GATE-03 (issue #33): the canonical
+   * authorization decision. Every resource handler
+   * consults this decision; the legacy
+   * `actorMaxSensitivity` string is kept as a derived
+   * helper. Optional for backward compatibility with
+   * callers that pre-date the v1.1.3 split — the
+   * resource defaults to the fail-closed decision when
+   * the field is absent.
+   */
+  readonly authorization?: AuthorizationDecision;
 }
 
 type Variables = Record<string, string | string[] | undefined>;
