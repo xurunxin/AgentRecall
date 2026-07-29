@@ -277,25 +277,30 @@ function validateArtifactDir() {
 function validateEvidence() {
   const evidencePath = join(ARTIFACT_DIR, "release-evidence.json");
   if (!existsSync(evidencePath)) {
-    // The evidence file is optional at prepare-time —
-    // operators may publish before the candidate
-    // workflow runs. We log a warning and move on.
-    log(
-      `release-evidence.json not present in ARTIFACT_DIR; skipping evidence verification (the release-candidate gate will produce it later)`
-    );
-    return;
+    fail("ARTIFACT_DIR is missing required release-evidence.json");
   }
   const verifyScript = join(repoRoot, "scripts", "verify-release-evidence.mjs");
-  const result = spawnSync(process.execPath, [verifyScript, evidencePath], {
+  const result = spawnSync(process.execPath, [verifyScript, "--stable", "--evidence", evidencePath], {
     cwd: repoRoot,
     encoding: "utf8",
     env: { ...process.env, GITHUB_SHA }
   });
   if (result.status !== 0) {
-    fail(
-      `verify-release-evidence.mjs rejected release-evidence.json: ${(result.stderr || "").trim() || "non-zero exit"}`
-    );
+    fail(`verify-release-evidence.mjs rejected release-evidence.json: ${(result.stderr || "").trim() || "non-zero exit"}`);
   }
+  let evidence;
+  try {
+    evidence = JSON.parse(readFileSync(evidencePath, "utf8"));
+  } catch (error) {
+    fail(`release-evidence.json is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (evidence.release_commit !== GITHUB_SHA || evidence.candidate_sha !== GITHUB_SHA) {
+    fail("verified evidence candidate SHA does not match GITHUB_SHA");
+  }
+  if (evidence.release_workflow?.conclusion !== "success") {
+    fail("tag-only release workflow has not succeeded");
+  }
+  return evidence;
 }
 
 function extractKnownLimits(changelogText) {
