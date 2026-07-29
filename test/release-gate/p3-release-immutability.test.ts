@@ -81,7 +81,9 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
-  writeFileSync
+  writeFileSync,
+  rmSync,
+  unlinkSync
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -291,7 +293,7 @@ describe("release-gate p3-release-immutability (Stage 18 #29, Task 10)", () => {
   afterEach(() => {
     for (const dir of tempDirs.splice(0)) {
       try {
-        spawnSync("rm", ["-rf", dir], { cwd: repoRoot });
+        rmSync(dir, { recursive: true, force: true });
       } catch {
         // ignore
       }
@@ -685,11 +687,7 @@ describe("release-gate p3-release-immutability (Stage 18 #29, Task 10)", () => {
       );
     } finally {
       try {
-        spawnSync("rm", ["-f", probePath], {
-          cwd: repoRoot,
-          encoding: "utf8",
-          shell: true
-        });
+        unlinkSync(probePath);
       } catch {
         // ignore
       }
