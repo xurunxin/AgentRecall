@@ -41,6 +41,10 @@ import {
   queryTokens,
   usageFromActiveEntries
 } from "./memory-service-helpers.js";
+import {
+  type AuthorizationDecision,
+  type SensitivityLevel
+} from "./auth-context.js";
 import { RANKING_VERSION, rankRecall, type RankedItem } from "./recall-ranker.js";
 import { detectRisksInEntry } from "../tools/risk-detector.js";
 import { dataOnlyFramingPreamble } from "../tools/data-only-framing.js";
@@ -143,10 +147,61 @@ export type ReadContext = {
    * fixtures that pre-date the v1.1.3 split.
    */
   activeProfile?: ToolProfile;
+  /**
+   * v1.1.3 GATE-03 (issue #33): the
+   * canonical authorization decision.
+   * Every read method consults
+   * `authorization.max_sensitivity` and
+   * threads it into the SQL-boundary
+   * filter. When `authorization` is
+   * unset (legacy callers), the read
+   * service falls back to
+   * `actorMaxSensitivity` for backward
+   * compatibility.
+   */
+  authorization?: AuthorizationDecision;
 };
 
 export class MemoryReadService {
   constructor(private readonly ctx: ReadContext) {}
+
+  /**
+   * v1.1.3 GATE-03 (issue #33): the single
+   * source of truth for the SQL-boundary
+   * sensitivity filter. Reads the canonical
+   * `authorization` decision when present,
+   * falling back to the legacy
+   * `actorMaxSensitivity` string for legacy
+   * callers that pre-date the v1.1.3 split.
+   */
+  private maxSensitivity(): SensitivityLevel {
+    if (this.ctx.authorization !== undefined) {
+      return this.ctx.authorization.max_sensitivity;
+    }
+    return this.ctx.actorMaxSensitivity ?? "normal";
+  }
+
+  /**
+   * v1.1.3 GATE-03 (issue #33): the
+   * unrestricted single-row read used by the
+   * write / maintenance paths. The no-options
+   * `peekEntry(id)` overload on the store is
+   * intentionally unrestricted (the CAS
+   * guards need to see every row); this
+   * accessor exists so callers can express
+   * "I am an internal authorized path" without
+   * reaching into the store directly.
+   *
+   * The write / maintenance services gate this
+   * on their own authorization: an Admin
+   * profile with a loaded capability may call
+   * it unconditionally; a Core / Extended
+   * service must consult its own decision
+   * before invoking this method.
+   */
+  peekEntryUnrestricted(id: string): import("../domain.js").MemoryEntry | undefined {
+    return this.ctx.store.peekEntry(id);
+  }
 
   getMemory(
     id: string,
@@ -180,7 +235,7 @@ export class MemoryReadService {
     // `undefined` — the caller cannot probe
     // whether the row exists.
     const entry = this.ctx.store.peekEntry(id, {
-      actorMaxSensitivity: this.ctx.actorMaxSensitivity ?? "normal"
+      actorMaxSensitivity: this.maxSensitivity()
     });
     return entry === undefined ? undefined : { entry, audit: this.ctx.store.getAuditEvents(id) };
   }
@@ -224,7 +279,7 @@ export class MemoryReadService {
     "not_found" | "forbidden_visibility"
   > {
     const classification = this.ctx.store.classifyEntryVisibility(id, {
-      actorMaxSensitivity: this.ctx.actorMaxSensitivity ?? "normal"
+      actorMaxSensitivity: this.maxSensitivity()
     });
     if (classification.visibility === "not_found") {
       return err("not_found", `memory ${id} not found`, { memory_id: id });
@@ -258,7 +313,7 @@ export class MemoryReadService {
     // cannot bypass the boundary by reading
     // the row a second time.
     const entry = this.ctx.store.peekEntry(id, {
-      actorMaxSensitivity: this.ctx.actorMaxSensitivity ?? "normal"
+      actorMaxSensitivity: this.maxSensitivity()
     });
     if (entry === undefined) {
       // The classifier said "visible" but the
@@ -292,7 +347,7 @@ export class MemoryReadService {
         // caller without the `sensitivity_visibility`
         // capability cannot see `private` or
         // `restricted` rows.
-        actor_max_sensitivity: this.ctx.actorMaxSensitivity ?? "normal"
+        actor_max_sensitivity: this.maxSensitivity()
       })
     };
   }
@@ -329,8 +384,11 @@ export class MemoryReadService {
     // the SQL-boundary sensitivity filter. The
     // default (`"normal"`) is fail-closed; the
     // admin profile overrides via
-    // `ReadContext.actorMaxSensitivity`.
-    const maxSensitivity = this.ctx.actorMaxSensitivity ?? "normal";
+    // `ReadContext.authorization.max_sensitivity`
+    // (v1.1.3 GATE-03). Legacy callers fall
+    // back to the deprecated `actorMaxSensitivity`
+    // string.
+    const maxSensitivity = this.maxSensitivity();
     const projectFtsItems =
       resolved.value.scope === "project"
         ? this.ctx.store.searchEntries({
@@ -432,19 +490,26 @@ export class MemoryReadService {
     }
     const resolvedProjectId = resolved.value.project_id;
     const budget = budgetFor(this.ctx.store, { scope: input.scope, project_id: resolvedProjectId });
-    const usage = this.ctx.store.getBudgetUsage(input);
+    // v1.1.3 GATE-03 (issue #33): the usage
+    // count and the cleanup-candidate scan are
+    // both filtered at the SQL boundary. The
+    // pre-GATE-03 implementation called
+    // `getBudgetUsage(input)` which aggregated
+    // every row in the scope (including
+    // restricted rows); on a Core / Extended
+    // caller this leaked the restricted usage
+    // total. Post-GATE-03 the budget surface
+    // honours the caller's decision: only the
+    // rows the caller can see count against
+    // the budget.
     const activeEntries = this.ctx.store.listEntries({
       scope: input.scope,
       ...(resolvedProjectId !== undefined ? { project_id: resolvedProjectId } : {}),
       status: "active",
       limit: 10_000,
-      // Stage 18 v1.1.2 (issue #23, ADR-0001):
-      // the budget accounting is filtered to the
-      // caller's authorised sensitivity. A
-      // `private` row counts against the budget
-      // only for callers who can see it.
-      actor_max_sensitivity: this.ctx.actorMaxSensitivity ?? "normal"
+      actor_max_sensitivity: this.maxSensitivity()
     });
+    const usage = usageFromActiveEntries(activeEntries);
     return {
       budget,
       usage,
@@ -683,7 +748,7 @@ export class MemoryReadService {
         limit: 10_000,
         // Stage 18 v1.1.2 (issue #23, ADR-0001):
         // SQL-boundary sensitivity filter.
-        actor_max_sensitivity: this.ctx.actorMaxSensitivity ?? "normal"
+        actor_max_sensitivity: this.maxSensitivity()
       });
     }
     return this.activeEntriesForScope(scope);
@@ -705,10 +770,10 @@ export class MemoryReadService {
       ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
       status: "active",
       limit: 10_000,
-      // Stage 18 v1.1.2 (issue #23, ADR-0001):
-      // SQL-boundary sensitivity filter.
-      actor_max_sensitivity: this.ctx.actorMaxSensitivity ?? "normal"
-    });
+// Stage 18 v1.1.2 (issue #23, ADR-0001):
+    // SQL-boundary sensitivity filter.
+    actor_max_sensitivity: this.maxSensitivity()
+  });
   }
 }
 

@@ -44,6 +44,7 @@ import { type RememberInput, type UpdateInput } from "./write-validator.js";
 import { buildRequestContext, type RequestContext } from "./request-context.js";
 import { CapabilityStore, InMemoryCapabilityStore } from "./admin/capability.js";
 import type { ToolProfile } from "./tools/profile.js";
+import { resolveAuthorization, type AuthorizationDecision } from "./services/auth-context.js";
 
 // Re-export the public types from the read service so the
 // existing `import { ListResult, ... } from "../memory-service"`
@@ -195,13 +196,29 @@ export class MemoryService {
     // the env vars.
     const visibilityLifted =
       activeProfile === "admin" && capabilityStore?.hasCapability() === true;
+    // v1.1.3 GATE-03 (issue #33): the canonical
+    // authorization decision. The
+    // `AuthorizationDecision` replaces the v1.1.2
+    // derived string as the single source of
+    // truth; the legacy `actorMaxSensitivity`
+    // string is kept as a derived helper for
+    // backward compatibility with callers that
+    // still take the string.
+    const authorization: AuthorizationDecision = resolveAuthorization(
+      {
+        activeProfile,
+        hasCapability: visibilityLifted
+      },
+      { kind: "read", restrictedAllowed: false }
+    );
     this.read = new MemoryReadService({
       store,
       defaultActor,
       identityResolver,
       resolveExporter: resolveExporterFn,
       actorMaxSensitivity: visibilityLifted ? "restricted" : "normal",
-      activeProfile
+      activeProfile,
+      authorization
     });
     this.write = new MemoryWriteService({
       store,
