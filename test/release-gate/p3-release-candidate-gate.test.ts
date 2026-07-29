@@ -38,8 +38,21 @@ describe("release candidate exact-SHA gate (#27)", () => {
     assert.match(workflow, /^name:\s*Release Candidate Gate\s*$/m);
     assert.match(workflow, /branches:\s*\["rc-\*"\]/);
     assert.match(workflow, /^jobs:\s*$/m);
-    for (const job of ["matrix", "mcp-blackbox-extracted", "verify-artifact-globs", "record-evidence"]) {
-      assert.match(workflow, new RegExp(`^  ${job}:\\s*$`, "m"));
+    // v1.1.3 GATE-06 (issue #36): the monolithic
+    // `matrix` / `mcp-blackbox-extracted` /
+    // `verify-artifact-globs` / `record-evidence`
+    // jobs are replaced by 5 segregated per-suite
+    // jobs + a matrix leg + a release-aggregate job.
+    for (const job of [
+      "matrix",
+      "unit-integration",
+      "mcp-blackbox",
+      "migrations",
+      "stress",
+      "packaged-artifact",
+      "release-aggregate"
+    ]) {
+      assert.match(workflow, new RegExp(`^  ${job}:\\s*$`, "m"), `${job} job must exist in release-candidate.yml`);
     }
     for (const os of ["ubuntu-latest", "macos-latest", "windows-latest"]) {
       assert.match(workflow, new RegExp(`\\b${os}\\b`));
@@ -59,13 +72,23 @@ describe("release candidate exact-SHA gate (#27)", () => {
       assert.ok(workflow.includes(command), `candidate workflow must contain ${command}`);
     }
 
-    assert.match(workflow, /test\/sqlite-store-migration\.test\.ts/);
-    assert.match(workflow, /test\/backup\.test\.ts/);
-    assert.match(workflow, /p3-import-preflight-budget\.test\.ts/);
-    assert.match(workflow, /mcp-all-tools-e2e-core\.test\.ts/);
-    assert.match(workflow, /mcp-all-tools-e2e-extended\.test\.ts/);
-    assert.match(workflow, /admin-default\/mcp-admin-default\.test\.ts/);
-    assert.match(workflow, /p0-cleanup\.test\.ts/);
+    // v1.1.3 GATE-06 (issue #36): the per-suite
+    // vitest configs are wired into the workflow;
+    // the monolithic matrix leg still runs the
+    // default config for cross-OS coverage. The
+    // individual test-file references are now in the
+    // per-suite configs (vitest.<suite>.config.ts),
+    // not in the workflow YAML.
+    for (const config of [
+      "vitest.config.ts",
+      "vitest.blackbox.config.ts",
+      "vitest.migrations.config.ts",
+      "vitest.stress.config.ts",
+      "vitest.packaged-artifact.config.ts"
+    ]) {
+      assert.match(workflow, new RegExp(config.replace(/\./g, "\\.")), `${config} must be referenced by the workflow`);
+    }
+    assert.match(workflow, /AGENT_RECALL_RELEASE_MODE:\s*"1"/);
     assert.match(workflow, /release-evidence\.json/);
     assert.match(workflow, /release-candidate\.json/);
     assert.match(workflow, /if-no-files-found:\s*error/);

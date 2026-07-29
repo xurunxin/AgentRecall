@@ -378,6 +378,124 @@ issues. The lane-owner landed blocker 1 (gating
   the same helper without a second
   implementation.
 
+## [1.1.3] — v1.1.3 GATE-06: heartbeat suppression removed + deterministic test orchestration (issue #36)
+
+Issue **#36** closes the v1.1.2 release-test
+topology violations: the heartbeat-filter proxy that
+ate vitest worker timeouts is removed, heavyweight
+suites are segregated into per-suite jobs, and every
+unhandled rejection / worker timeout / release-
+critical test skip is a release-blocking event.
+
+### Changed
+
+- **`test/setup/heartbeat-filter.ts` is DELETED.** The
+  v1.1.2 `globalThis.__vitest_worker__.rpc.onTaskUpdate`
+  Proxy that ate `[vitest-worker]: Timeout calling ...`
+  rejections is gone. The v1.1.3 replacement
+  (`vitest.setup.ts`) registers a `process.on('unhan-
+  dledRejection', ...)` handler that LOGS every
+  rejection AND THROWS in release mode
+  (`AGENT_RECALL_RELEASE_MODE=1`). The worker exits
+  non-zero; vitest surfaces the failure to the caller.
+
+- **`npm test` runs only the default config** (unit /
+  integration layer). Heavyweight suites (MCP black-
+  box, migration / backup / import, multi-process
+  10,000-op stress, extracted-artifact lifecycle) are
+  independent scripts under
+  `npm run test:<suite>` driven by
+  `scripts/run-test-suites.mjs` (the deterministic
+  orchestrator).
+
+- **The CI topology becomes 5 segregated per-suite jobs
+  + 1 matrix leg + 1 `release-aggregate` job** (7
+  jobs total, replacing the monolithic `matrix` +
+  `mcp-blackbox-extracted` + `verify-artifact-globs` +
+  `record-evidence` of v1.1.2). A failure in any one
+  suite blocks only that suite. The 3-OS × 1-Node
+  matrix leg is preserved for cross-platform coverage.
+
+- **`unhandled_rejections`, `worker_timeouts`, `test_
+  skips`, `child_process_leaks` are now release-block
+  ing events.** The orchestrator's stderr pattern
+  detector surfaces these as
+  `UNHANDLED_REJECTION` / `WORKER_TIMEOUT` / `TEST_
+  SKIP` / `CHILD_PROCESS_LEAK` failure codes. The
+  `scripts/release-evidence.mjs` aggregator promotes
+  any non-zero count to a release failure.
+
+### Added
+
+- 4 new per-suite vitest configs:
+  - `vitest.blackbox.config.ts` (forks + singleFork,
+    hosts the MCP black-box tests)
+  - `vitest.migrations.config.ts` (forks + singleFork,
+    hosts migration / backup / import tests)
+  - `vitest.stress.config.ts` (threads + maxThreads 8,
+    hosts ONLY `test/multi-process-stress.test.ts`,
+    `testTimeout: 300_000`)
+  - `vitest.packaged-artifact.config.ts` (forks +
+    singleFork, hosts the extracted-artifact lifecycle)
+
+- **`vitest.setup.ts`** — minimal unhandled-rejection
+  logging + release-mode throw (registered by every
+  vitest config).
+
+- **`scripts/run-test-suites.mjs`** — the deterministic
+  orchestrator. Runs every suite as a separate child
+  process via `child_process.spawn('npx', ['vitest',
+  ...])`; captures stdout + stderr + JUnit JSON +
+  JUnit XML + cleanup_status; aggregates JUnit; pins
+  the 10k-op stress counter via `JOB_ID`. Exposes
+  `--list` / `--inspect-stress` / `--out <dir>` /
+  `--only <suite[,suite]>` / `--no-stress` CLI.
+
+- **`scripts/synthesize-vitest-failures.mjs`** — the
+  synthetic-failure injector. Spawns a vitest process
+  with an injected setup file that emits a real
+  `process.on('unhandledRejection')` event (via
+  `Promise.reject(...)`) or a real worker timeout
+  (via keep-alive `setInterval(...)`). The
+  orchestrator's stderr pattern detector surfaces
+  both as `UNHANDLED_REJECTION` / `WORKER_TIMEOUT`.
+
+- **`test_summary.suites.<name>.unhandled_rejections`**
+  + `worker_timeouts` fields under the aggregator's
+  `test_summary` block. A non-zero value in any field
+  fails the evidence collection.
+
+- **`docs/adr/0008-deterministic-orchestration.md`** —
+  the ADR documenting the 5-job topology, the
+  synthetic-failure protocol, the heartbeat-deletion
+  rationale.
+
+- **`docs/guides/release-test-topology.md`** — the
+  operator guide: which CI job runs which suite,
+  expected duration ranges, where to look when a job
+  fails.
+
+- 2 new test files:
+  - `test/release-gate/v113-deterministic-orchestration.test.ts`
+    (32 tests across 12 describe blocks: per-suite
+    scripts, orchestrator contract, synthetic-failure
+    injector, heartbeat-filter deletion, aggregator
+    extension, 5-job CI topology, JUnit / cleanup-
+    status preservation, JOB_ID pinning)
+  - `test/release-gate/v113-stress-once.test.ts` (7
+    tests across 4 describe blocks: stress counter is
+    pinned per JOB_ID, `test:unit` does not include
+    the heavy stress, cleanup scripts do not run the
+    heavy stress)
+
+### Removed
+
+- **`test/setup/heartbeat-filter.ts`** — the v1.1.2
+  heartbeat-suppression Proxy. The new
+  `vitest.setup.ts` replaces it with the minimal
+  unhandled-rejection / uncaught-exception / exit
+  handlers.
+
 ## [1.1.2] — Stage 18 v1.1.2 release candidate gate (#27, Task 8)
 
 ### Added

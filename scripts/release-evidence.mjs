@@ -190,6 +190,112 @@ function aggregateTestSummary() {
   );
 }
 
+/**
+ * v1.1.3 GATE-06 (issue #36): per-suite breakdown
+ * sourced from `scripts/run-test-suites.mjs`'s
+ * `aggregate.json`. The orchestrator writes a
+ * `<out>/aggregate.json` with the shape
+ *
+ *   {
+ *     suites: {
+ *       "unit-integration": { passed, failed, skipped, unhandled_rejections, worker_timeouts },
+ *       "mcp-blackbox":     { ... },
+ *       "migrations":       { ... },
+ *       "stress":           { ... },
+ *       "packaged-artifact":{ ... }
+ *     },
+ *     totals: { passed, failed, skipped, total }
+ *   }
+ *
+ * The aggregator surfaces the breakdown under
+ * `test_summary.suites` so the operator / CI can
+ * confirm every suite passed + zero synthetic
+ * events fired. Any non-zero `unhandled_rejections`
+ * / `worker_timeouts` is a release-blocking event;
+ * `assertTestSummarySuites` raises if so.
+ *
+ * Returns `undefined` when no `aggregate.json` is
+ * present (the legacy monolithic `npm test` path);
+ * the verifier treats undefined as the v1.1.2 shape
+ * (no suites map) and refuses to gate on it.
+ */
+function readSuiteBreakdown() {
+  const direct = envJson("RELEASE_EVIDENCE_TEST_SUITES_JSON");
+  if (direct !== undefined) {
+    return assertTestSummarySuites(direct, "test_summary.suites (env)");
+  }
+  const aggregatePaths = walkFiles(runnerTemp).filter((path) => /aggregate\.json$/i.test(path));
+  if (aggregatePaths.length === 0) return undefined;
+  // The orchestrator may run multiple times in the
+  // same job; we merge per-suite counts across every
+  // aggregate.json so a partial orchestrator run
+  // still surfaces the relevant suites.
+  const merged = {
+    suites: {},
+    totals: { passed: 0, failed: 0, skipped: 0, total: 0 }
+  };
+  for (const path of aggregatePaths) {
+    const fragment = readJson(path);
+    if (!fragment || typeof fragment !== "object" || !fragment.suites || typeof fragment.suites !== "object") {
+      continue;
+    }
+    for (const [name, suite] of Object.entries(fragment.suites)) {
+      const entry = merged.suites[name] ?? {
+        passed: 0,
+        failed: 0,
+        skipped: 0,
+        unhandled_rejections: 0,
+        worker_timeouts: 0
+      };
+      entry.passed += Number(suite.passed ?? 0);
+      entry.failed += Number(suite.failed ?? 0);
+      entry.skipped += Number(suite.skipped ?? 0);
+      entry.unhandled_rejections += Number(suite.unhandled_rejections ?? 0);
+      entry.worker_timeouts += Number(suite.worker_timeouts ?? 0);
+      merged.suites[name] = entry;
+    }
+    if (fragment.totals && typeof fragment.totals === "object") {
+      merged.totals.passed += Number(fragment.totals.passed ?? 0);
+      merged.totals.failed += Number(fragment.totals.failed ?? 0);
+      merged.totals.skipped += Number(fragment.totals.skipped ?? 0);
+      merged.totals.total += Number(fragment.totals.total ?? 0);
+    }
+  }
+  return assertTestSummarySuites(merged, "test_summary.suites");
+}
+
+/**
+ * v1.1.3 GATE-06 (issue #36): validate the per-suite
+ * breakdown + promote non-zero synthetic counts to
+ * release failure. Every suite MUST have
+ *   - failed === 0
+ *   - unhandled_rejections === 0
+ *   - worker_timeouts === 0
+ *   - skipped === 0 (release-critical tests cannot skip)
+ * A single non-zero value in any field fails the
+ * evidence collection.
+ */
+function assertTestSummarySuites(input, label) {
+  if (input === null || typeof input !== "object") fail(`${label} is not an object`);
+  if (!input.suites || typeof input.suites !== "object") fail(`${label}.suites must be an object`);
+  const expectedSuites = ["unit-integration", "mcp-blackbox", "migrations", "stress", "packaged-artifact"];
+  for (const name of expectedSuites) {
+    const suite = input.suites[name];
+    if (!suite || typeof suite !== "object") fail(`${label}.suites.${name} is missing`);
+    for (const field of ["passed", "failed", "skipped", "unhandled_rejections", "worker_timeouts"]) {
+      const value = Number(suite[field] ?? 0);
+      if (!Number.isInteger(value) || value < 0) fail(`${label}.suites.${name}.${field} must be a non-negative integer`);
+      suite[field] = value;
+    }
+    if (suite.failed !== 0) fail(`${label}.suites.${name}.failed must equal zero (got ${suite.failed})`);
+    if (suite.skipped !== 0) fail(`${label}.suites.${name}.skipped must equal zero (release-critical tests cannot skip)`);
+    if (suite.unhandled_rejections !== 0) fail(`${label}.suites.${name}.unhandled_rejections must equal zero (got ${suite.unhandled_rejections})`);
+    if (suite.worker_timeouts !== 0) fail(`${label}.suites.${name}.worker_timeouts must equal zero (got ${suite.worker_timeouts})`);
+    if (suite.passed <= 0) fail(`${label}.suites.${name}.passed must be positive (got ${suite.passed})`);
+  }
+  return input;
+}
+
 function readMigrationSummary() {
   const direct = envJson("RELEASE_EVIDENCE_MIGRATION_SUMMARY_JSON");
   if (direct !== undefined) {
@@ -328,16 +434,28 @@ async function main() {
     return;
   }
 
-  const sha = process.env.GITHUB_SHA;
+const sha = process.env.GITHUB_SHA;
   if (sha === undefined || sha === "") fail("GITHUB_SHA is required for release evidence");
   const server = process.env.GITHUB_SERVER_URL ?? "https://github.com";
   const repository = process.env.GITHUB_REPOSITORY ?? "local/agent-recall";
   const runId = process.env.GITHUB_RUN_ID ?? "local";
   const workflowUrl = `${server}/${repository}/actions/runs/${runId}`;
   const migrationSummary = readMigrationSummary();
+  const aggregate = aggregateTestSummary();
+  const suites = readSuiteBreakdown();
+  // Backward-compat: the legacy test_summary shape
+  // (just `{passed, failed, skipped, total}`) is
+  // preserved when no per-suite breakdown is
+  // available. The new `totals_from` + `suites`
+  // fields appear ONLY when the orchestrator's
+  // aggregate.json is present (the v1.1.3 GATE-06
+  // shape).
+  const testSummary = suites === undefined
+    ? aggregate
+    : { ...aggregate, totals_from: "actual", suites: suites.suites };
   const evidence = {
     schema_version: 1,
-    // Stage 18 v1.1.2 (issue #29, Task 10): the
+    // Stage 18 v1.1.2 (issue #29, task 10): the
     // evidence file carries the canonical package
     // version the release-publication gate mints.
     // The `verify-release-evidence.mjs` verifier
@@ -359,7 +477,7 @@ async function main() {
     },
     artifacts: artifacts(),
     sha256_checksums: envJson("RELEASE_EVIDENCE_SHA256_JSON") ?? {},
-    test_summary: aggregateTestSummary(),
+    test_summary: testSummary,
     migration_summary: migrationSummary,
     known_non_blocking_limits: knownNonBlockingLimits()
   };

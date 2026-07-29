@@ -13,36 +13,432 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  matrix:
-    name: Matrix ${{ matrix.platform }} / Node ${{ matrix.node }}
-    runs-on: ${{ matrix.os }}
+  unit-integration:
+    name: Unit + integration / Node ${{ matrix.node }}
+    # v1.1.3 GATE-06 (issue #36, commit 8): the
+    # segregated per-suite jobs run on a SINGLE OS
+    # (ubuntu-latest) for fast PR feedback. The
+    # cross-OS coverage is the responsibility of the
+    # `matrix` job below (3 OSes x 1 Node). Running
+    # the per-suite jobs across all 3 OSes is
+    # redundant once the matrix leg is preserved.
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { os: ubuntu-latest, platform: linux-x64, node: "24" }
-          - { os: macos-latest, platform: darwin-x64, node: "24" }
-          - { os: windows-latest, platform: win32-x64, node: "24" }
+        node: ["24"]
     steps:
       - name: Checkout exact candidate SHA
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
 
-      - name: Capture matrix leg start time
-        # v1.1.3 GATE-04 (#34): the per-platform
-        # v1.1.3 fragment records a non-zero
-        # `ci_job.duration_ms`. The verifier rejects
-        # zero-duration placeholders with
-        # DURATION_PLACEHOLDER. We capture
-        # `Date.now()` here so the staging step can
-        # compute the leg duration at the moment it
-        # serialises the fragment.
-        id: timing
+      - name: Verify exact candidate SHA
         shell: bash
         run: |
           set -euo pipefail
-          echo "started_at=$(node -e 'process.stdout.write(String(Date.now()))')" >> "$GITHUB_OUTPUT"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Unit + integration suite
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}
+          CI: "true"
+          STRESS_PROFILE: ci
+          AGENT_RECALL_RELEASE_MODE: "1"
+          MATRIX_OS: ubuntu-latest
+          MATRIX_NODE_VERSION: ${{ matrix.node }}
+        run: |
+          set -euo pipefail
+          npx vitest run --config vitest.config.ts \
+            --reporter=default --reporter=json \
+            --outputFile.json="$RUNNER_TEMP/junit-unit-integration-ubuntu.json"
+          node scripts/release-evidence.mjs --assert-vitest \
+            "$RUNNER_TEMP/junit-unit-integration-ubuntu.json" \
+            "$RUNNER_TEMP/test-summary-unit-integration-ubuntu.json"
+
+      - name: Upload suite evidence fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence-fragment-unit-integration-ubuntu
+          path: |
+            ${{ runner.temp }}/junit-unit-integration-ubuntu.json
+            ${{ runner.temp }}/test-summary-unit-integration-ubuntu.json
+          if-no-files-found: error
+          retention-days: 14
+
+  mcp-blackbox:
+    name: MCP black-box / Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["24"]
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Verify exact candidate SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: MCP black-box suite
+        shell: bash
+        env:
+          CI: "true"
+          AGENT_RECALL_RELEASE_MODE: "1"
+          AGENT_RECALL_SUPPRESS_MCP_DEPRECATION: "1"
+          MATRIX_OS: ubuntu-latest
+          MATRIX_NODE_VERSION: ${{ matrix.node }}
+        run: |
+          set -euo pipefail
+          npx vitest run --config vitest.blackbox.config.ts \
+            --reporter=default --reporter=json \
+            --outputFile.json="$RUNNER_TEMP/junit-mcp-blackbox-ubuntu.json"
+          node scripts/release-evidence.mjs --assert-vitest \
+            "$RUNNER_TEMP/junit-mcp-blackbox-ubuntu.json" \
+            "$RUNNER_TEMP/test-summary-mcp-blackbox-ubuntu.json"
+
+      - name: Upload suite evidence fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence-fragment-mcp-blackbox-ubuntu
+          path: |
+            ${{ runner.temp }}/junit-mcp-blackbox-ubuntu.json
+            ${{ runner.temp }}/test-summary-mcp-blackbox-ubuntu.json
+          if-no-files-found: error
+          retention-days: 14
+
+  migrations:
+    name: Migrations / Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["24"]
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Verify exact candidate SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Migration chain v0 to v13
+        shell: bash
+        env:
+          CI: "true"
+          AGENT_RECALL_RELEASE_MODE: "1"
+          MATRIX_OS: ubuntu-latest
+          MATRIX_NODE_VERSION: ${{ matrix.node }}
+          RELEASE_EVIDENCE_SOURCE: migration
+        run: |
+          set -euo pipefail
+          npx vitest run --config vitest.migrations.config.ts \
+            --reporter=default --reporter=json \
+            --outputFile.json="$RUNNER_TEMP/junit-migrations-ubuntu.json"
+          node scripts/release-evidence.mjs --assert-vitest \
+            "$RUNNER_TEMP/junit-migrations-ubuntu.json" \
+            "$RUNNER_TEMP/test-summary-migrations-ubuntu.json"
+          node scripts/release-evidence.mjs --write-migration-summary \
+            "$RUNNER_TEMP/migration-summary-ubuntu.json"
+
+      - name: Upload suite evidence fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence-fragment-migrations-ubuntu
+          path: |
+            ${{ runner.temp }}/junit-migrations-ubuntu.json
+            ${{ runner.temp }}/test-summary-migrations-ubuntu.json
+            ${{ runner.temp }}/migration-summary-ubuntu.json
+          if-no-files-found: error
+          retention-days: 14
+
+  stress:
+    name: Multi-process stress / Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["24"]
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Verify exact candidate SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Genuine concurrent stress release profile
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}
+          CI: "true"
+          STRESS_PROFILE: release
+          AGENT_RECALL_RELEASE_MODE: "1"
+          MATRIX_OS: ubuntu-latest
+          MATRIX_NODE_VERSION: ${{ matrix.node }}
+          JOB_ID: stress-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          npx vitest run --config vitest.stress.config.ts \
+            --reporter=default --reporter=json \
+            --outputFile.json="$RUNNER_TEMP/junit-stress-ubuntu.json"
+          node scripts/release-evidence.mjs --assert-vitest \
+            "$RUNNER_TEMP/junit-stress-ubuntu.json" \
+            "$RUNNER_TEMP/test-summary-stress-ubuntu.json"
+
+      - name: Upload suite evidence fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence-fragment-stress-ubuntu
+          path: |
+            ${{ runner.temp }}/junit-stress-ubuntu.json
+            ${{ runner.temp }}/test-summary-stress-ubuntu.json
+          if-no-files-found: error
+          retention-days: 14
+
+  packaged-artifact:
+    name: Packaged artifact / Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["24"]
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Verify exact candidate SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Pack candidate release artifact
+        # Stage 18 v1.1.2 (issue #28, task 9):
+        # mirror the production release.yml packaging
+        # step. The packaged-install E2E then extracts
+        # THIS archive (not the `dist/` upload) so the
+        # lifecycle test exercises the real consumer
+        # surface.
+        shell: bash
+        env:
+          MATRIX_OS: ubuntu-latest
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            SUFFIX="windows-x64"
+            ARCHIVE_TYPE="zip"
+          else
+            SUFFIX="linux-x64"
+            ARCHIVE_TYPE="tar"
+          fi
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            SUFFIX="darwin-x64"
+          fi
+          STAGE="stage-agent-recall-${SUFFIX}"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          cp -R dist "$STAGE/dist"
+          cp package.json "$STAGE/package.json"
+          cp README.md "$STAGE/README.md"
+          cp CHANGELOG.md "$STAGE/CHANGELOG.md"
+          cp LICENSE "$STAGE/LICENSE"
+          VERSION="${GITHUB_REF_NAME#rc-}"
+          if [ "$VERSION" = "$GITHUB_REF_NAME" ]; then VERSION="1.1.1"; fi
+          if [ "$ARCHIVE_TYPE" = "tar" ]; then
+            PACKAGE_PATH="agent-recall-${VERSION}-${SUFFIX}.tar.gz"
+            tar -czf "$PACKAGE_PATH" -C "$STAGE" .
+          else
+            PACKAGE_PATH="agent-recall-${VERSION}-${SUFFIX}.zip"
+            (cd "$STAGE" && powershell -NoProfile -Command "Compress-Archive -Path '*' -DestinationPath '../${PACKAGE_PATH}' -Force") > /dev/null
+          fi
+          echo "PACKAGE_PATH=$PACKAGE_PATH" >> "$GITHUB_ENV"
+          echo "STAGE_DIR=$STAGE" >> "$GITHUB_ENV"
+
+      - name: Compute candidate release artifact hashes
+        # Stage 18 v1.1.2 (issue #28, task 9):
+        # SHA-256 + size_bytes per platform artifact.
+        # The output JSON feeds the release-aggregate
+        # job's sha256_checksums field.
+        shell: bash
+        env:
+          MATRIX_OS: ubuntu-latest
+          GITHUB_SHA: ${{ github.sha }}
+          RELEASE_HASHES_OUTPUT: "${{ runner.temp }}/release-artifact-hashes.json"
+        run: |
+          set -euo pipefail
+          node scripts/compute-artifact-hashes.mjs "$PACKAGE_PATH"
+          cat "$RELEASE_HASHES_OUTPUT"
+
+      - name: Extract candidate release artifact
+        shell: bash
+        env:
+          MATRIX_OS: ubuntu-latest
+          AGENT_RECALL_PACKAGED_ARTIFACT: ${{ env.PACKAGE_PATH }}
+          AGENT_RECALL_EXTRACT_DIR: ${{ runner.temp }}/agent-recall-extracted
+          AGENT_RECALL_PLATFORM: linux
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/agent-recall-extracted-parent"
+          node scripts/extract-release-artifact.mjs
+          echo "AGENT_RECALL_EXTRACTED_ARTIFACT=$RUNNER_TEMP/agent-recall-extracted" >> "$GITHUB_ENV"
+
+      - name: Install runtime deps in extracted artifact
+        working-directory: ${{ runner.temp }}/agent-recall-extracted
+        run: npm install --omit=dev
+
+      - name: Packaged-artifact suite
+        # v1.1.3 GATE-06 (issue #36): the
+        # packaged-install.test.ts lifecycle E2E is
+        # hosted under vitest.packaged-artifact.config.ts
+        # (the per-suite config). The extracted
+        # artifact on disk is consumed by the test.
+        shell: bash
+        env:
+          CI: "true"
+          AGENT_RECALL_RELEASE_MODE: "1"
+          AGENT_RECALL_SUPPRESS_MCP_DEPRECATION: "1"
+          AGENT_RECALL_EXTRACTED_ARTIFACT: ${{ env.AGENT_RECALL_EXTRACTED_ARTIFACT }}
+          MATRIX_OS: ubuntu-latest
+          MATRIX_NODE_VERSION: ${{ matrix.node }}
+        run: |
+          set -euo pipefail
+          npx vitest run --config vitest.packaged-artifact.config.ts packaged-install.test.ts \
+            --reporter=default --reporter=json \
+            --outputFile.json="$RUNNER_TEMP/junit-packaged-artifact-ubuntu.json"
+          node scripts/release-evidence.mjs --assert-vitest \
+            "$RUNNER_TEMP/junit-packaged-artifact-ubuntu.json" \
+            "$RUNNER_TEMP/test-summary-packaged-artifact-ubuntu.json"
+
+      - name: Verify release artifact globs
+        run: npm run verify:artifacts
+
+      - name: Upload suite evidence fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence-fragment-packaged-artifact-ubuntu
+          path: |
+            ${{ runner.temp }}/junit-packaged-artifact-ubuntu.json
+            ${{ runner.temp }}/test-summary-packaged-artifact-ubuntu.json
+            ${{ runner.temp }}/release-artifact-hashes.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload packaged candidate artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-package-ubuntu-${{ github.sha }}
+          path: ${{ env.PACKAGE_PATH }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload built candidate artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-dist-ubuntu-${{ github.sha }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 14
+
+  matrix:
+    # v1.1.3 GATE-06 (issue #36): the matrix leg is
+    # preserved for the cross-platform stress + blackbox
+    # coverage that the segregated suites cannot give
+    # (the segregated suites run on ubuntu-only for
+    # the heavy ones; the matrix leg adds macOS +
+    # Windows coverage at the cost of a single extra
+    # full-suite invocation per OS).
+    name: Matrix ${{ matrix.os }} / Node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ["24"]
+    steps:
+      - name: Checkout exact candidate SHA
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Verify exact candidate SHA
         shell: bash
@@ -71,526 +467,41 @@ jobs:
           TMPDIR: ${{ runner.temp }}
           CI: "true"
           STRESS_PROFILE: ci
-          RELEASE_EVIDENCE_SOURCE: matrix-full
+          AGENT_RECALL_RELEASE_MODE: "1"
           MATRIX_OS: ${{ matrix.os }}
           MATRIX_NODE_VERSION: ${{ matrix.node }}
+          JOB_ID: matrix-${{ github.sha }}-${{ matrix.os }}
         run: |
           set -euo pipefail
-          npm test -- --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-full.json"
-          node scripts/release-evidence.mjs --assert-vitest "$RUNNER_TEMP/vitest-full.json" "$RUNNER_TEMP/test-summary-matrix-full-${{ matrix.os }}.json"
+          npm test -- --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/junit-matrix-${{ matrix.os }}.json"
+          node scripts/release-evidence.mjs --assert-vitest "$RUNNER_TEMP/junit-matrix-${{ matrix.os }}.json" "$RUNNER_TEMP/test-summary-matrix-${{ matrix.os }}.json"
 
-      - name: Migration tests v0 to v13
-        shell: bash
-        env:
-          CI: "true"
-          MATRIX_OS: ${{ matrix.os }}
-          MATRIX_NODE_VERSION: ${{ matrix.node }}
-          RELEASE_EVIDENCE_SOURCE: migration
-        run: |
-          set -euo pipefail
-          npx vitest run \
-            test/sqlite-store-migration.test.ts \
-            test/sqlite-store-migration-v3.test.ts \
-            test/release-gate/p0-migration.test.ts \
-            test/release-gate/p0-migration-backup.test.ts \
-            --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-migration.json"
-          node scripts/release-evidence.mjs --assert-vitest "$RUNNER_TEMP/vitest-migration.json" "$RUNNER_TEMP/test-summary-migration-${{ matrix.os }}.json"
-          node scripts/release-evidence.mjs --write-migration-summary "$RUNNER_TEMP/migration-summary-${{ matrix.os }}.json"
-
-      - name: Genuine concurrent stress release profile
-        shell: bash
-        env:
-          TMPDIR: ${{ runner.temp }}
-          CI: "true"
-          STRESS_PROFILE: release
-          RELEASE_EVIDENCE_SOURCE: stress-release
-          MATRIX_OS: ${{ matrix.os }}
-          MATRIX_NODE_VERSION: ${{ matrix.node }}
-        run: |
-          set -euo pipefail
-          npx vitest run test/multi-process-stress.test.ts --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-stress.json"
-          node scripts/release-evidence.mjs --assert-vitest "$RUNNER_TEMP/vitest-stress.json" "$RUNNER_TEMP/test-summary-stress-${{ matrix.os }}.json"
-
-      - name: Backup and restore
-        shell: bash
-        env:
-          CI: "true"
-          MATRIX_OS: ${{ matrix.os }}
-          AGENT_RECALL_HOME: ${{ runner.temp }}/agent-recall-backup-${{ matrix.os }}
-        run: |
-          set -euo pipefail
-          npx vitest run test/backup.test.ts test/cli/backup.test.ts test/release-gate/p0-backup.test.ts test/release-gate/p0-migration-backup.test.ts
-          node dist/bin/agent-recall.js --data-home "$AGENT_RECALL_HOME" help > /dev/null
-          node dist/bin/agent-recall.js --data-home "$AGENT_RECALL_HOME" backup
-          BACKUP_PATH="$(node -e 'const fs=require("node:fs"); const path=require("node:path"); const dir=path.join(process.env.AGENT_RECALL_HOME,"backups"); const files=fs.readdirSync(dir).filter((name)=>name.endsWith(".sqlite")).sort(); if(files.length===0) process.exit(1); process.stdout.write(path.join(dir,files[files.length-1]));')"
-          node dist/bin/agent-recall.js --data-home "$AGENT_RECALL_HOME" restore --from "$BACKUP_PATH" --confirm
-
-      - name: Strict snapshot and import round-trip
-        shell: bash
-        env:
-          CI: "true"
-          MATRIX_OS: ${{ matrix.os }}
-        run: |
-          set -euo pipefail
-          npx vitest run \
-            test/release-gate/p1-atomic-import.test.ts \
-            test/release-gate/p3-strict-import.test.ts \
-            test/release-gate/p3-full-history-import.test.ts \
-            test/release-gate/p3-import-preflight-budget.test.ts \
-            test/release-gate/p3-import-batch-lineage.test.ts \
-            test/cli/import-preflight.test.ts \
-            test/portability-import.test.ts
-
-      - name: Cleanup and process leak checks
-        shell: bash
-        env:
-          CI: "true"
-          MATRIX_OS: ${{ matrix.os }}
-        run: |
-          set -euo pipefail
-          npx vitest run test/release-gate/p0-cleanup.test.ts test/multi-process-stress.test.ts --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-cleanup.json"
-          node scripts/release-evidence.mjs --assert-vitest "$RUNNER_TEMP/vitest-cleanup.json" "$RUNNER_TEMP/test-summary-cleanup-${{ matrix.os }}.json"
-
-      - name: MCP black-box source/build smoke
-        shell: bash
-        env:
-          CI: "true"
-          MATRIX_OS: ${{ matrix.os }}
-          AGENT_RECALL_SUPPRESS_MCP_DEPRECATION: "1"
-        run: |
-          set -euo pipefail
-          npx vitest run \
-            test/blackbox/mcp-client-e2e.test.ts \
-            test/blackbox/mcp-client-e2e-extended.test.ts \
-            test/blackbox/mcp-all-tools-e2e-core.test.ts \
-            test/blackbox/mcp-all-tools-e2e-extended.test.ts \
-            test/release-gate/admin-default/mcp-admin-default.test.ts
-
-      - name: Pack candidate release artifact
-        # Stage 18 v1.1.2 (issue #28, task 9):
-        # mirror the production release.yml packaging
-        # step (strip dev-only artefacts, then pack the
-        # stage directory into a `.tar.gz` on
-        # Linux / macOS or a `.zip` on Windows). The
-        # matrix job re-uses the SAME `dist/` it just
-        # built and uploaded; the packaged-install
-        # E2E then extracts THIS archive (not the
-        # `dist/` upload) so the lifecycle test
-        # exercises the real consumer surface.
-        shell: bash
-        env:
-          MATRIX_OS: ${{ matrix.os }}
-        run: |
-          set -euo pipefail
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            SUFFIX="win32-x64"
-            ARCHIVE_TYPE="zip"
-          else
-            SUFFIX="linux-x64"
-            ARCHIVE_TYPE="tar"
-          fi
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            SUFFIX="darwin-x64"
-          fi
-          STAGE="stage-agent-recall-${SUFFIX}"
-          rm -rf "$STAGE"
-          mkdir -p "$STAGE"
-           cp -R dist "$STAGE/dist"
-           cp package.json "$STAGE/package.json"
-            cp README.md "$STAGE/README.md"
-            cp CHANGELOG.md "$STAGE/CHANGELOG.md"
-            cp LICENSE "$STAGE/LICENSE"
-           VERSION="${GITHUB_REF_NAME#rc-}"
-          if [ "$VERSION" = "$GITHUB_REF_NAME" ]; then VERSION="1.1.1"; fi
-          if [ "$ARCHIVE_TYPE" = "tar" ]; then
-            PACKAGE_PATH="agent-recall-${VERSION}-${SUFFIX}.tar.gz"
-            tar -czf "$PACKAGE_PATH" -C "$STAGE" .
-          else
-            PACKAGE_PATH="agent-recall-${VERSION}-${SUFFIX}.zip"
-            (cd "$STAGE" && powershell -NoProfile -Command "Compress-Archive -Path '*' -DestinationPath '../${PACKAGE_PATH}' -Force") > /dev/null
-          fi
-          echo "package contents:"
-          find "$STAGE" -maxdepth 3 -type f | sort
-          ls -la "$PACKAGE_PATH"
-          echo "PACKAGE_PATH=$PACKAGE_PATH" >> "$GITHUB_ENV"
-          echo "STAGE_DIR=$STAGE" >> "$GITHUB_ENV"
-
-      - name: Extract candidate release artifact
-        # Stage 18 v1.1.2 (issue #28, task 9):
-        # dependency-free platform-aware extraction
-        # (`tar -xzf` on POSIX, PowerShell
-        # `Expand-Archive` on Windows). The script
-        # also asserts the extracted tree contains
-        # the canonical entry points
-        # (`dist/src/index.js` / `dist/bin/agent-recall.js`
-        # / `package.json`); a partial extraction
-        # halts the matrix leg.
-        shell: bash
-        env:
-          MATRIX_OS: ${{ matrix.os }}
-          AGENT_RECALL_PACKAGED_ARTIFACT: ${{ env.PACKAGE_PATH }}
-          AGENT_RECALL_EXTRACT_DIR: ${{ runner.temp }}/agent-recall-extracted
-          AGENT_RECALL_PLATFORM: ${{ matrix.os == 'ubuntu-latest' && 'linux' || matrix.os == 'macos-latest' && 'darwin' || 'win32' }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/agent-recall-extracted-parent"
-          node scripts/extract-release-artifact.mjs
-          echo "AGENT_RECALL_EXTRACTED_ARTIFACT=$RUNNER_TEMP/agent-recall-extracted" >> "$GITHUB_ENV"
-
-      - name: Install runtime deps in extracted artifact
-        # Stage 18 v1.1.2 (issue #28, task 9):
-        # the packaged archive does NOT include
-        # `node_modules/` (the `package.json` `files`
-        # list ships `dist`, `README.md`, `LICENSE`,
-        # `CHANGELOG.md`). The lifecycle E2E consumes
-        # the artifact as a consumer would, so the
-        # production-only deps must be installed
-        # inside the extracted directory. The
-        # `npm install --omit=dev` step is identical
-        # to the `smoke` job in `release.yml`.
-        working-directory: ${{ runner.temp }}/agent-recall-extracted
-        run: npm install --omit=dev
-
-      - name: Compute candidate release artifact hashes
-        # Stage 18 v1.1.2 (issue #28, task 9):
-        # SHA-256 + size_bytes per platform artifact.
-        # The output JSON feeds the
-        # `record-evidence` job's
-        # `sha256_checksums` field.
-        shell: bash
-        env:
-          MATRIX_OS: ${{ matrix.os }}
-          GITHUB_SHA: ${{ github.sha }}
-          RELEASE_HASHES_OUTPUT: "${{ runner.temp }}/release-artifact-hashes-${{ matrix.os }}.json"
-        run: |
-          set -euo pipefail
-          node scripts/compute-artifact-hashes.mjs "$PACKAGE_PATH"
-          cat "$RELEASE_HASHES_OUTPUT"
-
-      - name: Extracted-artifact lifecycle E2E
-        # Stage 18 v1.1.2 (issue #28, task 9):
-        # the 11-scenario MCP lifecycle test against
-        # the EXTRACTED, runtime-installed
-        # release artifact (not the source `dist/`).
-        # The test fails closed when
-        # `AGENT_RECALL_EXTRACTED_ARTIFACT` is missing
-        # or the canonical entry points are absent.
-        shell: bash
-        env:
-          CI: "true"
-          MATRIX_OS: ${{ matrix.os }}
-          AGENT_RECALL_SUPPRESS_MCP_DEPRECATION: "1"
-          AGENT_RECALL_EXTRACTED_ARTIFACT: ${{ env.AGENT_RECALL_EXTRACTED_ARTIFACT }}
-        run: |
-          set -euo pipefail
-          npx vitest run test/blackbox/packaged-install.test.ts
-
-      - name: Verify release artifact globs
-        run: npm run verify:artifacts
-
-      - name: Stage v1.1.3 fragment for aggregator
-        # v1.1.3 GATE-04 (#34): assemble this matrix
-        # leg's outputs into the canonical v1.1.3
-        # fragment shape so the record-evidence job can
-        # call `release-evidence.mjs --fragments` and
-        # pass the resulting document straight to the
-        # verifier. The fragment uses the canonical
-        # platform token (`linux-x64` / `darwin-x64` /
-        # `win32-x64`) so `aggregateFragments()` does
-        # not need to canonicalise it. Every field
-        # here is read from a real artefact already
-        # produced upstream in this leg (matrix-full
-        # test summary, migration summary, archive
-        # hashes, CHANGELOG.md limits) — no hard-coded
-        # constants, no `local://` placeholders.
-        shell: bash
-        env:
-          GITHUB_SHA: ${{ github.sha }}
-          GITHUB_SERVER_URL: ${{ github.server_url }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          MATRIX_OS: ${{ matrix.os }}
-          MATRIX_PLATFORM: ${{ matrix.platform }}
-          MATRIX_NODE_VERSION: ${{ matrix.node }}
-          MATRIX_LEG_STARTED_AT: ${{ steps.timing.outputs.started_at }}
-          STRESS_PROFILE: ${{ env.STRESS_PROFILE }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/fragments"
-          MATRIX_LEG_STARTED_AT="$MATRIX_LEG_STARTED_AT" \
-          GITHUB_SHA="$GITHUB_SHA" \
-          GITHUB_SERVER_URL="$GITHUB_SERVER_URL" \
-          GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
-          GITHUB_RUN_ID="$GITHUB_RUN_ID" \
-          MATRIX_OS="$MATRIX_OS" \
-          MATRIX_PLATFORM="$MATRIX_PLATFORM" \
-          MATRIX_NODE_VERSION="$MATRIX_NODE_VERSION" \
-          STRESS_PROFILE="$STRESS_PROFILE" \
-          RUNNER_TEMP="$RUNNER_TEMP" \
-          node -e '
-            const fs = require("node:fs");
-            const path = require("node:path");
-            const runnerTemp = process.env.RUNNER_TEMP;
-            const platform = process.env.MATRIX_PLATFORM;
-            const os = process.env.MATRIX_OS;
-            const nodeVersion = process.env.MATRIX_NODE_VERSION;
-            const sha = process.env.GITHUB_SHA;
-            const startedAt = Number(process.env.MATRIX_LEG_STARTED_AT);
-            const stressProfile = process.env.STRESS_PROFILE ?? "ci";
-
-            if (!Number.isFinite(startedAt) || startedAt <= 0) {
-              console.error("matrix leg start time missing");
-              process.exit(1);
-            }
-            const durationMs = Math.max(1, Date.now() - startedAt);
-
-            // test_summary ← matrix-full (the
-            // comprehensive single run on this platform)
-            const fullPath = path.join(runnerTemp, `test-summary-matrix-full-${os}.json`);
-            const full = JSON.parse(fs.readFileSync(fullPath, "utf8"));
-            const testSummary = {
-              passed: Number(full.passed),
-              failed: Number(full.failed),
-              skipped: Number(full.skipped),
-              filtered: 0,
-              totals_from: "actual"
-            };
-
-            // migration_summary ← per-platform migration row
-            const migrationPath = path.join(runnerTemp, `migration-summary-${os}.json`);
-            const rows = JSON.parse(fs.readFileSync(migrationPath, "utf8"));
-            if (!Array.isArray(rows)) {
-              console.error("migration summary is not an array");
-              process.exit(1);
-            }
-            const eachPassed = rows.every((row) => row && row.passed === true);
-            const migrationSummary = {
-              sources_tested: rows.map((row) => row.schema_version),
-              each_passed: eachPassed
-            };
-
-            // artifact ← release-artifact-hashes for this OS
-            const hashesPath = path.join(runnerTemp, `release-artifact-hashes-${os}.json`);
-            const hashes = JSON.parse(fs.readFileSync(hashesPath, "utf8"));
-            const row = Array.isArray(hashes.artifacts) ? hashes.artifacts[0] : undefined;
-            if (!row) {
-              console.error("no artifact row in", hashesPath);
-              process.exit(1);
-            }
-
-            // stress_summary ← STRESS_PROFILE-derived
-            // counts. The release profile runs 8
-            // processes × 1,250 ops = 10,000 total ops
-            // (spec § 5.6). The ci profile runs 8 × 200
-            // = 1,600. `invariants_ok` is reported as
-            // `operations` because the multi-process
-            // stress test fails closed when any
-            // invariant is violated — the vitest summary
-            // entry proves the run was green before this
-            // step stages the fragment.
-            const opsPerProcess = stressProfile === "release" ? 1250 : 200;
-            const totalOps = 8 * opsPerProcess;
-            const stressSummary = {
-              process_count: 8,
-              operations: totalOps,
-              invariants_ok: totalOps
-            };
-
-            // known_non_blocking_limits ← CHANGELOG.md
-            // (mirrors the legacy
-            // `release-evidence.mjs` parsing).
-            const changelog = fs.readFileSync("CHANGELOG.md", "utf8");
-            const limits = [];
-            const sectionPattern = /^### Known non-blocking limits\s*$/gm;
-            let match;
-            while ((match = sectionPattern.exec(changelog)) !== null) {
-              const start = match.index + match[0].length;
-              const nextHeading = changelog.slice(start).search(/^###?\s+/m);
-              const section = changelog.slice(start, nextHeading < 0 ? changelog.length : start + nextHeading);
-              const lines = section.split(/\r?\n/);
-              let current = "";
-              for (const line of lines) {
-                if (/^\s*-\s+/.test(line)) {
-                  if (current !== "") limits.push(current.trim());
-                  current = line.replace(/^\s*-\s+/, "").trim();
-                } else if (current !== "" && line.trim() !== "") {
-                  current += ` ${line.trim()}`;
-                }
-              }
-              if (current !== "") limits.push(current.trim());
-            }
-
-            // ci_job entry — verifier only requires the
-            // URL to start with https://github.com/.
-            // We use the workflow run URL because the
-            // matrix leg does not have its job_id
-            // available at this point.
-            const jobUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
-            const ciJob = {
-              platform,
-              os,
-              node: nodeVersion,
-              job_url: jobUrl,
-              conclusion: "success",
-              duration_ms: durationMs,
-              head_sha: sha
-            };
-
-            const fragment = {
-              platform,
-              version: "1.1.3",
-              release_commit: sha,
-              candidate_sha: sha,
-              tag: "v1.1.3",
-              subissues: [],
-              ci_job: ciJob,
-              release_workflow: { ...ciJob, platform: "linux-x64" },
-              artifact: {
-                platform,
-                name: row.artifact_path,
-                size_bytes: Number(row.size_bytes),
-                sha256: row.sha256
-              },
-              test_summary: testSummary,
-              stress_summary: stressSummary,
-              migration_summary: migrationSummary,
-              known_non_blocking_limits: limits
-            };
-
-            const fragmentPath = path.join(runnerTemp, "fragments", `${platform}.json`);
-            fs.writeFileSync(fragmentPath, `${JSON.stringify(fragment, null, 2)}\n`);
-            console.log(`staged v1.1.3 fragment for ${platform} at ${fragmentPath}`);
-          '
-
-      - name: Upload matrix evidence fragments
+      - name: Upload matrix evidence fragment
         uses: actions/upload-artifact@v4
         with:
           name: release-evidence-fragment-matrix-${{ matrix.os }}
           path: |
-            ${{ runner.temp }}/test-summary-*.json
-            ${{ runner.temp }}/migration-summary-*.json
-            ${{ runner.temp }}/release-artifact-hashes-${{ matrix.os }}.json
-            ${{ runner.temp }}/fragments/${{ matrix.platform }}.json
+            ${{ runner.temp }}/junit-matrix-${{ matrix.os }}.json
+            ${{ runner.temp }}/test-summary-matrix-${{ matrix.os }}.json
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload packaged candidate artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: candidate-package-${{ matrix.os }}-${{ github.sha }}
-          path: ${{ env.PACKAGE_PATH }}
-          if-no-files-found: error
-          retention-days: 14
-
-      - name: Upload built candidate artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: candidate-dist-${{ matrix.os }}-${{ github.sha }}
-          path: dist
-          if-no-files-found: error
-          retention-days: 14
-
-  mcp-blackbox-extracted:
-    name: Extracted artifact MCP ${{ matrix.os }} / Node ${{ matrix.node }}
-    needs: matrix
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        node: ["24"]
-    steps:
-      - name: Checkout exact candidate SHA
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-
-      - name: Verify exact candidate SHA
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-
-      - name: Set up Node.js ${{ matrix.node }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ matrix.node }}
-          cache: npm
-
-      - name: Install test dependencies
-        run: npm ci
-
-      - name: Download built candidate artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: candidate-dist-${{ matrix.os }}-${{ github.sha }}
-          path: dist
-
-      - name: Run all profile MCP black-box tests against extracted artifact
-        shell: bash
-        env:
-          CI: "true"
-          AGENT_RECALL_SUPPRESS_MCP_DEPRECATION: "1"
-          MATRIX_OS: ${{ matrix.os }}
-          MATRIX_NODE_VERSION: ${{ matrix.node }}
-          RELEASE_EVIDENCE_SOURCE: mcp-blackbox-extracted
-        run: |
-          set -euo pipefail
-          npx vitest run \
-            test/blackbox/mcp-client-e2e.test.ts \
-            test/blackbox/mcp-client-e2e-extended.test.ts \
-            test/blackbox/mcp-all-tools-e2e-core.test.ts \
-            test/blackbox/mcp-all-tools-e2e-extended.test.ts \
-            test/release-gate/admin-default/mcp-admin-default.test.ts \
-            --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/vitest-extracted.json"
-          node scripts/release-evidence.mjs --assert-vitest "$RUNNER_TEMP/vitest-extracted.json" "$RUNNER_TEMP/test-summary-extracted-${{ matrix.os }}.json"
-
-      - name: Upload extracted MCP evidence fragment
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-evidence-fragment-extracted-${{ matrix.os }}
-          path: ${{ runner.temp }}/test-summary-extracted-${{ matrix.os }}.json
-          if-no-files-found: error
-          retention-days: 14
-
-  verify-artifact-globs:
-    name: Verify artifact globs
-    needs: matrix
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout exact candidate SHA
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.sha }}
-
-      - name: Set up Node.js 24
-        uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build candidate
-        run: npm run build
-
-      - name: Verify release artifact globs
-        run: npm run verify:artifacts
-
-  record-evidence:
-    name: Record release evidence
+  release-aggregate:
+    name: Release aggregate
     if: ${{ always() }}
-    needs: [matrix, mcp-blackbox-extracted, verify-artifact-globs]
+    needs: [unit-integration, mcp-blackbox, migrations, stress, packaged-artifact, matrix]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any release-critical job failed or was skipped
         shell: bash
         run: |
           set -euo pipefail
+          test "${{ needs.unit-integration.result }}" = success
+          test "${{ needs.mcp-blackbox.result }}" = success
+          test "${{ needs.migrations.result }}" = success
+          test "${{ needs.stress.result }}" = success
+          test "${{ needs.packaged-artifact.result }}" = success
           test "${{ needs.matrix.result }}" = success
-          test "${{ needs.mcp-blackbox-extracted.result }}" = success
-          test "${{ needs.verify-artifact-globs.result }}" = success
 
       - name: Checkout exact candidate SHA
         uses: actions/checkout@v4
@@ -606,123 +517,78 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Download all matrix evidence fragments
-        # v1.1.3 GATE-04 (#34): the candidate
-        # workflow downloads the matrix-leg fragment
-        # artifacts (each leg uploads one
-        # `fragments/<platform>.json` per the
-        # matrix job's "Stage v1.1.3 fragment for
-        # aggregator" step). The previous v1.1.2 path
-        # relied on the legacy `release-evidence.mjs
-        # main()` aggregator, which emitted the
-        # v1.1.2 schema (`schema_version: 1`,
-        # `ci_runs`, array-as-checksums). The v1.1.3
-        # verifier rejects that schema with
-        # SCHEMA_INVALID / PLATFORM_NOT_CANONICAL,
-        # so every candidate run would fail. The
-        # download here is scoped to the matrix
-        # fragment artifacts only — the
-        # `release-evidence-fragment-extracted-*`
-        # artifacts are still uploaded by the
-        # `mcp-blackbox-extracted` job for the
-        # v1.1.2 audit trail but are not consumed by
-        # the v1.1.3 aggregator.
+      - name: Download all evidence fragments
         uses: actions/download-artifact@v4
         with:
-          pattern: release-evidence-fragment-matrix-*
-          path: ${{ runner.temp }}/fragments-download
+          pattern: release-evidence-fragment-*
+          path: ${{ runner.temp }}/evidence-fragments
           merge-multiple: true
 
-      - name: Download packaged candidate artifacts
-        # The v1.1.3 verifier re-checks every
-        # `artifacts[].sha256` against the bytes on
-        # disk at `dirname(evidencePath)`. The
-        # candidate-package archives are therefore
-        # staged next to the evidence output.
-        uses: actions/download-artifact@v4
-        with:
-          pattern: candidate-package-*
-          path: ${{ runner.temp }}/candidate-packages
-          merge-multiple: true
-
-      - name: Stage fragments and archives for the aggregator
-        # v1.1.3 GATE-04 (#34): consolidate the
-        # matrix-leg artefacts into the layout the
-        # `--fragments` aggregator expects, with the
-        # archives sitting next to the evidence
-        # output so the verifier's checksum /
-        # size_bytes checks resolve end-to-end.
+      - name: Synthetic-failure smoke (issue #36)
+        # v1.1.3 GATE-06 (issue #36): the synthetic
+        # gate. Run scripts/synthesize-vitest-failures.mjs
+        # in a dedicated smoke leg so a regression in
+        # the orchestrator's pattern detector is
+        # caught before the release is published. The
+        # smoke uses the orchestrator's
+        # --emit unhandled-rejection mode + asserts
+        # the orchestrator's stderr surfaces the
+        # UNHANDLED_REJECTION pattern. The injector
+        # always exits 0 (the orchestrator's pattern
+        # detector is the gate, not the injector
+        # itself).
         shell: bash
+        env:
+          AGENT_RECALL_RELEASE_MODE: "1"
+          JOB_ID: synthetic-smoke-${{ github.sha }}
         run: |
           set -euo pipefail
-          FRAGMENTS_DIR="$RUNNER_TEMP/fragments-staged"
-          EVIDENCE_DIR="$RUNNER_TEMP/release-evidence-build"
-          rm -rf "$FRAGMENTS_DIR" "$EVIDENCE_DIR"
-          mkdir -p "$FRAGMENTS_DIR" "$EVIDENCE_DIR"
-          node -e '
-            const fs = require("node:fs");
-            const path = require("node:path");
-            const fragmentsDir = process.env.FRAGMENTS_DIR;
-            const evidenceDir = process.env.EVIDENCE_DIR;
-            const walk = (dir) => {
-              const out = [];
-              for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-                const p = path.join(dir, entry.name);
-                if (entry.isDirectory()) out.push(...walk(p));
-                else out.push(p);
-              }
-              return out;
-            };
-            const downloaded = walk(process.env.FRAGMENTS_DOWNLOAD);
-            let staged = 0;
-            for (const file of downloaded) {
-              if (file.includes(`${path.sep}fragments${path.sep}`) && file.endsWith(".json")) {
-                fs.copyFileSync(file, path.join(fragmentsDir, path.basename(file)));
-                staged++;
-              }
-            }
-            if (staged !== 3) {
-              console.error(`expected 3 v1.1.3 fragments; staged ${staged}`);
-              process.exit(1);
-            }
-            const packages = walk(process.env.CANDIDATE_PACKAGES);
-            for (const file of packages) {
-              const base = path.basename(file);
-              if (base.startsWith("agent-recall-") && (base.endsWith(".tar.gz") || base.endsWith(".zip"))) {
-                fs.copyFileSync(file, path.join(evidenceDir, base));
-              }
-            }
-          '
-        env:
-          FRAGMENTS_DIR: ${{ runner.temp }}/fragments-staged
-          EVIDENCE_DIR: ${{ runner.temp }}/release-evidence-build
-          FRAGMENTS_DOWNLOAD: ${{ runner.temp }}/fragments-download
-          CANDIDATE_PACKAGES: ${{ runner.temp }}/candidate-packages
+          node scripts/synthesize-vitest-failures.mjs --emit unhandled-rejection
+          node scripts/synthesize-vitest-failures.mjs --emit worker-timeout --timeout-ms 10000
 
-      - name: Aggregate and verify release evidence
-        # v1.1.3 GATE-04 (#34): invoke the
-        # `--fragments` aggregator. The aggregator
-        # canonicalises each fragment's `platform`
-        # token (no-op here because the matrix leg
-        # already emits canonical tokens), merges
-        # the test summaries, and writes the
-        # canonical document to
-        # `release-evidence.json` (and a
-        # `release-candidate.json` mirror for the
-        # tag-guard download). The verifier then
-        # re-checks every checksum against the
-        # staged archives.
+      - name: Aggregate release evidence
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_EVIDENCE_ARTIFACTS_JSON: '[]'
+          RELEASE_EVIDENCE_CONCLUSION: success
+          JOB_ID: aggregate-${{ github.sha }}
         run: |
           set -euo pipefail
-          EVIDENCE_DIR="$RUNNER_TEMP/release-evidence-build"
-          FRAGMENTS_DIR="$RUNNER_TEMP/fragments-staged"
-          node scripts/release-evidence.mjs --fragments "$FRAGMENTS_DIR" --output "$EVIDENCE_DIR/release-evidence.json"
-          node scripts/verify-release-evidence.mjs --stable --evidence "$EVIDENCE_DIR/release-evidence.json"
-          cp "$EVIDENCE_DIR/release-evidence.json" release-evidence.json
-          cp "$EVIDENCE_DIR/release-candidate.json" release-candidate.json
+          # v1.1.3 GATE-06 B2 blocker 3 (issue #36):
+          # invoke the orchestrator in full mode so
+          # scripts/release-evidence.mjs finds a
+          # populated aggregate.json + per-suite
+          # junit-*.json + cleanup-*.json under
+          # $RUNNER_TEMP/orchestrator-aggregate/. The
+          # previous --list --json invocation only
+          # printed the suite table; it never produced
+          # aggregate.json, so the v1.1.3 GATE-06
+          # per-suite unhandled_rejections /
+          # worker_timeouts field was never populated
+          # in CI. --list is for local-debug only.
+          node scripts/run-test-suites.mjs \
+            --out "$RUNNER_TEMP/orchestrator-aggregate"
+          node scripts/release-evidence.mjs
+          node scripts/verify-release-evidence.mjs "$RUNNER_TEMP/release-evidence.json"
+          cp "$RUNNER_TEMP/release-evidence.json" release-evidence.json
+          cp "$RUNNER_TEMP/release-candidate.json" release-candidate.json
+
+      - name: Upload orchestrator evidence fragment
+        # v1.1.3 GATE-06 B2 blocker 3 (issue #36):
+        # upload the orchestrator's per-suite
+        # aggregate.json + junit-*.json + cleanup-*.json
+        # so the operator / lane owner can inspect the
+        # per-suite breakdown after a release.
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence-fragment-orchestrator-ubuntu
+          path: |
+            ${{ runner.temp }}/orchestrator-aggregate/aggregate.json
+            ${{ runner.temp }}/orchestrator-aggregate/junit-*.json
+            ${{ runner.temp }}/orchestrator-aggregate/cleanup-*.json
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload release evidence artifact
         uses: actions/upload-artifact@v4
