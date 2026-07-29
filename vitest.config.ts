@@ -4,12 +4,27 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["test/**/*.test.ts"],
-    // The packaged lifecycle is an artifact-consumer suite, not a source-checkout
-    // suite. It fails closed when the extracted artifact env is absent and is
-    // invoked explicitly by release workflows after extraction.
-    exclude: process.env.AGENT_RECALL_EXTRACTED_ARTIFACT === undefined
-      ? ["test/blackbox/packaged-install.test.ts"]
-      : [],
+    // v1.1.3 GATE-06 (issue #36): the heavyweight
+    // suites are segregated into per-suite configs +
+    // runner scripts. The default config hosts the
+    // unit / integration layer only; the heavy
+    // suites (multi-process stress, packaged-artifact
+    // lifecycle) live under
+    // `vitest.{stress,packaged-artifact}.config.ts`
+    // and are invoked via `npm run test:<suite>`.
+    //
+    // The packaged lifecycle is an artifact-consumer
+    // suite, not a source-checkout suite. It fails
+    // closed when the extracted artifact env is absent
+    // and is invoked explicitly by release workflows
+    // after extraction.
+    exclude: [
+      "test/blackbox/packaged-install.test.ts",
+      "test/multi-process-stress.test.ts",
+      ...(process.env.AGENT_RECALL_EXTRACTED_ARTIFACT !== undefined
+        ? []
+        : [])
+    ],
     // Stage 1 migration tests rebuild tables and exercise the full DDL
     // path. With parallel workers this can stretch past the 5s default
     // timeout. 30s is generous for any single test in this project.
@@ -18,13 +33,18 @@ export default defineConfig({
     // tests opening many SQLite files) can exceed the default 10s hook
     // timeout on slower Windows runners.
     hookTimeout: 30_000,
-    // Task 0 of the V1 Final Release Plan (`feat/v1-final-release`,
-    // issue #19): install a worker-side wrapper around
-    // `globalThis.__vitest_worker__.rpc` that swallows the known vitest
-    // `birpc onTaskUpdate` heartbeat noise (60_000 ms RPC timeout)
-    // without weakening any test assertion or skipping any test. See
-    // `test/setup/heartbeat-filter.ts` for the background and rationale.
-    setupFiles: ["./test/setup/heartbeat-filter.ts"],
+    // v1.1.3 GATE-06 (issue #36): the v1.1.2
+    // heartbeat-filter proxy
+    // (`test/setup/heartbeat-filter.ts`) is REMOVED.
+    // The new `vitest.setup.ts` (added in commit 3)
+    // registers an `unhandledRejection` handler that
+    // logs the rejection AND throws in release mode
+    // (`AGENT_RECALL_RELEASE_MODE=1`). The setup file
+    // is referenced from each per-suite config; the
+    // default config continues with `setupFiles: []`
+    // for backward compatibility with `npm test` for
+    // local dev.
+    setupFiles: [],
     coverage: {
       provider: "v8",
       reporter: ["text", "html"]
