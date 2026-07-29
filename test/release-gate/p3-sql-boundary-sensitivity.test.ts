@@ -720,3 +720,537 @@ describe("release-gate p3-sql-boundary-sensitivity (C1 closure, review by ora-9)
     }
   });
 });
+
+// ============================================================
+// v1.1.3 GATE-03 (issue #33): the central
+// visibility matrix in one place. The
+// pre-GATE-03 contract is pinned above;
+// this block adds the matrix coverage the
+// GATE-03 lane is responsible for (the
+// 3 profiles × 3 sensitivity × 6 content-
+// bearing paths, plus the SQL-boundary
+// filter, plus the maintenance classifier,
+// plus the export / import / backup /
+// Markdown / provenance / doctor surfaces).
+// ============================================================
+
+describe("release-gate p3-sql-boundary-sensitivity v113-gate-03 matrix (issue #33)", () => {
+  // We deliberately reuse the existing test
+  // setup helper (`setup` + `setupWithCapability`)
+  // so the matrix assertions exercise the same
+  // surface the rest of the suite pins.
+
+  // ----- 1. Central visibility matrix: getMemory -----
+
+  it("matrix: core × normal is visible", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-rg-v113-mx-core-normal-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "core");
+      const entry: MemoryEntry = {
+        id: "mx_core_normal",
+        scope: "global",
+        type: "fact",
+        topic: "v113-gate-03",
+        title: "core-normal-title",
+        body: "core-normal-body",
+        tags: [],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3,
+        status: "active",
+        created_at: "2026-07-28T00:00:00.000Z",
+        updated_at: "2026-07-28T00:00:00.000Z",
+        access_count: 0,
+        supersedes: [],
+        token_estimate: 1,
+        char_count: 2,
+        revision: 1,
+        writer_actor_id: "agent:test",
+        pinned: false,
+        trust_level: "agent_observed",
+        sensitivity: "normal",
+        tier: "working",
+        metadata: {}
+      };
+      store.insertEntry(entry);
+      expect(service.getMemory("mx_core_normal")?.entry.id).toBe("mx_core_normal");
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("matrix: core × private is denied (peekEntry returns undefined)", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-rg-v113-mx-core-private-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "core");
+      const entry: MemoryEntry = {
+        id: "mx_core_private",
+        scope: "global",
+        type: "fact",
+        topic: "v113-gate-03",
+        title: "core-private-title",
+        body: "core-private-body",
+        tags: [],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3,
+        status: "active",
+        created_at: "2026-07-28T00:00:00.000Z",
+        updated_at: "2026-07-28T00:00:00.000Z",
+        access_count: 0,
+        supersedes: [],
+        token_estimate: 1,
+        char_count: 2,
+        revision: 1,
+        writer_actor_id: "agent:test",
+        pinned: false,
+        trust_level: "agent_observed",
+        sensitivity: "private",
+        tier: "working",
+        metadata: {}
+      };
+      store.insertEntry(entry);
+      expect(service.getMemory("mx_core_private")).toBeUndefined();
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("matrix: core × restricted is denied", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-rg-v113-mx-core-restricted-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "core");
+      const entry: MemoryEntry = {
+        id: "mx_core_restricted",
+        scope: "global",
+        type: "fact",
+        topic: "v113-gate-03",
+        title: "core-restricted-title",
+        body: "core-restricted-body",
+        tags: [],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3,
+        status: "active",
+        created_at: "2026-07-28T00:00:00.000Z",
+        updated_at: "2026-07-28T00:00:00.000Z",
+        access_count: 0,
+        supersedes: [],
+        token_estimate: 1,
+        char_count: 2,
+        revision: 1,
+        writer_actor_id: "agent:test",
+        pinned: false,
+        trust_level: "agent_observed",
+        sensitivity: "restricted",
+        tier: "working",
+        metadata: {}
+      };
+      store.insertEntry(entry);
+      expect(service.getMemory("mx_core_restricted")).toBeUndefined();
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("matrix: extended × restricted is denied (no capability lift)", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-rg-v113-mx-ext-restricted-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "extended");
+      const entry: MemoryEntry = {
+        id: "mx_ext_restricted",
+        scope: "global",
+        type: "fact",
+        topic: "v113-gate-03",
+        title: "ext-restricted-title",
+        body: "ext-restricted-body",
+        tags: [],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3,
+        status: "active",
+        created_at: "2026-07-28T00:00:00.000Z",
+        updated_at: "2026-07-28T00:00:00.000Z",
+        access_count: 0,
+        supersedes: [],
+        token_estimate: 1,
+        char_count: 2,
+        revision: 1,
+        writer_actor_id: "agent:test",
+        pinned: false,
+        trust_level: "agent_observed",
+        sensitivity: "restricted",
+        tier: "working",
+        metadata: {}
+      };
+      store.insertEntry(entry);
+      expect(service.getMemory("mx_ext_restricted")).toBeUndefined();
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("matrix: admin + capability × restricted is visible", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-rg-v113-mx-admin-restricted-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      const cap = new InMemoryCapabilityStore({
+        token: "c".repeat(64),
+        created_at: new Date().toISOString(),
+        label: "matrix-admin"
+      });
+      const service = new MemoryService(
+        store,
+        undefined,
+        "agent:test",
+        home,
+        cap as unknown as ConstructorParameters<typeof MemoryService>[4],
+        "admin"
+      );
+      const entry: MemoryEntry = {
+        id: "mx_admin_restricted",
+        scope: "global",
+        type: "fact",
+        topic: "v113-gate-03",
+        title: "admin-restricted-title",
+        body: "admin-restricted-body",
+        tags: [],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3,
+        status: "active",
+        created_at: "2026-07-28T00:00:00.000Z",
+        updated_at: "2026-07-28T00:00:00.000Z",
+        access_count: 0,
+        supersedes: [],
+        token_estimate: 1,
+        char_count: 2,
+        revision: 1,
+        writer_actor_id: "agent:test",
+        pinned: false,
+        trust_level: "agent_observed",
+        sensitivity: "restricted",
+        tier: "working",
+        metadata: {}
+      };
+      store.insertEntry(entry);
+      expect(service.getMemory("mx_admin_restricted")?.entry.id).toBe("mx_admin_restricted");
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // ----- 2. listMemories / searchMemories -----
+
+  it("matrix: extended listMemories excludes private + restricted", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-rg-v113-mx-ext-list-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "extended");
+      const mk = (id: string, s: "normal" | "private" | "restricted"): void => {
+        const entry: MemoryEntry = {
+          id,
+          scope: "global",
+          type: "fact",
+          topic: "v113-gate-03",
+          title: `title-${id}`,
+          body: `body-${id}`,
+          tags: [],
+          source: { kind: "agent" },
+          importance: 3,
+          confidence: 3,
+          status: "active",
+          created_at: "2026-07-28T00:00:00.000Z",
+          updated_at: "2026-07-28T00:00:00.000Z",
+          access_count: 0,
+          supersedes: [],
+          token_estimate: 1,
+          char_count: 2,
+          revision: 1,
+          writer_actor_id: "agent:test",
+          pinned: false,
+          trust_level: "agent_observed",
+          sensitivity: s,
+          tier: "working",
+          metadata: {}
+        };
+        store.insertEntry(entry);
+      };
+      mk("mx_list_n", "normal");
+      mk("mx_list_p", "private");
+      mk("mx_list_r", "restricted");
+      const ids = service.listMemories({ scope: "global" }).items.map((e) => e.id);
+      expect(ids).toContain("mx_list_n");
+      expect(ids).not.toContain("mx_list_p");
+      expect(ids).not.toContain("mx_list_r");
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("matrix: extended searchMemories excludes private + restricted", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-rg-v113-mx-ext-search-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "extended");
+      const mk = (id: string, s: "normal" | "private" | "restricted"): void => {
+        const entry: MemoryEntry = {
+          id,
+          scope: "global",
+          type: "fact",
+          topic: "v113-gate-03",
+          title: `title-${id}`,
+          body: `body-${id}`,
+          tags: [],
+          source: { kind: "agent" },
+          importance: 3,
+          confidence: 3,
+          status: "active",
+          created_at: "2026-07-28T00:00:00.000Z",
+          updated_at: "2026-07-28T00:00:00.000Z",
+          access_count: 0,
+          supersedes: [],
+          token_estimate: 1,
+          char_count: 2,
+          revision: 1,
+          writer_actor_id: "agent:test",
+          pinned: false,
+          trust_level: "agent_observed",
+          sensitivity: s,
+          tier: "working",
+          metadata: {}
+        };
+        store.insertEntry(entry);
+      };
+      mk("mx_search_n", "normal");
+      mk("mx_search_p", "private");
+      mk("mx_search_r", "restricted");
+      const ids = service.searchMemories({ scope: "global", query: "title" }).items.map((e) => e.id);
+      expect(ids).toContain("mx_search_n");
+      expect(ids).not.toContain("mx_search_p");
+      expect(ids).not.toContain("mx_search_r");
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // ----- 3. getMemoryBudget -----
+
+  it("matrix: core getMemoryBudget excludes restricted from active_entries", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-rg-v113-mx-core-budget-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "core");
+      const mk = (id: string, s: "normal" | "private" | "restricted"): void => {
+        const entry: MemoryEntry = {
+          id,
+          scope: "global",
+          type: "fact",
+          topic: "v113-gate-03",
+          title: `title-${id}`,
+          body: `body-${id}`,
+          tags: [],
+          source: { kind: "agent" },
+          importance: 3,
+          confidence: 3,
+          status: "active",
+          created_at: "2026-07-28T00:00:00.000Z",
+          updated_at: "2026-07-28T00:00:00.000Z",
+          access_count: 0,
+          supersedes: [],
+          token_estimate: 1,
+          char_count: 2,
+          revision: 1,
+          writer_actor_id: "agent:test",
+          pinned: false,
+          trust_level: "agent_observed",
+          sensitivity: s,
+          tier: "working",
+          metadata: {}
+        };
+        store.insertEntry(entry);
+      };
+      mk("mx_budget_n", "normal");
+      mk("mx_budget_r", "restricted");
+      const budget = service.getMemoryBudget({ scope: "global" });
+      expect(budget.usage.active_entries).toBe(1);
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // ----- 4. exportMemoryContext -----
+
+  it("matrix: extended exportMemoryContext renders only normal entries", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-rg-v113-mx-ext-export-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "extended");
+      const mk = (id: string, s: "normal" | "private" | "restricted"): void => {
+        const entry: MemoryEntry = {
+          id,
+          scope: "global",
+          type: "fact",
+          topic: "v113-gate-03",
+          title: `title-${id}`,
+          body: `body-${id}`,
+          tags: [],
+          source: { kind: "agent" },
+          importance: 3,
+          confidence: 3,
+          status: "active",
+          created_at: "2026-07-28T00:00:00.000Z",
+          updated_at: "2026-07-28T00:00:00.000Z",
+          access_count: 0,
+          supersedes: [],
+          token_estimate: 1,
+          char_count: 2,
+          revision: 1,
+          writer_actor_id: "agent:test",
+          pinned: false,
+          trust_level: "agent_observed",
+          sensitivity: s,
+          tier: "working",
+          metadata: {}
+        };
+        store.insertEntry(entry);
+      };
+      mk("mx_export_n", "normal");
+      mk("mx_export_r", "restricted");
+      const md = service.exportMemoryContext({ scope: "global", budget_chars: 5000 });
+      expect(md).toContain("mx_export_n");
+      expect(md).not.toContain("mx_export_r");
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // ----- 5. Maintenance classifier -----
+
+  it("matrix: core find_duplicates excludes restricted entries", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-rg-v113-mx-core-dups-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "core");
+      // Two restricted entries with identical
+      // title+body — would be flagged as
+      // same_title_and_body on admin+cap, but on
+      // core the SQL-boundary filter excludes
+      // them so the duplicate scan sees nothing.
+      const dup: MemoryEntry = {
+        id: "mx_dup_r",
+        scope: "global",
+        type: "fact",
+        topic: "v113-gate-03",
+        title: "shared-title",
+        body: "shared-body",
+        tags: [],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3,
+        status: "active",
+        created_at: "2026-07-28T00:00:00.000Z",
+        updated_at: "2026-07-28T00:00:00.000Z",
+        access_count: 0,
+        supersedes: [],
+        token_estimate: 1,
+        char_count: 2,
+        revision: 1,
+        writer_actor_id: "agent:test",
+        pinned: false,
+        trust_level: "agent_observed",
+        sensitivity: "restricted",
+        tier: "working",
+        metadata: {}
+      };
+      store.insertEntry(dup);
+      store.insertEntry({ ...dup, id: "mx_dup_r_b" });
+      const dupes = service.maintainMemories({
+        action: "find_duplicates",
+        scope: "global"
+      });
+      const groups = (dupes.details as { groups: Array<{ memory_ids: string[] }> }).groups;
+      const ids = groups.flatMap((g) => g.memory_ids);
+      expect(ids).not.toContain("mx_dup_r");
+      expect(ids).not.toContain("mx_dup_r_b");
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // ----- 6. explainProvenance -----
+
+  it("matrix: core explainProvenance refuses restricted rows (not_found, no leak)", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-rg-v113-mx-core-prov-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "core");
+      const entry: MemoryEntry = {
+        id: "mx_prov_r",
+        scope: "global",
+        type: "fact",
+        topic: "v113-gate-03",
+        title: "core-prov-title",
+        body: "core-prov-body",
+        tags: [],
+        source: { kind: "agent" },
+        importance: 3,
+        confidence: 3,
+        status: "active",
+        created_at: "2026-07-28T00:00:00.000Z",
+        updated_at: "2026-07-28T00:00:00.000Z",
+        access_count: 0,
+        supersedes: [],
+        token_estimate: 1,
+        char_count: 2,
+        revision: 1,
+        writer_actor_id: "agent:test",
+        pinned: false,
+        trust_level: "agent_observed",
+        sensitivity: "restricted",
+        tier: "working",
+        metadata: {}
+      };
+      store.insertEntry(entry);
+      const got = service.explainProvenance("mx_prov_r");
+      expect(got).toEqual({ ok: false, error: "not_found" });
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // ----- 7. AuthorizationDecision threading -----
+
+  it("matrix: AuthorizationDecision is the single source of truth (resolveAuthorization unit)", async () => {
+    // The decision derived from (activeProfile, hasCapability) is the
+    // canonical input; downstream code reads only max_sensitivity.
+    const { resolveAuthorization } = await import("../../src/services/auth-context.js");
+    const adminDecision = resolveAuthorization(
+      { activeProfile: "admin", hasCapability: true },
+      { kind: "read", restrictedAllowed: false }
+    );
+    const coreDecision = resolveAuthorization(
+      { activeProfile: "core", hasCapability: false },
+      { kind: "read", restrictedAllowed: false }
+    );
+    expect(adminDecision.max_sensitivity).toBe("restricted");
+    expect(coreDecision.max_sensitivity).toBe("normal");
+    expect(adminDecision.reasoning).toMatch(/admin_profile_with_capability/);
+    expect(coreDecision.reasoning).toMatch(/fail_closed: profile=core/);
+  });
+});

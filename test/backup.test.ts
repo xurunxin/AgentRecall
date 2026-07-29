@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -97,7 +97,109 @@ describe("listBackups", () => {
     expect(items.length).toBe(1);
     expect(items[0].name).toBe("memory-a.sqlite");
   });
+
+  // v1.1.3 GATE-03 (issue #33) review Blocker 3:
+  // the listing surface filters at the SQL
+  // boundary. A Core caller does not see
+  // backups whose live tier exceeds
+  // `max_sensitivity: "normal"`.
+  it("omits restricted backups when the authorization ceiling is normal", () => {
+    // Build two SQLite files: one with only
+    // normal entries, one with restricted
+    // entries. The listing with the
+    // `authorization: { max_sensitivity: "normal" }`
+    // option must omit the restricted backup
+    // and surface only the normal one.
+    const dir = tmpDir();
+    const normalFile = join(dir, "memory-normal.sqlite");
+    const restrictedFile = join(dir, "memory-restricted.sqlite");
+    // Use `runBackup` so the files carry the
+    // canonical schema (`memory_entries` table).
+    const normalStore = seedStore(tmpDir());
+    writeFileSync(normalFile, "");
+    // The simplest way to land a real
+    // `memory_entries` row is to construct a
+    // fresh SQLiteMemoryStore on a tmp path,
+    // insert a row, then copy the file. We
+    // inline a tiny SQLiteMemoryStore lifecycle
+    // here so the test does not depend on a
+    // helper that wasn't designed for it.
+    buildBackupWithEntries(normalFile, [{ id: "n1", sensitivity: "normal" }]);
+    buildBackupWithEntries(restrictedFile, [{ id: "r1", sensitivity: "restricted" }]);
+    normalStore.close();
+    const filtered = listBackups(dir, {
+      authorization: { max_sensitivity: "normal" }
+    });
+    expect(filtered.length).toBe(1);
+    expect(filtered[0].name).toBe("memory-normal.sqlite");
+    // Sanity: without `authorization`, the
+    // pre-GATE-03 surface returns every backup.
+    const unfiltered = listBackups(dir);
+    expect(unfiltered.length).toBe(2);
+  });
+
+  it("surfaces restricted backups when the authorization ceiling is restricted", () => {
+    const dir = tmpDir();
+    buildBackupWithEntries(join(dir, "memory-normal.sqlite"), [
+      { id: "n1", sensitivity: "normal" }
+    ]);
+    buildBackupWithEntries(join(dir, "memory-restricted.sqlite"), [
+      { id: "r1", sensitivity: "restricted" }
+    ]);
+    const items = listBackups(dir, {
+      authorization: { max_sensitivity: "restricted" }
+    });
+    expect(items.length).toBe(2);
+  });
 });
+
+/**
+ * Build a self-contained backup file at
+ * `targetPath` carrying the given `memory_entries`
+ * rows. The file is a fresh SQLite database
+ * with the schema v1.1.1+ `memory_entries`
+ * table so the v1.1.3 GATE-03 sensitivity
+ * probe (`SELECT MAX(CASE sensitivity ...)`)
+ * can run against it.
+ */
+function buildBackupWithEntries(
+  targetPath: string,
+  entries: Array<{ id: string; sensitivity: "normal" | "private" | "restricted" }>
+): void {
+  const tmp = mkdtempSync(join(tmpdir(), "lm-bkp-probe-"));
+  const store = new SQLiteMemoryStore(join(tmp, "memory.sqlite"));
+  for (const e of entries) {
+    store.insertEntry({
+      id: e.id,
+      scope: "global",
+      type: "fact",
+      topic: "bkp-probe",
+      title: e.id,
+      body: e.id,
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3,
+      status: "active",
+      created_at: "2026-07-29T00:00:00.000Z",
+      updated_at: "2026-07-29T00:00:00.000Z",
+      access_count: 0,
+      supersedes: [],
+      token_estimate: 1,
+      char_count: 2,
+      revision: 1,
+      writer_actor_id: "agent:bkp-probe",
+      pinned: false,
+      trust_level: "agent_observed",
+      sensitivity: e.sensitivity,
+      tier: "working",
+      metadata: {}
+    });
+  }
+  store.close();
+  copyFileSync(join(tmp, "memory.sqlite"), targetPath);
+  rmSync(tmp, { recursive: true, force: true });
+}
 
 describe("runBackup failure path", () => {
   it("returns BackupError when the disk rejects the write (path blocked by file)", () => {

@@ -12,13 +12,21 @@
 
 import { CanonicalExporter, type ExportScopeInput as CanonicalInput, type ExportScopeResult } from "./portability/exporter.js";
 import type { ExportFormat } from "./portability/canonical-model.js";
+// v1.1.3 GATE-03 (issue #33): the router threads
+// the `authorization` field through to the
+// `MarkdownExporter` so the fail-closed throw path
+// is reached on an unauthorized restricted export.
+import { MarkdownExporter, type ExportScopeInput as MarkdownInput } from "./markdown-exporter.js";
 
 export type { ExportFormat };
 
 // Re-export the input / result types under the legacy
 // names so callers that imported from this module keep
-// working.
-export type ExportScopeInput = CanonicalInput;
+// working. The router's input type is the union of
+// the markdownexporter's (which carries the optional
+// `authorization`) and the canonical one (which does
+// not).
+export type ExportScopeInput = CanonicalInput & MarkdownInput;
 export type { ExportScopeResult };
 
 /**
@@ -29,12 +37,28 @@ export type { ExportScopeResult };
  */
 export class FormatRouter {
   private readonly exporter: CanonicalExporter;
+  // v1.1.3 GATE-03 (issue #33): the router can also
+  // route to the markdown-only exporter so the
+  // `authorization` field on the input is honoured
+  // (the `MarkdownExporter.exportScope` is the
+  // single point that throws `ForbiddenVisibilityError`).
+  private readonly markdownExporter: MarkdownExporter;
 
   constructor(private readonly exportRoot: string) {
     this.exporter = new CanonicalExporter(exportRoot);
+    this.markdownExporter = new MarkdownExporter(exportRoot);
   }
 
   export(input: ExportScopeInput): ExportScopeResult {
+    // v1.1.3 GATE-03 (issue #33): the markdown
+    // path delegates to the `MarkdownExporter` so
+    // the `authorization` throw path is reached.
+    // The JSON / YAML paths delegate to the
+    // canonical exporter (no throw; the envelope's
+    // `max_sensitivity` field is the audit signal).
+    if (input.format === undefined || input.format === "markdown") {
+      return this.markdownExporter.exportScope(input);
+    }
     return this.exporter.exportScope(input);
   }
 

@@ -18,8 +18,18 @@
 // entry point. The store handles de-duplication
 // (PRIMARY KEY `(memory_id, source_kind, source_ref)`)
 // so a repeat call is a no-op.
+//
+// v1.1.3 GATE-03 (issue #33): the explanation
+// surface honours the canonical authorization
+// decision. A Core / Extended caller asking for
+// the provenance of a restricted row receives
+// `{ ok: false, error: "not_found" }` — the
+// response shape never leaks the row's existence,
+// the row's id, or any link metadata. Admin +
+// capability callers see the full explanation.
 
 import type { SQLiteMemoryStore } from "../sqlite-store.js";
+import { type AuthorizationDecision, type SensitivityLevel } from "./auth-context.js";
 
 export type ProvenanceSourceKind =
   | "issue"
@@ -118,16 +128,89 @@ export function recordProvenance(
 }
 
 /**
- * Return the durable provenance link chain for a
- * memory, plus a stable human-readable summary. The
- * chain is what an agent would surface in response to
- * "where did this memory come from?"; the summary is
- * what an MCP `explain_provenance` tool would render.
+ * Compare a row's sensitivity against the caller's
+ * visibility ceiling. Returns `true` when the
+ * caller is authorized to see the row.
+ *
+ * v1.1.3 GATE-03 (issue #33): the matrix
+ *   - `"normal"` ≤ `"normal"`, `"private"`, `"restricted"`
+ *   - `"private"` ≤ `"private"`, `"restricted"`
+ *   - `"restricted"` ≤ `"restricted"` only
+ *
+ * `normalizeSensitivity` is the ordered comparator
+ * for the SQL-boundary filter; a row's
+ * `sensitivity` value is "visible" when it is at
+ * or below the caller's ceiling.
+ */
+export function isSensitivityVisible(
+  rowSensitivity: "normal" | "private" | "restricted",
+  ceiling: SensitivityLevel
+): boolean {
+  const rank: Record<SensitivityLevel, number> = {
+    normal: 0,
+    private: 1,
+    restricted: 2
+  };
+  return rank[rowSensitivity] <= rank[ceiling];
+}
+
+/**
+ * v1.1.3 GATE-03 (issue #33): an optional
+ * authorization decision. When supplied, the
+ * explanation surface filters links to the
+ * caller's visible subset. Legacy callers that
+ * omit the field see the unfiltered explanation
+ * (the pre-GATE-03 behaviour); new callers MUST
+ * thread the decision so a Core / Extended
+ * caller never sees restricted-edge metadata.
+ *
+ * v1.1.3 GATE-03 (issue #33) Blocker 6 review
+ * fix: the SQL-boundary filter is the primary
+ * gate (the `peekEntry` honours the
+ * `actorMaxSensitivity` predicate). The
+ * `isSensitivityVisible` helper is the
+ * per-row defence-in-depth check: even when the
+ * store-layer filter is bypassed (e.g. a
+ * future refactor that promotes the helper to
+ * internal authorised paths), the canonical
+ * visibility ordering is honoured here. The
+ * helper is a typed comparator over the
+ * canonical sensitivity ladder:
+ *   `normal <= private <= restricted`.
+ * A row whose tier exceeds the caller's ceiling
+ * is described as `not_found` (NOT
+ * `forbidden_visibility`) because the
+ * provenance path is the single-row read alias —
+ * the canonical explanation surface does not
+ * leak the row's existence.
  */
 export function explainProvenance(
   store: SQLiteMemoryStore,
-  memory_id: string
-): ProvenanceExplanation {
+  memory_id: string,
+  options: { authorization?: AuthorizationDecision } = {}
+): ProvenanceExplanation | { ok: false; error: "not_found" } {
+  const ceiling: SensitivityLevel =
+    options.authorization?.max_sensitivity ?? "restricted";
+  const entry = store.peekEntry(memory_id, { actorMaxSensitivity: ceiling });
+  if (entry === undefined) {
+    return { ok: false, error: "not_found" };
+  }
+  // v1.1.3 GATE-03 (issue #33) Blocker 6 review
+  // fix: wire `isSensitivityVisible` into the
+  // explanation path so the per-row contract is
+  // enforced at the helper boundary in addition
+  // to the SQL-boundary filter. A future
+  // `relatedMemories` follow-up (which is
+  // surfaced from the same store) inherits the
+  // same visibility ordering without a second
+  // helper. The check is fail-closed: an
+  // invisible row returns `not_found` (never
+  // `forbidden_visibility`) because the
+  // explanation surface is the single-row
+  // read alias.
+  if (!isSensitivityVisible(entry.sensitivity, ceiling)) {
+    return { ok: false, error: "not_found" };
+  }
   const links = store.getProvenance(memory_id);
   const summary = links.map((link) => formatLink(link));
   return { memory_id, links, summary };

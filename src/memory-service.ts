@@ -44,6 +44,7 @@ import { type RememberInput, type UpdateInput } from "./write-validator.js";
 import { buildRequestContext, type RequestContext } from "./request-context.js";
 import { CapabilityStore, InMemoryCapabilityStore } from "./admin/capability.js";
 import type { ToolProfile } from "./tools/profile.js";
+import { resolveAuthorization, type AuthorizationDecision } from "./services/auth-context.js";
 
 // Re-export the public types from the read service so the
 // existing `import { ListResult, ... } from "../memory-service"`
@@ -117,6 +118,16 @@ export class MemoryService {
    * exists in their data home.
    */
   private readonly activeProfile: ToolProfile;
+
+  /**
+   * v1.1.3 GATE-03 (issue #33): the canonical
+   * authorization decision. Held as a private
+   * field so the public façade methods
+   * (`explainProvenance`, `recordProvenance`,
+   * etc.) can consult it without re-deriving
+   * the ceiling on every call.
+   */
+  private readonly authorization!: AuthorizationDecision;
 
   constructor(
     store: SQLiteMemoryStore,
@@ -195,13 +206,30 @@ export class MemoryService {
     // the env vars.
     const visibilityLifted =
       activeProfile === "admin" && capabilityStore?.hasCapability() === true;
+    // v1.1.3 GATE-03 (issue #33): the canonical
+    // authorization decision. The
+    // `AuthorizationDecision` replaces the v1.1.2
+    // derived string as the single source of
+    // truth; the legacy `actorMaxSensitivity`
+    // string is kept as a derived helper for
+    // backward compatibility with callers that
+    // still take the string.
+    const authorization: AuthorizationDecision = resolveAuthorization(
+      {
+        activeProfile,
+        hasCapability: visibilityLifted
+      },
+      { kind: "read", restrictedAllowed: false }
+    );
+    this.authorization = authorization;
     this.read = new MemoryReadService({
       store,
       defaultActor,
       identityResolver,
       resolveExporter: resolveExporterFn,
       actorMaxSensitivity: visibilityLifted ? "restricted" : "normal",
-      activeProfile
+      activeProfile,
+      authorization
     });
     this.write = new MemoryWriteService({
       store,
@@ -215,6 +243,13 @@ export class MemoryService {
       // types against the per-process
       // profile.
       activeProfile,
+      // v1.1.3 GATE-03 (issue #33): the canonical
+      // authorization decision. The internal CAS
+      // path uses `peekEntryUnrestricted` only
+      // when this decision lifts visibility;
+      // otherwise the write path consults the
+      // SQL-boundary filter.
+      authorization,
       configureProjectBudget: (project_id, budget, canonical_path, display_name) =>
         this.configureProjectBudget(project_id, budget, canonical_path, display_name)
     });
@@ -223,7 +258,16 @@ export class MemoryService {
       defaultActor,
       identityResolver,
       ...(this.dataHome !== undefined ? { dataHome: this.dataHome } : {}),
-      resolveExporter: resolveExporterFn
+      resolveExporter: resolveExporterFn,
+      // v1.1.3 GATE-03 (issue #33): thread the
+      // canonical authorization decision so the
+      // maintenance helpers consult the same
+      // sensitivity ceiling as the read surface.
+      authorization,
+      // The `MaintenanceActionPolicy` table
+      // consults the active profile to gate
+      // `requiresAdminProfile` actions.
+      activeProfile
     });
     this._store = store;
     this.planStore = new MaintenancePlanStore(store);
@@ -435,7 +479,17 @@ export class MemoryService {
     kind: "up" | "down" | "pin" | "hide";
     actor_id?: string;
   }): { ok: true } | { ok: false; error: "not_found" } {
-    const entry = this.store.peekEntry(input.memory_id);
+    // v1.1.3 GATE-03 (issue #33) review fix 2:
+    // thread the SQL-boundary sensitivity filter. A
+    // Core / Extended caller probing a restricted
+    // row id sees `not_found` (the caller's
+    // existence-probe is not exposed). The
+    // feedback row is NOT written for invisible
+    // entries.
+    const ceiling = this.authorization.max_sensitivity;
+    const entry = this.store.peekEntry(input.memory_id, {
+      actorMaxSensitivity: ceiling
+    });
     if (entry === undefined) {
       return { ok: false, error: "not_found" };
     }
@@ -468,7 +522,17 @@ export class MemoryService {
     source_ref: string;
     actor_id?: string;
   }): { ok: true } | { ok: false; error: "not_found" | "invalid_input" } {
-    const entry = this.store.peekEntry(input.memory_id);
+    // v1.1.3 GATE-03 (issue #33) review fix 2:
+    // thread the SQL-boundary sensitivity filter. A
+    // Core / Extended caller probing a restricted
+    // row id sees `not_found` (the caller's
+    // existence-probe is not exposed). The
+    // provenance link is NOT written for invisible
+    // entries.
+    const ceiling = this.authorization.max_sensitivity;
+    const entry = this.store.peekEntry(input.memory_id, {
+      actorMaxSensitivity: ceiling
+    });
     if (entry === undefined) {
       return { ok: false, error: "not_found" };
     }
@@ -487,11 +551,22 @@ export class MemoryService {
    * `explain_memory_provenance` MCP tool renders.
    */
   explainProvenance(memory_id: string): ProvenanceExplanation | { ok: false; error: "not_found" } {
-    const entry = this.store.peekEntry(memory_id);
+    // v1.1.3 GATE-03 (issue #33): the
+    // explanation surface is filtered at the
+    // SQL boundary. The peekEntry threads the
+    // canonical authorization decision (the
+    // same decision the read service uses), so
+    // a Core / Extended caller asking for the
+    // provenance of a restricted row sees
+    // `not_found` — the response never leaks
+    // the row's existence or any link
+    // metadata.
+    const ceiling = this.authorization.max_sensitivity;
+    const entry = this.store.peekEntry(memory_id, { actorMaxSensitivity: ceiling });
     if (entry === undefined) {
       return { ok: false, error: "not_found" };
     }
-    return explainProvenance(this.store, memory_id);
+    return explainProvenance(this.store, memory_id, { authorization: this.authorization });
   }
 
   /**
@@ -533,17 +608,23 @@ export class MemoryService {
         next: MemoryEntry["trust_level"];
       }
     | { ok: false; error: "not_found" | "unauthorized" | "invalid_input"; message?: string } {
-    // Stage 18 v1.1.2 follow-up (review by ora-8):
-    // `peekEntry` is the write-path gate (the
-    // promotion is a trust-tier escalation). The
-    // SQL-boundary sensitivity predicate does
-    // NOT apply here — the row must be visible
-    // so the service can read the current
-    // `trust_level` and decide whether the
-    // transition is legal. The pre-follow-up
-    // overload (no options) is the explicit
-    // contract for this case.
-    const entry = this.store.peekEntry(input.memory_id);
+    // v1.1.3 GATE-03 (issue #33) review fix 2:
+    // `confirmMemoryTrust` is an internal write-path
+    // CAS (the promotion is a trust-tier escalation).
+    // The transition is gated on BOTH the SQL-boundary
+    // sensitivity filter AND the capability check
+    // (a `trust_promotion` per-request token is
+    // required with `profile_required: "admin"`).
+    // The SQL-boundary filter closes the existence
+    // probe: a Core / Extended caller probing a
+    // restricted row id sees `not_found`, never the
+    // row's `trust_level` tier. The capability gate
+    // is the authorization surface for actual
+    // promotion; a Core / Extended caller cannot supply
+    // a valid `trust_promotion` token anyway.
+    const entry = this.store.peekEntry(input.memory_id, {
+      actorMaxSensitivity: this.authorization.max_sensitivity
+    });
     if (entry === undefined) {
       return { ok: false, error: "not_found" };
     }
@@ -926,9 +1007,31 @@ export class MemoryService {
     // touch a memory without a recorded revision); we
     // build the snapshot here so the validator can refuse
     // any "unplanned_target".
+    //
+    // v1.1.3 GATE-03 (issue #33) review fix 2:
+    // `applyMaintenance` is an internal CAS path
+    // (the apply step mutates rows). The plan was
+    // already built by `planMaintenance` under the
+    // caller's `activeProfile` + capability; the
+    // apply step is gated on the same authorization.
+    // The SQL-boundary sensitivity filter closes the
+    // existence probe: a Core / Extended caller
+    // probing a restricted row via `applyMaintenance`
+    // sees `revision === -1` (the row is invisible),
+    // which causes the validator's CAS check to fail
+    // closed with `stale_revision` (analogous to a
+    // genuine revision drift). The
+    // `MaintenanceActionPolicy` table already gates
+    // destructive actions on the Admin profile, so
+    // the only path that can land on this loop with
+    // a restricted row is Admin+capability, where the
+    // canonical decision lifts visibility to
+    // `"restricted"` and the filter is a no-op.
     const currentRevisions: Record<string, number> = {};
     for (const action of plan.proposed_actions) {
-      const entry = this.store.peekEntry(action.target_memory_id);
+      const entry = this.store.peekEntry(action.target_memory_id, {
+        actorMaxSensitivity: this.authorization.max_sensitivity
+      });
       currentRevisions[action.target_memory_id] = entry?.revision ?? -1;
     }
 
@@ -1287,7 +1390,18 @@ export class MemoryService {
       return { backup_dir: undefined, entries: [] };
     }
     const backupDir = join(this.dataHome, "backups");
-    return { backup_dir: backupDir, entries: listBackups(backupDir) };
+    // v1.1.3 GATE-03 (issue #33) Blocker 3: thread
+    // the canonical authorization decision through
+    // `listBackups` so a Core / Extended caller
+    // never sees restricted-tagged backups. The
+    // SQL-boundary filter is the same contract as
+    // every other content-bearing path.
+    return {
+      backup_dir: backupDir,
+      entries: listBackups(backupDir, {
+        authorization: { max_sensitivity: this.authorization.max_sensitivity }
+      })
+    };
   }
 
   /**
@@ -1296,9 +1410,19 @@ export class MemoryService {
    * importer's conflict-resolution path so a `replace`
    * can compare revisions without bumping the live
    * entry's access count.
+   *
+   * v1.1.3 GATE-03 (issue #33) review fix 2:
+   * thread the SQL-boundary sensitivity filter. A
+   * Core / Extended caller probing a restricted row
+   * id sees `undefined` (the caller's
+   * existence-probe is not exposed). The importer's
+   * internal CAS path uses `service.store.peekEntry(id)`
+   * directly when unrestricted access is required.
    */
   peekMemoryById(id: string): MemoryEntry | undefined {
-    return this._store.peekEntry(id);
+    return this._store.peekEntry(id, {
+      actorMaxSensitivity: this.authorization.max_sensitivity
+    });
   }
 
   /**

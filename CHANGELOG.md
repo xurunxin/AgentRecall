@@ -221,6 +221,157 @@ full design.
   header during the merge of `feat/v1.1.3-gate-01-identity`
   + `feat/v1.1.3-gate-02-capability` so the publication
   record stays one entry per release.
+- **GATE-03: one sensitivity policy across every
+  read / export / resource / maintenance / CLI / MCP
+  surface (issue #33).** The canonical
+  `AuthorizationDecision` (`max_sensitivity`,
+  `capability_token_present`, `reasoning`) is the
+  single source of truth for every content-bearing
+  path. The SQL-boundary filter remains the ONLY place
+  sensitivity is decided; the maintenance service
+  consults the new `MaintenanceActionPolicy` table
+  (the 12-action classification); the exporter
+  envelope surfaces `max_sensitivity`; the
+  MarkdownExporter exits 1 with `forbidden_visibility`
+  on unauthorized restricted exports; the CLI / MCP
+  / tools / doctor surface thread the decision via
+  the typed field. See `docs/adr/0006-one-sensitivity-policy.md`
+  for the full design and
+  `docs/guides/sensitivity-matrix.md` for the
+  operator-facing matrix.
+
+### Added (GATE-03)
+
+- **`src/services/auth-context.ts`** — the canonical
+  authorization decision + `resolveAuthorization(ctx,
+  operation)`. Pure, dependency-free; the resolver
+  does NOT call `CapabilityStore.authorize(...)` —
+  the caller does that and signals via
+  `requestCapability`.
+- **`MaintenanceActionPolicy`** — the canonical
+  per-action sensitivity policy table. Exported from
+  `memory-maintenance-service.ts` so future lanes
+  extend the registry without inlining policy at
+  each dispatch site.
+- **`peekEntryUnrestricted(id)`** — the typed
+  unrestricted single-row read on `MemoryReadService`.
+  Restricted to internal authorized paths (write +
+  maintenance); callers must consult their own
+  authorization before invoking it.
+- **`FORBIDDEN_VISIBILITY`** — the stable error code
+  exported from `markdown-exporter.ts`. Callers
+  branch on this code (the CLI maps it to exit 1).
+- **`docs/adr/0006-one-sensitivity-policy.md`** — the
+  ADR documenting the canonical decision, the
+  maintenance classification, the per-row vs
+  per-bundle semantics, and the v1.1.2 scoped limits
+  this lane closes.
+- **`docs/guides/sensitivity-matrix.md`** — the
+  operator-facing matrix matching the test assertions.
+
+### Tests (GATE-03)
+
+- **`test/release-gate/v113-sensitivity-policy.test.ts`**
+  (NEW, 31 tests) — the central matrix (3 profiles ×
+  3 sensitivity × 6 content-bearing paths) plus the
+  SQL-boundary filter, the maintenance classifier,
+  and the per-row export / import / backup / Markdown
+  / provenance / doctor surfaces.
+- **4 existing suites extended** (commit 7):
+  - `p3-sql-boundary-sensitivity.test.ts` (+12)
+  - `mcp-all-tools-e2e-core.test.ts` (+6)
+  - `mcp-all-tools-e2e-extended.test.ts` (+6)
+  - `admin-default/mcp-admin-default.test.ts` (+6)
+
+### Fixes (GATE-03 review by `ora-10`)
+
+Issue #33's oracle review returned 6 blocking
+issues. The lane-owner landed blocker 1 (gating
+`peekEntryUnrestricted` as private) in commit
+`bbd5b83`. The remaining 5 blockers are closed in
+5 self-contained commits:
+
+- **`fix(svc): thread authorization through 5
+  unfiltered peekEntry call sites in
+  MemoryService`** (blocker 2) — the SQL-boundary
+  filter is now applied at every `peekEntry(id)`
+  call site in `src/memory-service.ts`
+  (`confirmMemoryTrust` + `applyMaintenance`). The
+  three sites in `recordFeedback` /
+  `recordProvenance` / `explainProvenance` were
+  already closed in `bbd5b83`; the two sites in
+  the internal CAS paths are now closed with the
+  same filter. The dual-gate contract (the
+  SQL-boundary filter on the read; the
+  `trust_promotion` per-request capability on the
+  promotion) is the canonical authorization
+  surface for `confirmMemoryTrust`. The apply
+  step's `revision: -1` on an invisible row
+  causes the validator's CAS check to fail closed
+  with `stale_revision` — analogous to a genuine
+  revision drift.
+
+- **`feat(backup): implement SQL-boundary filter
+  for `listBackups` authorization`** (blocker 3)
+  — `listBackups` no longer reads the
+  `authorization` parameter into a local `visible`
+  variable and discards it. The listing opens each
+  backup file in read-only mode (the same
+  `verifyBackup` probe pattern, no new
+  dependency) and runs
+  `SELECT MAX(CASE sensitivity WHEN 'restricted' THEN 3 WHEN 'private' THEN 2 ELSE 1 END) FROM memory_entries`
+  to derive the backup's tier; the file is
+  omitted when its tier exceeds the caller's
+  `max_sensitivity`. Pre-GATE-03 behaviour is
+  preserved when the caller omits the option.
+
+- **`test(v113-gate-03): replace 4 placeholder
+  tests with real assertions`** (blocker 4) —
+  the four `expect(store).toBeDefined()` /
+  `expect(svc).toBeDefined()` placeholders in
+  `v113-sensitivity-policy.test.ts` are now real
+  end-to-end assertions: the maintenance
+  `apply_merge_duplicates` test seeds 2 actual
+  duplicates + 1 distinct entry and asserts
+  Core sees the duplicate group but the apply
+  step refuses with `error: "unauthorized"`; the
+  import test builds a JSON snapshot bundle
+  via `CanonicalExporter.exportScope({ format:
+  "json" })` and asserts the preflight
+  rejects the restricted row; the backup
+  inspection test seeds two real
+  schema-v1.1.1+ backup files via a new local
+  `writeBackupWithEntries` helper and asserts
+  the restricted backup is filtered out; the
+  `MarkdownExporter` test asserts the new
+  `ForbiddenVisibilityError` throw path.
+
+- **`fix(markdown): throw
+  `ForbiddenVisibilityError` on unauthorized
+  restricted exports + wire CLI exit code`**
+  (blocker 5) — the `FORBIDDEN_VISIBILITY`
+  constant is no longer dead code. The
+  `MarkdownExporter.exportScope` path throws a
+  typed `ForbiddenVisibilityError` (carrying the
+  stable `code: "forbidden_visibility"` and a
+  `details.memory_ids` list) when the caller's
+  authorization ceiling is below `"restricted"`
+  and the export input contains restricted
+  rows. The CLI `export` command catches the
+  error and exits 1 with the stable
+  `forbidden_visibility` code. The pre-GATE-03
+  surface (no `authorization` field) is preserved
+  for backward compatibility.
+
+- **`fix(provenance): wire `isSensitivityVisible`
+  into `explainProvenance`** (blocker 6) — the
+  helper is no longer dead code. The
+  `explainProvenance` path now applies the
+  helper as a per-row defence-in-depth check on
+  top of the SQL-boundary filter. A future
+  `relatedMemories` follow-up surface inherits
+  the same helper without a second
+  implementation.
 
 ## [1.1.2] — Stage 18 v1.1.2 release candidate gate (#27, Task 8)
 

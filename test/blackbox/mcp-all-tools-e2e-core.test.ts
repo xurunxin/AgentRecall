@@ -47,6 +47,9 @@ import {
   CORE_TOOL_NAMES,
   EXTENDED_TOOL_NAMES
 } from "../../src/tools/register-tools.js";
+import { MemoryService } from "../../src/memory-service.js";
+import { SQLiteMemoryStore } from "../../src/sqlite-store.js";
+import type { MemoryEntry } from "../../src/domain.js";
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), "../../..");
 const SERVER_ENTRY = join(REPO_ROOT, "dist", "src", "index.js");
@@ -775,5 +778,143 @@ describe("MCP all-tools black-box E2E - Core profile (v1.1.2 #22 Task 3 follow-u
     // envelope that some downstream paths
     // still emit before the profile gate).
     expect(code).toMatch(/profile_mismatch|unauthorized/);
+  });
+});
+
+// ============================================================
+// v1.1.3 GATE-03 (issue #33): the Core-
+// profile matrix assertions. The MCP black-
+// box suite above is end-to-end; the
+// matrix assertions below pin the GATE-03
+// behaviour on the service surface that
+// the Core profile exercises. The build
+// artifact is NOT required for these
+// matrix assertions — they construct a
+// fresh MemoryService per test.
+// ============================================================
+
+describe("v113-gate-03 matrix: Core profile (issue #33)", () => {
+  function makeEntry(id: string, sensitivity: "normal" | "private" | "restricted"): MemoryEntry {
+    return {
+      id,
+      scope: "global",
+      type: "fact",
+      topic: "v113-gate-03",
+      title: `title-${id}`,
+      body: `body-${id}`,
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3,
+      status: "active",
+      created_at: "2026-07-28T00:00:00.000Z",
+      updated_at: "2026-07-28T00:00:00.000Z",
+      access_count: 0,
+      supersedes: [],
+      token_estimate: 1,
+      char_count: 2,
+      revision: 1,
+      writer_actor_id: "agent:test",
+      pinned: false,
+      trust_level: "agent_observed",
+      sensitivity,
+      tier: "working",
+      metadata: {}
+    };
+  }
+
+  it("Core × restricted row: getMemoryWithVisibility returns forbidden_visibility without leaking entry_sensitivity", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-v113-gate-03-core-mx-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      store.insertEntry(makeEntry("v113_core_r", "restricted"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "core");
+      const got = service.getMemoryWithVisibility("v113_core_r");
+      expect(got.ok).toBe(false);
+      if (got.ok) return;
+      expect(got.error).toBe("forbidden_visibility");
+      expect(got.details?.["entry_sensitivity"]).toBeUndefined();
+      expect(Object.keys(got.details ?? {}).some((k) => k === "sensitivity")).toBe(false);
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("Core × restricted row: listMemories excludes the row at the SQL boundary", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-v113-gate-03-core-list-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      store.insertEntry(makeEntry("v113_core_list_n", "normal"));
+      store.insertEntry(makeEntry("v113_core_list_r", "restricted"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "core");
+      const ids = service.listMemories({ scope: "global" }).items.map((e) => e.id);
+      expect(ids).toContain("v113_core_list_n");
+      expect(ids).not.toContain("v113_core_list_r");
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("Core × restricted row: searchMemories excludes the row at the SQL boundary", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-v113-gate-03-core-search-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      store.insertEntry(makeEntry("v113_core_search_n", "normal"));
+      store.insertEntry(makeEntry("v113_core_search_r", "restricted"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "core");
+      const ids = service.searchMemories({ scope: "global", query: "title" }).items.map((e) => e.id);
+      expect(ids).toContain("v113_core_search_n");
+      expect(ids).not.toContain("v113_core_search_r");
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("Core × restricted row: getMemoryBudget excludes the row from active_entries", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-v113-gate-03-core-budget-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      store.insertEntry(makeEntry("v113_core_budget_n", "normal"));
+      store.insertEntry(makeEntry("v113_core_budget_r", "restricted"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "core");
+      const budget = service.getMemoryBudget({ scope: "global" });
+      expect(budget.usage.active_entries).toBe(1);
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("Core × restricted row: exportMemoryContext renders only normal entries", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-v113-gate-03-core-export-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      store.insertEntry(makeEntry("v113_core_export_n", "normal"));
+      store.insertEntry(makeEntry("v113_core_export_r", "restricted"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "core");
+      const md = service.exportMemoryContext({ scope: "global", budget_chars: 5000 });
+      expect(md).toContain("v113_core_export_n");
+      expect(md).not.toContain("v113_core_export_r");
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("Core × restricted row: explainProvenance returns not_found (no row existence leak)", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-v113-gate-03-core-prov-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      store.insertEntry(makeEntry("v113_core_prov_r", "restricted"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "core");
+      const got = service.explainProvenance("v113_core_prov_r");
+      expect(got).toEqual({ ok: false, error: "not_found" });
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
