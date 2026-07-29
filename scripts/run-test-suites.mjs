@@ -65,7 +65,7 @@
 //   2 — orchestrator-level failure (CLI misuse, missing config, etc.)
 
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -341,7 +341,6 @@ function detectChildProcessLeaks(outDir, suiteName) {
   const leaks = [];
   const base = tmpdir();
   if (!existsSync(base)) return leaks;
-  const { readdirSync } = require("node:fs");
   for (const entry of readdirSync(base)) {
     if (entry.startsWith("lm-stress-home-") || entry.startsWith("lm-stress-barrier-")) {
       leaks.push({ kind: "orphan-temp-dir", path: join(base, entry), suite: suiteName });
