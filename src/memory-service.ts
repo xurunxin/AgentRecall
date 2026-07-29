@@ -1390,7 +1390,18 @@ export class MemoryService {
       return { backup_dir: undefined, entries: [] };
     }
     const backupDir = join(this.dataHome, "backups");
-    return { backup_dir: backupDir, entries: listBackups(backupDir) };
+    // v1.1.3 GATE-03 (issue #33) Blocker 3: thread
+    // the canonical authorization decision through
+    // `listBackups` so a Core / Extended caller
+    // never sees restricted-tagged backups. The
+    // SQL-boundary filter is the same contract as
+    // every other content-bearing path.
+    return {
+      backup_dir: backupDir,
+      entries: listBackups(backupDir, {
+        authorization: { max_sensitivity: this.authorization.max_sensitivity }
+      })
+    };
   }
 
   /**

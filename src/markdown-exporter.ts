@@ -6,6 +6,7 @@ import type { BudgetUsage } from "./sqlite-store.js";
 import { CanonicalExporter } from "./portability/exporter.js";
 import { safeTopicBase, shortHash } from "./portability/canonical-model.js";
 import { AUTHORITY_NOTICE } from "./portability/renderers.js";
+import { isSensitivityVisible } from "./services/provenance.js";
 
 export type ContextPackInput = {
   title: string;
@@ -13,12 +14,87 @@ export type ContextPackInput = {
   entries: Array<MemoryEntry & { trust_boost?: number; writer?: string }>;
 };
 
+/**
+ * v1.1.3 GATE-03 (issue #33): the optional
+ * `authorization` field on the export input.
+ * When supplied, the `MarkdownExporter` enforces
+ * the SQL-boundary sensitivity filter: an entry
+ * whose `sensitivity` exceeds the caller's
+ * `max_sensitivity` triggers a
+ * `ForbiddenVisibilityError` carrying the
+ * stable `FORBIDDEN_VISIBILITY` code. The
+ * exporter is the SINGLE place this check
+ * happens on the export surface — the canonical
+ * exporter already enforces the filter on the
+ * envelope's `max_sensitivity` field, but the
+ * Markdown exporter ALSO throws on the way in
+ * so the CLI / MCP can branch on the stable
+ * code without inspecting file contents.
+ */
 export type ExportScopeInput = {
   scope: MemoryScope;
   project_id?: string;
   entries: MemoryEntry[];
   budgetStatus: string | BudgetUsage;
+  /**
+   * The canonical authorization decision. When
+   * omitted, the exporter is
+   * backward-compatible with the pre-GATE-03
+   * surface (no throw; every entry is exported).
+   */
+  authorization?: { max_sensitivity: "normal" | "private" | "restricted" };
 };
+
+/**
+ * v1.1.3 GATE-03 (issue #33): the stable error
+ * thrown when a MarkdownExporter caller asks for
+ * a restricted export without the authorization
+ * to see restricted rows. The `code` field is
+ * the stable `FORBIDDEN_VISIBILITY` constant so
+ * callers (CLI / MCP) can branch on the failure
+ * mode without parsing the message. The
+ * `details.memory_ids` field lists the offending
+ * entries so an operator can triage without a
+ * second pass.
+ */
+export class ForbiddenVisibilityError extends Error {
+  public readonly code: "forbidden_visibility";
+  public readonly details: { memory_ids: string[] };
+  constructor(memoryIds: string[]) {
+    super(
+      `forbidden_visibility: MarkdownExporter refused ${memoryIds.length} restricted entry/entries because the caller's authorization does not lift to "restricted"`
+    );
+    this.name = "ForbiddenVisibilityError";
+    this.code = "forbidden_visibility";
+    this.details = { memory_ids: memoryIds };
+  }
+}
+
+/**
+ * v1.1.3 GATE-03 (issue #33): the helper that
+ * walks the input entries and returns the ids
+ * whose `sensitivity` exceeds the caller's
+ * `max_sensitivity`. The MarkdownExporter
+ * throws `ForbiddenVisibilityError` with this
+ * list when the call is unauthorized. The
+ * canonical visibility ordering is the same
+ * `isSensitivityVisible` ordering the
+ * `explainProvenance` surface uses; reusing
+ * the helper keeps the per-row contract
+ * uniform across every content-bearing path.
+ */
+function findUnauthorizedEntries(
+  entries: ReadonlyArray<MemoryEntry>,
+  maxSensitivity: "normal" | "private" | "restricted"
+): string[] {
+  const out: string[] = [];
+  for (const e of entries) {
+    if (!isSensitivityVisible(e.sensitivity, maxSensitivity)) {
+      out.push(e.id);
+    }
+  }
+  return out;
+}
 
 export type ExportScopeResult = {
   indexPath: string;
@@ -197,8 +273,30 @@ export class MarkdownExporter {
    * Backward-compat wrapper around `CanonicalExporter`.
    * The legacy callers (CLI, doctor, smoke tests) get
    * the same {indexPath, topicPaths} shape.
+   *
+   * v1.1.3 GATE-03 (issue #33): when the caller
+   * supplies an `authorization` decision, the
+   * exporter enforces the SQL-boundary sensitivity
+   * filter on the input entries. An entry whose
+   * tier exceeds the caller's `max_sensitivity`
+   * triggers a `ForbiddenVisibilityError` carrying
+   * the stable `FORBIDDEN_VISIBILITY` code. The
+   * throw is fail-closed: the caller's caller
+   * (CLI / MCP) sees the stable code and exits 1
+   * without inspecting the file system. The
+   * pre-GATE-03 surface (no `authorization`) is
+   * preserved for backward compatibility.
    */
   exportScope(input: ExportScopeInput): ExportScopeResult {
+    if (input.authorization !== undefined) {
+      const offenders = findUnauthorizedEntries(
+        input.entries,
+        input.authorization.max_sensitivity
+      );
+      if (offenders.length > 0) {
+        throw new ForbiddenVisibilityError(offenders);
+      }
+    }
     return this.inner.exportScope({ ...input, format: "markdown" });
   }
 
