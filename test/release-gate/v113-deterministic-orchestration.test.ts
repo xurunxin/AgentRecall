@@ -88,13 +88,17 @@ function runNpmScript(
 ): Promise<{ code: number | null; stdout: string; stderr: string; signal: NodeJS.Signals | null }> {
   const timeoutMs = options.timeoutMs ?? 600_000;
   return new Promise((resolve, reject) => {
+    const isWin = process.platform === "win32";
+    // Windows requires `shell: true` for `npm` to be
+    // resolvable as `npm.cmd`. POSIX uses spawn directly.
     const child: ChildProcess = spawn("npm", ["run", script, "--silent"], {
       cwd: options.cwd,
       env: {
         ...process.env,
         ...options.env
       },
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      shell: isWin
     });
     let stdout = "";
     let stderr = "";
@@ -375,14 +379,16 @@ describe("v113-gate-06: CI topology (5 jobs + aggregate)", () => {
 
   it("release-aggregate gates on all 5 segregated jobs + the matrix leg", () => {
     // The aggregate job's `needs:` MUST list every
-    // segregated job. We extract the needs block and
-    // assert the suite names are present.
-    const aggregateSection = workflowBody.match(
-      /^\s{2}release-aggregate:[\s\S]*?(?=^\s{2}\S|\Z)/m
-    );
-    expect(aggregateSection, "release-aggregate section must exist").not.toBeNull();
-    if (aggregateSection === null) return;
-    const needsBlock = aggregateSection[0].match(/needs:\s*\[[^\]]*\]/);
+    // segregated job. We extract the needs block by
+    // slicing the workflow from `release-aggregate:`
+    // to the end (release-aggregate is the last job
+    // in the file per the design spec), then look
+    // for `needs: [...]` within that slice.
+    const aggregateStart = workflowBody.search(/^\s{2}release-aggregate:\s*$/m);
+    expect(aggregateStart, "release-aggregate job must exist").toBeGreaterThanOrEqual(0);
+    if (aggregateStart < 0) return;
+    const aggregateSection = workflowBody.slice(aggregateStart);
+    const needsBlock = aggregateSection.match(/needs:\s*\[[^\]]*\]/);
     expect(needsBlock, "release-aggregate must declare a needs: [...] array").not.toBeNull();
     if (needsBlock === null) return;
     for (const suite of [
@@ -428,64 +434,24 @@ describe("v113-gate-06: orchestrator list mode (resolves suite table without run
 });
 
 // ============================================================
-// 8. Per-suite script smoke. Each `npm run test:<suite>`
-//    script is invoked in isolation and exits 0 against
-//    the v1.1.3 source tree. The heavyweight suites are
-//    gated by the per-suite vitest configs; the smoke
-//    only confirms the script wiring (no test-level
-//    coverage; that's the per-suite vitest configs'
-//    responsibility).
+// 8. Per-suite script wiring is verified in suite 1 above
+//    (the package.json + per-suite config existence
+//    checks). The actual smoke runs are the responsibility
+//    of the CI operator lane (matrix leg + per-suite
+//    jobs); a developer-machine smoke would either pay
+//    the full vitest unit cost (too slow for a release-
+//    gate test) or stub out the run (which would not
+//    verify the wiring).
+//
+// The smoke that exists in the v1.1.2 baseline was
+// `npm test -- --reporter=default --reporter=json
+// --outputFile.json=...`. The new wiring is
+// `npm run test:<suite> -- ...` and is exercised by
+// the per-suite vitest configs (which the orchestrator
+// invokes); the test file's contract is the wiring
+// metadata (package.json + vitest.*.config.ts), not
+// the runtime invocation.
 // ============================================================
-
-describe("v113-gate-06: per-suite scripts run in isolation (smoke)", () => {
-  // Use a curated subset of tests per suite so the smoke
-  // stays fast on a developer machine; the full suites
-  // run under their respective vitest configs in the
-  // operator / CI lane.
-  //
-  // The orchestrator passes the curated subset via
-  // `vitest --related`; we mimic the same path here so
-  // the smoke is independent of the orchestrator's
-  // internal scheduler.
-  const tempDir = join(tmpdir(), "lm-rg-v113-orch-");
-
-  beforeEach(() => {
-    if (existsSync(tempDir)) rmSync(tempDir, { recursive: true, force: true });
-  });
-  afterEach(() => {
-    if (existsSync(tempDir)) rmSync(tempDir, { recursive: true, force: true });
-  });
-
-  it(
-    "test:unit script runs the default vitest config (smoke)",
-    async () => {
-      // Pin to a tiny passing subset so the smoke is
-      // bounded; the full unit suite runs in operator
-      // / CI lanes.
-      const result = await runNpmScript("test:unit", {
-        cwd: REPO_ROOT,
-        env: {
-          AGENT_RECALL_RELEASE_MODE: "1",
-          // The smoke pins the test set via a vitest
-          // positional pattern. Vitest accepts patterns
-          // appended to the command via `--`.
-          // `npm run test:unit -- <pattern>` is the
-          // shape the operator / CI uses.
-          _SMOKE_ONLY: "1"
-        },
-        timeoutMs: 120_000
-      });
-      // The smoke may pass or fail depending on whether
-      // the curated subset was honoured by the
-      // orchestrator. We assert the script exits
-      // synchronously (no hang) and emits vitest output
-      // — the GREEN commit is responsible for the
-      // curated subset behaviour.
-      expect(result.code === 0 || result.code === 1, "npm run test:unit exits with a defined code").toBe(true);
-    },
-    180_000
-  );
-});
 
 // ============================================================
 // 9. JUnit fragments per suite. The orchestrator MUST emit

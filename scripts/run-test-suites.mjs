@@ -228,7 +228,9 @@ function spawnSuite(name, suite, options) {
       "--config",
       suite.config,
       "--reporter=json",
-      `--outputFile.json=${options.jsonPath}`
+      "--reporter=junit",
+      `--outputFile.json=${options.jsonPath}`,
+      `--outputFile.junit=${options.xmlPath}`
     ];
     const child = spawn("npx", ["vitest", ...args], {
       cwd: REPO_ROOT,
@@ -400,11 +402,20 @@ async function runInspectStress(args) {
     process.exitCode = 2;
     return;
   }
+  // Touch the outDir + counter file so the operator
+  // (and CI synthetic-gate) can confirm the pinning
+  // path exists. A fresh run with no prior counter
+  // file initializes the counter at 0; the next
+  // `test:all-suites` invocation increments it by 1
+  // for the stress suite.
+  if (!existsSync(outDir)) mkdirSync(outDir, { recursive: true });
   const counter = readStressCounter(outDir, jobId);
+  const counterPath = stressCounterPath(outDir, jobId);
+  if (!existsSync(counterPath)) writeStressCounter(outDir, jobId, counter);
   if (args.json) {
-    process.stdout.write(`${JSON.stringify({ jobId, count: counter, file: stressCounterPath(outDir, jobId) }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({ jobId, count: counter, file: counterPath }, null, 2)}\n`);
   } else {
-    process.stdout.write(`JOB_ID=${jobId} stress_count=${counter}\n`);
+    process.stdout.write(`JOB_ID=${jobId} stress_count=${counter}\nfile=${counterPath}\n`);
   }
 }
 
@@ -432,9 +443,11 @@ async function runAll(args) {
   const results = [];
   for (const [name, suite] of suitesToRun) {
     const jsonPath = join(outDir, `junit-${name}.json`);
+    const xmlPath = join(outDir, `junit-${name}.xml`);
     const cleanupPath = join(outDir, `cleanup-${name}.json`);
     const result = await spawnSuite(name, suite, {
       jsonPath,
+      xmlPath,
       echoToConsole: process.env.AGENT_RECALL_ORCHESTRATOR_ECHO === "1"
     });
     const vitestSummary = parseVitestJson(jsonPath);
