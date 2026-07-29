@@ -42,7 +42,7 @@
 // consumer; the unit tests are GREEN as soon as the
 // `auth-context.ts` module exists.
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -54,6 +54,9 @@ import {
   type AuthContextShape,
   type AuthorizationDecision
 } from "../../src/services/auth-context.js";
+import { FORBIDDEN_VISIBILITY, MarkdownExporter } from "../../src/markdown-exporter.js";
+import { preflightImport } from "../../src/portability/importer.js";
+import { CanonicalExporter } from "../../src/portability/exporter.js";
 import type { MemoryEntry } from "../../src/domain.js";
 
 // ============================================================
@@ -453,18 +456,112 @@ describe("v113-gate-03: maintenance classification (MaintenanceActionPolicy tabl
     // find_duplicates scan excludes private / restricted
     // rows. A normal-only scope yields a 0-item plan;
     // the apply no-ops.
+    //
+    // The pre-revision fixture seeded 2 NON-DUPLICATE
+    // entries, so the assertion passed regardless of
+    // profile. The fix seeds 2 actual duplicates PLUS 1
+    // distinct entry: on Core, the duplicate detector
+    // must return 0 groups (the policy blocks); on
+    // Admin+capability, the duplicate detector must
+    // return the duplicate group. This pin the per-row
+    // contract from both sides.
     const home = mkdtempSync(join(tmpdir(), "lm-rg-v113-sens-m3-"));
     const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
-    const svc = new MemoryService(store, undefined, "agent:test", home, undefined, "core");
-    seedEntry(store, { id: "merge_normal", sensitivity: "normal" });
-    seedEntry(store, { id: "merge_restricted", sensitivity: "restricted" });
-    const dupes = svc.maintainMemories({
+    const coreSvc = new MemoryService(store, undefined, "agent:test", home, undefined, "core");
+    // Two entries with IDENTICAL title + body so the
+    // duplicate detector pairs them under
+    // `same_title_and_body`. The third entry is distinct.
+    const dupA = seedEntry(store, { id: "dup_a", sensitivity: "normal" });
+    const dupB = seedEntry(store, { id: "dup_b", sensitivity: "normal" });
+    // Overwrite title + body so the pair is a real
+    // duplicate (the `seedEntry` helper builds a unique
+    // title per id).
+    store.updateEntry(dupA.id, {
+      title: "shared-merge-title",
+      body: "shared-merge-body",
+      updated_at: "2026-07-28T00:00:00.000Z"
+    });
+    store.updateEntry(dupB.id, {
+      title: "shared-merge-title",
+      body: "shared-merge-body",
+      updated_at: "2026-07-28T00:00:00.000Z"
+    });
+    seedEntry(store, { id: "merge_distinct", sensitivity: "normal" });
+    // Core sees a normal-only scan; the duplicate
+    // detector has NOT run on restricted rows because
+    // there are none, but the
+    // `MaintenanceActionPolicy` table still requires the
+    // Admin profile for `merge_duplicates`. The Core
+    // `find_duplicates` call returns the duplicate pair
+    // (both rows are normal), but a Core caller cannot
+    // *apply* the merge because the policy table denies
+    // the destructive action.
+    const coreDupes = coreSvc.maintainMemories({
       action: "find_duplicates",
       scope: "global"
     });
-    // find_duplicates on core sees only normal entries;
-    // no duplicate pairs → empty groups list.
-    expect((dupes.details as { groups: unknown[] }).groups.length).toBe(0);
+    const coreGroups = (coreDupes.details as { groups: Array<{ memory_ids: string[] }> }).groups;
+    const coreIds = coreGroups.flatMap((g) => g.memory_ids);
+    // Core sees the duplicate group (the rows are
+    // normal-only, so the SQL-boundary filter does not
+    // hide them).
+    expect(coreIds).toContain("dup_a");
+    expect(coreIds).toContain("dup_b");
+    // BUT the apply step refuses: the policy table
+    // restricts `merge_duplicates` to the Admin profile.
+    const coreApply = coreSvc.maintainMemories({
+      action: "merge_duplicates",
+      scope: "global",
+      strategy: "keep_first"
+    });
+    expect((coreApply.details as { error?: string }).error).toBe("unauthorized");
+    // Admin+capability sees AND can apply the merge.
+    const cap = new InMemoryCapabilityStore({
+      token: "a".repeat(64),
+      created_at: new Date().toISOString(),
+      label: "merge-admin"
+    });
+    const adminSvc = new MemoryService(
+      store,
+      undefined,
+      "agent:test",
+      home,
+      cap as unknown as ConstructorParameters<typeof MemoryService>[4],
+      "admin"
+    );
+    const adminApply = adminSvc.maintainMemories({
+      action: "merge_duplicates",
+      scope: "global",
+      strategy: "keep_first"
+    });
+    const adminDetails = adminApply.details as {
+      groups: Array<{ keep_id: string; superseded_ids: string[] }>;
+      applied: Array<{ keep_id: string; superseded_ids: string[] }>;
+    };
+    // The `merge_duplicates` action's `groups` field
+    // carries `keep_id` + `superseded_ids` (NOT
+    // `memory_ids` — the `find_duplicates` action
+    // is the one that surfaces the `memory_ids`
+    // list). The Admin+capability apply sees the
+    // duplicate pair and collapses one row (the
+    // survivor is the keep_id; the other is the
+    // superseded_id).
+    const keepIds = adminDetails.groups.map((g) => g.keep_id);
+    const supersededIds = adminDetails.groups.flatMap((g) => g.superseded_ids);
+    // For a 2-row duplicate pair, ONE row is the
+    // keep_id and the OTHER is the superseded_id.
+    expect(keepIds.length).toBe(1);
+    expect(supersededIds.length).toBe(1);
+    expect(["dup_a", "dup_b"]).toContain(keepIds[0]);
+    expect(["dup_a", "dup_b"]).toContain(supersededIds[0]);
+    // The keep_id and superseded_id are distinct
+    // (the duplicate detector never collapses the
+    // keep_id onto itself).
+    expect(keepIds[0]).not.toBe(supersededIds[0]);
+    // The `applied` array is the same as `groups`
+    // when the apply succeeded (the
+    // `same_title_and_body` auto-collapse path).
+    expect(adminDetails.applied.length).toBe(1);
     store.close();
     rmSync(home, { recursive: true, force: true });
   });
@@ -600,10 +697,115 @@ describe("v113-gate-03: per-row export / import / backup / markdown / provenance
     // release). The new contract is per-row: a Core /
     // Extended importer rejects restricted rows even
     // when the bundle-level flag is true.
+    //
+    // v1.1.3 GATE-03 (issue #33) review fix 4: the
+    // pre-revision placeholder only checked `service` was
+    // defined. The post-revision assertion exercises the
+    // per-row contract end-to-end: build a snapshot
+    // bundle containing a normal + a restricted entry,
+    // run `preflightImport` on Core, and assert the
+    // restricted row's preflight decision is `reject`
+    // with `sensitivity_denied`. The preflight is the
+    // per-row gate; the apply path never sees the
+    // restricted row.
     const home = mkdtempSync(join(tmpdir(), "lm-rg-v113-sens-imp-"));
     const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
     const svc = new MemoryService(store, undefined, "agent:test", home, undefined, "core");
-    expect(svc).toBeDefined();
+    // Build a JSON snapshot bundle under
+    // `dataHome/exports` so the importer can locate
+    // it. The MarkdownExporter is markdown-only;
+    // the canonical exporter writes the JSON
+    // manifest + topic files the importer expects.
+    const exportRoot = join(home, "exports");
+    mkdirSync(exportRoot, { recursive: true });
+    const exporter = new CanonicalExporter(exportRoot);
+    const exportResult = exporter.exportScope({
+      scope: "global",
+      format: "json",
+      entries: [
+        {
+          id: "imp_normal",
+          scope: "global",
+          type: "fact",
+          topic: "v113-gate-03",
+          title: "imp normal",
+          body: "imp normal body",
+          tags: [],
+          source: { kind: "agent" },
+          importance: 3,
+          confidence: 3,
+          status: "active",
+          created_at: "2026-07-28T00:00:00.000Z",
+          updated_at: "2026-07-28T00:00:00.000Z",
+          access_count: 0,
+          supersedes: [],
+          token_estimate: 1,
+          char_count: 2,
+          revision: 1,
+          writer_actor_id: "agent:test",
+          pinned: false,
+          trust_level: "agent_observed",
+          sensitivity: "normal",
+          tier: "working",
+          metadata: {}
+        },
+        {
+          id: "imp_restricted",
+          scope: "global",
+          type: "fact",
+          topic: "v113-gate-03",
+          title: "imp restricted",
+          body: "imp restricted body",
+          tags: [],
+          source: { kind: "agent" },
+          importance: 3,
+          confidence: 3,
+          status: "active",
+          created_at: "2026-07-28T00:00:00.000Z",
+          updated_at: "2026-07-28T00:00:00.000Z",
+          access_count: 0,
+          supersedes: [],
+          token_estimate: 1,
+          char_count: 2,
+          revision: 1,
+          writer_actor_id: "agent:test",
+          pinned: false,
+          trust_level: "agent_observed",
+          sensitivity: "restricted",
+          tier: "working",
+          metadata: {}
+        }
+      ],
+      budgetStatus: "ok"
+    });
+    expect(existsSync(exportResult.indexPath)).toBe(true);
+    // Run the preflight on Core (no capability).
+    // The per-row sensitivity filter rejects the
+    // restricted row at the per-row gate. The
+    // preflight's fail-fast path surfaces either
+    // `sensitivity_denied` (when the per-row check
+    // is reached) or `unauthorized` (when the
+    // capability is missing for the entire bundle).
+    // The new contract is per-row: a Core / Extended
+    // caller that lacks a capability cannot land a
+    // restricted row, regardless of the
+    // `allow_restricted` bundle flag.
+    const preflight = preflightImport(svc, join(exportRoot, "global"), "global", undefined, "json", {
+      conflict: "fail",
+      dry_run: false,
+      actor: "agent:test",
+      allow_restricted: false
+    });
+    expect(preflight.ok).toBe(false);
+    if (preflight.ok) throw new Error("preflight unexpectedly succeeded");
+    // Either the per-row `sensitivity_denied` or
+    // the bundle-level `unauthorized` is acceptable
+    // — both are the per-row contract. The Core
+    // caller (no capability) hits `unauthorized`
+    // first; a Core caller with a malformed
+    // capability would hit `sensitivity_denied` at
+    // the per-row check.
+    expect(["sensitivity_denied", "unauthorized"]).toContain(preflight.error);
     store.close();
     rmSync(home, { recursive: true, force: true });
   });
@@ -616,9 +818,29 @@ describe("v113-gate-03: per-row export / import / backup / markdown / provenance
     // Core caller enumerating every backup in
     // `dataHome/backups/`. Post-#33 the list is the
     // visible subset.
+    //
+    // v1.1.3 GATE-03 (issue #33) review fix 4: the
+    // pre-revision placeholder only checked `store` was
+    // defined. The post-revision assertion exercises the
+    // `MemoryService.listBackups` surface end-to-end:
+    // seed two backups (one normal + one restricted),
+    // call `listBackups()` on a Core service, and
+    // assert the restricted backup is filtered out.
     const home = mkdtempSync(join(tmpdir(), "lm-rg-v113-sens-bkp-"));
+    const backupDir = join(home, "backups");
+    mkdirSync(backupDir, { recursive: true });
+    // Build two real schema-v1.1.1+ backup files.
+    writeBackupWithEntries(join(backupDir, "memory-normal.sqlite"), [
+      { id: "n1", sensitivity: "normal" }
+    ]);
+    writeBackupWithEntries(join(backupDir, "memory-restricted.sqlite"), [
+      { id: "r1", sensitivity: "restricted" }
+    ]);
     const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
-    expect(store).toBeDefined();
+    const svc = new MemoryService(store, undefined, "agent:test", home, undefined, "core");
+    const listed = svc.listBackups();
+    expect(listed.entries.length).toBe(1);
+    expect(listed.entries[0].name).toBe("memory-normal.sqlite");
     store.close();
     rmSync(home, { recursive: true, force: true });
   });
@@ -629,10 +851,95 @@ describe("v113-gate-03: per-row export / import / backup / markdown / provenance
     // "restricted". The exit code is the stable
     // `forbidden_visibility` so a caller can branch on
     // the failure mode.
+    //
+    // v1.1.3 GATE-03 (issue #33) review fix 4: the
+    // pre-revision placeholder only checked `store` was
+    // defined. The post-revision assertion runs the
+    // `MarkdownExporter.exportScope` path on a Core
+    // service with a restricted entry in the input —
+    // the exporter throws `ForbiddenVisibilityError`
+    // carrying the stable `FORBIDDEN_VISIBILITY` code.
+    // The throw path is exercised end-to-end.
     const home = mkdtempSync(join(tmpdir(), "lm-rg-v113-sens-mdexp-"));
-    const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
-    expect(store).toBeDefined();
-    store.close();
+    const exportRoot = join(home, "exports");
+    mkdirSync(exportRoot, { recursive: true });
+    const exporter = new MarkdownExporter(exportRoot);
+    // The export input is a single restricted entry
+    // and the caller's authorization ceiling is
+    // `"normal"` (the fail-closed Core default). The
+    // exporter throws `ForbiddenVisibilityError`
+    // carrying the stable `FORBIDDEN_VISIBILITY` code.
+    expect(() =>
+      exporter.exportScope({
+        scope: "global",
+        entries: [
+          {
+            id: "mdexp_restricted",
+            scope: "global",
+            type: "fact",
+            topic: "v113-gate-03",
+            title: "mdexp restricted",
+            body: "mdexp restricted body",
+            tags: [],
+            source: { kind: "agent" },
+            importance: 3,
+            confidence: 3,
+            status: "active",
+            created_at: "2026-07-28T00:00:00.000Z",
+            updated_at: "2026-07-28T00:00:00.000Z",
+            access_count: 0,
+            supersedes: [],
+            token_estimate: 1,
+            char_count: 2,
+            revision: 1,
+            writer_actor_id: "agent:test",
+            pinned: false,
+            trust_level: "agent_observed",
+            sensitivity: "restricted",
+            tier: "working",
+            metadata: {}
+          }
+        ],
+        budgetStatus: "ok",
+        authorization: { max_sensitivity: "normal" }
+      })
+    ).toThrow(FORBIDDEN_VISIBILITY);
+    // Sanity: with `max_sensitivity: "restricted"`,
+    // the same input is exported without throwing.
+    const ok = exporter.exportScope({
+      scope: "global",
+      entries: [
+        {
+          id: "mdexp_restricted_ok",
+          scope: "global",
+          type: "fact",
+          topic: "v113-gate-03",
+          title: "mdexp restricted ok",
+          body: "mdexp restricted ok body",
+          tags: [],
+          source: { kind: "agent" },
+          importance: 3,
+          confidence: 3,
+          status: "active",
+          created_at: "2026-07-28T00:00:00.000Z",
+          updated_at: "2026-07-28T00:00:00.000Z",
+          access_count: 0,
+          supersedes: [],
+          token_estimate: 1,
+          char_count: 2,
+          revision: 1,
+          writer_actor_id: "agent:test",
+          pinned: false,
+          trust_level: "agent_observed",
+          sensitivity: "restricted",
+          tier: "working",
+          metadata: {}
+        }
+      ],
+      budgetStatus: "ok",
+      authorization: { max_sensitivity: "restricted" }
+    });
+    expect(existsSync(ok.indexPath)).toBe(true);
     rmSync(home, { recursive: true, force: true });
   });
 
@@ -716,3 +1023,58 @@ describe("v113-gate-03: AuthorizationDecision threading (MemoryService)", () => 
     rmSync(home, { recursive: true, force: true });
   });
 });
+
+// ============================================================
+// Helper: write a JSON snapshot bundle through the
+// `MarkdownExporter` so the per-row sensitivity filter on
+// the import has a real on-disk bundle to read. The text
+// snapshot exercises the per-row decision at the
+// preflight stage.
+// ============================================================
+
+/**
+ * Write a self-contained backup file at `targetPath`
+ * carrying the given `memory_entries` rows so the
+ * v1.1.3 GATE-03 SQL probe (`SELECT MAX(CASE
+ * sensitivity ...)`) can classify the file. The
+ * helper is local to the test file because the
+ * test-only schema is intentionally narrow.
+ */
+function writeBackupWithEntries(
+  targetPath: string,
+  entries: Array<{ id: string; sensitivity: "normal" | "private" | "restricted" }>
+): void {
+  const tmp = mkdtempSync(join(tmpdir(), "lm-rg-v113-sens-bkp-"));
+  const store = new SQLiteMemoryStore(join(tmp, "memory.sqlite"));
+  for (const e of entries) {
+    store.insertEntry({
+      id: e.id,
+      scope: "global",
+      type: "fact",
+      topic: "v113-gate-03",
+      title: e.id,
+      body: e.id,
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3,
+      status: "active",
+      created_at: "2026-07-28T00:00:00.000Z",
+      updated_at: "2026-07-28T00:00:00.000Z",
+      access_count: 0,
+      supersedes: [],
+      token_estimate: 1,
+      char_count: 2,
+      revision: 1,
+      writer_actor_id: "agent:test",
+      pinned: false,
+      trust_level: "agent_observed",
+      sensitivity: e.sensitivity,
+      tier: "working",
+      metadata: {}
+    });
+  }
+  store.close();
+  copyFileSync(join(tmp, "memory.sqlite"), targetPath);
+  rmSync(tmp, { recursive: true, force: true });
+}
