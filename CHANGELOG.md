@@ -7,6 +7,11 @@ a personal tool, but the file structure is here for future contributors).
 
 ## [1.1.3] — v1.1.3 GATE-01 + GATE-02: side-effect-free identity resolution + profile-scoped admin capability (issues #31, #32)
 
+### GATE-04 — Release evidence fail-closed (issue #34)
+
+- Canonicalised release platforms to `linux-x64`, `darwin-x64`, and `win32-x64`; added a versioned evidence schema and fail-closed stable verifier that rejects placeholders, fabricated totals, incomplete artifact sets, and checksum mismatches.
+- Release preparation and tag-only publication now require verified evidence tied to the exact candidate SHA.
+
 Issue **#31** closes the v1.1.2 IDENTITY-CARVE-OUT that
 documented why `applyImport` revalidated revisions + aggregate
 budget inside the apply transaction but deliberately did NOT

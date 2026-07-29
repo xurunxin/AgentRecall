@@ -362,8 +362,18 @@ describe("extracted-artifact lifecycle E2E (Stage 18 v1.1.2 issue #28, task 9)",
     assert.doesNotMatch(workflow, /\|\|\s*true/);
 
     // The record-evidence job ingests the hashes into
-    // the existing evidence contract.
-    assert.match(workflow, /release-artifact-hashes\.json/);
+    // the existing evidence contract. v1.1.3 GATE-04
+    // (#34): the v1.1.3 fragment carries the per-OS
+    // archive sha256 inside `fragment.artifact`,
+    // which the matrix leg stages in the
+    // `fragments/<platform>.json` upload. The
+    // record-evidence job feeds that fragment into the
+    // `--fragments` aggregator, which produces a
+    // canonical document with `sha256_checksums`
+    // populated from the per-platform artifacts.
+    assert.match(workflow, /release-artifact-hashes-/);
+    assert.match(workflow, /fragments\/\$\{\{\s*matrix\.platform\s*\}\}\.json/);
+    assert.match(workflow, /--fragments/);
     assert.match(workflow, /sha256_checksums/);
 
     // Tab-indentation is forbidden by the existing
@@ -377,15 +387,19 @@ describe("extracted-artifact lifecycle E2E (Stage 18 v1.1.2 issue #28, task 9)",
     assert.match(workflow, /packaged-install\.test\.ts/);
     assert.match(workflow, /scripts\/compute-artifact-hashes\.mjs/);
     // The packaged-install suite is run per platform
-    // (linux-x64, darwin-x64, windows-x64). The
+    // (linux-x64, darwin-x64, win32-x64). The
     // literal suffix values appear in the
     // `package` matrix's `include:` entries; the
     // `verify-extracted-artifacts` matrix reuses the
     // same suffixes via `${{
     // steps.platform.outputs.SUFFIX }}`.
+    // The v1.1.3 contract (#34) replaces the legacy
+    // `windows-x64` artifact suffix with the canonical
+    // `win32-x64` token; the matrix + verify steps
+    // must align.
     assert.match(workflow, /suffix:\s*linux-x64/);
     assert.match(workflow, /suffix:\s*darwin-x64/);
-    assert.match(workflow, /suffix:\s*windows-x64/);
+    assert.match(workflow, /suffix:\s*win32-x64/);
     assert.match(
       workflow,
       /agent-recall-\${{\s*matrix\.suffix\s*}}/,

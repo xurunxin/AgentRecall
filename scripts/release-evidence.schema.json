@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "release-evidence.schema.json",
+  "title": "ReleaseEvidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "version", "release_commit", "tag", "candidate_sha", "subissues", "ci_jobs", "release_workflow", "artifacts", "sha256_checksums", "test_summary", "stress_summary", "migration_summary", "known_non_blocking_limits"],
+  "properties": {
+    "schema_version": { "const": "1.1.3" },
+    "version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "release_commit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "tag": { "type": "string", "pattern": "^v\\d+\\.\\d+\\.\\d+$" },
+    "candidate_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "subissues": { "type": "array", "items": { "type": "object", "required": ["number", "state", "title"], "properties": { "number": { "type": "integer" }, "state": { "const": "closed" }, "title": { "type": "string" } } } },
+    "ci_jobs": { "type": "array", "items": { "$ref": "#/$defs/job" } },
+    "release_workflow": { "$ref": "#/$defs/job" },
+    "artifacts": { "type": "array", "items": { "type": "object", "required": ["platform", "name", "size_bytes", "sha256"], "properties": { "platform": { "$ref": "#/$defs/platform" }, "name": { "type": "string" }, "size_bytes": { "type": "integer", "minimum": 0 }, "sha256": { "$ref": "#/$defs/sha256" } } } },
+    "sha256_checksums": { "type": "object", "additionalProperties": { "$ref": "#/$defs/sha256" } },
+    "test_summary": { "type": "object", "required": ["passed", "failed", "skipped", "filtered", "totals_from"], "properties": { "passed": { "$ref": "#/$defs/count" }, "failed": { "$ref": "#/$defs/count" }, "skipped": { "$ref": "#/$defs/count" }, "filtered": { "$ref": "#/$defs/count" }, "totals_from": { "enum": ["actual", "constant"] } } },
+    "stress_summary": { "type": "object", "required": ["process_count", "operations", "invariants_ok"], "properties": { "process_count": { "$ref": "#/$defs/count" }, "operations": { "$ref": "#/$defs/count" }, "invariants_ok": { "$ref": "#/$defs/count" } } },
+    "migration_summary": { "type": "object", "required": ["sources_tested", "each_passed"], "properties": { "sources_tested": { "type": "array", "items": { "type": "string" } }, "each_passed": { "type": "boolean" } } },
+    "known_non_blocking_limits": { "type": "array", "items": { "type": "string" } }
+  },
+  "$defs": {
+    "platform": { "enum": ["linux-x64", "darwin-x64", "win32-x64"] },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "count": { "type": "integer", "minimum": 0 },
+    "job": { "type": "object", "required": ["platform", "os", "node", "job_url", "conclusion", "duration_ms", "head_sha"], "properties": { "platform": { "$ref": "#/$defs/platform" }, "os": { "type": "string" }, "node": { "type": "string" }, "job_url": { "type": "string" }, "conclusion": { "enum": ["success", "failure"] }, "duration_ms": { "type": "integer", "minimum": 0 }, "head_sha": { "type": "string", "pattern": "^[0-9a-f]{40}$" } } }
+  }
+}

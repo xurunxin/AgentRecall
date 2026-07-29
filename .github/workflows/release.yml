@@ -105,7 +105,9 @@ jobs:
       - name: Run evidence verifier
         env:
           GITHUB_SHA: ${{ github.sha }}
-        run: node scripts/verify-release-evidence.mjs "$RUNNER_TEMP/release-evidence/release-evidence.json"
+        run: |
+          node scripts/verify-release-evidence.mjs --stable --evidence "$RUNNER_TEMP/release-evidence/release-evidence.json"
+          node -e 'const fs=require("node:fs"); const e=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); if(e.release_commit!==process.env.GITHUB_SHA || e.candidate_sha!==process.env.GITHUB_SHA) process.exit(1)' "$RUNNER_TEMP/release-evidence/release-evidence.json"
 
   package:
     needs: verify-release-evidence
@@ -127,7 +129,7 @@ jobs:
           - os: windows-latest
             node: "24"
             archive: zip
-            suffix: windows-x64
+            suffix: win32-x64
     steps:
       - name: Checkout exact tag commit
         uses: actions/checkout@v4
@@ -258,7 +260,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ "$RUNNER_OS" = "Windows" ]; then SUFFIX="windows-x64"; ARCHIVE_TYPE="zip"; PLATFORM_TAG="win32"
+          if [ "$RUNNER_OS" = "Windows" ]; then SUFFIX="win32-x64"; ARCHIVE_TYPE="zip"; PLATFORM_TAG="win32"
           elif [ "$RUNNER_OS" = "macOS" ]; then SUFFIX="darwin-x64"; ARCHIVE_TYPE="tar"; PLATFORM_TAG="darwin"
           else SUFFIX="linux-x64"; ARCHIVE_TYPE="tar"; PLATFORM_TAG="linux"; fi
           echo "SUFFIX=${SUFFIX}" >> "$GITHUB_OUTPUT"
@@ -339,7 +341,7 @@ jobs:
             archive: tar
             smoke_cmd: "node dist/bin/agent-recall.js"
           - os: windows-latest
-            suffix: windows-x64
+            suffix: win32-x64
             archive: zip
             smoke_cmd: "node dist/bin/agent-recall.js"
     steps:

@@ -1,4 +1,5 @@
 import { strict as assert } from "node:assert";
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -156,48 +157,52 @@ describe("release candidate exact-SHA gate (#27)", () => {
     const runnerTemp = mkdtempSync(join(tmpdir(), "agent-recall-verify-evidence-"));
     const evidencePath = join(runnerTemp, "release-evidence.json");
     const sha = "fedcba9876543210fedcba9876543210fedcba98";
+    // v1.1.3 GATE-04 (#34) migration: the verifier
+    // now requires the canonical v1.1.3 schema with
+    // checksums-as-object, `ci_jobs` (not `ci_runs`),
+    // canonical platform vocabulary, `stress_summary`,
+    // `subissues`, and real artifacts on disk whose
+    // bytes match the recorded sha256. We materialise
+    // three deterministic dummy archives next to the
+    // evidence file so the verifier's CHECKSUM_BYTES
+    // check passes.
+    const platforms = ["linux-x64", "darwin-x64", "win32-x64"] as const;
+    const artifacts = platforms.map((platform) => {
+      const name = `agent-recall-1.1.3-${platform}.${platform === "win32-x64" ? "zip" : "tar.gz"}`;
+      const bytes = `fixture ${platform}\n`;
+      writeFileSync(join(runnerTemp, name), bytes);
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      return { platform, name, size_bytes: bytes.length, sha256 };
+    });
+    const sha256Checksums = Object.fromEntries(artifacts.map((a) => [a.name, a.sha256]));
+    const job = (platform: string) => ({
+      platform,
+      os: "ubuntu-latest",
+      node: "24",
+      job_url: "https://github.com/xurx/agent-recall/actions/runs/42/job/100",
+      conclusion: "success",
+      duration_ms: 1000,
+      head_sha: sha
+    });
     const validEvidence = {
-      schema_version: 1,
-      // Stage 18 v1.1.2 (issue #29, Task 10): the
-      // evidence file MUST carry the `version`
-      // field the release-publication gate mints.
-      version: "1.1.2",
+      schema_version: "1.1.3",
+      version: "1.1.3",
       candidate_sha: sha,
       release_commit: sha,
-      tag: null,
-      ci_runs: [
-        {
-          job_name: "Matrix ubuntu-latest / Node 24",
-          os: "ubuntu-latest",
-          node: "24",
-          job_url: "https://github.com/xurx/agent-recall/actions/runs/42/job/100",
-          workflow_url: "https://github.com/xurx/agent-recall/actions/runs/42",
-          conclusion: "success",
-          duration_ms: 1000
-        }
-      ],
-      release_workflow: {
-        name: "Release Candidate Gate",
-        run_id: "42",
-        run_number: "7",
-        job: "record-evidence",
-        url: "https://github.com/xurx/agent-recall/actions/runs/42",
-        conclusion: "success",
-        duration_ms: 1000
-      },
-      // Stage 18 v1.1.2 (issue #29, Task 10): the
-      // `artifacts` array MUST cover all three
-      // publication platforms (linux-x64 / darwin-x64
-      // / win32-x64). A partial manifest is rejected
-      // by the verifier.
-      artifacts: [
-        { name: "agent-recall-1.1.2-linux-x64.tar.gz", sha256: "a".repeat(64) },
-        { name: "agent-recall-1.1.2-darwin-x64.tar.gz", sha256: "b".repeat(64) },
-        { name: "agent-recall-1.1.2-win32-x64.zip", sha256: "c".repeat(64) }
-      ],
-      sha256_checksums: {},
-      test_summary: { passed: 10, failed: 0, skipped: 0, total: 10 },
-      migration_summary: migrationSummary(),
+      tag: "v1.1.3",
+      subissues: [],
+      ci_jobs: artifacts.map((a) => job(a.platform)),
+      release_workflow: job("linux-x64"),
+      artifacts: artifacts.map((a) => ({
+        platform: a.platform,
+        name: a.name,
+        size_bytes: a.size_bytes,
+        sha256: a.sha256
+      })),
+      sha256_checksums: sha256Checksums,
+      test_summary: { passed: 10, failed: 0, skipped: 0, filtered: 0, totals_from: "actual" },
+      stress_summary: { process_count: 1, operations: 10, invariants_ok: 10 },
+      migration_summary: { sources_tested: ["v0", "v1"], each_passed: true },
       known_non_blocking_limits: ["Task 9 will replace the extracted-dist wiring with the final package fixture."]
     };
     writeFileSync(evidencePath, `${JSON.stringify(validEvidence, null, 2)}\n`);
@@ -214,8 +219,12 @@ describe("release candidate exact-SHA gate (#27)", () => {
       evidencePath,
       `${JSON.stringify({
         ...validEvidence,
-        test_summary: { passed: 0, failed: 1, skipped: 0, total: 1 },
-        migration_summary: migrationSummary().slice(1)
+        // v1.1.3 contract: a stable-mode evidence
+        // document must declare test totals from the
+        // actual vitest run, not a constant. The
+        // verifier rejects `"constant"` with the
+        // TEST_TOTALS_FROM_CONSTANT reason code.
+        test_summary: { passed: 0, failed: 1, skipped: 0, filtered: 0, totals_from: "constant" }
       }, null, 2)}\n`
     );
     const incomplete = runNode(verifyScriptPath, [evidencePath], env);
