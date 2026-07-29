@@ -1,161 +1,144 @@
-# Sensitivity matrix — operator-facing reference
+# Sensitivity matrix — operator guide
 
-Date: 2026-07-28
-Lane: v1.1.3 GATE-03 (issue #33)
-Companion: `docs/adr/0006-one-sensitivity-policy.md`
+This guide documents the v1.1.3 GATE-03 (issue #33)
+sensitivity policy. It is the operator-facing companion
+to `docs/adr/0006-one-sensitivity-policy.md` (the
+ADR that documents the canonical `AuthorizationDecision`
++ the maintenance classification + the per-row vs
+per-bundle semantics).
 
-This guide documents the 3-profile × 3-sensitivity
-matrix the v1.1.3 GATE-03 lane pins. Every row / column
-maps to a real assertion in
-`test/release-gate/v113-sensitivity-policy.test.ts`.
+## TL;DR
 
-## Profiles
+- **Core and Extended profiles never inherit
+  `"restricted"` visibility.** A Core / Extended
+  process with a valid `admin.cap` in its data
+  home still sees only `"normal"` rows at the SQL
+  boundary. The capability file is operator-only
+  metadata; it does NOT auto-authorize restricted
+  reads on a non-Admin profile.
+- **Only the Admin profile + a loaded capability
+  gains `"restricted"` visibility.** The
+  per-process in-memory token (loaded at startup)
+  is the gate; the per-request capability token
+  is the per-call exception for non-`profile_required`
+  capability types only.
+- **The SQL boundary is the source of truth.** Every
+  content-bearing path consults the canonical
+  `AuthorizationDecision` and applies the filter at
+  the SQL layer. No path filters at response
+  rendering time.
+- **`forbidden_visibility` is the stable error code**
+  for unauthorized restricted access from every
+  surface. The error envelope NEVER includes the
+  row's `sensitivity` literal or any row-derived
+  secret (title / body / tags / source).
 
-- **Core** — the packaged default. Fail-closed.
-- **Extended** — adds maintenance / semantic tools;
-  same fail-closed visibility contract as Core.
-- **Admin** — adds the privileged surface; lifts
-  visibility to `"restricted"` ONLY when the process
-  loaded a valid capability at startup.
+## Central visibility matrix
 
-The active profile is set via the
-`AGENT_RECALL_PROFILE` env var (`core` / `extended` /
-`admin`); the CLI and MCP entry resolve it through
-`resolveActiveProfile(...)`.
+| Profile × Sensitivity | Read | Search / List / Recall | Export | Maintenance apply | Import restricted bundle | Admin capability |
+|-----------------------|------|------------------------|--------|-------------------|---------------------------|------------------|
+| Core × normal         | yes  | yes                    | yes    | yes (apply_archive / apply_merge on normal-only) | n/a (must opt in via `allow_restricted: true` + capability token) | denied |
+| Core × private        | denied | denied                | denied | denied          | denied                   | denied |
+| Core × restricted     | denied | denied                | denied | denied          | denied                   | denied |
+| Extended × normal     | yes  | yes                    | yes    | yes             | n/a                       | denied |
+| Extended × private    | denied | denied                | denied | denied          | denied                   | denied |
+| Extended × restricted | denied | denied                | denied | denied          | denied                   | denied |
+| Admin × normal        | yes  | yes                    | yes    | yes             | yes (with capability)     | yes (per-request) |
+| Admin × private       | yes  | yes                    | yes    | yes (with capability) | yes (with capability) | yes (per-request) |
+| Admin × restricted    | yes  | yes                    | yes    | yes (with capability) | yes (with capability) | yes (per-request) |
 
-## Sensitivity tiers
+## Maintenance action classification
 
-Every `memory_entries` row carries one of three
-sensitivity values:
+| Action | Safe in Extended | Restricted to Admin | Capability-required |
+|--------|------------------|----------------------|---------------------|
+| `view_cleanup_candidates` | yes (normal-only listing) | — | — |
+| `plan_archive_low_value` | yes (dry-run) | — | — |
+| `plan_merge_duplicates` | yes (dry-run) | — | — |
+| `plan_apply_maintenance` | yes (dry-run, normal-only) | — | — |
+| `apply_archive_low_value` | yes (normal-only) | — | — |
+| `apply_merge_duplicates` | — | yes (Admin profile, normal + private only) | per-request capability token for restricted merges |
+| `apply_supersede` | — | yes (Admin profile) | — |
+| `apply_forget` | — | yes (Admin profile) | per-request capability token for `sensitivity_restricted` forgets |
+| `apply_maintenance` | — | yes | — |
+| `preview_budget_bypass` | — | — | yes (`trust_promotion`) |
+| `apply_force_forget` | — | — | yes (`sensitivity_restricted`) |
+| `rebuild_markdown_index` | yes (limited to visible scope) | — | — |
 
-- `"normal"` — visible to every profile.
-- `"private"` — visible only to Admin + capability.
-- `"restricted"` — visible only to Admin +
-  capability.
+## Common operator questions
 
-## Matrix
+### Q: I have a valid `admin.cap` in my data home but my Core process still shows `"normal"` visibility. Why?
 
-The table reads as: "Does the {profile} profile see
-{operation}-class rows of {sensitivity} tier?"
+A: That's the v1.1.3 GATE-03 contract. A Core or
+Extended process NEVER inherits `"restricted"`
+visibility merely because `admin.cap` exists in
+its data home. The capability file is
+operator-only metadata; the visibility ceiling
+is profile-scoped.
 
-### Read surface
+To gain `"restricted"` visibility, restart the
+process with `AGENT_RECALL_PROFILE=admin` (the
+MCP server entry fail-closes at startup if the
+Admin profile is active without a valid capability).
 
-| Profile × Sensitivity | Read (getMemory) | Search / List / Recall | Budget | Markdown Export |
-|-----------------------|------------------|------------------------|--------|-----------------|
-| Core × normal         | yes              | yes                    | yes    | yes             |
-| Core × private        | **denied** (not_found) | **denied** (filtered at SQL) | **denied** | **denied** |
-| Core × restricted     | **denied** (forbidden_visibility) | **denied** | **denied** | **denied** |
-| Extended × normal     | yes              | yes                    | yes    | yes             |
-| Extended × private    | **denied** (not_found) | **denied** | **denied** | **denied** |
-| Extended × restricted | **denied** (forbidden_visibility) | **denied** | **denied** | **denied** |
-| Admin × normal        | yes              | yes                    | yes    | yes             |
-| Admin × private       | yes              | yes                    | yes    | yes             |
-| Admin × restricted    | yes              | yes                    | yes    | yes             |
+### Q: My Admin process fails to start. What do I do?
 
-The deny paths on `getMemory` surface two distinct
-error codes:
+A: The Admin-profile MCP server entry refuses to
+start without a valid capability. Run
+`agent-recall admin grant` to install a valid
+capability (writes the canonical `admin.cap` with
+`0o600` / Windows owner-only ACL), then restart.
 
-- `"not_found"` — for rows that don't exist OR for
-  rows the caller can't see but the resource layer
-  refuses to acknowledge exist.
-- `"forbidden_visibility"` — for single-row reads
-  (`getMemoryWithVisibility`) where the row exists at
-  a higher sensitivity than the caller's ceiling.
+### Q: I get `forbidden_visibility` when I try to read a `restricted` row. What does that mean?
 
-The deny path NEVER surfaces the row's `sensitivity`
-literal, title, body, tags, source, or any other
-row-derived secret.
+A: The SQL-boundary filter is hiding the row. The
+`forbidden_visibility` error envelope NEVER
+includes the row's `sensitivity` literal or any
+row-derived secret (title / body / tags /
+source) — only the operational metadata
+(`memory_id`). To see the row, restart with the
+Admin profile + a loaded capability.
 
-### Maintenance surface (12 actions)
+### Q: My `apply_merge_duplicates` call returns zero merges on Core. What do I do?
 
-The maintenance service consults the
-`MaintenanceActionPolicy` table to gate destructive
-actions. The current `MaintenanceAction` enum maps to
-six of the spec's twelve actions; the planner
-(`planMaintenance`) covers the planning actions.
+A: The v1.1.3 GATE-03 spec restricts
+`apply_merge_duplicates` to the Admin profile
+(the destructive path requires Admin). On
+Core / Extended, the maintenance service
+refuses the action with `unauthorized`.
 
-| Action | Core / Extended | Admin (no capability) | Admin + capability |
-|--------|-----------------|-----------------------|---------------------|
-| `archive_low_value` (apply) | yes (normal-only) | yes (normal-only) | yes (normal-only) |
-| `expire_due` (apply) | yes (normal-only) | yes (normal-only) | yes (normal-only) |
-| `rebuild_markdown_index` | yes (visible scope) | yes (visible scope) | yes (visible scope) |
-| `vacuum_fts` | yes (schema op) | yes (schema op) | yes (schema op) |
-| `find_duplicates` | yes (normal-only) | yes (normal-only) | yes (all sensitivity) |
-| `merge_duplicates` | **denied** (`unauthorized`) | **denied** (`unauthorized`) | yes |
+To merge on Core, run `find_duplicates` (the
+read-only path is safe on Core) and then
+manually supersede the duplicate rows via
+`update_memory` with the canonical `revision`
++ `user_confirmed` flag (which itself requires
+the `trust_promotion` capability on the
+per-request path).
 
-The planner (`planMaintenance`) yields zero destructive
-items on Core / Extended (the duplicate scan excludes
-restricted rows); a Core caller running `applyMaintenance`
-sees a no-op plan.
+### Q: Can I use a per-request capability token to lift Core's visibility ceiling?
 
-### Import / Export / Backup / Markdown
+A: No. The v1.1.3 GATE-03 spec is clear: a
+per-request capability token on Core / Extended
+authorizes the **operation** (e.g.
+`import_trust_restore` on a restricted bundle)
+but does NOT lift the **visibility** ceiling.
+Visibility is profile-scoped; the per-request
+token is the per-call exception for non-`profile_required`
+capability types only.
 
-| Surface | Core / Extended | Admin + capability |
-|---------|-----------------|---------------------|
-| `CanonicalExporter.exportScope` | normal + private rows | restricted rows included |
-| Envelope `max_sensitivity` field | `"normal"` or `"private"` | `"restricted"` |
-| `importMemoryExport` (per-row) | restricted rows refused at apply | restricted rows accepted |
-| `allow_restricted: true` (bundle-level) | deprecated-but-accepted | deprecated-but-accepted |
-| `listBackups` | full list (no per-backup sensitivity tags) | full list |
-| `MarkdownExporter.exportScope` | restricted rows refused with `forbidden_visibility` exit 1 | restricted rows included |
+For restricted visibility, the Admin profile
++ a loaded capability is the only path.
 
-The bundle-level `allow_restricted: true` flag is
-deprecated-but-preserved for one release. The canonical
-per-row enforcement is on the importer's apply step.
+## See also
 
-### Provenance / Doctor / MCP resources
-
-| Surface | Core / Extended | Admin + capability |
-|---------|-----------------|---------------------|
-| `explainProvenance` (restricted row) | `not_found` (no row existence leak) | full explanation |
-| `memory://health` | surfaces `active_profile` + `capability_state` | surfaces `active_profile: "admin"` + `capability_state: "granted"` |
-| `memory://project/{id}/memory/{mid}` | restricted row → `forbidden_visibility` | full row |
-| Doctor checks | walk visible scope only | walk every scope |
-
-## CLI mapping
-
-The CLI's `AGENT_RECALL_PROFILE` env var controls the
-per-invocation authorization:
-
-```sh
-AGENT_RECALL_PROFILE=core       agent-recall list
-AGENT_RECALL_PROFILE=extended   agent-recall list
-AGENT_RECALL_PROFILE=admin      agent-recall list
-```
-
-The CLI commands (`list` / `show` / `search` / `export`
-/ `diagnostics`) thread the same decision the MCP
-server threads; the deny path exits 1 with the same
-stable error codes.
-
-## Audit log
-
-Every read / write / maintenance / export / import
-operation that consults the decision emits an audit
-row with:
-
-- `metadata.active_profile` — the caller's profile.
-- `metadata.capability_state` — `granted` / `missing`
-  / `drift`.
-- `metadata.max_sensitivity` — the decision's value.
-
-The audit row NEVER includes the capability token
-bytes. The reasoning string mentions the capability
-type only by its stable code (e.g.
-`sensitivity_restricted`), never the token.
-
-## Acceptance matrix
-
-The matrix above is pinned in the following test files
-(commit 7):
-
-- `test/release-gate/v113-sensitivity-policy.test.ts`
-  — 31 tests (the central matrix).
-- `test/release-gate/p3-sql-boundary-sensitivity.test.ts`
-  — 12 new matrix assertions.
-- `test/blackbox/mcp-all-tools-e2e-core.test.ts` — 6
-  Core-profile matrix assertions.
-- `test/blackbox/mcp-all-tools-e2e-extended.test.ts` —
-  6 Extended-profile matrix assertions.
-- `test/release-gate/admin-default/mcp-admin-default.test.ts`
-  — 6 Admin-profile matrix assertions.
+- `docs/adr/0006-one-sensitivity-policy.md` — the
+  ADR that documents the canonical
+  `AuthorizationDecision` + the maintenance
+  classification + the per-row vs per-bundle
+  semantics.
+- `src/services/auth-context.ts` — the canonical
+  authorization decision + the
+  `MAINTENANCE_ACTION_POLICY` table.
+- `src/services/memory-read-service.ts` — every
+  read method threads the decision.
+- `docs/superpowers/specs/2026-07-28-v1.1.3-gate-03-sensitivity-design.md`
+  — the design spec for #33.
