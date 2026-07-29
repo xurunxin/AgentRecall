@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CANONICAL_PLATFORMS, canonicalPlatform } from "./canonical-platforms.mjs";
 
@@ -297,7 +297,20 @@ function handleAggregation() {
   if (!fragmentsDir) fail("usage: --fragments <directory> [--output <path>]");
   const paths = walkFiles(fragmentsDir).filter(path => path.endsWith(".json"));
   const evidence = aggregateFragments(paths);
-  writeFileSync(output, `${JSON.stringify(evidence, null, 2)}\n`);
+  // v1.1.3 GATE-04 (#34): the candidate workflow
+  // tag guard (`release.yml`) reads
+  // `release-candidate.json` to verify the candidate
+  // SHA against the tagged commit. The legacy `main()`
+  // path writes both files; the `--fragments` handler
+  // mirrors that contract by writing the candidate
+  // mirror alongside `output` so the workflow's
+  // `cp` step finds it without depending on the
+  // `$RUNNER_TEMP` default. (`output` is absolute
+  // in CI; the local-dev fallback is `outputPath`
+  // which is always under `$RUNNER_TEMP`.)
+  const json = `${JSON.stringify(evidence, null, 2)}\n`;
+  writeFileSync(output, json);
+  writeFileSync(join(dirname(output), "release-candidate.json"), json);
   console.log(`release evidence written to ${output}`);
 }
 

@@ -362,8 +362,18 @@ describe("extracted-artifact lifecycle E2E (Stage 18 v1.1.2 issue #28, task 9)",
     assert.doesNotMatch(workflow, /\|\|\s*true/);
 
     // The record-evidence job ingests the hashes into
-    // the existing evidence contract.
-    assert.match(workflow, /release-artifact-hashes\.json/);
+    // the existing evidence contract. v1.1.3 GATE-04
+    // (#34): the v1.1.3 fragment carries the per-OS
+    // archive sha256 inside `fragment.artifact`,
+    // which the matrix leg stages in the
+    // `fragments/<platform>.json` upload. The
+    // record-evidence job feeds that fragment into the
+    // `--fragments` aggregator, which produces a
+    // canonical document with `sha256_checksums`
+    // populated from the per-platform artifacts.
+    assert.match(workflow, /release-artifact-hashes-/);
+    assert.match(workflow, /fragments\/\$\{\{\s*matrix\.platform\s*\}\}\.json/);
+    assert.match(workflow, /--fragments/);
     assert.match(workflow, /sha256_checksums/);
 
     // Tab-indentation is forbidden by the existing
