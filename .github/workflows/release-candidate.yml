@@ -555,13 +555,40 @@ jobs:
           JOB_ID: aggregate-${{ github.sha }}
         run: |
           set -euo pipefail
-          EVIDENCE_FRAGMENTS_DIR="$RUNNER_TEMP/evidence-fragments" \
-          GITHUB_TOKEN="$GITHUB_TOKEN" \
-            node scripts/run-test-suites.mjs --list --json
+          # v1.1.3 GATE-06 B2 blocker 3 (issue #36):
+          # invoke the orchestrator in full mode so
+          # scripts/release-evidence.mjs finds a
+          # populated aggregate.json + per-suite
+          # junit-*.json + cleanup-*.json under
+          # $RUNNER_TEMP/orchestrator-aggregate/. The
+          # previous --list --json invocation only
+          # printed the suite table; it never produced
+          # aggregate.json, so the v1.1.3 GATE-06
+          # per-suite unhandled_rejections /
+          # worker_timeouts field was never populated
+          # in CI. --list is for local-debug only.
+          node scripts/run-test-suites.mjs \
+            --out "$RUNNER_TEMP/orchestrator-aggregate"
           node scripts/release-evidence.mjs
           node scripts/verify-release-evidence.mjs "$RUNNER_TEMP/release-evidence.json"
           cp "$RUNNER_TEMP/release-evidence.json" release-evidence.json
           cp "$RUNNER_TEMP/release-candidate.json" release-candidate.json
+
+      - name: Upload orchestrator evidence fragment
+        # v1.1.3 GATE-06 B2 blocker 3 (issue #36):
+        # upload the orchestrator's per-suite
+        # aggregate.json + junit-*.json + cleanup-*.json
+        # so the operator / lane owner can inspect the
+        # per-suite breakdown after a release.
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-evidence-fragment-orchestrator-ubuntu
+          path: |
+            ${{ runner.temp }}/orchestrator-aggregate/aggregate.json
+            ${{ runner.temp }}/orchestrator-aggregate/junit-*.json
+            ${{ runner.temp }}/orchestrator-aggregate/cleanup-*.json
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Upload release evidence artifact
         uses: actions/upload-artifact@v4
