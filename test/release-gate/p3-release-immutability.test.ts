@@ -128,6 +128,7 @@ function buildFixture(opts: {
   artifactMismatch?: "missing-archive" | "missing-hash" | null;
   dryRun?: boolean;
   skipFixture?: boolean;
+  skipEvidence?: boolean;
 }): { env: NodeJS.ProcessEnv; headSha: string } {
   const head = opts.headSha ?? spawnSync("git", ["rev-parse", "HEAD"], {
     cwd: repoRoot,
@@ -168,7 +169,7 @@ function buildFixture(opts: {
       writeFileSync(archivePath, placeholder);
       const sha256 = createHash("sha256").update(placeholder).digest("hex");
       hashes.push({
-        platform: p.platform,
+        platform: p.suffix, // v1.1.3 canonical platform
         artifact_path: filename,
         sha256,
         size_bytes: placeholder.length,
@@ -196,12 +197,84 @@ function buildFixture(opts: {
     writeFileSync(join(artifactDir, "LICENSE"), "fixture LICENSE\n");
     writeFileSync(join(artifactDir, "README.md"), "fixture README\n");
     writeFileSync(join(artifactDir, "CHANGELOG.md"), "fixture CHANGELOG\n");
+    // v1.1.3 GATE-04 (#34): the prepare-release
+    // verifier gate requires a canonical
+    // `release-evidence.json` next to the staging
+    // tree. The verifier exits 0 on this document
+    // when the contracts are met (canonical
+    // platforms, checksums-as-object, `test_summary`
+    // with `totals_from: "actual"`, real artifacts
+    // on disk whose bytes match the recorded
+    // sha256). Tests that exercise the
+    // "missing / placeholder evidence" path opt
+    // out via `skipEvidence: true` so the
+    // verifier-required gate stays fail-closed.
+    if (!opts.skipEvidence && opts.artifactMismatch !== "missing-archive") {
+      const releaseTag = opts.releaseTag ?? "v1.1.3";
+      const job = (platform: string) => ({
+        platform,
+        os: "ubuntu-latest",
+        node: "24",
+        job_url: "https://github.com/xurunxin/AgentRecall/actions/runs/0/jobs/0",
+        conclusion: "success",
+        duration_ms: 1000,
+        head_sha: sha
+      });
+      const artifacts = hashes.map((h) => ({
+        platform: h.platform,
+        name: h.artifact_path,
+        size_bytes: h.size_bytes,
+        sha256: h.sha256
+      }));
+      const evidence = {
+        schema_version: "1.1.3",
+        version: "1.1.2",
+        release_commit: sha,
+        tag: releaseTag,
+        candidate_sha: sha,
+        subissues: [],
+        ci_jobs: artifacts.map((a) => job(a.platform)),
+        release_workflow: job("linux-x64"),
+        artifacts,
+        sha256_checksums: Object.fromEntries(artifacts.map((a) => [a.name, a.sha256])),
+        test_summary: {
+          passed: 1,
+          failed: 0,
+          skipped: 0,
+          filtered: 0,
+          totals_from: "actual"
+        },
+        stress_summary: {
+          process_count: 1,
+          operations: 1,
+          invariants_ok: 1
+        },
+        migration_summary: {
+          sources_tested: ["v0"],
+          each_passed: true
+        },
+        known_non_blocking_limits: []
+      };
+      writeFileSync(
+        join(artifactDir, "release-evidence.json"),
+        `${JSON.stringify(evidence, null, 2)}\n`
+      );
+    }
   }
+  // v1.1.3 GATE-04 (#34): the default tag is the
+  // upcoming release ("v1.1.3") which does NOT yet
+  // exist in the worktree. The Stage 18 v1.1.2 lane
+  // pinned the default to "v1.1.2" but that tag is
+  // already present on main, so the tag check would
+  // fire before the SHA / artifact /
+  // evidence checks. Tests that exercise the
+  // existing-tag rejection path explicitly pass
+  // `releaseTag: "v1.1.1"`.
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     GITHUB_SHA: sha,
     ARTIFACT_DIR: artifactDir ?? "",
-    RELEASE_TAG: opts.releaseTag ?? "v1.1.2",
+    RELEASE_TAG: opts.releaseTag ?? "v1.1.3",
     DRY_RUN: opts.dryRun === false ? "0" : "1"
   };
   return { env, headSha: head };
@@ -294,7 +367,7 @@ describe("release-gate p3-release-immutability (Stage 18 #29, Task 10)", () => {
     assert.match(result.stderr, /release-artifact-hashes|hash|manifest/i);
   });
 
-  it("prepare-release.mjs in DRY_RUN=1 does not actually create the v1.1.2 tag", () => {
+  it("prepare-release.mjs in DRY_RUN=1 does not actually create the v1.1.3 tag", () => {
     const { env } = buildFixture({
       artifactDir: null,
       dryRun: true
@@ -305,7 +378,7 @@ describe("release-gate p3-release-immutability (Stage 18 #29, Task 10)", () => {
     // Sanity: the tag does not exist before we run.
     const before = runScript(
       "git",
-      ["tag", "--list", "v1.1.2"],
+      ["tag", "--list", "v1.1.3"],
       { ...env }
     );
     assert.equal(before.stdout.trim(), "");
@@ -318,10 +391,10 @@ describe("release-gate p3-release-immutability (Stage 18 #29, Task 10)", () => {
 
     const after = runScript(
       "git",
-      ["tag", "--list", "v1.1.2"],
+      ["tag", "--list", "v1.1.3"],
       { ...env }
     );
-    assert.equal(after.stdout.trim(), "", "v1.1.2 tag must not be created in dry-run mode");
+    assert.equal(after.stdout.trim(), "", "v1.1.3 tag must not be created in dry-run mode");
   });
 
   it("prepare-release.mjs writes release-notes.md + issue-19-evidence-comment.md with all 9 required fields", () => {
@@ -421,15 +494,15 @@ describe("release-gate p3-release-immutability (Stage 18 #29, Task 10)", () => {
     // must clean it up before exit. We can't reliably
     // read the developer's `~/.gitconfig` from inside
     // a child process, but we can verify the script
-    // source above. The `git tag --list v1.1.2` check
+    // source above. The `git tag --list v1.1.3` check
     // in the previous test additionally confirms the
     // script did NOT create a real tag in DRY_RUN=1.
     const tagListing = spawnSync(
       "git",
-      ["tag", "--list", "v1.1.2"],
+      ["tag", "--list", "v1.1.3"],
       { cwd: repoRoot, env, encoding: "utf8" }
     );
-    assert.equal(tagListing.stdout.trim(), "", "no v1.1.2 tag must exist after a dry-run");
+    assert.equal(tagListing.stdout.trim(), "", "no v1.1.3 tag must exist after a dry-run");
   });
 
   it("verify-release-evidence.mjs rejects an evidence file missing the version field", () => {
@@ -437,35 +510,48 @@ describe("release-gate p3-release-immutability (Stage 18 #29, Task 10)", () => {
     tempDirs.push(runnerTemp);
     const evidencePath = join(runnerTemp, "release-evidence.json");
     const sha = "fedcba9876543210fedcba9876543210fedcba98";
+    // v1.1.3 GATE-04 (#34): the verifier enforces
+    // the canonical v1.1.3 schema. We materialise a
+    // near-complete document with every required
+    // field EXCEPT `version`, so the zod schema
+    // check (SCHEMA_INVALID) is the rejection reason
+    // we observe. The artifact + checksum fields
+    // are populated with real on-disk bytes so the
+    // earlier CHECKSUM_BYTES_MISMATCH / empty /
+    // canonical-platform checks stay green.
+    const platforms = ["linux-x64", "darwin-x64", "win32-x64"] as const;
+    const artifacts = platforms.map((platform) => {
+      const name = `${platform}.tgz`;
+      const bytes = `fixture ${platform}\n`;
+      writeFileSync(join(runnerTemp, name), bytes);
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      return { platform, name, size_bytes: bytes.length, sha256 };
+    });
+    const job = (platform: string) => ({
+      platform,
+      os: "ubuntu-latest",
+      node: "24",
+      job_url: "https://github.com/xurunxin/AgentRecall/actions/runs/0/jobs/0",
+      conclusion: "success",
+      duration_ms: 100,
+      head_sha: sha
+    });
     const base = {
-      schema_version: 1,
+      schema_version: "1.1.3",
+      // `version` is intentionally omitted to
+      // exercise the SCHEMA_INVALID path that the
+      // v1.1.3 verifier emits.
       candidate_sha: sha,
       release_commit: sha,
-      tag: "v1.1.2",
-      ci_runs: [
-        {
-          job_name: "Matrix",
-          os: "ubuntu-latest",
-          node: "24",
-          job_url: "https://example.com/job/1",
-          workflow_url: "https://example.com/workflow/1",
-          conclusion: "success",
-          duration_ms: 100
-        }
-      ],
-      release_workflow: {
-        name: "Release Candidate Gate",
-        run_id: "1",
-        run_number: "1",
-        job: "record-evidence",
-        url: "https://example.com/workflow/1",
-        conclusion: "success",
-        duration_ms: 100
-      },
-      artifacts: [],
-      sha256_checksums: {},
-      test_summary: { passed: 1, failed: 0, skipped: 0, total: 1 },
-      migration_summary: [{ schema_version: "v13", passed: true }],
+      tag: "v1.1.3",
+      subissues: [],
+      ci_jobs: artifacts.map((a) => job(a.platform)),
+      release_workflow: job("linux-x64"),
+      artifacts,
+      sha256_checksums: Object.fromEntries(artifacts.map((a) => [a.name, a.sha256])),
+      test_summary: { passed: 1, failed: 0, skipped: 0, filtered: 0, totals_from: "actual" },
+      stress_summary: { process_count: 1, operations: 1, invariants_ok: 1 },
+      migration_summary: { sources_tested: ["v0"], each_passed: true },
       known_non_blocking_limits: ["limit"]
     };
     writeFileSync(evidencePath, `${JSON.stringify(base, null, 2)}\n`);
@@ -481,41 +567,44 @@ describe("release-gate p3-release-immutability (Stage 18 #29, Task 10)", () => {
     tempDirs.push(runnerTemp);
     const evidencePath = join(runnerTemp, "release-evidence.json");
     const sha = "0123456789abcdef0123456789abcdef01234567";
+    // v1.1.3 GATE-04 (#34): the canonical v1.1.3
+    // schema requires every artifact to declare a
+    // `platform` field AND the artifact set to
+    // cover exactly one entry per canonical
+    // platform. We omit the win32-x64 artifact on
+    // purpose so the verifier rejects the document
+    // with MISMATCHED_PLATFORMS.
+    const platforms = ["linux-x64", "darwin-x64"] as const;
+    const artifacts = platforms.map((platform) => {
+      const name = `${platform}.tgz`;
+      const bytes = `fixture ${platform}\n`;
+      writeFileSync(join(runnerTemp, name), bytes);
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      return { platform, name, size_bytes: bytes.length, sha256 };
+    });
+    const job = (platform: string) => ({
+      platform,
+      os: "ubuntu-latest",
+      node: "24",
+      job_url: "https://github.com/xurunxin/AgentRecall/actions/runs/0/jobs/0",
+      conclusion: "success",
+      duration_ms: 100,
+      head_sha: sha
+    });
     const base = {
-      schema_version: 1,
-      version: "1.1.2",
+      schema_version: "1.1.3",
+      version: "1.1.3",
       candidate_sha: sha,
       release_commit: sha,
-      tag: "v1.1.2",
-      ci_runs: [
-        {
-          job_name: "Matrix",
-          os: "ubuntu-latest",
-          node: "24",
-          job_url: "https://example.com/job/1",
-          workflow_url: "https://example.com/workflow/1",
-          conclusion: "success",
-          duration_ms: 100
-        }
-      ],
-      release_workflow: {
-        name: "Release Candidate Gate",
-        run_id: "1",
-        run_number: "1",
-        job: "record-evidence",
-        url: "https://example.com/workflow/1",
-        conclusion: "success",
-        duration_ms: 100
-      },
-      // Only linux-x64 + darwin-x64; win32-x64 is
-      // missing on purpose.
-      artifacts: [
-        { name: "agent-recall-1.1.2-linux-x64.tar.gz", sha256: "a".repeat(64) },
-        { name: "agent-recall-1.1.2-darwin-x64.tar.gz", sha256: "b".repeat(64) }
-      ],
-      sha256_checksums: {},
-      test_summary: { passed: 1, failed: 0, skipped: 0, total: 1 },
-      migration_summary: [{ schema_version: "v13", passed: true }],
+      tag: "v1.1.3",
+      subissues: [],
+      ci_jobs: [job("linux-x64"), job("darwin-x64")],
+      release_workflow: job("linux-x64"),
+      artifacts,
+      sha256_checksums: Object.fromEntries(artifacts.map((a) => [a.name, a.sha256])),
+      test_summary: { passed: 1, failed: 0, skipped: 0, filtered: 0, totals_from: "actual" },
+      stress_summary: { process_count: 1, operations: 1, invariants_ok: 1 },
+      migration_summary: { sources_tested: ["v0"], each_passed: true },
       known_non_blocking_limits: ["limit"]
     };
     writeFileSync(evidencePath, `${JSON.stringify(base, null, 2)}\n`);
@@ -523,7 +612,7 @@ describe("release-gate p3-release-immutability (Stage 18 #29, Task 10)", () => {
     const env = { ...process.env, GITHUB_SHA: sha };
     const result = runScript(verifyScriptPath, [evidencePath], env);
     assert.equal(result.status, 1, "verify must exit 1 when artifacts is missing a platform");
-    assert.match(result.stderr, /win32-x64|artifact|platform/i);
+    assert.match(result.stderr, /win32-x64|artifact|platform|mismatch/i);
   });
 
   it("ADR-0004 documents the immutability + evidence policy", () => {

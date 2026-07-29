@@ -377,15 +377,19 @@ describe("extracted-artifact lifecycle E2E (Stage 18 v1.1.2 issue #28, task 9)",
     assert.match(workflow, /packaged-install\.test\.ts/);
     assert.match(workflow, /scripts\/compute-artifact-hashes\.mjs/);
     // The packaged-install suite is run per platform
-    // (linux-x64, darwin-x64, windows-x64). The
+    // (linux-x64, darwin-x64, win32-x64). The
     // literal suffix values appear in the
     // `package` matrix's `include:` entries; the
     // `verify-extracted-artifacts` matrix reuses the
     // same suffixes via `${{
     // steps.platform.outputs.SUFFIX }}`.
+    // The v1.1.3 contract (#34) replaces the legacy
+    // `windows-x64` artifact suffix with the canonical
+    // `win32-x64` token; the matrix + verify steps
+    // must align.
     assert.match(workflow, /suffix:\s*linux-x64/);
     assert.match(workflow, /suffix:\s*darwin-x64/);
-    assert.match(workflow, /suffix:\s*windows-x64/);
+    assert.match(workflow, /suffix:\s*win32-x64/);
     assert.match(
       workflow,
       /agent-recall-\${{\s*matrix\.suffix\s*}}/,
