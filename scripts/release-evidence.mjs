@@ -385,6 +385,16 @@ const sha = process.env.GITHUB_SHA;
   const migrationSummary = readMigrationSummary();
   const aggregate = aggregateTestSummary();
   const suites = readSuiteBreakdown();
+  // Backward-compat: the legacy test_summary shape
+  // (just `{passed, failed, skipped, total}`) is
+  // preserved when no per-suite breakdown is
+  // available. The new `totals_from` + `suites`
+  // fields appear ONLY when the orchestrator's
+  // aggregate.json is present (the v1.1.3 GATE-06
+  // shape).
+  const testSummary = suites === undefined
+    ? aggregate
+    : { ...aggregate, totals_from: "actual", suites: suites.suites };
   const evidence = {
     schema_version: 1,
     // Stage 18 v1.1.2 (issue #29, task 10): the
@@ -409,13 +419,7 @@ const sha = process.env.GITHUB_SHA;
     },
     artifacts: artifacts(),
     sha256_checksums: envJson("RELEASE_EVIDENCE_SHA256_JSON") ?? {},
-    test_summary: suites === undefined
-      ? { ...aggregate, totals_from: "actual" }
-      : {
-          ...aggregate,
-          totals_from: "actual",
-          suites: suites.suites
-        },
+    test_summary: testSummary,
     migration_summary: migrationSummary,
     known_non_blocking_limits: knownNonBlockingLimits()
   };

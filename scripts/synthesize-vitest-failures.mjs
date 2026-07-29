@@ -266,20 +266,20 @@ async function main() {
   });
 
   const result = await runSynthetic(args);
-  // We treat the synthetic run as success when the
-  // process exited (regardless of code): the goal is
-  // to surface the failure to the orchestrator. The
-  // orchestrator inspects the orchestrator-side
-  // stderr + the per-suite cleanup_status bundle.
-  if (result.code === 0 && !result.timedOut) {
-    // Synthetic kind `both` may legitimately exit 0
-    // because vitest reports unhandled rejection via
-    // the worker stderr stream and continues. We
-    // don't require exit 0; we emit the marker and
-    // let the orchestrator's pattern detector
-    // decide.
-  }
-  process.exit(result.code ?? 0);
+  // We always exit 0: the goal is to surface the
+  // synthetic event to the orchestrator's pattern
+  // detector (which greps for UNHANDLED_REJECTION /
+  // WORKER_TIMEOUT in the orchestrator-side stderr).
+  // The injector itself is a smoke, not a release
+  // gate — the orchestrator's pattern detector IS
+  // the gate. Exiting non-zero here would force the
+  // `release-aggregate` job to fail on the
+  // synthetic smoke, which is the wrong surface
+  // (the smoke is meant to demonstrate that the
+  // orchestrator's pattern detector works, not to
+  // gate the release on the smoke itself).
+  void result;
+  process.exit(0);
 }
 
 main().catch((err) => {
