@@ -239,7 +239,15 @@ function spawnSuite(name, suite, options) {
         AGENT_RECALL_RELEASE_MODE: process.env.AGENT_RECALL_RELEASE_MODE ?? "1",
         JOB_ID: process.env.JOB_ID ?? `local-${randomUUID()}`
       },
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      // v1.1.3 GATE-06 B2 blocker 2 (issue #36): on
+      // Windows, `npx` is resolved as `npx.cmd` via
+      // `PATHEXT`. Without `shell: true` Node's spawn
+      // only looks for `npx.exe`, so the child fails
+      // with ENOENT. On POSIX, leave `shell` unset so
+      // the child inherits the parent's argv (no extra
+      // shell process / no arg-quoting concerns).
+      shell: process.platform === "win32"
     });
 
     let stdout = "";

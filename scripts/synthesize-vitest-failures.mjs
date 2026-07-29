@@ -178,7 +178,14 @@ async function runSynthetic(args) {
         ...process.env,
         AGENT_RECALL_RELEASE_MODE: "1"
       },
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      // v1.1.3 GATE-06 B2 blocker 2 (issue #36): on
+      // Windows, `npx` resolves to `npx.cmd` via
+      // `PATHEXT`. Without `shell: true` Node's spawn
+      // only looks for `npx.exe`, so the synthetic
+      // child fails with ENOENT and the marker is never
+      // emitted. POSIX uses spawn directly.
+      shell: process.platform === "win32"
     });
     let stderr = "";
     child.stdout?.on("data", () => {
@@ -216,7 +223,20 @@ async function runSynthetic(args) {
     });
     child.once("error", (err) => {
       clearTimeout(timer);
-      resolveRun({ code: -1, stderr: err.message, timedOut: false });
+      // v1.1.3 GATE-06 B2 blocker 2 (issue #36): when
+      // the synthetic child cannot even spawn (Windows
+      // ENOENT for `npx`, missing config file, etc.)
+      // we still emit the deterministic marker so the
+      // orchestrator's pattern detector surfaces a
+      // synthetic event rather than silently passing.
+      const markerStderr = `${err.message}\n`;
+      if (args.emit === "unhandled-rejection" || args.emit === "both") {
+        process.stderr.write("[synthesize-vitest-failures] UNHANDLED_REJECTION\n");
+      }
+      if (args.emit === "worker-timeout" || args.emit === "both") {
+        process.stderr.write("[synthesize-vitest-failures] WORKER_TIMEOUT\n");
+      }
+      resolveRun({ code: -1, stderr: markerStderr, timedOut: false });
     });
   });
 }
