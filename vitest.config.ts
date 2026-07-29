@@ -39,12 +39,8 @@ export default defineConfig({
     // The new `vitest.setup.ts` (added in commit 3)
     // registers an `unhandledRejection` handler that
     // logs the rejection AND throws in release mode
-    // (`AGENT_RECALL_RELEASE_MODE=1`). The setup file
-    // is referenced from each per-suite config; the
-    // default config continues with `setupFiles: []`
-    // for backward compatibility with `npm test` for
-    // local dev.
-    setupFiles: [],
+    // (`AGENT_RECALL_RELEASE_MODE=1`).
+    setupFiles: ["./vitest.setup.ts"],
     coverage: {
       provider: "v8",
       reporter: ["text", "html"]

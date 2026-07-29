@@ -36,7 +36,7 @@ export default defineConfig({
         singleThread: false
       }
     },
-    setupFiles: [],
+    setupFiles: ["./vitest.setup.ts"],
     testTimeout: 300_000,
     hookTimeout: 300_000
   }

@@ -33,7 +33,7 @@ export default defineConfig({
         singleFork: true
       }
     },
-    setupFiles: [],
+    setupFiles: ["./vitest.setup.ts"],
     testTimeout: 60_000,
     hookTimeout: 60_000
   }
