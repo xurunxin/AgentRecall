@@ -50,6 +50,10 @@ import {
   CORE_TOOL_NAMES,
   EXTENDED_TOOL_NAMES
 } from "../../../src/tools/register-tools.js";
+import { MemoryService } from "../../../src/memory-service.js";
+import { SQLiteMemoryStore } from "../../../src/sqlite-store.js";
+import { InMemoryCapabilityStore } from "../../../src/admin/capability.js";
+import type { MemoryEntry } from "../../../src/domain.js";
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), "../../../..");
 const SERVER_ENTRY = join(REPO_ROOT, "dist", "src", "index.js");
@@ -433,6 +437,155 @@ describe("release-gate mcp-admin-default (Stage 18 v1.1.2 #23, ADR-0001)", () =>
       } catch {
         // best effort
       }
+    }
+  });
+});
+
+// ============================================================
+// v1.1.3 GATE-03 (issue #33): the Admin-
+// profile matrix assertions. The Admin
+// profile + capability lifts visibility to
+// "restricted"; every cell of the matrix
+// the Admin profile exercises must surface.
+// ============================================================
+
+describe("v113-gate-03 matrix: Admin profile (issue #33)", () => {
+  function makeEntry(id: string, sensitivity: "normal" | "private" | "restricted"): MemoryEntry {
+    return {
+      id,
+      scope: "global",
+      type: "fact",
+      topic: "v113-gate-03",
+      title: `title-${id}`,
+      body: `body-${id}`,
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3,
+      status: "active",
+      created_at: "2026-07-28T00:00:00.000Z",
+      updated_at: "2026-07-28T00:00:00.000Z",
+      access_count: 0,
+      supersedes: [],
+      token_estimate: 1,
+      char_count: 2,
+      revision: 1,
+      writer_actor_id: "agent:test",
+      pinned: false,
+      trust_level: "agent_observed",
+      sensitivity,
+      tier: "working",
+      metadata: {}
+    };
+  }
+
+  /**
+   * Build a fresh Admin-profile MemoryService
+   * on a temp data home. The caller is
+   * responsible for closing the store via
+   * `service.store.close()` BEFORE removing
+   * the data home (Windows file locks would
+   * otherwise reject `rmSync` with EPERM).
+   */
+  function adminService(home: string): MemoryService {
+    const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+    const cap = new InMemoryCapabilityStore({
+      token: "d".repeat(64),
+      created_at: new Date().toISOString(),
+      label: "v113-gate-03-admin"
+    });
+    const service = new MemoryService(
+      store,
+      undefined,
+      "agent:test",
+      home,
+      cap as unknown as ConstructorParameters<typeof MemoryService>[4],
+      "admin"
+    );
+    return service;
+  }
+
+  it("Admin + capability × restricted row: getMemory surfaces the row", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-v113-gate-03-admin-get-"));
+    try {
+      const service = adminService(home);
+      service.store.insertEntry(makeEntry("v113_admin_r", "restricted"));
+      expect(service.getMemory("v113_admin_r")?.entry.id).toBe("v113_admin_r");
+      service.store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("Admin + capability × restricted row: listMemories includes the row", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-v113-gate-03-admin-list-"));
+    try {
+      const service = adminService(home);
+      service.store.insertEntry(makeEntry("v113_admin_list_r", "restricted"));
+      const ids = service.listMemories({ scope: "global" }).items.map((e) => e.id);
+      expect(ids).toContain("v113_admin_list_r");
+      service.store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("Admin + capability × restricted row: searchMemories includes the row", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-v113-gate-03-admin-search-"));
+    try {
+      const service = adminService(home);
+      service.store.insertEntry(makeEntry("v113_admin_search_r", "restricted"));
+      const ids = service.searchMemories({ scope: "global", query: "title" }).items.map((e) => e.id);
+      expect(ids).toContain("v113_admin_search_r");
+      service.store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("Admin + capability × restricted row: getMemoryBudget includes the row", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-v113-gate-03-admin-budget-"));
+    try {
+      const service = adminService(home);
+      service.store.insertEntry(makeEntry("v113_admin_budget_r", "restricted"));
+      const budget = service.getMemoryBudget({ scope: "global" });
+      expect(budget.usage.active_entries).toBe(1);
+      service.store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("Admin + capability × restricted row: exportMemoryContext renders the row", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-v113-gate-03-admin-export-"));
+    try {
+      const service = adminService(home);
+      service.store.insertEntry(makeEntry("v113_admin_export_r", "restricted"));
+      const md = service.exportMemoryContext({ scope: "global", budget_chars: 5000 });
+      expect(md).toContain("v113_admin_export_r");
+      service.store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("Admin + capability × restricted row: explainProvenance returns the full explanation", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-v113-gate-03-admin-prov-"));
+    try {
+      const service = adminService(home);
+      service.store.insertEntry(makeEntry("v113_admin_prov_r", "restricted"));
+      const got = service.explainProvenance("v113_admin_prov_r");
+      // Admin + capability surfaces the full
+      // explanation (not the deny-path
+      // `{ ok: false, error: "not_found" }`
+      // shape). The result carries the
+      // `memory_id` + `links` array on the
+      // success path.
+      expect("memory_id" in (got as { memory_id: string })).toBe(true);
+      expect("links" in (got as { links: unknown[] })).toBe(true);
+      service.store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
     }
   });
 });

@@ -46,6 +46,9 @@ import {
   EXTENDED_TOOL_NAMES
 } from "../../src/tools/register-tools.js";
 import { existsSync } from "node:fs";
+import { MemoryService } from "../../src/memory-service.js";
+import { SQLiteMemoryStore } from "../../src/sqlite-store.js";
+import type { MemoryEntry } from "../../src/domain.js";
 
 const REPO_ROOT = resolve(fileURLToPath(import.meta.url), "../../..");
 const SERVER_ENTRY = join(REPO_ROOT, "dist", "src", "index.js");
@@ -983,5 +986,138 @@ describe("MCP all-tools black-box E2E - Extended profile (v1.1.2 #22 Task 3 foll
     expect(r2.isError).toBe(true);
     const code = failureCode(r2);
     expect(code).toMatch(/idempotency_mismatch|key_reuse|key was reused/);
+  });
+});
+
+// ============================================================
+// v1.1.3 GATE-03 (issue #33): the Extended-
+// profile matrix assertions. Same shape
+// as the Core / Admin counterparts: a
+// service-level surface that does not
+// require the built artifact.
+// ============================================================
+
+describe("v113-gate-03 matrix: Extended profile (issue #33)", () => {
+  function makeEntry(id: string, sensitivity: "normal" | "private" | "restricted"): MemoryEntry {
+    return {
+      id,
+      scope: "global",
+      type: "fact",
+      topic: "v113-gate-03",
+      title: `title-${id}`,
+      body: `body-${id}`,
+      tags: [],
+      source: { kind: "agent" },
+      importance: 3,
+      confidence: 3,
+      status: "active",
+      created_at: "2026-07-28T00:00:00.000Z",
+      updated_at: "2026-07-28T00:00:00.000Z",
+      access_count: 0,
+      supersedes: [],
+      token_estimate: 1,
+      char_count: 2,
+      revision: 1,
+      writer_actor_id: "agent:test",
+      pinned: false,
+      trust_level: "agent_observed",
+      sensitivity,
+      tier: "working",
+      metadata: {}
+    };
+  }
+
+  it("Extended × restricted row: getMemoryWithVisibility refuses (forbidden_visibility, no leak)", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-v113-gate-03-ext-mx-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      store.insertEntry(makeEntry("v113_ext_r", "restricted"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "extended");
+      const got = service.getMemoryWithVisibility("v113_ext_r");
+      expect(got.ok).toBe(false);
+      if (got.ok) return;
+      expect(got.error).toBe("forbidden_visibility");
+      expect(got.details?.["entry_sensitivity"]).toBeUndefined();
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("Extended × restricted row: listMemories excludes the row at the SQL boundary", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-v113-gate-03-ext-list-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      store.insertEntry(makeEntry("v113_ext_list_n", "normal"));
+      store.insertEntry(makeEntry("v113_ext_list_r", "restricted"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "extended");
+      const ids = service.listMemories({ scope: "global" }).items.map((e) => e.id);
+      expect(ids).toContain("v113_ext_list_n");
+      expect(ids).not.toContain("v113_ext_list_r");
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("Extended × restricted row: searchMemories excludes the row at the SQL boundary", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-v113-gate-03-ext-search-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      store.insertEntry(makeEntry("v113_ext_search_n", "normal"));
+      store.insertEntry(makeEntry("v113_ext_search_r", "restricted"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "extended");
+      const ids = service.searchMemories({ scope: "global", query: "title" }).items.map((e) => e.id);
+      expect(ids).toContain("v113_ext_search_n");
+      expect(ids).not.toContain("v113_ext_search_r");
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("Extended × restricted row: getMemoryBudget excludes the row from active_entries", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-v113-gate-03-ext-budget-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      store.insertEntry(makeEntry("v113_ext_budget_n", "normal"));
+      store.insertEntry(makeEntry("v113_ext_budget_r", "restricted"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "extended");
+      const budget = service.getMemoryBudget({ scope: "global" });
+      expect(budget.usage.active_entries).toBe(1);
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("Extended × restricted row: exportMemoryContext renders only normal entries", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-v113-gate-03-ext-export-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      store.insertEntry(makeEntry("v113_ext_export_n", "normal"));
+      store.insertEntry(makeEntry("v113_ext_export_r", "restricted"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "extended");
+      const md = service.exportMemoryContext({ scope: "global", budget_chars: 5000 });
+      expect(md).toContain("v113_ext_export_n");
+      expect(md).not.toContain("v113_ext_export_r");
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("Extended × restricted row: explainProvenance returns not_found", () => {
+    const home = mkdtempSync(join(tmpdir(), "lm-v113-gate-03-ext-prov-"));
+    try {
+      const store = new SQLiteMemoryStore(join(home, "memory.sqlite"));
+      store.insertEntry(makeEntry("v113_ext_prov_r", "restricted"));
+      const service = new MemoryService(store, undefined, "agent:test", home, undefined, "extended");
+      const got = service.explainProvenance("v113_ext_prov_r");
+      expect(got).toEqual({ ok: false, error: "not_found" });
+      store.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
