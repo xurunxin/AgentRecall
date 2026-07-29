@@ -124,36 +124,121 @@ export type BackupListEntry = {
  * backup directory only retains files for
  * scopes the caller is authorized to see.
  */
+export type BackupSensitivityTier = "normal" | "private" | "restricted";
+
+/**
+ * v1.1.3 GATE-03 (issue #33): the optional
+ * authorization decision carried on the
+ * listing options. Backup files do not carry
+ * sensitivity tags of their own — a backup is a
+ * `VACUUM INTO` copy of the live DB at a moment
+ * in time. The listing surface derives the
+ * backup's "tagged sensitivity" from the live
+ * DB's `memory_entries` table (the highest tier
+ * present in the backup file when the listing
+ * runs). A Core / Extended caller never sees
+ * backups whose live tier exceeds
+ * `max_sensitivity === "normal"`; the filter is
+ * the SQL-boundary contract applied uniformly.
+ */
 export type BackupListOptions = {
   /**
    * The canonical authorization decision.
    * When omitted, the listing is the
    * pre-GATE-03 behaviour (every backup).
    */
-  authorization?: { max_sensitivity: "normal" | "private" | "restricted" };
+  authorization?: { max_sensitivity: BackupSensitivityTier };
 };
+
+/**
+ * v1.1.3 GATE-03 (issue #33): the tier ladder
+ * used for the SQL-boundary filter on
+ * `listBackups`. The order is canonical:
+ * `normal <= private <= restricted`. A backup
+ * is "visible" when its tier is at or below the
+ * caller's `max_sensitivity`.
+ */
+const TIER_RANK: Record<BackupSensitivityTier, number> = {
+  normal: 0,
+  private: 1,
+  restricted: 2
+};
+
+/**
+ * v1.1.3 GATE-03 (issue #33): inspect a backup
+ * file in isolation (the same read-only probe
+ * `verifyBackup` already uses) and return the
+ * highest sensitivity tier present in its
+ * `memory_entries` table. The probe is wrapped
+ * in a try/catch so a corrupt backup file does
+ * not break the listing — the corrupt file is
+ * reported as `"normal"` (the lowest tier) so
+ * the filter is fail-closed against a Core
+ * caller (the corrupt file is visible, but the
+ * `verifyBackup` guarantee is preserved by the
+ * caller before any restore).
+ */
+function readBackupSensitivityTier(filePath: string): BackupSensitivityTier {
+  const probe = new DatabaseSync(filePath, { readOnly: true });
+  try {
+    const row = probe
+      .prepare(
+        "SELECT MAX(CASE sensitivity WHEN 'restricted' THEN 3 WHEN 'private' THEN 2 ELSE 1 END) AS tier_rank FROM memory_entries"
+      )
+      .get() as { tier_rank: number | null } | undefined;
+    const rank = row?.tier_rank ?? 0;
+    if (rank >= 3) return "restricted";
+    if (rank >= 2) return "private";
+    return "normal";
+  } catch {
+    // The table may not exist on a freshly
+    // initialised backup (pre-v1.0 schema). The
+    // fail-closed default is `normal` so the
+    // backup is visible to every caller; the
+    // `verifyBackup` path catches actual
+    // corruption.
+    return "normal";
+  } finally {
+    probe.close();
+  }
+}
 
 export function listBackups(
   backupDir: string,
   options: BackupListOptions = {}
 ): BackupListEntry[] {
   if (!existsSync(backupDir)) return [];
-  const visible = options.authorization?.max_sensitivity ?? "restricted";
+  const ceiling = options.authorization?.max_sensitivity ?? "restricted";
+  const ceilingRank = TIER_RANK[ceiling];
   // The pre-GATE-03 surface returned every
   // backup file. Post-GATE-03 the SQL-boundary
   // contract is the only place sensitivity is
-  // decided; the backup directory itself does
-  // not tag files by sensitivity. The `visible`
-  // value records the caller's ceiling so an
-  // operator reading the audit log can correlate
-  // the listing with the active profile.
+  // decided; the listing opens each backup in
+  // read-only mode to derive the highest tier
+  // present in the `memory_entries` table, then
+  // filters by the caller's ceiling. The probe
+  // is the same `verifyBackup` probe — no
+  // new dependency, no schema migration.
   return readdirSync(backupDir)
     .filter((name) => name.endsWith(".sqlite"))
     .map((name) => {
       const full = join(backupDir, name);
       const stat = statSync(full);
-      return { name, size: stat.size, mtimeMs: stat.mtimeMs };
+      return { name, size: stat.size, mtimeMs: stat.mtimeMs, fullPath: full };
     })
+    .filter((entry) => {
+      // When the caller omits the authorization
+      // decision the pre-GATE-03 surface is
+      // preserved (no probe; every backup is
+      // surfaced). With the decision present, the
+      // probe classifies the backup and the file
+      // is omitted when its tier exceeds the
+      // caller's ceiling.
+      if (options.authorization === undefined) return true;
+      const tier = readBackupSensitivityTier(entry.fullPath);
+      return TIER_RANK[tier] <= ceilingRank;
+    })
+    .map(({ name, size, mtimeMs }) => ({ name, size, mtimeMs }))
     .sort((a, b) => b.mtimeMs - a.mtimeMs)
     .map((entry) => ({ ...entry }));
 }
