@@ -12,12 +12,37 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { MemoryService } from "../src/memory-service.js";
 import { SQLiteMemoryStore } from "../src/sqlite-store.js";
+import { InMemoryCapabilityStore } from "../src/admin/capability.js";
 import type { MemoryEntry } from "../src/domain.js";
 
 function setup() {
   const dataHome = mkdtempSync(join(tmpdir(), "lm-dry-run-"));
   const store = new SQLiteMemoryStore(join(dataHome, "memory.sqlite"));
-  const service = new MemoryService(store, undefined, "agent:test", dataHome);
+  // v1.1.3 GATE-03 (issue #33): the dry-run
+  // surface for `merge_duplicates` is restricted
+  // to the Admin profile (the destructive
+  // path is Admin-only; the dry-run reports
+  // the would_supersede plan but does not
+  // actually mutate). The other dry-run actions
+  // (`archive_low_value`, `expire_due`) remain
+  // safe on Core. The service is constructed
+  // with the Admin profile + a loaded
+  // capability so the `merge_duplicates`
+  // dry-run path is authorized.
+  const knownToken = "b".repeat(64);
+  const capStore = new InMemoryCapabilityStore({
+    token: knownToken,
+    created_at: new Date().toISOString(),
+    label: "maintenance-dry-run"
+  });
+  const service = new MemoryService(
+    store,
+    undefined,
+    "agent:test",
+    dataHome,
+    capStore as never,
+    "admin"
+  );
   return { service, store, dataHome };
 }
 
