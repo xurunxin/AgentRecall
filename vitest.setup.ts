@@ -26,6 +26,10 @@
 // every unhandled rejection is now a real failure in
 // release mode.
 
+import { existsSync, readdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 declare global {
   // eslint-disable-next-line no-var
   var __agentRecallVitestSetupInstalled: boolean | undefined;
@@ -132,9 +136,6 @@ if (!globalThis.__agentRecallVitestSetupInstalled) {
     // removes the `lm-stress-home-*` directories
     // via its own `afterAll`. We just clear any
     // obvious orphans.
-    const { existsSync, readdirSync, rmSync } = require("node:fs") as typeof import("node:fs");
-    const { tmpdir } = require("node:os") as typeof import("node:os");
-    const { join } = require("node:path") as typeof import("node:path");
     const base = tmpdir();
     if (!existsSync(base)) return;
     for (const entry of readdirSync(base)) {
