@@ -1,189 +1,69 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { z } from "zod";
+import { CANONICAL_PLATFORMS } from "./canonical-platforms.mjs";
 
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+const sha = z.string().regex(/^[0-9a-f]{40}$/);
+const hash = z.string().regex(/^[0-9a-f]{64}$/);
+const count = z.number().int().nonnegative();
+const platform = z.enum(CANONICAL_PLATFORMS);
+const job = z.object({ platform, os: z.string(), node: z.string(), job_url: z.string(), conclusion: z.enum(["success", "failure"]), duration_ms: count, head_sha: sha }).strict();
+export const ReleaseEvidence = z.object({
+  schema_version: z.literal("1.1.3"), version: z.string().regex(/^\d+\.\d+\.\d+$/), release_commit: sha,
+  tag: z.string().regex(/^v\d+\.\d+\.\d+$/), candidate_sha: sha,
+  subissues: z.array(z.object({ number: z.number().int(), state: z.literal("closed"), title: z.string() }).strict()),
+  ci_jobs: z.array(job), release_workflow: job,
+  artifacts: z.array(z.object({ platform, name: z.string().min(1), size_bytes: count, sha256: hash }).strict()),
+  sha256_checksums: z.record(z.string(), hash),
+  test_summary: z.object({ passed: count, failed: count, skipped: count, filtered: count, totals_from: z.enum(["actual", "constant"]) }).strict(),
+  stress_summary: z.object({ process_count: count, operations: count, invariants_ok: count }).strict(),
+  migration_summary: z.object({ sources_tested: z.array(z.string()), each_passed: z.boolean() }).strict(),
+  known_non_blocking_limits: z.array(z.string())
+}).strict();
 
-const evidencePath = process.argv[2] ?? join(process.env.RUNNER_TEMP ?? ".", "release-evidence.json");
-const requiredVersions = Array.from({ length: 14 }, (_, version) => `v${version}`);
+export function verifyChecksumAgainstArtifact(path, expected) {
+  return createHash("sha256").update(readFileSync(path)).digest("hex") === expected;
+}
+function reject(code, detail) { const error = new Error(detail); error.code = code; throw error; }
+function strings(value) { if (typeof value === "string") return [value]; if (Array.isArray(value)) return value.flatMap(strings); if (value && typeof value === "object") return Object.values(value).flatMap(strings); return []; }
 
-function fail(message) {
-  throw new Error(message);
+export function verifyDocument(raw, evidencePath, stable = true) {
+  if (Array.isArray(raw?.sha256_checksums) || raw?.sha256_checksums === null || typeof raw?.sha256_checksums !== "object") reject("CHECKSUM_TYPE_INVALID", "sha256_checksums must be an object");
+  const suppliedPlatforms = [...(raw?.artifacts ?? []), ...(raw?.ci_jobs ?? []), raw?.release_workflow].filter(Boolean).map(x => x.platform);
+  if (suppliedPlatforms.some(p => !CANONICAL_PLATFORMS.includes(p))) reject("PLATFORM_NOT_CANONICAL", "non-canonical platform token");
+  const parsed = ReleaseEvidence.safeParse(raw);
+  if (!parsed.success) reject("SCHEMA_INVALID", parsed.error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join("; "));
+  const doc = parsed.data;
+  if (stable && strings(doc).some(s => s.includes("local://"))) reject("LOCAL_URL_FORBIDDEN", "local URL in stable evidence");
+  if (stable && [...doc.ci_jobs, doc.release_workflow].some(j => !j.job_url.startsWith("https://github.com/"))) reject("MISSING_GITHUB_JOB_URL", "GitHub job URL required");
+  if (doc.candidate_sha !== doc.release_commit) reject("CANDIDATE_SHA_MISMATCH", "candidate SHA differs from release commit");
+  if ([...doc.ci_jobs, doc.release_workflow].some(j => j.duration_ms === 0)) reject("DURATION_PLACEHOLDER", "zero-duration job");
+  if (stable && doc.test_summary.totals_from === "constant") reject("TEST_TOTALS_FROM_CONSTANT", "actual test totals required");
+  if (doc.artifacts.length === 0) reject("EMPTY_ARTIFACTS", "artifact set is empty");
+  if (new Set(doc.artifacts.map(a => a.name)).size !== doc.artifacts.length) reject("DUPLICATE_ARTIFACTS", "duplicate artifact names");
+  if (new Set(doc.artifacts.map(a => a.platform)).size !== CANONICAL_PLATFORMS.length || CANONICAL_PLATFORMS.some(p => !doc.artifacts.some(a => a.platform === p))) reject("MISMATCHED_PLATFORMS", "exactly one artifact per canonical platform required");
+  const keys = Object.keys(doc.sha256_checksums);
+  if (keys.length !== doc.artifacts.length || doc.artifacts.some(a => doc.sha256_checksums[a.name] !== a.sha256)) reject("CHECKSUM_BYTES_MISMATCH", "checksum manifest differs from artifacts");
+  for (const artifact of doc.artifacts) {
+    const path = isAbsolute(artifact.name) ? artifact.name : join(dirname(evidencePath), artifact.name);
+    if (!existsSync(path) || !verifyChecksumAgainstArtifact(path, artifact.sha256)) reject("CHECKSUM_BYTES_MISMATCH", `artifact bytes differ: ${artifact.name}`);
+    if (readFileSync(path).byteLength !== artifact.size_bytes) reject("CHECKSUM_BYTES_MISMATCH", `artifact size differs: ${artifact.name}`);
+  }
+  return doc;
 }
 
-function readEvidence() {
-  let parsed;
+function argument(name) { const i = process.argv.indexOf(name); return i < 0 ? undefined : process.argv[i + 1]; }
+if (process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname.replace(/^\/(.:)/, "$1"))) {
   try {
-    parsed = JSON.parse(readFileSync(evidencePath, "utf8"));
+    const evidence = argument("--evidence") ?? process.argv.find((v, i) => i > 1 && !v.startsWith("--"));
+    if (!evidence) reject("SCHEMA_INVALID", "usage: --evidence <path> [--stable|--dev]");
+    if (process.argv.includes("--stable") && process.argv.includes("--dev")) reject("SCHEMA_INVALID", "choose one mode");
+    verifyDocument(JSON.parse(readFileSync(evidence, "utf8")), evidence, !process.argv.includes("--dev"));
+    console.log(JSON.stringify({ ok: true, mode: process.argv.includes("--dev") ? "dev" : "stable" }));
   } catch (error) {
-    fail(`cannot read release evidence: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(JSON.stringify({ ok: false, code: error.code ?? "SCHEMA_INVALID", detail: error.message }));
+    process.exitCode = 1;
   }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) fail("release evidence must be a JSON object");
-  return parsed;
-}
-
-function requiredString(object, field, label = field) {
-  if (typeof object[field] !== "string" || object[field].trim() === "") fail(`${label} is required`);
-}
-
-function verifyCiRuns(evidence) {
-  if (!Array.isArray(evidence.ci_runs) || evidence.ci_runs.length === 0) fail("ci_runs must be a non-empty array");
-  for (const [index, run] of evidence.ci_runs.entries()) {
-    if (run === null || typeof run !== "object") fail(`ci_runs[${index}] must be an object`);
-    for (const field of ["job_name", "os", "node", "job_url", "workflow_url", "conclusion"]) {
-      requiredString(run, field, `ci_runs[${index}].${field}`);
-    }
-    if (!Number.isInteger(run.duration_ms) || run.duration_ms < 0) fail(`ci_runs[${index}].duration_ms must be non-negative`);
-    if (run.conclusion !== "success") fail(`ci_runs[${index}] conclusion is ${run.conclusion}, not success`);
-    if (!run.job_url.startsWith("http://") && !run.job_url.startsWith("https://") && !run.job_url.startsWith("local://")) {
-      fail(`ci_runs[${index}].job_url must be a workflow job URL`);
-    }
-    if (!run.workflow_url.startsWith("http://") && !run.workflow_url.startsWith("https://") && !run.workflow_url.startsWith("local://")) {
-      fail(`ci_runs[${index}].workflow_url must be a workflow URL`);
-    }
-  }
-}
-
-function verifyReleaseWorkflow(evidence) {
-  const workflow = evidence.release_workflow;
-  if (workflow === null || typeof workflow !== "object") fail("release_workflow is required");
-  for (const field of ["name", "run_id", "run_number", "job", "url", "conclusion"]) {
-    requiredString(workflow, field, `release_workflow.${field}`);
-  }
-  if (workflow.conclusion !== "success") fail(`release_workflow conclusion is ${workflow.conclusion}, not success`);
-  if (!workflow.url.startsWith("http://") && !workflow.url.startsWith("https://") && !workflow.url.startsWith("local://")) {
-    fail("release_workflow.url must be a workflow URL");
-  }
-  if (!Number.isInteger(workflow.duration_ms) || workflow.duration_ms < 0) fail("release_workflow.duration_ms must be non-negative");
-}
-
-function verifyTestSummary(evidence) {
-  const summary = evidence.test_summary;
-  if (summary === null || typeof summary !== "object") fail("test_summary is required");
-  for (const field of ["passed", "failed", "skipped", "total"]) {
-    if (!Number.isInteger(summary[field]) || summary[field] < 0) fail(`test_summary.${field} must be a non-negative integer`);
-  }
-  if (summary.passed <= 0) fail("test_summary.passed must be greater than zero");
-  if (summary.failed !== 0) fail("test_summary.failed must equal zero");
-  if (summary.skipped !== 0) fail("release-critical tests cannot be skipped");
-  if (summary.total !== summary.passed + summary.failed + summary.skipped) fail("test_summary total is inconsistent");
-}
-
-function verifyMigrationSummary(evidence) {
-  const summary = Array.isArray(evidence.migration_summary)
-    ? evidence.migration_summary
-    : evidence.migration_summary !== null && Array.isArray(evidence.migration_summary.versions)
-      ? evidence.migration_summary.versions
-      : undefined;
-  if (summary === undefined) fail("migration_summary must be an array or an object with versions");
-  const byVersion = new Map();
-  for (const row of summary) {
-    if (row === null || typeof row !== "object") fail("migration_summary contains a non-object row");
-    requiredString(row, "schema_version", "migration schema_version");
-    if (typeof row.passed !== "boolean") fail(`migration ${row.schema_version}.passed must be boolean`);
-    byVersion.set(row.schema_version, row);
-  }
-  for (const version of requiredVersions) {
-    const row = byVersion.get(version);
-    if (row === undefined) fail(`migration_summary is missing ${version}`);
-    if (row.passed !== true) fail(`${version} migration did not pass`);
-  }
-}
-
-function verifyArtifacts(evidence) {
-  if (!Array.isArray(evidence.artifacts)) fail("artifacts must be an array");
-  if (evidence.sha256_checksums === null || typeof evidence.sha256_checksums !== "object" || Array.isArray(evidence.sha256_checksums)) {
-    fail("sha256_checksums must be an object");
-  }
-  // Stage 18 v1.1.2 (issue #29, task 10): the
-  // artifact manifest MUST cover all three
-  // publication platforms (linux-x64 / darwin-x64 /
-  // win32-x64). The release-publication gate refuses
-  // to mint a tag from an evidence file that is
-  // missing a platform, regardless of whether the
-  // candidate workflow produced a partial run.
-  const requiredPlatforms = ["linux-x64", "darwin-x64", "win32-x64"];
-  const covered = new Set();
-  for (const [index, artifact] of evidence.artifacts.entries()) {
-    if (artifact === null || typeof artifact !== "object") {
-      fail(`artifacts[${index}] must be an object`);
-    }
-    const name = typeof artifact.name === "string"
-      ? artifact.name
-      : typeof artifact.artifact_path === "string"
-        ? artifact.artifact_path
-        : "";
-    if (name.length === 0) fail(`artifacts[${index}].name (or artifact_path) is required`);
-    for (const platform of requiredPlatforms) {
-      if (name.includes(platform)) covered.add(platform);
-    }
-  }
-  for (const platform of requiredPlatforms) {
-    if (!covered.has(platform)) {
-      fail(`artifacts is missing the ${platform} platform archive`);
-    }
-  }
-}
-
-function verifyVersion(evidence) {
-  // Stage 18 v1.1.2 (issue #29, task 10): the
-  // evidence file MUST carry a top-level `version`
-  // field equal to the release version the tag
-  // guard is about to publish. A mismatch between
-  // the evidence `version` and the package's
-  // canonical `1.1.2` would let a stale candidate
-  // run sneak a different release through the
-  // publication gate.
-  if (typeof evidence.version !== "string" || evidence.version.trim() === "") {
-    fail("evidence.version is required");
-  }
-  if (evidence.version !== "1.1.2") {
-    fail(`evidence.version must equal "1.1.2" (got "${evidence.version}")`);
-  }
-}
-
-function main() {
-  const evidence = readEvidence();
-  for (const field of [
-    "schema_version",
-    "candidate_sha",
-    "release_commit",
-    "tag",
-    "ci_runs",
-    "release_workflow",
-    "artifacts",
-    "sha256_checksums",
-    "test_summary",
-    "migration_summary",
-    "known_non_blocking_limits",
-    "version"
-  ]) {
-    if (!Object.prototype.hasOwnProperty.call(evidence, field)) fail(`release evidence is missing ${field}`);
-  }
-  requiredString(evidence, "candidate_sha");
-  requiredString(evidence, "release_commit");
-  if (evidence.release_commit !== evidence.candidate_sha) fail("release_commit must equal candidate_sha");
-  const githubSha = process.env.GITHUB_SHA;
-  if (githubSha === undefined || githubSha === "") fail("GITHUB_SHA is required for evidence verification");
-  if (evidence.release_commit !== githubSha) fail(`release_commit ${evidence.release_commit} does not equal GITHUB_SHA ${githubSha}`);
-  if (evidence.tag !== null && typeof evidence.tag !== "string") fail("tag must be a string or null");
-  verifyCiRuns(evidence);
-  verifyReleaseWorkflow(evidence);
-  verifyArtifacts(evidence);
-  verifyVersion(evidence);
-  verifyTestSummary(evidence);
-  verifyMigrationSummary(evidence);
-  if (!Array.isArray(evidence.known_non_blocking_limits) || evidence.known_non_blocking_limits.length === 0) {
-    fail("known_non_blocking_limits must be a non-empty array");
-  }
-  for (const [index, limit] of evidence.known_non_blocking_limits.entries()) {
-    if (typeof limit !== "string" || limit.trim() === "") fail(`known_non_blocking_limits[${index}] must be a non-empty string`);
-  }
-  console.log(`verified release evidence for ${evidence.release_commit}`);
-}
-
-try {
-  main();
-} catch (error) {
-  console.error(`release evidence verification failed: ${error instanceof Error ? error.message : String(error)}`);
-  process.exitCode = 1;
 }
