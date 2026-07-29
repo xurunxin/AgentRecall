@@ -263,7 +263,11 @@ export class MemoryService {
       // canonical authorization decision so the
       // maintenance helpers consult the same
       // sensitivity ceiling as the read surface.
-      authorization
+      authorization,
+      // The `MaintenanceActionPolicy` table
+      // consults the active profile to gate
+      // `requiresAdminProfile` actions.
+      activeProfile
     });
     this._store = store;
     this.planStore = new MaintenancePlanStore(store);

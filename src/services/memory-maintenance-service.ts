@@ -49,6 +49,84 @@ export type MaintenanceAction =
   | "find_duplicates"
   | "merge_duplicates";
 
+/**
+ * v1.1.3 GATE-03 (issue #33): the per-action
+ * sensitivity policy. The table is the single
+ * source of truth for "which profile / capability
+ * is authorized to run this action". Helpers that
+ * consult the decision on a per-row basis
+ * (find_duplicates, archive_low_value, etc.) use
+ * the `filterAtSQLBoundary` flag; helpers that
+ * mutate rows on a per-row basis (merge_duplicates)
+ * use `requiresAdminProfile` / `requiresCapability`
+ * to gate destructive operations.
+ */
+export const MaintenanceActionPolicy: Readonly<
+  Record<
+    MaintenanceAction,
+    {
+      /**
+       * Whether the action's row-scan honours the
+       * SQL-boundary sensitivity filter. `true`
+       * for every action that walks the
+       * active-entries table.
+       */
+      filterAtSQLBoundary: boolean;
+      /**
+       * When `true`, the action is restricted to
+       * the Admin profile (the active process must
+       * be `activeProfile === "admin"` with a
+       * loaded capability). The Core / Extended
+       * profiles refuse the action with
+       * `unauthorized`.
+       */
+      requiresAdminProfile: boolean;
+      /**
+       * When set, the action additionally
+       * requires a per-request capability token of
+       * the named type (e.g.
+       * `sensitivity_restricted`). The
+       * `CapabilityStore.authorize(...)` check is
+       * the gate.
+       */
+      requiresCapability?: "trust_promotion" | "sensitivity_restricted";
+    }
+  >
+> = {
+  archive_low_value: {
+    filterAtSQLBoundary: true,
+    requiresAdminProfile: false
+  },
+  expire_due: {
+    filterAtSQLBoundary: true,
+    requiresAdminProfile: false
+  },
+  rebuild_markdown_index: {
+    filterAtSQLBoundary: true,
+    requiresAdminProfile: false
+  },
+  vacuum_fts: {
+    // VACUUM is a schema operation; it does not
+    // walk rows. The SQL-boundary filter is
+    // // irrelevant.
+    filterAtSQLBoundary: false,
+    requiresAdminProfile: false
+  },
+  find_duplicates: {
+    filterAtSQLBoundary: true,
+    requiresAdminProfile: false
+  },
+  merge_duplicates: {
+    filterAtSQLBoundary: true,
+    // `merge_duplicates` mutates rows via
+    // `applySupersede`; the destructive contract
+    // restricts the action to the Admin profile
+    // (the per-request capability token gate
+    // lives in the write path, not here).
+    requiresAdminProfile: true
+  }
+};
+
 export type DuplicateGroup = {
   reason: "same_title_and_body" | "same_title" | "same_body" | "similar_title_and_body";
   fingerprint: string;
@@ -100,6 +178,14 @@ export type MaintenanceContext = {
    * separate string.
    */
   authorization?: AuthorizationDecision;
+  /**
+   * v1.1.3 GATE-03 (issue #33): the active
+   * tool profile. The `MaintenanceActionPolicy`
+   * table consults this to gate
+   * `requiresAdminProfile` actions. Defaults to
+   * `"core"` so legacy callers stay compatible.
+   */
+  activeProfile?: "core" | "extended" | "admin";
 };
 
 export class MemoryMaintenanceService {
@@ -169,6 +255,30 @@ export class MemoryMaintenanceService {
       scope: resolved.value.scope,
       ...(resolved.value.project_id !== undefined ? { project_id: resolved.value.project_id } : {})
     };
+    // v1.1.3 GATE-03 (issue #33): consult the
+    // `MaintenanceActionPolicy` table before
+    // dispatching. An action that requires the
+    // Admin profile is refused on Core / Extended
+    // with `unauthorized`; the per-row sensitivity
+    // filter is the helper's responsibility (every
+    // helper that walks the active-entries table
+    // threads the decision into the SQL-boundary
+    // filter). The table is the single source of
+    // truth; future lanes extend the registry
+    // instead of inlining the policy at each
+    // dispatch site.
+    const policy = MaintenanceActionPolicy[input.action];
+    const activeProfile = this.ctx.activeProfile ?? "core";
+    if (policy.requiresAdminProfile && activeProfile !== "admin") {
+      return {
+        action: input.action,
+        changed: 0,
+        details: {
+          error: "unauthorized",
+          message: `maintenance action '${input.action}' requires the admin profile; set AGENT_RECALL_PROFILE=admin and supply a valid capability`
+        }
+      };
+    }
     switch (input.action) {
       case "find_duplicates":
         return this.findDuplicatesChunked(scope, input);
