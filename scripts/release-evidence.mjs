@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { CANONICAL_PLATFORMS, canonicalPlatform } from "./canonical-platforms.mjs";
 
 const repoRoot = resolve(fileURLToPath(import.meta.url), "..", "..");
 const runnerTemp = process.env.RUNNER_TEMP ?? resolve(repoRoot, ".tmp", "runner");
@@ -260,7 +261,51 @@ function assertNoUndefined(value, path = "evidence") {
   }
 }
 
+function argument(name) {
+  const index = process.argv.indexOf(name);
+  return index < 0 ? undefined : process.argv[index + 1];
+}
+
+export function aggregateFragments(fragmentPaths) {
+  if (fragmentPaths.length !== CANONICAL_PLATFORMS.length) fail(`MISMATCHED_PLATFORMS: expected ${CANONICAL_PLATFORMS.length} fragments`);
+  const fragments = fragmentPaths.map(readJson);
+  const normalised = fragments.map((fragment, index) => {
+    const platform = canonicalPlatform(fragment.platform);
+    if (!platform) fail(`PLATFORM_NOT_CANONICAL: ${fragment.platform}`);
+    const artifact = fragment.artifact ?? fragment.artifacts?.[0];
+    if (!artifact) fail(`EMPTY_ARTIFACTS: fragment ${index}`);
+    return { ...fragment, platform, artifact: { ...artifact, platform, name: artifact.name ?? basename(artifact.artifact_path) } };
+  });
+  if (new Set(normalised.map(f => f.platform)).size !== CANONICAL_PLATFORMS.length) fail("MISMATCHED_PLATFORMS: fragments do not cover canonical platforms");
+  const base = normalised[0];
+  const totals = normalised.reduce((sum, f) => ({ passed: sum.passed + Number(f.test_summary?.passed ?? 0), failed: sum.failed + Number(f.test_summary?.failed ?? 0), skipped: sum.skipped + Number(f.test_summary?.skipped ?? 0), filtered: sum.filtered + Number(f.test_summary?.filtered ?? 0) }), { passed: 0, failed: 0, skipped: 0, filtered: 0 });
+  if (normalised.some(f => f.test_summary?.totals_from !== "actual")) fail("TEST_TOTALS_FROM_CONSTANT: fragments must contain actual Vitest totals");
+  const artifacts = normalised.map(f => f.artifact);
+  return {
+    schema_version: "1.1.3", version: base.version, release_commit: base.release_commit, tag: base.tag,
+    candidate_sha: base.candidate_sha, subissues: base.subissues ?? [], ci_jobs: normalised.map(f => ({ ...f.ci_job, platform: f.platform })),
+    release_workflow: base.release_workflow, artifacts,
+    sha256_checksums: Object.fromEntries(artifacts.map(a => [a.name, a.sha256])),
+    test_summary: { ...totals, totals_from: "actual" }, stress_summary: base.stress_summary,
+    migration_summary: base.migration_summary, known_non_blocking_limits: base.known_non_blocking_limits ?? []
+  };
+}
+
+function handleAggregation() {
+  const fragmentsDir = argument("--fragments");
+  const output = argument("--output") ?? outputPath;
+  if (!fragmentsDir) fail("usage: --fragments <directory> [--output <path>]");
+  const paths = walkFiles(fragmentsDir).filter(path => path.endsWith(".json"));
+  const evidence = aggregateFragments(paths);
+  writeFileSync(output, `${JSON.stringify(evidence, null, 2)}\n`);
+  console.log(`release evidence written to ${output}`);
+}
+
 async function main() {
+  if (process.argv.includes("--fragments")) {
+    handleAggregation();
+    return;
+  }
   if (process.argv[2] === "--assert-vitest") {
     handleVitestAssertion();
     return;
@@ -311,7 +356,9 @@ async function main() {
   console.log(`release evidence written to ${outputPath}`);
 }
 
-main().catch((error) => {
-  console.error(`release evidence failed: ${error instanceof Error ? error.message : String(error)}`);
-  process.exitCode = 1;
-});
+if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    console.error(`release evidence failed: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  });
+}
