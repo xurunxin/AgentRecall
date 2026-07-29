@@ -117,12 +117,20 @@ if (!globalThis.__agentRecallVitestSetupInstalled) {
     // eslint-disable-next-line no-console
     console.error(formatFailure(failure));
     if (shouldEscalate(failure)) {
+      // Release mode: throw synchronously so the
+      // worker exits non-zero and vitest surfaces
+      // the failure to the caller.
       throw err;
     }
-    // Non-release: log + re-emit. Node's default
-    // uncaughtException handler prints the stack
-    // and exits; the re-emit preserves that path.
-    throw err;
+    // Non-release mode: log + re-emit through
+    // Node's default uncaughtException handler so
+    // the test run still exits non-zero, but the
+    // re-emit happens AFTER this handler returns
+    // (so the [vitest.setup] FAILURE log line
+    // above is observable first).
+    process.nextTick(() => {
+      throw err;
+    });
   });
 
   process.on("exit", () => {
