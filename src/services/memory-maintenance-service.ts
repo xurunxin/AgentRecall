@@ -36,6 +36,10 @@ import { runBackup, verifyBackup } from "../backup.js";
 import { resolveMemoryScope, type ProjectIdentityResolver } from "../scope-resolver.js";
 import { createHash } from "node:crypto";
 import type { RequestContext } from "../request-context.js";
+import {
+  type AuthorizationDecision,
+  type SensitivityLevel
+} from "./auth-context.js";
 
 export type MaintenanceAction =
   | "archive_low_value"
@@ -84,10 +88,37 @@ export type MaintenanceContext = {
   exporter?: MarkdownExporter;
   /** Returns a MarkdownExporter (shared with read side via a factory). */
   resolveExporter: () => MarkdownExporter;
+  /**
+   * v1.1.3 GATE-03 (issue #33): the canonical
+   * authorization decision. Maintenance helpers
+   * consult this before scanning the entries
+   * table so a Core / Extended caller never sees
+   * restricted rows in the cleanup-candidate or
+   * duplicate-group scan. The decision is the
+   * single source of truth — downstream code
+   * never reads `actorMaxSensitivity` as a
+   * separate string.
+   */
+  authorization?: AuthorizationDecision;
 };
 
 export class MemoryMaintenanceService {
   constructor(private readonly ctx: MaintenanceContext) {}
+
+  /**
+   * v1.1.3 GATE-03 (issue #33): the maintenance
+   * surface's view of the SQL-boundary sensitivity
+   * filter. Returns `"normal"` by default (the
+   * fail-closed contract) and lifts to the
+   * canonical decision's value when one is
+   * supplied. Legacy callers (test fixtures
+   * predating the v1.1.3 split) get `"normal"`
+   * because the maintenance service was previously
+   * unrestricted on the read side.
+   */
+  private maxSensitivity(): SensitivityLevel {
+    return this.ctx.authorization?.max_sensitivity ?? "normal";
+  }
 
   maintainMemories(input: MaintainMemoriesInput, ctx?: RequestContext): MaintainMemoriesResult {
     if (input.batch_size !== undefined) {
@@ -315,7 +346,25 @@ export class MemoryMaintenanceService {
   ): MaintainMemoriesResult {
     const batchSize = input.batch_size ?? 500;
     const onProgress = input.onProgress;
-    const allEntries = activeEntriesForScope(this.ctx.store, scope);
+    // v1.1.3 GATE-03 (issue #33): the
+    // active-entries scan is filtered at the
+    // SQL boundary so a Core / Extended caller
+    // never sees restricted rows in the
+    // duplicate-group detection. The
+    // pre-GATE-03 implementation walked every
+    // row in the scope (the maintenance
+    // service was an internal authorized path
+    // — the new contract restricts the helper
+    // to the caller's visible subset unless
+    // the caller is Admin with a loaded
+    // capability).
+    const allEntries = this.ctx.store.listEntries({
+      scope: scope.scope,
+      ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
+      status: "active",
+      limit: 10_000,
+      actor_max_sensitivity: this.maxSensitivity()
+    });
     const total = allEntries.length;
     if (total === 0) {
       onProgress?.(0, 0);
@@ -356,7 +405,15 @@ export class MemoryMaintenanceService {
     const strategy: "keep_first" | "keep_newest" = input.strategy ?? "keep_first";
     const dryRun = input.dry_run === true;
     const onProgress = input.onProgress;
-    const allEntries = activeEntriesForScope(this.ctx.store, scope);
+    // v1.1.3 GATE-03 (issue #33): mirror the
+    // decision's filter on the merge scan.
+    const allEntries = this.ctx.store.listEntries({
+      scope: scope.scope,
+      ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
+      status: "active",
+      limit: 10_000,
+      actor_max_sensitivity: this.maxSensitivity()
+    });
     const groups = this.findDuplicateGroups(allEntries);
 
     const wouldSupersede: Array<{
@@ -440,10 +497,23 @@ export class MemoryMaintenanceService {
   private rebuildMarkdownIndex(scope: ResolvedReadScope, ctx?: RequestContext): MaintainMemoriesResult {
     assertProjectScope(scope, "rebuild_markdown_index");
     const exporter = this.ctx.resolveExporter();
+    // v1.1.3 GATE-03 (issue #33): the markdown
+    // rebuild is filtered to the caller's visible
+    // scope. Pre-GATE-03 the rebuild walked every
+    // row in the scope (the maintenance path was
+    // internally authorized); post-GATE-03 the
+    // rebuild respects the same SQL-boundary
+    // filter as the read surface.
+    const entries = this.ctx.store.listEntries({
+      scope: scope.scope,
+      ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
+      limit: 10_000,
+      actor_max_sensitivity: this.maxSensitivity()
+    });
     const staged = exporter.stageScope({
       scope: scope.scope,
       ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
-      entries: allEntriesForScope(this.ctx.store, scope),
+      entries,
       budgetStatus: usageForScope(this.ctx.store, scope)
     });
     const changed = staged.topicPaths.length + 1;
@@ -482,7 +552,20 @@ export class MemoryMaintenanceService {
   private expireDueMemories(scope: ResolvedReadScope, dryRun = false, ctx?: RequestContext): MaintainMemoriesResult {
     assertProjectScope(scope, "expire_due");
     const now = nowIso();
-    const expired = activeEntriesForScope(this.ctx.store, scope)
+    // v1.1.3 GATE-03 (issue #33): the expiry
+    // scan is filtered at the SQL boundary. A
+    // restricted row that has expired stays
+    // untouched on a Core / Extended caller
+    // (an Admin + capability caller still sees
+    // it because the canonical decision lifts
+    // visibility to `"restricted"`).
+    const expired = this.ctx.store.listEntries({
+      scope: scope.scope,
+      ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
+      status: "active",
+      limit: 10_000,
+      actor_max_sensitivity: this.maxSensitivity()
+    })
       .filter((entry) => isDue(entry.expires_at, now))
       .sort((a, b) => compareText(a.expires_at ?? "", b.expires_at ?? "") || compareText(a.id, b.id));
 
@@ -539,7 +622,18 @@ export class MemoryMaintenanceService {
 
   private archiveLowValueMemories(scope: ResolvedReadScope, dryRun = false, ctx?: RequestContext): MaintainMemoriesResult {
     assertProjectScope(scope, "archive_low_value");
-    const lowValue = activeEntriesForScope(this.ctx.store, scope)
+    // v1.1.3 GATE-03 (issue #33): the
+    // archive-low-value scan is filtered at the
+    // SQL boundary. A restricted row that
+    // matches the low-value predicate stays
+    // untouched on a Core / Extended caller.
+    const lowValue = this.ctx.store.listEntries({
+      scope: scope.scope,
+      ...(scope.project_id !== undefined ? { project_id: scope.project_id } : {}),
+      status: "active",
+      limit: 10_000,
+      actor_max_sensitivity: this.maxSensitivity()
+    })
       .filter((entry) => entry.importance <= 2 && entry.confidence <= 2 && entry.access_count === 0 && entry.source.kind !== "user")
       .sort(compareLowValueCandidates);
 

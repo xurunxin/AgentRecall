@@ -60,6 +60,9 @@ import {
   type AuthorizationRequest,
   type CapabilityRecord
 } from "../admin/capability.js";
+import {
+  type AuthorizationDecision as SensitivityAuthorizationDecision
+} from "./auth-context.js";
 
 type RememberError = "invalid_schema" | "invalid_scope" | "invalid_state" | "secret_detected" | "unauthorized" | "capacity_exceeded" | "duplicate_candidate" | "idempotency_mismatch" | "idempotency_in_flight";
 type UpdateError = "not_found" | "invalid_state" | "invalid_schema" | "secret_detected" | "unauthorized" | "capacity_exceeded" | "stale_revision" | "idempotency_mismatch" | "idempotency_in_flight";
@@ -123,6 +126,19 @@ export type WriteContext = {
    * default to `"core"` (fail-closed).
    */
   activeProfile?: ToolProfile;
+  /**
+   * v1.1.3 GATE-03 (issue #33): the canonical
+   * sensitivity authorization decision. The
+   * internal CAS path uses
+   * `peekEntryUnrestricted(id)` only when the
+   * decision lifts visibility to
+   * `"restricted"`; otherwise the write path
+   * consults the SQL-boundary filter. The
+   * legacy v1.1.2 `capabilityStore` continues
+   * to gate `trust_promotion` and
+   * `sensitivity_restricted` writes.
+   */
+  authorization?: SensitivityAuthorizationDecision;
   /** Returns the configured project scope (or creates one with default budget). */
   configureProjectBudget: (
     project_id: string,

@@ -232,6 +232,13 @@ export class MemoryService {
       // types against the per-process
       // profile.
       activeProfile,
+      // v1.1.3 GATE-03 (issue #33): the canonical
+      // authorization decision. The internal CAS
+      // path uses `peekEntryUnrestricted` only
+      // when this decision lifts visibility;
+      // otherwise the write path consults the
+      // SQL-boundary filter.
+      authorization,
       configureProjectBudget: (project_id, budget, canonical_path, display_name) =>
         this.configureProjectBudget(project_id, budget, canonical_path, display_name)
     });
@@ -240,7 +247,12 @@ export class MemoryService {
       defaultActor,
       identityResolver,
       ...(this.dataHome !== undefined ? { dataHome: this.dataHome } : {}),
-      resolveExporter: resolveExporterFn
+      resolveExporter: resolveExporterFn,
+      // v1.1.3 GATE-03 (issue #33): thread the
+      // canonical authorization decision so the
+      // maintenance helpers consult the same
+      // sensitivity ceiling as the read surface.
+      authorization
     });
     this._store = store;
     this.planStore = new MaintenancePlanStore(store);
