@@ -163,6 +163,26 @@ export function isSensitivityVisible(
  * (the pre-GATE-03 behaviour); new callers MUST
  * thread the decision so a Core / Extended
  * caller never sees restricted-edge metadata.
+ *
+ * v1.1.3 GATE-03 (issue #33) Blocker 6 review
+ * fix: the SQL-boundary filter is the primary
+ * gate (the `peekEntry` honours the
+ * `actorMaxSensitivity` predicate). The
+ * `isSensitivityVisible` helper is the
+ * per-row defence-in-depth check: even when the
+ * store-layer filter is bypassed (e.g. a
+ * future refactor that promotes the helper to
+ * internal authorised paths), the canonical
+ * visibility ordering is honoured here. The
+ * helper is a typed comparator over the
+ * canonical sensitivity ladder:
+ *   `normal <= private <= restricted`.
+ * A row whose tier exceeds the caller's ceiling
+ * is described as `not_found` (NOT
+ * `forbidden_visibility`) because the
+ * provenance path is the single-row read alias —
+ * the canonical explanation surface does not
+ * leak the row's existence.
  */
 export function explainProvenance(
   store: SQLiteMemoryStore,
@@ -171,18 +191,24 @@ export function explainProvenance(
 ): ProvenanceExplanation | { ok: false; error: "not_found" } {
   const ceiling: SensitivityLevel =
     options.authorization?.max_sensitivity ?? "restricted";
-  // The `peekEntry` with options surfaces the row's
-  // sensitivity so the decision can be applied at
-  // the explanation boundary. When the row is
-  // invisible (filtered out), the SQL-boundary
-  // predicate returns `undefined` and the caller
-  // sees `not_found` (NOT `forbidden_visibility`)
-  // because the provenance path is the
-  // single-row read alias — the canonical
-  // explanation surface does not leak the row's
-  // existence.
   const entry = store.peekEntry(memory_id, { actorMaxSensitivity: ceiling });
   if (entry === undefined) {
+    return { ok: false, error: "not_found" };
+  }
+  // v1.1.3 GATE-03 (issue #33) Blocker 6 review
+  // fix: wire `isSensitivityVisible` into the
+  // explanation path so the per-row contract is
+  // enforced at the helper boundary in addition
+  // to the SQL-boundary filter. A future
+  // `relatedMemories` follow-up (which is
+  // surfaced from the same store) inherits the
+  // same visibility ordering without a second
+  // helper. The check is fail-closed: an
+  // invisible row returns `not_found` (never
+  // `forbidden_visibility`) because the
+  // explanation surface is the single-row
+  // read alias.
+  if (!isSensitivityVisible(entry.sensitivity, ceiling)) {
     return { ok: false, error: "not_found" };
   }
   const links = store.getProvenance(memory_id);
