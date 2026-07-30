@@ -290,6 +290,25 @@ publication lifecycle (extract → install → lifecycle E2E) is pinned in
 `docs/adr/0003-extracted-artifact-lifecycle.md` and
 `docs/guides/release-publication.md`.
 
+## OpenCode integration
+
+To use AgentRecall from [OpenCode](https://opencode.ai) register the MCP
+server (for active tool calls) and optionally the bundled
+prompt-injection plugin (for passive `[AGENT_RECALL]` context on every
+LLM turn). The canonical recipe — including `mcp:` and `plugin:`
+configuration, environment variables, options table, smoke tests, and
+uninstall steps — lives in
+[`docs/guides/opencode-install.md`](docs/guides/opencode-install.md).
+The plugin source is bundled inside this repository at
+`opencode-plugin/`.
+
+The MCP server runs **independently** of the plugin: it is a pure
+JSON-RPC-over-stdio process that responds to `initialize` and
+`tools/list` without touching the system prompt. The plugin only
+appends a context block to `output.system` via
+`experimental.chat.system.transform`. Removing the plugin entry from
+`opencode.json` does not affect MCP tool availability.
+
 ## Upgrade / Rollback
 
 ### Upgrade v1.1.2 → v1.1.3

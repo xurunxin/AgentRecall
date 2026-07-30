@@ -1,0 +1,19 @@
+{
+  "name": "agent-recall-opencode-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Bundled inside the agent-recall (local-memory-mcp) package. Auto-injects AgentRecall entries into the opencode system prompt via experimental.chat.system.transform.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {}
+}

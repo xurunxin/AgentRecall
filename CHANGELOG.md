@@ -5,6 +5,41 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [Unreleased] — OpenCode plugin colocated + install guide
+
+### Changed (repo structure only; no behaviour change)
+
+- The OpenCode prompt-injection plugin previously lived as a separate
+  sibling project (`G:\Projects\MetronX\opencode-agent-recall-plugin`,
+  package name `opencode-agent-recall-plugin` v0.1.0). It is now bundled
+  inside this repository at `opencode-plugin/` with package name
+  `agent-recall-opencode-plugin`. The standalone directory is removed.
+- `~/.config/opencode/opencode.json` plugin path updated to the new
+  location. The MCP server registration (`mcp.agent-recall`) was
+  already independent of the plugin and is unchanged.
+- `index.js`, `test/plugin.test.mjs`, and the plugin's readme move
+  verbatim — `experimental.chat.system.transform` behaviour, options,
+  failure modes, and the 5-test `node --test` smoke suite are
+  unchanged.
+- New file: `docs/guides/opencode-install.md` — canonical recipe for
+  registering AgentRecall with OpenCode (MCP server + optional plugin,
+  environment variables, options table, smoke tests, uninstall steps).
+- `README.md` gains an "OpenCode integration" section that links to
+  the install guide and clarifies that the MCP server runs
+  independently of the plugin (verified by running the MCP server
+  directly via stdio JSON-RPC; 11 tools advertise under
+  `initialize` + `tools/list` with no plugin involvement).
+
+### Verified
+
+- `npm --prefix opencode-plugin test` → `pass 5 fail 0` against the
+  moved copy.
+- Standalone MCP `node dist/src/index.js` responds to
+  `initialize` (`serverInfo.name=agent-recall, version=1.1.3`) and
+  `tools/list` (11 tools) with no plugin loaded.
+- `~/.config/opencode/opencode.json` parses as valid JSON after the
+  plugin path edit.
+
 ## [1.1.3] — v1.1.3 GATE-01 + GATE-02: side-effect-free identity resolution + profile-scoped admin capability (issues #31, #32)
 
 ### GATE-04 — Release evidence fail-closed (issue #34)
