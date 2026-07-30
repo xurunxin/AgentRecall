@@ -84,4 +84,48 @@ describe("sqlite-driver (Node path; vitest always runs on Node)", () => {
     db.exec("SELECT 1");
     db.close();
   });
+
+  it("createSqliteDb(path, { readOnly: true }) opens in read-only mode (writes fail)", () => {
+    // Pre-populate the file so the read-only open succeeds
+    // (node:sqlite fails to open a non-existent file in
+    // read-only mode).
+    const setup = createSqliteDb(dbPath);
+    setup.exec("CREATE TABLE t (n INTEGER NOT NULL)");
+    setup.prepare("INSERT INTO t VALUES (?)").run(7);
+    setup.close();
+
+    // Reopen in read-only mode.
+    const db = createSqliteDb(dbPath, { readOnly: true });
+
+    // Reading must still work.
+    const row = db.prepare("SELECT n FROM t").get<{ n: number }>();
+    expect(row).toEqual({ n: 7 });
+
+    // Writing must fail under read-only mode.
+    expect(() => {
+      db.prepare("INSERT INTO t VALUES (?)").run(42);
+    }).toThrow();
+
+    db.close();
+  });
+
+  it("createSqliteDb(path, { enableForeignKeyConstraints: true }) enables FK enforcement", () => {
+    const db = createSqliteDb(dbPath, {
+      enableForeignKeyConstraints: true
+    });
+    const row = db
+      .prepare("PRAGMA foreign_keys")
+      .get<{ foreign_keys: number }>();
+    expect(row?.foreign_keys).toBe(1);
+    db.close();
+  });
+
+  it("createSqliteDb(path, { timeout: 1234 }) sets busy_timeout to 1234", () => {
+    // Node 24's node:sqlite returns the busy_timeout pragma as
+    // { timeout: N } (the underlying SQLite column name).
+    const db = createSqliteDb(dbPath, { timeout: 1234 });
+    const row = db.prepare("PRAGMA busy_timeout").get<{ timeout: number }>();
+    expect(row?.timeout).toBe(1234);
+    db.close();
+  });
 });

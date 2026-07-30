@@ -17,6 +17,21 @@
 // built-ins. The Bun branch loads `bun:sqlite` via
 // `createRequire` so the module is never evaluated under
 // Node.
+//
+// Options contract (binding — Task 2 depends on this):
+//   - readOnly: open the database in read-only mode.
+//     Node: passes `{ readOnly: true }` to DatabaseSync.
+//     Bun: passes `{ readonly: true }` (note camelCase).
+//   - enableForeignKeyConstraints: enable FK enforcement.
+//     Node: passes `{ enableForeignKeyConstraints: true }`
+//     to DatabaseSync. Bun: emits `PRAGMA foreign_keys = ON`
+//     after open (bun:sqlite has no constructor option for
+//     this; FK is OFF by default in bun:sqlite).
+//   - timeout: busy-timeout in milliseconds.
+//     Node: passes `{ timeout: N }` to DatabaseSync.
+//     Bun: emits `PRAGMA busy_timeout = N` after open
+//     (bun:sqlite 1.3.x has no `timeout` constructor option
+//     — verified against bun-types).
 
 import { DatabaseSync } from "node:sqlite";
 import { createRequire } from "node:module";
@@ -42,6 +57,15 @@ export interface SqliteDb {
   exec(sql: string): void;
   prepare(sql: string): SqliteStatement;
   close(): void;
+}
+
+// Options accepted by `createSqliteDb` (and the per-backend
+// `createNodeDb` / `createBunDb`). All fields are optional; the
+// adapter applies only the fields that are present.
+export interface SqliteDbOptions {
+  readOnly?: boolean;
+  enableForeignKeyConstraints?: boolean;
+  timeout?: number;
 }
 
 export const IS_BUN: boolean =
@@ -103,8 +127,19 @@ class NodeDbAdapter implements SqliteDb {
   }
 }
 
-export function createNodeDb(path: string): SqliteDb {
-  return new NodeDbAdapter(new DatabaseSync(path));
+export function createNodeDb(path: string, opts?: SqliteDbOptions): SqliteDb {
+  // node:sqlite's DatabaseSync accepts the same three options
+  // (readOnly, enableForeignKeyConstraints, timeout) on the
+  // constructor, so they pass through verbatim. Passing
+  // `undefined` for a field is equivalent to not passing it.
+  const raw = opts
+    ? new DatabaseSync(path, {
+        readOnly: opts.readOnly,
+        enableForeignKeyConstraints: opts.enableForeignKeyConstraints,
+        timeout: opts.timeout
+      })
+    : new DatabaseSync(path);
+  return new NodeDbAdapter(raw);
 }
 
 // --- Bun backend (bun:sqlite) ---
@@ -151,16 +186,52 @@ class BunDbAdapter implements SqliteDb {
   }
 }
 
-export function createBunDb(path: string): SqliteDb {
+export function createBunDb(path: string, opts?: SqliteDbOptions): SqliteDb {
   // bun:sqlite is only available at Bun runtime. Loading via
   // createRequire throws MODULE_NOT_FOUND under Node, which
   // surfaces as the synchronous throw the unit tests assert.
   const mod = requireESM("bun:sqlite") as {
-    Database: new (path: string) => BunDatabaseRaw;
+    Database: new (
+      path: string,
+      options?: { readonly?: boolean }
+    ) => BunDatabaseRaw;
   };
-  return new BunDbAdapter(new mod.Database(path));
+
+  // Translate SqliteDbOptions to bun:sqlite's constructor
+  // options. bun-types 1.3.x exposes only `readonly` on the
+  // constructor; `enableForeignKeyConstraints` and `timeout`
+  // are not supported as constructor options in bun:sqlite
+  // (verified: passing `{ timeout: N }` throws SQLITE_MISUSE;
+  // there is no FK constructor option). Both are therefore
+  // applied via PRAGMA after open, below.
+  const bunOpts: { readonly?: boolean } = {};
+  if (opts?.readOnly === true) {
+    bunOpts.readonly = true;
+  }
+
+  const raw =
+    Object.keys(bunOpts).length > 0
+      ? new mod.Database(path, bunOpts)
+      : new mod.Database(path);
+
+  if (opts?.enableForeignKeyConstraints === true) {
+    // FK is OFF by default in bun:sqlite; emit the PRAGMA
+    // unconditionally to match the caller's intent.
+    raw.exec("PRAGMA foreign_keys = ON");
+  }
+  if (opts?.timeout !== undefined) {
+    // bun:sqlite has no `timeout` constructor option; apply
+    // busy_timeout via PRAGMA after open so the observable
+    // behaviour matches node:sqlite.
+    raw.exec(`PRAGMA busy_timeout = ${opts.timeout}`);
+  }
+
+  return new BunDbAdapter(raw);
 }
 
-export function createSqliteDb(path: string): SqliteDb {
-  return IS_BUN ? createBunDb(path) : createNodeDb(path);
+export function createSqliteDb(
+  path: string,
+  opts?: SqliteDbOptions
+): SqliteDb {
+  return IS_BUN ? createBunDb(path, opts) : createNodeDb(path, opts);
 }
