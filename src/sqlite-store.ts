@@ -1,6 +1,12 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { DatabaseSync, type SQLInputValue, type SQLOutputValue } from "node:sqlite";
+import {
+  createSqliteDb,
+  type SqliteBindValue as SQLInputValue,
+  type SqliteRowValue as SQLOutputValue,
+  type SqliteDb,
+  type SqliteStatement
+} from "./sqlite-driver.js";
 import { nowIso } from "./domain.js";
 
 const IS_WINDOWS = process.platform === "win32";
@@ -648,14 +654,14 @@ export type StoreOpenMode =
   | "read_write_auto_migrate";
 
 export class SQLiteMemoryStore {
-  private readonly db: DatabaseSync;
+  private readonly db: SqliteDb;
   private transactionDepth = 0;
   private readonly openMode: StoreOpenMode;
 
   constructor(dbPath: string, openMode: StoreOpenMode = "read_write_no_migrate") {
     mkdirSync(dirname(dbPath), { recursive: true });
     const readonly = openMode === "read_only";
-    this.db = new DatabaseSync(dbPath, {
+    this.db = createSqliteDb(dbPath, {
       enableForeignKeyConstraints: true,
       timeout: 5000,
       readOnly: readonly
@@ -710,7 +716,7 @@ export class SQLiteMemoryStore {
    * (VACUUM INTO). Do not call arbitrary statements; doing so bypasses
    * the store's row-decoding and audit/FTS bookkeeping.
    */
-  backupHandle(): DatabaseSync {
+  backupHandle(): SqliteDb {
     return this.db;
   }
 
@@ -1833,7 +1839,7 @@ export class SQLiteMemoryStore {
   }
 
   getProjectScope(projectId: string): ProjectScope | undefined {
-    const row = this.db.prepare("SELECT * FROM project_scopes WHERE project_id = ?").get(projectId);
+    const row = this.db.prepare("SELECT * FROM project_scopes WHERE project_id = ?").get<Row>(projectId);
     return row === undefined ? undefined : decodeProject(row);
   }
 
@@ -2144,7 +2150,7 @@ export class SQLiteMemoryStore {
     const offset = normalizeOffset(filters.offset);
     const rows = this.db
       .prepare(`SELECT * FROM memory_entries ${where} ORDER BY updated_at DESC LIMIT ? OFFSET ?`)
-      .all(...params, limit, offset);
+      .all<Row>(...params, limit, offset);
     return rows.map(decodeEntry);
   }
 
@@ -2167,7 +2173,7 @@ export class SQLiteMemoryStore {
         LIMIT ? OFFSET ?
       `
       )
-      .all(query, ...params, limit, offset);
+      .all<Row>(query, ...params, limit, offset);
     return rows.map(decodeEntry);
   }
 
@@ -2283,7 +2289,7 @@ export class SQLiteMemoryStore {
   getAuditEvents(memoryId: string): MemoryAuditEvent[] {
     return this.db
       .prepare("SELECT * FROM audit_events WHERE memory_id = ? ORDER BY created_at ASC")
-      .all(memoryId)
+      .all<Row>(memoryId)
       .map(decodeAudit);
   }
 
@@ -3417,7 +3423,7 @@ export class SQLiteMemoryStore {
     const offset = normalizeOffset(filters.offset);
     return this.db
       .prepare(`SELECT * FROM audit_events ${where} ORDER BY created_at ASC, id ASC LIMIT ? OFFSET ?`)
-      .all(...params, limit, offset)
+      .all<Row>(...params, limit, offset)
       .map(decodeAudit);
   }
 
@@ -3602,7 +3608,7 @@ export class SQLiteMemoryStore {
         ${where}
       `
       )
-      .get(...params);
+      .get<Row>(...params);
     const topicRows = this.db
       .prepare(
         `
@@ -3613,7 +3619,7 @@ export class SQLiteMemoryStore {
         ORDER BY topic ASC
       `
       )
-      .all(...params);
+      .all<Row>(...params);
     const topicChars = new Map<string, number>();
     for (const row of topicRows) {
       topicChars.set(stringCell(row, "topic"), numberCell(row, "chars"));
@@ -3628,7 +3634,7 @@ export class SQLiteMemoryStore {
   }
 
   private readEntry(id: string): MemoryEntry | undefined {
-    const row = this.db.prepare("SELECT * FROM memory_entries WHERE id = ?").get(id);
+    const row = this.db.prepare("SELECT * FROM memory_entries WHERE id = ?").get<Row>(id);
     if (row === undefined) return undefined;
     const entry = decodeEntry(row);
     // Stage 16 v1.1.1 PR-1 (#11): the canonical access

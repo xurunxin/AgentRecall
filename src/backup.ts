@@ -21,7 +21,7 @@ import {
   unlinkSync
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { createSqliteDb, type SqliteDb } from "./sqlite-driver.js";
 
 export type BackupResult = {
   path: string;
@@ -58,7 +58,7 @@ export function backupFilename(date: Date = new Date()): string {
   return `memory-${safeTimestamp(date)}.sqlite`;
 }
 
-export function runBackup(db: DatabaseSync, options: BackupOptions): BackupResult {
+export function runBackup(db: SqliteDb, options: BackupOptions): BackupResult {
   const keep = options.keep ?? 14;
   const now = options.now ?? new Date();
   const target = join(options.backupDir, backupFilename(now));
@@ -179,7 +179,7 @@ const TIER_RANK: Record<BackupSensitivityTier, number> = {
  * caller before any restore).
  */
 function readBackupSensitivityTier(filePath: string): BackupSensitivityTier {
-  const probe = new DatabaseSync(filePath, { readOnly: true });
+  const probe = createSqliteDb(filePath, { readOnly: true });
   try {
     const row = probe
       .prepare(
@@ -267,7 +267,7 @@ export function verifyBackup(filePath: string): VerifiedBackup {
   if (!existsSync(filePath)) {
     throw new BackupError(`Backup file not found: ${filePath}`);
   }
-  const probe = new DatabaseSync(filePath, { readOnly: true });
+  const probe = createSqliteDb(filePath, { readOnly: true });
   try {
     const check = probe.prepare("PRAGMA quick_check").get() as
       | { quick_check: string | number }
@@ -313,7 +313,7 @@ export type RestoreResult = {
 export function restoreBackup(opts: {
   backupFile: string;
   targetDbPath: string;
-  liveDbHandle: DatabaseSync;
+  liveDbHandle: SqliteDb;
   /** Optional override for the pre-restore live backup
    *  directory. Defaults to `<dirname(targetDbPath)>/backups`. */
   backupDir?: string;

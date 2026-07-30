@@ -18,7 +18,7 @@
 
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { createSqliteDb } from "../../sqlite-driver.js";
 import { listBackups } from "../../backup.js";
 import type { CheckContext, CheckResult } from "../types.js";
 
@@ -49,9 +49,9 @@ export function checkBackupVerification(ctx: CheckContext): CheckResult {
     };
   }
 
-  let handle: DatabaseSync;
+  let handle: ReturnType<typeof createSqliteDb>;
   try {
-    handle = new DatabaseSync(fullPath, { readOnly: true });
+    handle = createSqliteDb(fullPath, { readOnly: true });
   } catch (err) {
     return {
       name: "backup_verification",
