@@ -29,6 +29,19 @@ import { fileURLToPath } from "node:url";
 const FALLBACK_VERSION = "0.0.0";
 
 function resolvePackageVersion(): string {
+  // Bun-compiled binaries inject the package version at
+  // build time via `--define process.env.AGENT_RECALL_VERSION='"X.Y.Z"'`
+  // (see scripts/build-bun-binary.mjs). If present and
+  // non-empty, prefer it: under the Bun binary,
+  // `import.meta.url` resolves to a virtual path with no
+  // package.json, so the walk below would fall through to
+  // FALLBACK_VERSION. Under Node, this env var is unset
+  // during normal use, and the package.json walk handles
+  // resolution as before.
+  const envVersion = process.env.AGENT_RECALL_VERSION;
+  if (typeof envVersion === "string" && envVersion.length > 0) {
+    return envVersion;
+  }
   try {
     // Walk up from this file's location looking for a
     // package.json with a `name` matching this package.
