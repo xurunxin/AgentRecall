@@ -1,6 +1,7 @@
 # Build artefacts
 node_modules/
 dist/
+dist-bin/
 coverage/
 
 # Local data homes (legacy + current naming)
