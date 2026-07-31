@@ -86,7 +86,7 @@ for (const plat of PLATFORMS) {
     try {
       execFileSync(
         "bun",
-        ["build", "--compile", `--target=${bunTarget}`, "--define", `process.env.AGENT_RECALL_VERSION="1.1.3"`, "--outfile", outfile, src],
+        ["build", "--compile", `--target=${bunTarget}`, "--define", `process.env.AGENT_RECALL_VERSION='${pkg.version}'`, "--outfile", outfile, src],
         { stdio: "inherit" }
       );
       const size = statSync(outfile).size;
