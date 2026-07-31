@@ -5,6 +5,48 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [Unreleased] — Bun single-file binary distribution
+
+### Added (additive; Node path unchanged)
+
+- `src/sqlite-driver.ts` — thin runtime-detecting adapter
+  that lets the existing store call either `node:sqlite`
+  (Node) or `bun:sqlite` (Bun) through one interface. The
+  three call sites in `src/sqlite-store.ts`, `src/backup.ts`,
+  and `src/doctor/checks/backup-verification.ts` route
+  through `createSqliteDb(path)`.
+- `scripts/build-bun-binary.mjs` — emits per-platform
+  `bun build --compile` single-file executables for both
+  `agent-recall-<plat>` and `agent-recall-mcp-<plat>`. Writes
+  `dist-bin/MANIFEST.json` with `bun_version`, `source_sha`,
+  and per-binary SHA-256.
+- `scripts/smoke-bun-binary.mjs` — six-step smoke test
+  (`--version`, `help`, `doctor`, export+import round-trip,
+  `backup`, post-backup `doctor`) against the Bun binary
+  with a temp data home. Skips cleanly when no binary is
+  present for the host platform.
+- `test/unit/sqlite-driver.test.ts` — adapter unit tests
+  (vitest on Node).
+- `test/smoke/bun-binary.test.ts` — vitest smoke for the
+  locally-built Bun binary; auto-skips when no binary is
+  present.
+- `docs/guides/bun-distribution.md` — canonical recipe
+  covering build, install, smoke test, capability matrix,
+  and release channel.
+
+### Verified
+
+- `npm run build:bun` produces all eight binaries on the
+  host platform with no errors. Cross-platform compilation
+  requires per-platform build hosts (see the release-pipeline
+  follow-up ADR).
+- `npm run smoke:bun` exits 0 on the host-platform binary.
+- `npx vitest run` passes with the two new test files
+  included; all pre-existing tests pass without modification.
+- `npm run build` (Node `tsc` → `dist/`) is unchanged;
+  the npm package builds and the `bin` paths still resolve.
+- `package.json` `dependencies` field is unchanged.
+
 ## [Unreleased] — OpenCode plugin colocated + install guide
 
 ### Changed (repo structure only; no behaviour change)

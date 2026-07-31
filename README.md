@@ -290,6 +290,32 @@ publication lifecycle (extract → install → lifecycle E2E) is pinned in
 `docs/adr/0003-extracted-artifact-lifecycle.md` and
 `docs/guides/release-publication.md`.
 
+### Bun single-file binary (additive)
+
+For operators who need a single-file drop-in without Node.js
+or `npm install`:
+
+```bash
+# 1. Download the binary for your platform from the GitHub release
+VERSION="1.1.3"
+PLATFORM="linux-x64"   # or darwin-x64, darwin-arm64, win32-x64
+curl -L -o agent-recall \
+  "https://github.com/xurunxin/AgentRecall/releases/download/v${VERSION}/agent-recall-${PLATFORM}"
+chmod +x agent-recall
+
+# 2. Verify against the release MANIFEST.json (recommended)
+curl -L -O "https://github.com/xurunxin/AgentRecall/releases/download/v${VERSION}/MANIFEST.json"
+sha256sum -c <(jq -r ".entries[] | select(.platform==\"${PLATFORM}\" and .kind==\"cli\") | \"agent-recall  \" + .sha256" MANIFEST.json)
+
+# 3. Run
+./agent-recall doctor
+```
+
+The Bun binary ships its own SQLite driver (`bun:sqlite`); no
+Node runtime is required on the consumer host. See
+[`docs/guides/bun-distribution.md`](docs/guides/bun-distribution.md)
+for the full recipe and the capability matrix.
+
 ## OpenCode integration
 
 To use AgentRecall from [OpenCode](https://opencode.ai) register the MCP
