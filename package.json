@@ -19,6 +19,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:bun": "node scripts/build-bun-binary.mjs",
+    "smoke:bun": "node scripts/smoke-bun-binary.mjs",
     "dev": "tsx src/index.ts",
     "start": "node dist/src/index.js",
     "cli": "tsx bin/agent-recall.ts",
