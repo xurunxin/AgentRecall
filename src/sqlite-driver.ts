@@ -14,9 +14,11 @@
 //     load via `typeof Bun !== "undefined"`.
 //
 // No new npm dependencies. Both backends are runtime
-// built-ins. The Bun branch loads `bun:sqlite` via
-// `createRequire` so the module is never evaluated under
-// Node.
+// built-ins. Both branches lazy-load their native module via
+// `createRequire`: the Bun branch loads `bun:sqlite` so it is
+// never evaluated under Node, and the Node branch loads
+// `node:sqlite` so it is never evaluated at Bun module load
+// (Bun does not ship `node:sqlite`).
 //
 // Options contract (binding — Task 2 depends on this):
 //   - readOnly: open the database in read-only mode.
@@ -33,7 +35,6 @@
 //     (bun:sqlite 1.3.x has no `timeout` constructor option
 //     — verified against bun-types).
 
-import { DatabaseSync } from "node:sqlite";
 import { createRequire } from "node:module";
 
 const requireESM = createRequire(import.meta.url);
@@ -128,17 +129,39 @@ class NodeDbAdapter implements SqliteDb {
 }
 
 export function createNodeDb(path: string, opts?: SqliteDbOptions): SqliteDb {
-  // node:sqlite's DatabaseSync accepts the same three options
-  // (readOnly, enableForeignKeyConstraints, timeout) on the
-  // constructor, so they pass through verbatim. Passing
-  // `undefined` for a field is equivalent to not passing it.
+  // node:sqlite is loaded via createRequire so that the Bun
+  // binary distribution never evaluates a static import at
+  // module load (Bun does not ship `node:sqlite`). Under Node,
+  // the lazy require returns the same { DatabaseSync } shape
+  // as the static-import form, and the constructor accepts the
+  // same three options as before — mirroring how createBunDb
+  // lazy-loads `bun:sqlite` below.
+  const mod = requireESM("node:sqlite") as {
+    DatabaseSync: new (
+      path: string,
+      options?: {
+        readOnly?: boolean | undefined;
+        enableForeignKeyConstraints?: boolean | undefined;
+        timeout?: number | undefined;
+      }
+    ) => {
+      exec(sql: string): void;
+      prepare(sql: string): NodeStatementRaw;
+      close(): void;
+    };
+  };
+
+  // DatabaseSync accepts the same three options (readOnly,
+  // enableForeignKeyConstraints, timeout) on the constructor,
+  // so they pass through verbatim. Passing `undefined` for a
+  // field is equivalent to not passing it.
   const raw = opts
-    ? new DatabaseSync(path, {
+    ? new mod.DatabaseSync(path, {
         readOnly: opts.readOnly,
         enableForeignKeyConstraints: opts.enableForeignKeyConstraints,
         timeout: opts.timeout
       })
-    : new DatabaseSync(path);
+    : new mod.DatabaseSync(path);
   return new NodeDbAdapter(raw);
 }
 
