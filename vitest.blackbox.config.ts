@@ -26,6 +26,7 @@ export default defineConfig({
       "test/blackbox/mcp-client-e2e-extended.test.ts",
       "test/blackbox/mcp-all-tools-e2e-core.test.ts",
       "test/blackbox/mcp-all-tools-e2e-extended.test.ts",
+      "test/blackbox/mcp-shutdown.test.ts",
       "test/release-gate/admin-default/mcp-admin-default.test.ts",
       "test/release-gate/profile-default/mcp-profile-default.test.ts"
     ],

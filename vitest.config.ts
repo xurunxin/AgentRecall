@@ -19,6 +19,7 @@ export default defineConfig({
     // and is invoked explicitly by release workflows
     // after extraction.
     exclude: [
+      "test/blackbox/**",
       "test/blackbox/packaged-install.test.ts",
       "test/multi-process-stress.test.ts",
       ...(process.env.AGENT_RECALL_EXTRACTED_ARTIFACT !== undefined

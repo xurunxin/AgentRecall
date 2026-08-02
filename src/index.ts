@@ -174,6 +174,71 @@ export async function main(): Promise<void> {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  // v1.1.4 (graceful shutdown fix): wire stdin
+  // EOF + SIGINT/SIGTERM to a clean shutdown
+  // sequence. Pre-fix the server stayed alive
+  // forever (the SDK's StdioServerTransport
+  // never observes `stdin` `end` / `close`),
+  // and SIGTERM killed the child without
+  // closing the SQLite handle. Idle residency
+  // is preserved: the server only exits when
+  // the stdio pipe is gone or a signal arrives,
+  // not on mere inactivity. The shutdown hook
+  // closes the SQLite store LAST so any final
+  // audit event the server emits during its own
+  // close() can land before the file handle is
+  // released. The hook is silent on the hot
+  // path; stdout stays protocol-clean.
+  //
+  // The lifecycle module additionally enforces:
+  //   - `process.exit(0)` on a clean shutdown
+  //     (otherwise the Node process would stay
+  //     alive parked on the SQLite / stdio
+  //     handles).
+  //   - a 1500 ms ceiling on the shutdown
+  //     sequence (hung handler → hard-exit with
+  //     code 1 so the host can reap the
+  //     process).
+  //   - second-signal escape (SIGINT/SIGTERM
+  //     while the sequence is in flight →
+  //     hard-exit with code 1).
+  //   - a verbose reason log gated behind
+  //     AGENT_RECALL_VERBOSE_STDIO=1 (one
+  //     stderr line at shutdown trigger time).
+  const { installServerLifecycle } = await import(
+    "./mcp/server-lifecycle.js"
+  );
+  installServerLifecycle({
+    server,
+    transport,
+    onShutdown: () => service.store.close(),
+    onShutdownError: (error: unknown) => {
+      // Diagnostics go to stderr, never stdout.
+      // The MCP JSON-RPC stream is `process.stdout`;
+      // a leak here would corrupt the next frame.
+      console.error(
+        `${serverName()} shutdown error:`,
+        error instanceof Error ? error.message : String(error)
+      );
+    },
+    onShutdownStart: (reason) => {
+      // Mirror the AGENT_RECALL_VERBOSE_STDIO
+      // gate from the connected-on-stdio hint
+      // (PR-8, issue #16) so the hot path stays
+      // silent unless the operator opts in. The
+      // reason string is one of "stdio_end",
+      // "stdio_close", "SIGINT", "SIGTERM".
+      if (process.env.AGENT_RECALL_VERBOSE_STDIO === "1") {
+        const label =
+          reason === "stdio_end" ? "stdin EOF" :
+          reason === "stdio_close" ? "stdin closed" :
+          reason;
+        console.error(
+          `${serverName()} shutting down (${label})`
+        );
+      }
+    }
+  });
   // Stage 16 v1.1.1 PR-8 (issue #16, spec § 11.2):
   // the connected-on-stdio status hint is gated
   // behind `AGENT_RECALL_VERBOSE_STDIO` so the
