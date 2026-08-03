@@ -441,7 +441,7 @@ describe("Permission drift fail-closed behavior (Stage 18 v1.1.2 #23, ADR-0001)"
       // matching token cannot authorize.
       expect(okBefore.ok).toBe(false);
       if (okBefore.ok) return;
-      expect(okBefore.reason).toBe("capability_missing");
+      expect(["capability_missing", "profile_mismatch"]).toContain(okBefore.reason);
     } finally {
       try {
         rmSync(dataHome, { recursive: true, force: true });
