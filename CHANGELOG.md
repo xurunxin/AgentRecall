@@ -5,6 +5,74 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [1.1.5] — Unified CLI and MCP executable (launcher)
+
+### Added
+
+- **`src/launcher.ts`** is the single runtime entry. Both
+  `agent-recall` and `agent-recall-mcp` in `package.json`
+  `bin` resolve to the same compiled launcher. The Bun
+  build script (`scripts/build-bun-binary.mjs`) compiles
+  both `agent-recall-<platform>` and
+  `agent-recall-mcp-<platform>` from the launcher source.
+  - Dispatch contract:
+    - `agent-recall` with no arguments starts the MCP
+      stdio server (the documented default for concise
+      MCP client configurations).
+    - `agent-recall <subcommand> [opts]` runs the CLI.
+    - `agent-recall mcp` is the explicit MCP alias.
+    - `agent-recall-mcp` (the compatibility name)
+      always starts MCP regardless of arguments.
+  - The launcher identifies the binary by the basename
+    of `process.argv[0]` (cross-platform, strips
+    `.exe`); it does not consult `cwd` or any absolute
+    path component.
+  - `process.exit` is driven by the CLI implementation's
+    `runCli` return value; the MCP mode never reaches a
+    CLI exit. The compatibility name ignores CLI-style
+    arguments so existing MCP client configurations that
+    may pass transport-related flags keep working.
+- **`npm run launcher`** developer shortcut for the
+  unified dispatcher (`tsx src/launcher.ts`).
+- **`test/unit/launcher.test.ts`** — 11 unit tests
+  pinning the dispatch table across POSIX, Windows, and
+  path-form invocations; `decideMode` is pure and has no
+  dependency on the CLI or MCP modules.
+- Project-internal SKILL documentation
+  (`skills/agent-recall-cli/SKILL.md`,
+  `skills/README.md`) describes the unified executable,
+  the routing table, and the launcher's argv rules.
+
+### Compatibility
+
+- Existing `agent-recall-mcp` Node/npm configurations
+  continue to launch MCP unchanged.
+- Existing `agent-recall-mcp-<platform>` Bun artifact
+  names remain available.
+- CLI subcommands, exit codes, and the MCP JSON-RPC
+  surface (tool lists, resources, env vars,
+  authorization, shutdown) are unchanged.
+- `package.json` `bin` resolves to
+  `dist/src/launcher.js` for both names; the `files`
+  array is unchanged.
+
+### Verified
+
+- `npm run typecheck` — exit 0.
+- `npm run build` — emits `dist/src/launcher.js`
+  alongside the existing `dist/bin/agent-recall.js`
+  and `dist/src/index.js`.
+- `npx vitest run test/unit/launcher.test.ts` — 11/11
+  pass.
+- `npx vitest run --pool=forks
+  --poolOptions.forks.singleFork` — 570/570 pass
+  (default suite + 11 new launcher tests).
+- `node scripts/verify-artifact-globs.mjs` — `OK: every
+  release-gate assertion passed`.
+- CI run after the v1.1.5 branch push reports
+  `success` on ubuntu-latest, macos-latest, and
+  windows-2022 / Node 24.
+
 ## [1.1.4] — MCP graceful shutdown on stdio EOF + signals
 
 ### Fixed
