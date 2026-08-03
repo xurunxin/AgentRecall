@@ -25,6 +25,7 @@
     "start": "node dist/src/index.js",
     "cli": "tsx bin/agent-recall.ts",
     "cli:doctor": "tsx bin/agent-recall.ts doctor",
+    "launcher": "tsx src/launcher.ts",
     "test": "vitest run",
     "test:unit": "vitest run",
     "test:blackbox": "vitest run --config vitest.blackbox.config.ts",
