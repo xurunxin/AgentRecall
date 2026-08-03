@@ -72,10 +72,27 @@ for (const plat of PLATFORMS) {
   const ext = plat.startsWith("win32") ? ".exe" : "";
   const bunTarget = `bun-${plat}`;
 
-  for (const [kind, entry, src] of [
-    ["cli", `agent-recall-${plat}${ext}`, "bin/agent-recall.ts"],
-    ["mcp", `agent-recall-mcp-${plat}${ext}`, "dist/src/index.js"]
-  ]) {
+    for (const [kind, entry, src] of [
+      [
+        "cli",
+        `agent-recall-${plat}${ext}`,
+        // v1.1.4: both Bun artifacts are
+        // compiled from the unified launcher.
+        // The dispatcher resolves the
+        // canonical vs. compatibility name
+        // at runtime via argv[0]. The
+        // manifest `kind` field stays as
+        // "cli" / "mcp" so the existing
+        // release verifier does not need
+        // to change shape.
+        "dist/src/launcher.js"
+      ],
+      [
+        "mcp",
+        `agent-recall-mcp-${plat}${ext}`,
+        "dist/src/launcher.js"
+      ]
+    ]) {
     const outfile = join(OUT_DIR, entry);
     console.log(`build-bun-binary: ${bunTarget} ${kind} -> ${outfile}`);
     // Per the brief: a non-host platform may fail (Bun cross-compile
