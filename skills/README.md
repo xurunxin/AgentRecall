@@ -23,7 +23,7 @@ Current skills:
 
 | Skill | Purpose |
 | --- | --- |
-| `agent-recall-cli` | Operate the AgentRecall CLI (`agent-recall` binary): health checks, memory inspection, export/import, backup/restore, schema migration, admin capability. |
+| `agent-recall-cli` | Operate the unified `agent-recall` executable: CLI subcommands for health checks, memory inspection, export/import, backup/restore, schema migration, admin capability. The same binary with no arguments starts the MCP stdio server. |
 
 Adding a new skill:
 

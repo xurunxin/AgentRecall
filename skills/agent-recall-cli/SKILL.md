@@ -1,23 +1,40 @@
 ---
 name: agent-recall-cli
-description: Operate the AgentRecall CLI (`agent-recall` binary). Use when the user wants to inspect, search, export, import, back up, restore, or migrate the local AgentRecall memory store, run a health check (`doctor`), manage the operator capability (`admin grant/status/revoke`), or troubleshoot SQLite / backup / schema issues without booting the MCP server. Triggers include "agent-recall", "agent recall", "本地记忆", "记忆数据库", "memory store", "memory CLI", "记忆查询", "记忆导出", "记忆备份", "记忆恢复", "doctor check", "memory health", "schema migration", "admin capability", "记忆审核", "审计事件", "memory audit", "operator capability". Also use when the user invokes the `agent-recall` binary directly, asks about `~/.agent-recall/`, or mentions the `AGENT_RECALL_HOME` / `AGENT_RECALL_PROFILE` environment variables.
+description: Operate the AgentRecall unified `agent-recall` binary. Use when the user wants to inspect, search, export, import, back up, restore, or migrate the local AgentRecall memory store, run a health check (`doctor`), manage the operator capability (`admin grant/status/revoke`), or troubleshoot SQLite / backup / schema issues without booting the MCP server. Triggers include "agent-recall", "agent recall", "本地记忆", "记忆数据库", "memory store", "memory CLI", "记忆查询", "记忆导出", "记忆备份", "记忆恢复", "doctor check", "memory health", "schema migration", "admin capability", "记忆审核", "审计事件", "memory audit", "operator capability". Also use when the user invokes the `agent-recall` binary directly, asks about `~/.agent-recall/`, or mentions the `AGENT_RECALL_HOME` / `AGENT_RECALL_PROFILE` environment variables.
 ---
 
-# agent-recall CLI
+# agent-recall CLI (unified executable)
 
-AgentRecall ships two binaries; this skill covers the standalone
-CLI only. For the MCP server surface (10 read/write/plan tools per
-profile), reach for the MCP client config instead — the CLI does
+Starting with v1.1.4 the `agent-recall` binary is a single
+launcher that dispatches to either the CLI surface described in
+this document or the MCP stdio server based on the invocation.
+The MCP server surface (10 read/write/plan tools per profile)
+still lives in its own server configuration; the CLI does
 **not** register MCP tools.
 
 | Binary | Purpose |
 | --- | --- |
-| `agent-recall` | CLI: inspection, health checks, manual backups, schema migration, admin capability. |
-| `agent-recall-mcp` | MCP stdio server (separate binary, **not** covered here). |
+| `agent-recall` | Unified executable. With no arguments it starts the MCP stdio server. With any subcommand (e.g. `doctor`, `admin status`) it runs the CLI. |
+| `agent-recall-mcp` | Compatibility MCP entry point. Always starts the MCP stdio server. Internally the same launcher source as `agent-recall`. |
 
 The packaged entry point after `npm install` is
 `node_modules/.bin/agent-recall`. From a source checkout run
-`npm run cli -- <args>` or `npx tsx bin/agent-recall.ts <args>`.
+`npm run launcher -- <args>` to exercise the unified dispatcher
+directly, or `npm run cli -- <args>` to bypass the dispatch and
+invoke the CLI module straight from `bin/agent-recall.ts`.
+
+### Unified executable routing (v1.1.4)
+
+| Invocation | Mode | Reason |
+| --- | --- | --- |
+| `agent-recall` (no arguments) | MCP | The MCP default; matches the historical `agent-recall-mcp` shape. |
+| `agent-recall <subcommand> [opts]` | CLI | Any subcommand (including the explicit `mcp` alias) is forwarded to the CLI parser. |
+| `agent-recall-mcp [anything]` | MCP | Compatibility entry point; the launcher recognises the basename and always starts MCP. |
+
+The launcher identifies the binary by the basename of
+`process.argv[0]`, stripping a trailing `.exe` on Windows. CLI
+users must supply a subcommand; the CLI does NOT print help when
+the binary is invoked with no arguments.
 
 ## Decision table
 
