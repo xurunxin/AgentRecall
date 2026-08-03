@@ -37,6 +37,7 @@ import {
   CapabilityStore,
   InMemoryCapabilityStore,
   PermissionDriftError,
+  validatePermissionBoundary,
   _INTERNAL
 } from "../../src/admin/capability.js";
 import { buildRequestContext } from "../../src/request-context.js";
@@ -498,7 +499,8 @@ describe("CapabilityStore.validatePermissionBoundary (v1.1.3 GATE-02 issue #32)"
     };
     writeFileSync(path, JSON.stringify(body, null, 2), { mode: 0o600 });
     chmodSync(path, 0o600);
-    const result = (globalThis as { validatePermissionBoundary?: typeof import("../../src/admin/capability.js").validatePermissionBoundary }).validatePermissionBoundary?.(path);
+      const result = validatePermissionBoundary(path);
+
     // The validator is exported by capability.ts;
     // the dynamic import above avoids a top-level
     // circular dependency in the test fixture.
@@ -514,22 +516,18 @@ describe("CapabilityStore.validatePermissionBoundary (v1.1.3 GATE-02 issue #32)"
     };
     writeFileSync(path, JSON.stringify(body, null, 2), { mode: 0o644 });
     chmodSync(path, 0o644);
-    // The helper IS exported; the test below
-    // calls it via a dynamic require.
-    const cap = require("../../src/admin/capability.js") as typeof import("../../src/admin/capability.js");
-    const result = cap.validatePermissionBoundary(path);
+    const result = validatePermissionBoundary(path);
     expect(result).toEqual({ ok: false, reason: "permission_drift" });
   });
 
   it("POSIX symlink is rejected with reason:symlink", () => {
     if (process.platform === "win32") return;
     const target = join(dataHome, "target-cap.txt");
-    writeFileSync(target, { token: "c".repeat(64), created_at: new Date().toISOString() } as never);
+    writeFileSync(target, JSON.stringify({ token: "c".repeat(64), created_at: new Date().toISOString() }));
     chmodSync(target, 0o600);
     const linkPath = join(dataHome, CAPABILITY_FILENAME);
     symlinkSync(target, linkPath);
-    const cap = require("../../src/admin/capability.js") as typeof import("../../src/admin/capability.js");
-    const result = cap.validatePermissionBoundary(linkPath);
+    const result = validatePermissionBoundary(linkPath);
     expect(result).toEqual({ ok: false, reason: "symlink" });
   });
 
