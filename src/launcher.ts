@@ -30,8 +30,6 @@
 // directory or any absolute path
 // component.
 
-import { basename } from "node:path";
-
 export type DispatchMode = "cli" | "mcp";
 
 export interface DispatchRequest {
@@ -64,7 +62,20 @@ function stripExe(name: string): string {
 
 function basenameOf(value: string): string {
   if (value.length === 0) return "";
-  return stripExe(basename(value));
+  // Cross-platform basename: `node:path.basename`
+  // is platform-specific and rejects backslashes
+  // on POSIX, which makes path-form
+  // `agent-recall` from a Windows-launched
+  // launcher ambiguous on POSIX CI. Use a manual
+  // split on both `/` and `\` so a path from
+  // either OS normalises to the same last
+  // component.
+  const idx = Math.max(
+    value.lastIndexOf("/"),
+    value.lastIndexOf("\\")
+  );
+  const name = idx === -1 ? value : value.slice(idx + 1);
+  return stripExe(name);
 }
 
 /**
