@@ -23,6 +23,20 @@ export default defineConfig({
       "test/blackbox/mcp-shutdown.test.ts",
       "test/multi-process-stress.test.ts",
       "test/release-gate/**",
+      // v1.1.5 (launcher release): the Bun
+      // single-file-binary smoke skips when
+      // `dist-bin/agent-recall-<plat>` is
+      // absent (the host runner that runs the
+      // default unit / integration layer
+      // does not have the Bun build artefact).
+      // The release-candidate workflow
+      // exercises it on a per-matrix leg
+      // that builds the artefact first.
+      // Excluding it here keeps the default
+      // `npm test` green and unsuppressed
+      // (release-evidence.mjs is fail-closed
+      // on `skipped !== 0`).
+      "test/smoke/bun-binary.test.ts",
       ...(process.env.AGENT_RECALL_EXTRACTED_ARTIFACT !== undefined
         ? []
         : [])
