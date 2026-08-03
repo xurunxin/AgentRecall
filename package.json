@@ -5,8 +5,8 @@
   "type": "module",
   "description": "Local-first MCP memory server for coding agents.",
   "bin": {
-    "agent-recall": "./dist/bin/agent-recall.js",
-    "agent-recall-mcp": "./dist/src/index.js"
+    "agent-recall": "./dist/src/launcher.js",
+    "agent-recall-mcp": "./dist/src/launcher.js"
   },
   "files": [
     "dist",
