@@ -34,12 +34,7 @@ Add the server block to `~/.config/opencode/opencode.json` under `mcp`:
 }
 ```
 
-This exposes all 11 tools (`recall_context`, `remember`, `search_memories`,
-`get_memory`, `list_memories`, `update_memory`, `forget_memory`,
-`get_memory_budget`, `explain_recall`, `list_backups`, `supersede_memory`)
-to every OpenCode session in every project. The `mcp:` block is the
-**only** registration needed for MCP tool availability — the plugin
-documented in step 2 is independent.
+This exposes the tools registered by the active MCP profile. The packaged default is Core (10 tools); set `AGENT_RECALL_PROFILE=extended` for the 20-tool Extended surface, or use `admin` with a valid operator capability. The `mcp:` block is the **only** registration needed for MCP tool availability — the plugin documented in step 2 is independent.
 
 ## 2. Register the prompt-injection plugin (optional)
 
@@ -93,16 +88,15 @@ a failure is a no-op so LLM calls still proceed.
 The MCP server reads these from its own process environment (set in the
 `mcp.agent-recall.environment` block or shell):
 
-| Variable                               | Default                      | Purpose                                                 |
-|----------------------------------------|------------------------------|---------------------------------------------------------|
-| `AGENT_RECALL_HOME` (or `LOCAL_MEMORY_MCP_HOME`) | `~/.agent-recall/` on Windows / `~/.agent-recall` on POSIX | Data home; the SQLite store lives at `${HOME}/memory.sqlite`. |
-| `AGENT_RECALL_ACTOR`                   | `user:cli`                   | Used for audit attribution when a tool call arrives from outside an MCP client (e.g. ad-hoc CLI use). |
-| `AGENT_RECALL_PROFILE`                 | `core`                       | One of `core` / `extended` / `full` / `admin`. Affects tool surface. |
-| `AGENT_RECALL_SUPPRESS_MCP_DEPRECATION`| unset                        | Set to `1` to silence the one-time migration note.      |
-| `AGENT_RECALL_VERBOSE_STDIO`           | unset                        | Set to `1` for verbose stdio logs while debugging.      |
+| `AGENT_RECALL_HOME` | `~/.agent-recall` | Data home; the SQLite store lives at `${AGENT_RECALL_HOME}/memory.sqlite`. |
+| `AGENT_RECALL_ACTOR` | `agent` | Default audit actor. |
+| `AGENT_RECALL_PROFILE` | `core` | `core`, `extended`, or `admin`; `admin` additionally requires a valid operator capability. |
+| `AGENT_RECALL_SUPPRESS_MCP_DEPRECATION` | unset | Set to `1` to silence the one-time MCP deprecation notice. |
+| `AGENT_RECALL_VERBOSE_STDIO` | unset | Set to `1` to print a one-shot shutdown reason to stderr when stdin closes or a termination signal arrives. stdout remains protocol-clean. |
 
-The plugin honours `AGENT_RECALL_HOME` (or `LOCAL_MEMORY_MCP_HOME`)
-through the same resolution chain; pass `db_path` in options to override.
+The plugin honours `AGENT_RECALL_HOME` through the same resolution chain; pass `db_path` in options to override.
+
+As of v1.1.4, the MCP stdio server closes cleanly when the client closes stdin or sends `SIGINT` / `SIGTERM`. Set `AGENT_RECALL_VERBOSE_STDIO=1` to print a one-shot reason line to stderr; the default hot path is silent and stdout remains protocol-clean.
 
 ## 4. Verify
 
@@ -125,7 +119,7 @@ printf '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion
 ```
 
 Expected: a `serverInfo.name: "agent-recall"` response followed by a
-`tools/list` response listing the 11 tools.
+`tools/list` response listing the tools in the selected profile.
 
 ## 5. Smoke test the plugin in isolation
 

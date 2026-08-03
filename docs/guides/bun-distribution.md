@@ -35,8 +35,8 @@ the release's `MANIFEST.json`, then drop it onto `PATH`:
 
 ```bash
 # linux-x64 example
-curl -L -o agent-recall https://github.com/xurunxin/AgentRecall/releases/download/v1.1.3/agent-recall-linux-x64
-curl -L -o MANIFEST.json https://github.com/xurunxin/AgentRecall/releases/download/v1.1.3/MANIFEST.json
+curl -L -o agent-recall https://github.com/xurunxin/AgentRecall/releases/download/v1.1.4/agent-recall-linux-x64
+curl -L -o MANIFEST.json https://github.com/xurunxin/AgentRecall/releases/download/v1.1.4/MANIFEST.json
 sha256sum -c <(jq -r '.entries[] | select(.platform=="linux-x64" and .kind=="cli") | "agent-recall  " + .sha256' MANIFEST.json)
 chmod +x agent-recall
 sudo mv agent-recall /usr/local/bin/agent-recall

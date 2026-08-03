@@ -257,7 +257,7 @@ vocabulary is `linux-x64`, `darwin-x64`, `win32-x64`.
 
 ```bash
 # 1. Pick the canonical-platform artefact
-VERSION="1.1.3"
+VERSION="1.1.4"
 PLATFORM="linux-x64"   # or `darwin-x64` or `win32-x64`
 ARCHIVE="agent-recall-${VERSION}-${PLATFORM}.tar.gz"
 # Windows: `agent-recall-${VERSION}-${PLATFORM}.zip`
@@ -297,7 +297,7 @@ or `npm install`:
 
 ```bash
 # 1. Download the binary for your platform from the GitHub release
-VERSION="1.1.3"
+VERSION="1.1.4"
 PLATFORM="linux-x64"   # or darwin-x64, darwin-arm64, win32-x64
 curl -L -o agent-recall \
   "https://github.com/xurunxin/AgentRecall/releases/download/v${VERSION}/agent-recall-${PLATFORM}"
@@ -339,41 +339,32 @@ appends a context block to `output.system` via
 
 ### Upgrade v1.1.2 → v1.1.3
 
-The v1.1.3 migration is **schema-preserving**: the v1.1.2 schema v13
-is sufficient. The v1.1.3 lane adds the additive `import_batches`
-lineage table (`schema v13`, the row is minted only on a successful
-apply) and the additive `audit_metadata_json` column on
-`import_batches` (covered by `addColumnIfMissing` for pre-existing
-v13 databases). `user_version` stays at `13`.
+The v1.1.3 migration is **schema-preserving**: v1.1.2 schema v13 remains sufficient. The release added identity-resolution and capability-boundary contracts without changing `user_version`.
+
+For a v1.1.2 → v1.1.3 upgrade, stop the server, replace `dist/`, run `node dist/bin/agent-recall.js migrate --yes`, and restart with the same `AGENT_RECALL_HOME` and `AGENT_RECALL_ACTOR`. The command is idempotent.
+
+### Upgrade v1.1.3 → v1.1.4
+
+The v1.1.4 migration is **schema-preserving**: schema v13 remains sufficient. The release adds graceful MCP stdio shutdown on stdin EOF / close and `SIGINT` / `SIGTERM`; the SQLite store is closed after the MCP server and transport. Set `AGENT_RECALL_VERBOSE_STDIO=1` to print a one-shot shutdown reason to stderr; stdout remains protocol-clean.
 
 Upgrade recipe (per host):
 
 1. Stop the running MCP server / CLI process.
-2. Replace `dist/` with the v1.1.3 build (`tar -xzf` / `Expand-Archive`).
-3. Re-run `npm install --omit=dev` if the new `package.json` carries
-   a dependency change (v1.1.3 does not).
-4. Run `node dist/bin/agent-recall.js migrate --yes` (no-op for
-   v13 → v13; idempotent for any pre-existing v0..v12 store that
-   needs the staged migrations).
-5. Restart the MCP server with the same `AGENT_RECALL_HOME` and
-   `AGENT_RECALL_ACTOR`.
+2. Replace `dist/` with the v1.1.4 build (`tar -xzf` / `Expand-Archive`).
+3. Re-run `npm install --omit=dev` if the new `package.json` carries a dependency change (v1.1.4 does not).
+4. Run `node dist/bin/agent-recall.js migrate --yes` (no-op for v13 → v13; idempotent for older stores that need staged migrations).
+5. Restart the MCP server with the same `AGENT_RECALL_HOME` and `AGENT_RECALL_ACTOR`.
 
-### Rollback v1.1.3 → v1.1.2
+### Rollback v1.1.4 → v1.1.3
 
-The v1.1.2 surface is preserved by the v1.1.3 release (no breaking
-changes). To roll back:
+The v1.1.3 surface is preserved by v1.1.4. To roll back:
 
 1. Stop the running MCP server / CLI process.
-2. Restore the v1.1.2 `dist/` from a known-good backup (the
-   `agent-recall backup` command writes
-   `<AGENT_RECALL_HOME>/backups/memory-<timestamp>.sqlite`).
-3. If the v1.1.3 `import_batches` lineage rows are unwanted, run
-   `node dist/bin/agent-recall.js doctor` to confirm no v1.1.3-only
-   data is in the live store.
-4. Restart the MCP server with the v1.1.2 binary.
+2. Restore the v1.1.3 `dist/` from a known-good backup (the `agent-recall backup` command writes `<AGENT_RECALL_HOME>/backups/memory-<timestamp>.sqlite`).
+3. Run `node dist/bin/agent-recall.js doctor` if you need to confirm the live store is healthy.
+4. Restart the MCP server with the v1.1.3 binary.
 
-The schema-preserving contract means a roll-forward (v1.1.2 → v1.1.3)
-or roll-backward (v1.1.3 → v1.1.2) does NOT require a data migration.
+The schema-preserving contract means rolling between v1.1.3 and v1.1.4 does NOT require a data migration.
 
 ## Configuration
 
@@ -391,7 +382,8 @@ warning.
 | `AGENT_RECALL_TRUST_SOFT` | `0.1` | Recall `trust_boost` for memories the calling agent recently touched. Must be in `[0, 1]`. |
 | `AGENT_RECALL_SUPPRESS_MCP_DEPRECATION` | unset | Set to `1` to silence the one-time MCP server deprecation notice. |
 | `AGENT_RECALL_ALLOW_UNBOUND_PROJECT_ID` | unset (strict-by-default) | v1.1.2 (issue #21) → v1.1.3 (#31): default-off legacy escape hatch. When set to `1`, a `project_id`-only call without a registered identity is allowed in "unbound" mode. The default strict mode refuses unknown ids at the resolver before any project scope, alias, memory, audit, or budget row is created. |
-| `AGENT_RECALL_PROFILE` | `core` (the packaged default) | v1.1.2 (issue #22 + #23) → v1.1.3 (#32): selects the active MCP tool profile. `core` registers the 10 read / write / plan essentials; `extended` adds 10 memory-semantics + administrative tools; `admin` registers the same 20-tool surface as `extended` but gates `profile_required: "admin"` capabilities behind the load-time capability check. Unknown values fail-closed at startup. |
+| `AGENT_RECALL_PROFILE` | `core` (the packaged default) | Selects the active MCP tool profile. `core` registers the 10 read / write / plan essentials; `extended` adds 10 memory-semantics + administrative tools; `admin` registers the same 20-tool surface as `extended` but gates `profile_required: "admin"` capabilities behind the load-time capability check. Unknown values fail-closed at startup. |
+| `AGENT_RECALL_VERBOSE_STDIO` | unset | Set to `1` to emit one shutdown-reason line to stderr for stdin EOF / close, `SIGINT`, or `SIGTERM`. The default hot path is silent and stdout remains protocol-clean. |
 
 ## Memory Hygiene
 
@@ -489,7 +481,7 @@ Operators publish only from a commit with exact, retained release
 evidence:
 
 1. Freeze the intended commit and push it to an `rc-*` branch, for
-   example: `git push origin HEAD:rc-1.1.3-candidate`. This triggers
+   example: `git push origin HEAD:rc-1.1.4-candidate`. This triggers
    `.github/workflows/release-candidate.yml` on Ubuntu, macOS, and
    Windows with Node 24. Do not add release-blocking changes after
    the run; a new commit requires a new candidate run and invalidates
@@ -505,7 +497,7 @@ evidence:
    example:
    `candidate SHA: <40-char SHA>; workflow: https://github.com/xurunxin/AgentRecall/actions/runs/<run-id>`.
 4. Push the release tag only after the evidence is green:
-   `git tag v1.1.3 <candidate-sha> && git push origin v1.1.3`.
+   `git tag v1.1.4 <candidate-sha> && git push origin v1.1.4`.
    `release.yml` finds a successful candidate workflow for that exact
    SHA, verifies the evidence artifact and `release_commit`, and fails
    closed if the tag points anywhere else. A tag cannot rely on
@@ -630,7 +622,7 @@ The operator-facing surface is `scripts/prepare-release.mjs`:
 ```bash
 GITHUB_SHA="$(git rev-parse HEAD)" \
 ARTIFACT_DIR="$PWD/dist-stage" \
-RELEASE_TAG="v1.1.3" \
+RELEASE_TAG="v1.1.4" \
 DRY_RUN="1" \
   node scripts/prepare-release.mjs
 ```
@@ -651,7 +643,7 @@ lifecycle) is segregated into an independent script and CI job.
 Run the per-suite tests:
 
 ```bash
-# unit / integration layer (default; the v1.1.3 contract)
+# unit / integration layer (default)
 npm test
 
 # heavyweight suites (each has its own vitest config)
@@ -676,8 +668,7 @@ npm run verify:artifacts
 ## Changelog
 
 Stage-level changes are tracked in
-[`CHANGELOG.md`](./CHANGELOG.md). The v1.1.3 section is the
-unreleased head; the v1.1.2 section is the previous release.
+[`CHANGELOG.md`](./CHANGELOG.md). The v1.1.4 section is the latest release; the v1.1.3 section is the previous release.
 
 ## Verification
 
