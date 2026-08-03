@@ -71,6 +71,18 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Windows granted capability ACL diagnostics
+        if: ${{ matrix.os == 'windows-2022' }}
+        shell: pwsh
+        run: |
+          $home = Join-Path $env:RUNNER_TEMP "agent-recall-grant-probe"
+          New-Item -ItemType Directory -Force -Path $home | Out-Null
+          $env:AGENT_RECALL_HOME = $home
+          npx tsx bin/agent-recall.ts admin grant --json
+          icacls (Join-Path $home "admin.cap")
+          npx tsx bin/agent-recall.ts admin status --json
+          whoami /user
+
       - name: Unit + integration tests
         run: npx vitest run --pool=forks --poolOptions.forks.singleFork
         env:
