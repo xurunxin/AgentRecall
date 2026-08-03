@@ -976,27 +976,108 @@ function validateWindowsAcl(
 function extractWindowsPrincipals(stdout: string): string[] {
   const out: string[] = [];
   const lines = stdout.split(/\r?\n/);
-  let isFirst = true;
   for (const rawLine of lines) {
     const line = rawLine.replace(/\s+$/, "");
     if (line.trim().length === 0) continue;
-    // Find the rights block: the FIRST
-    // occurrence of `:(` followed by a
-    // closing `)`. The principal is
-    // everything before that block.
-    const rightsMatch = line.match(/:\(([A-Z][^)]*)\)/);
-    if (rightsMatch === null) continue;
-    const rightsIdx = rightsMatch.index ?? -1;
-    let principalSection = line.slice(0, rightsIdx).trim();
-    if (isFirst) {
-      // Strip the path (everything before the
-      // last whitespace before the rights).
-      const lastWs = principalSection.lastIndexOf(" ");
-      if (lastWs >= 0) {
-        principalSection = principalSection.slice(lastWs + 1);
-      }
-      isFirst = false;
+    const rightsAnchor = line.search(/:\(/);
+    if (rightsAnchor === -1) continue;
+    const head = line.slice(0, rightsAnchor);
+    const trimmedHead = head.trim();
+    if (trimmedHead.length === 0) continue;
+    const tokens = trimmedHead.split(/\s+/);
+    if (tokens.length === 1) {
+      out.push(tokens[0] ?? "");
+      continue;
     }
+    // SID-shaped principal suffix.
+    const last = tokens[tokens.length - 1] ?? "";
+    if (!last.includes("\\")) {
+      // No backslash in the last token: the
+      // principal has no SID form (e.g.
+      // `Everyone`). Use the whole head
+      // verbatim.
+      out.push(trimmedHead);
+      continue;
+    }
+    // Walk backwards over the trailing
+    // authority run. An `icacls` principal
+    // is always `<authority>\…` where the
+    // authority may be split into several
+    // whitespace-separated tokens, e.g.
+    //   `NT AUTHORITY\SYSTEM`,
+    //   `BUILTIN\Administrators`,
+    //   `NT SERVICE\…`,
+    //   `APPLICATION PACKAGE AUTHORITY\…`.
+    // The authority tokens come BEFORE the
+    // SID-leaf (the trailing token) and are
+    // joined by spaces. We collect the
+    // maximum trailing run of authority
+    // tokens that, together with the SID-
+    // leaf, form a valid principal.
+    const known = new Set(["NT", "BUILTIN", "APPLICATION", "NT SERVICE"]);
+    // The principal is the trailing
+    // `tokens.slice(k)`, where `k` is the
+    // earliest index such that
+    //   1) `tokens[k] ∈ known`, or
+    //   2) the tokens from `k` to the end
+    //      are a known authority run: a
+    //      known keyword, optionally with
+    //      one non-keyword gap word, then the
+    //      SID-leaf, and (only for
+    //      `APPLICATION PACKAGE AUTHORITY`)
+    //      two non-keyword gap words.
+    // We start with the trailing SID-leaf
+    // and consume authority tokens.
+    let principalStart = tokens.length - 1; // SID-leaf index
+    let consumedAuthority = 0;
+    while (principalStart > 0) {
+      const candidate = tokens[principalStart - 1] ?? "";
+      if (known.has(candidate)) {
+        principalStart = principalStart - 1;
+        consumedAuthority = 1;
+        break;
+      }
+      // `APPLICATION PACKAGE AUTHORITY` is a
+      // two-gap authority; consume two
+      // non-keyword tokens only when the
+      // SID-leaf is preceded by `AUTHORITY`
+      // (a known authority keyword).
+      if (
+        consumedAuthority === 0 &&
+        (candidate === "AUTHORITY" || candidate === "SERVICE") &&
+        tokens[principalStart - 2] !== undefined &&
+        (tokens[principalStart - 2] ?? "") === "NT"
+      ) {
+        // `NT SERVICE\…` is two non-keyword
+        // gap tokens (SERVICE, then the
+        // SID-leaf). Already handled the
+        // SERVICE; we still need the next
+        // preceding token to be a known
+        // authority.
+        principalStart = principalStart - 1;
+        consumedAuthority = 1;
+        // Loop continues to consume the
+        // preceding `NT`.
+        continue;
+      }
+      // Allow a single non-keyword gap
+      // word between an authority keyword
+      // and the SID-leaf (e.g. `AUTHORITY`
+      // in `NT AUTHORITY\SYSTEM`,
+      // `PACKAGE` in `APPLICATION PACKAGE
+      // AUTHORITY`).
+      if (consumedAuthority > 0) {
+        // We have already consumed at
+        // least one authority keyword; this
+        // candidate is a single non-keyword
+        // word belonging to the authority
+        // prefix. Stop after one gap word.
+        principalStart = principalStart - 1;
+        break;
+      }
+      break;
+    }
+    const principalSection = tokens.slice(principalStart).join(" ");
     if (principalSection.length === 0) continue;
     out.push(principalSection);
   }
@@ -1232,7 +1313,17 @@ export const _INTERNAL = {
   // single source of truth.
   TOKEN_PATTERN: CAPABILITY_TOKEN_SHAPE,
   // The file mode the POSIX path enforces.
-  POSIX_MODE: CAPABILITY_FILE_MODE
+  POSIX_MODE: CAPABILITY_FILE_MODE,
+  // v1.1.4 (Stage 19): the Windows ACL
+  // principal parser is exposed so unit
+  // tests can pin its behaviour against
+  // canonical `icacls` fixture output
+  // (e.g. `<path> runnervm\runneradmin:(I)(F)`).
+  // Production callers must not rely on
+  // the parser — the validator owns the
+  // caller surface.
+  parseWindowsPrincipals: (stdout: string): string[] =>
+    extractWindowsPrincipals(stdout)
   // The `_INTERNAL.WINDOWS_RIGHTS` constant
   // was removed in v1.1.3 GATE-02: the value
   // was stale (it claimed `(R,W)` while the

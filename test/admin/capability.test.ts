@@ -533,3 +533,32 @@ describe("CapabilityStore.validatePermissionBoundary (v1.1.3 GATE-02 issue #32)"
     expect(JSON.stringify(status)).not.toContain("d".repeat(64));
   });
 });
+
+describe("Windows ACL principal parser (v1.1.4 Stage 19)", () => {
+  it("extracts the operator principal from the canonical icacls output", () => {
+    const fixture = [
+      "C:\\Users\\runnervm\\AppData\\Local\\Temp\\admin.cap ",
+      "NT AUTHORITY\\SYSTEM:(F)",
+      "BUILTIN\\Administrators:(F)",
+      "runnervm\\runneradmin:(F)",
+      "",
+      "Successfully processed 1 files; Failed processing 0 files"
+    ].join("\r\n");
+    const principals = _INTERNAL.parseWindowsPrincipals(fixture);
+    expect(principals).toContain("runnervm\\runneradmin");
+  });
+
+  it("strips chained inherited rights like (I)(F)", () => {
+    const fixture = [
+      "C:\\Temp\\admin.cap NT AUTHORITY\\SYSTEM:(I)(F)",
+      "BUILTIN\\Administrators:(I)(F)",
+      "runnervm\\runneradmin:(F)"
+    ].join("\r\n");
+    const principals = _INTERNAL.parseWindowsPrincipals(fixture);
+    expect(principals).toEqual([
+      "NT AUTHORITY\\SYSTEM",
+      "BUILTIN\\Administrators",
+      "runnervm\\runneradmin"
+    ]);
+  });
+});
