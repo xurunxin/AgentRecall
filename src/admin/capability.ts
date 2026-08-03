@@ -392,6 +392,27 @@ export class CapabilityStore {
         : validatePermissionBoundary(this.path);
       if (!validation.ok) {
         this.driftReason = validation.reason;
+        // v1.1.4 (Stage 19): emit a one-shot
+        // diagnostic so the CI failure logs
+        // show the actual on-disk ACL that
+        // gated the file as drift. Hot path
+        // is silent on success; the dump
+        // only fires when the validator
+        // refuses the file. The dump is
+        // plain stderr text (not a log
+        // framework dependency).
+        if (process.platform === "win32") {
+          try {
+            const acl = execFileSync("icacls", [this.path], { encoding: "utf8" });
+            process.stderr.write(
+              `[agent-recall:capability-drift] reason=${validation.reason} path=${this.path}\n${acl}\n`
+            );
+          } catch {
+            process.stderr.write(
+              `[agent-recall:capability-drift] reason=${validation.reason} path=${this.path} (icacls probe failed)\n`
+            );
+          }
+        }
         return;
       }
       this.record = readCapabilityFromDisk(this.path);
