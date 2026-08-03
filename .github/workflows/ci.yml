@@ -75,11 +75,11 @@ jobs:
         if: ${{ matrix.os == 'windows-2022' }}
         shell: pwsh
         run: |
-          $home = Join-Path $env:RUNNER_TEMP "agent-recall-grant-probe"
-          New-Item -ItemType Directory -Force -Path $home | Out-Null
-          $env:AGENT_RECALL_HOME = $home
+          $probeHome = Join-Path $env:RUNNER_TEMP "agent-recall-grant-probe"
+          New-Item -ItemType Directory -Force -Path $probeHome | Out-Null
+          $env:AGENT_RECALL_HOME = $probeHome
           npx tsx bin/agent-recall.ts admin grant --json
-          icacls (Join-Path $home "admin.cap")
+          icacls (Join-Path $probeHome "admin.cap")
           npx tsx bin/agent-recall.ts admin status --json
           whoami /user
 
