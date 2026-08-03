@@ -5,6 +5,113 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [1.1.4] — MCP graceful shutdown on stdio EOF + signals
+
+### Fixed
+
+- **MCP stdio server now exits cleanly on disconnect.**
+  Pre-fix, `src/index.ts` connected the
+  `StdioServerTransport` and returned; the Node process
+  stayed alive forever parked on `process.stdin`. The
+  SDK's transport only listens for `data` / `error` on
+  stdin — never `end` / `close` — so when the parent
+  process closed the stdio pipe (or died), the child
+  kept running idle. On `SIGTERM` / `SIGINT` Node's
+  default handler killed the child without closing the
+  SQLite handle first.
+  - New module `src/mcp/server-lifecycle.ts` wires a
+    small, focused shutdown path: stdin `end` / `close`
+    (the parent closed the pipe) → transport closes →
+    server closes → SQLite store closes (via the
+    caller-supplied `onShutdown` hook) → listeners
+    detached. Idle residency is PRESERVED: the server
+    only exits when the pipe is genuinely gone or a
+    signal arrives, never on mere inactivity.
+  - `SIGINT` and `SIGTERM` trigger the same clean
+    path. The listener overrides Node's default
+    termination so the shutdown sequence runs before
+    the process is reaped.
+  - Stdout stays protocol-clean: the module NEVER
+    writes to stdout; the hot path is silent. Shutdown
+    errors route through the caller's `onShutdownError`
+    sink (stderr only in the MCP server entry).
+  - **Bounded shutdown + escape hatch.** The sequence
+    races against an unref'd `setTimeout` (default
+    1500 ms). If the ceiling is hit, `onShutdownError`
+    logs the timeout and the process exits with code
+    1 so the host can reap it. A second signal
+    arriving after the sequence has started bypasses
+    the sequence and hard-exits with code 1 (escape
+    hatch for stuck shutdowns).
+  - `process.exit(0)` on clean shutdown. The lifecycle
+    module invokes `exitFn(0)` after the sequence
+    completes; without this the Node process would
+    stay alive parked on the SQLite / stdio handles.
+    `exitFn` is a new option (default `process.exit`)
+    so unit tests can assert the exit code without
+    killing the worker.
+  - **Verbose reason log.** A one-shot stderr line
+    gated behind `AGENT_RECALL_VERBOSE_STDIO=1`
+    (`agent-recall shutting down (stdin EOF)` /
+    `… (SIGTERM)` / `… (SIGINT)`). The hot path is
+    silent unless verbose mode is on; stdout stays
+    protocol-clean.
+- `src/index.ts` `main()` now installs the lifecycle
+  right after `server.connect(transport)`. The SQLite
+  store closes LAST so any final audit event the server
+  emits during its own `close()` can land before the file
+  handle is released.
+
+### Added
+
+- `test/unit/mcp-server-lifecycle.test.ts` — 19 unit
+  tests pinning the lifecycle module's contract: end /
+  close / SIGINT / SIGTERM triggers, idempotency under
+  multi-trigger storms, transport closes before server,
+  `onShutdown` runs after server, errors caught and routed
+  to `onShutdownError`, uninstall detaches listeners,
+  idle residency preserved, explicit `handle.shutdown(reason)`
+  is idempotent, no `console.log` leaks on the hot path,
+  `process.exit(0)` on clean shutdown, `process.exit(1)`
+  on ceiling / error paths, second-signal escape hatch,
+  verbose reason log per reason.
+- `test/blackbox/mcp-shutdown.test.ts` — real
+  child-process regression test. Spawns `node --import
+  tsx src/index.ts` (no build artifact touched), closes
+  stdin, and asserts the child exits with code 0 within
+  2.5 s with empty stderr. SIGTERM / SIGINT cases are
+  documented as POSIX-only (Node on Windows terminates
+  unconditionally on SIGTERM/SIGINT even with a listener
+  installed). Wired into `vitest.blackbox.config.ts`.
+
+### CI
+
+- `vitest.config.ts` excludes `test/release-gate/**` plus
+  the packaged-artifact + multi-process-stress + blackbox
+  sub-suites from the default `npm test` invocation. The
+  `release-candidate.yml` workflow runs the release-gate
+  suite explicitly per-suite; the segregated per-suite
+  configs (`vitest.{migrations,stress,blackbox,packaged-artifact}.config.ts`)
+  continue to host their respective tests. This keeps
+  the default `npm test` fast and stable on `main`
+  while the `rc-*` branch still exercises the full
+  release-gate matrix.
+
+### Verified
+
+- `npx vitest run test/unit/mcp-server-lifecycle.test.ts` →
+  19/19 pass.
+- `npx vitest run --config vitest.blackbox.config.ts
+  test/blackbox/mcp-shutdown.test.ts` → 4/4 pass (stdin
+  EOF clean exit, verbose log present; SIGTERM / SIGINT
+  skipped on win32 with documented rationale).
+- `npm test` (default vitest config, used by CI's
+  `Unit + integration` step) → 557/557 pass.
+- `npm run test:blackbox` → 114/114 pass.
+- `npm run typecheck` → exit 0.
+- Real Node dist + Bun `agent-recall-mcp-win32-x64.exe`
+  verified to exit `code 0, signal null` after stdin EOF.
+
 ## [Unreleased] — Bun single-file binary distribution
 
 ### Added (additive; Node path unchanged)
