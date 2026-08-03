@@ -72,7 +72,7 @@ jobs:
         run: npm run build
 
       - name: Unit + integration tests
-        run: npm test -- --pool=forks --poolOptions.forks.singleFork
+        run: npx vitest run --pool=forks --poolOptions.forks.singleFork
         env:
           # The vitest runs spawn many short-lived
           # sqlite databases under the system temp

@@ -1136,16 +1136,12 @@ function enforceWindowsOwnerOnlySync(path: string): void {
   const user = currentWindowsUser();
   execFileSync(
     "icacls",
-    [
-      path,
-      "/inheritance:r",
-      "/grant:r",
-      `${user}:(F)`,
-      "/remove",
-      "Everyone",
-      "/remove",
-      "Users"
-    ],
+    [path, "/inheritance:r", "/grant:r", `${user}:(F)`],
+    { stdio: "ignore" }
+  );
+  execFileSync(
+    "icacls",
+    [path, "/remove:g", "Everyone", "/remove:g", "Users"],
     { stdio: "ignore" }
   );
 }

@@ -36,7 +36,6 @@ import {
   CAPABILITY_FILENAME,
   CapabilityStore,
   InMemoryCapabilityStore,
-  PermissionDriftError,
   validatePermissionBoundary,
   _INTERNAL
 } from "../../src/admin/capability.js";
@@ -389,8 +388,8 @@ describe("InMemoryCapabilityStore (Stage 18 v1.1.2 #23, ADR-0001)", () => {
   });
 });
 
-describe("PermissionDriftError (Stage 18 v1.1.2 #23, ADR-0001)", () => {
-  it("is thrown when the on-disk file has the wrong POSIX mode", () => {
+describe("Permission drift fail-closed behavior (Stage 18 v1.1.2 #23, ADR-0001)", () => {
+  it("refuses an on-disk file with the wrong POSIX mode", () => {
     if (process.platform === "win32") return;
     const dataHome = newDataHome();
     try {
@@ -436,28 +435,13 @@ describe("PermissionDriftError (Stage 18 v1.1.2 #23, ADR-0001)", () => {
         capability_type: "trust_promotion",
         requestContext: buildRequestContext({})
       });
-      // Note: the on-disk file is currently
-      // 0o644 (we chmod'd it). The fresh store
-      // was constructed before the chmod, so
-      // its in-memory record is intact. The
-      // permission check runs at authorize time
-      // and would surface `permission_drift`.
-      // The current implementation reads the
-      // token from the in-memory record
-      // (loaded at construction) and skips the
-      // on-disk permission re-check. The
-      // fail-closed contract is enforced at
-      // the next `grant()` call (which refuses
-      // to write a file with the wrong mode).
-      // The in-memory record remains valid for
-      // the lifetime of the process.
-      expect(okBefore.ok).toBe(true);
-      void PermissionDriftError; // keep the
-      // import non-empty (the class is part of
-      // the public surface but the runtime
-      // throw is gated on the chmod path; the
-      // import + type assertion above is the
-      // test's coverage).
+      // A fresh store must fail closed when the file's
+      // permission boundary has drifted. The load-time
+      // validator clears the in-memory record, so the
+      // matching token cannot authorize.
+      expect(okBefore.ok).toBe(false);
+      if (okBefore.ok) return;
+      expect(okBefore.reason).toBe("capability_missing");
     } finally {
       try {
         rmSync(dataHome, { recursive: true, force: true });
