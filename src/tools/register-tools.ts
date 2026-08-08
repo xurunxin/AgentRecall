@@ -45,6 +45,27 @@ export type MemoryToolHandler = (input: unknown, extra?: HandlerExtra) => Promis
 export type MemoryToolHandlers = Record<MemoryToolName, MemoryToolHandler>;
 
 /**
+ * Optional per-request tracker wired into the
+ * per-tool callback wrapper. The MCP entry passes
+ * a tracker that mutates a shared in-flight counter
+ * so the stdio idle-exit timer (Stage 1, task 3) can
+ * consult the counter via `isMessageInFlight` and
+ * hold the deadline while a tool handler is
+ * running. `onStart` fires before the handler is
+ * invoked; `onEnd` fires in a `finally` so the
+ * counter is decremented even when the handler
+ * throws or returns a `Result` failure. Optional —
+ * the default is no-op so existing callers (the
+ * test helper `registerMemoryTools`, the
+ * `p3-mcp-tool-annotations` regression) keep
+ * working unchanged.
+ */
+export type RequestTracker = {
+  onStart: () => void;
+  onEnd: () => void;
+};
+
+/**
  * The wire-level tool list. Order matters because some
  * clients render tools in registration order; the Stage 9
  * tools stay first, the Stage 12 PR9 additions follow. The
@@ -1012,7 +1033,18 @@ export const EXTENDED_TOOL_NAMES: readonly MemoryToolName[] = memoryToolNames.fi
   (name) => !CORE_TOOL_NAMES.includes(name)
 );
 
-export function registerCoreTools(server: MemoryToolServer, service: MemoryService): void {
+export function registerCoreTools(
+  server: MemoryToolServer,
+  service: MemoryService,
+  // v1.1.5 (Stage 1, task 3): optional
+  // per-request tracker. The MCP entry passes a
+  // closure that mutates a shared in-flight
+  // counter so the stdio idle-exit timer can
+  // hold the deadline while a tool handler is
+  // running. Optional so the test helper and
+  // any other caller stays backwards compatible.
+  tracker?: RequestTracker
+): void {
   const handlers = createMemoryToolHandlers(service);
   for (const name of CORE_TOOL_NAMES) {
     server.registerTool(
@@ -1023,12 +1055,33 @@ export function registerCoreTools(server: MemoryToolServer, service: MemoryServi
         outputSchema: GENERIC_OUTPUT_SCHEMA,
         annotations: ANNOTATIONS[name]
       },
-      async (input: unknown, extra: unknown) => handlers[name](input, extra as HandlerExtra | undefined)
+      // v1.1.5 (Stage 1, task 3): wrap the
+      // callback in a try/finally so the
+      // tracker's `onEnd` fires even when the
+      // handler throws or returns a `Result`
+      // failure — the in-flight counter must
+      // be balanced or the idle timer would
+      // never re-fire.
+      async (input: unknown, extra: unknown) => {
+        if (tracker !== undefined) tracker.onStart();
+        try {
+          return await handlers[name](input, extra as HandlerExtra | undefined);
+        } finally {
+          if (tracker !== undefined) tracker.onEnd();
+        }
+      }
     );
   }
 }
 
-export function registerExtendedTools(server: MemoryToolServer, service: MemoryService): void {
+export function registerExtendedTools(
+  server: MemoryToolServer,
+  service: MemoryService,
+  // v1.1.5 (Stage 1, task 3): see
+  // `registerCoreTools` for the rationale. Same
+  // optional tracker hook; same no-op default.
+  tracker?: RequestTracker
+): void {
   // v1.1.2 (issue #22): Extended = Core + the
   // additional memory-semantics + administrative
   // tools. The previous implementation only
@@ -1050,7 +1103,22 @@ export function registerExtendedTools(server: MemoryToolServer, service: MemoryS
         outputSchema: GENERIC_OUTPUT_SCHEMA,
         annotations: ANNOTATIONS[name]
       },
-      async (input: unknown, extra: unknown) => handlers[name](input, extra as HandlerExtra | undefined)
+      // v1.1.5 (Stage 1, task 3): see
+      // `registerCoreTools` for the rationale.
+      // The same try/finally wrapper is applied
+      // here so the tracker stays balanced for
+      // every tool on the Extended surface
+      // (Core read/write + the four
+      // memory-semantics tools + the
+      // administrative tools).
+      async (input: unknown, extra: unknown) => {
+        if (tracker !== undefined) tracker.onStart();
+        try {
+          return await handlers[name](input, extra as HandlerExtra | undefined);
+        } finally {
+          if (tracker !== undefined) tracker.onEnd();
+        }
+      }
     );
   }
 }
