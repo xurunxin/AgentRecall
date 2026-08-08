@@ -42,11 +42,13 @@
 //     stays consistent. The provided transport is
 //     used as-is for `connect()` and `close()`.
 //
-//   - `forceRegister` is intentionally **not**
-//     exposed. Task 9 (Stage 4) may add it if the
-//     production HTTP server needs to override the
-//     default actor on first initialize; not in
-//     Task 8's scope.
+//   - `forceRegister` is exposed for the
+//     production HTTP route layer. Task 9's
+//     `runHttpServer` uses it as a defensive
+//     fallback in the SDK's
+//     `onsessioninitialized` callback so an
+//     actor-override seam is available without
+//     blocking the synchronous-insert path.
 import { randomUUID } from "node:crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -191,6 +193,35 @@ export class SessionManager {
    */
   get(id: string): SessionEntry | undefined {
     return this.sessions.get(id);
+  }
+
+  /**
+   * Stage 4 / Task 9: defensive seam for the
+   * HTTP route layer. When the SDK fires
+   * `onsessioninitialized` with an id that is
+   * NOT in the map (e.g. the transport was
+   * constructed with its own `sessionIdGenerator`
+   * rather than the one `create()` injected),
+   * the route layer calls `forceRegister` to
+   * add the entry after the fact. In the current
+   * `create()` shape the SDK's callback always
+   * sees the pre-generated id, so this is a
+   * fallback for transports built outside
+   * `create()`. The brief's `runHttpServer` uses
+   * the seam to register the default actor on
+   * first initialize; Task 10 will replace it
+   * with explicit initialize-body parsing.
+   */
+  forceRegister(
+    id: string,
+    transport: StreamableHTTPServerTransport,
+    actor: SessionActor
+  ): void {
+    this.sessions.set(id, {
+      transport,
+      actor,
+      createdAt: new Date().toISOString()
+    });
   }
 
   /**
