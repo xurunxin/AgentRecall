@@ -11,6 +11,20 @@
 // host whitelist is empty — the spec § 共享安全 rule
 // that an HTTP daemon with no `allowedHosts` must not
 // start at all).
+//
+// Fix-round 1: the per-session routing logic
+// (`handleHttpRequest`'s `if (POST && !sessionId)`
+// branch) was rewritten to pre-generate the id,
+// build the transport with a matching
+// `sessionIdGenerator`, and call
+// `transport.handleRequest(req, res)` synchronously
+// so the first `initialize` POST actually reaches
+// the SDK. A bind-and-listen test that exercises
+// this path is deferred to a follow-up — it needs
+// a live `httpServer` plus a real or stubbed
+// `StreamableHTTPServerTransport`, which is a
+// larger surface than the brief's precondition-only
+// test list.
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

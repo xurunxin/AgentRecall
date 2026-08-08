@@ -42,13 +42,20 @@
 //     stays consistent. The provided transport is
 //     used as-is for `connect()` and `close()`.
 //
-//   - `forceRegister` is exposed for the
-//     production HTTP route layer. Task 9's
-//     `runHttpServer` uses it as a defensive
-//     fallback in the SDK's
-//     `onsessioninitialized` callback so an
-//     actor-override seam is available without
-//     blocking the synchronous-insert path.
+//   - `forceRegister` is exposed as a
+//     production HTTP route seam. It is NOT
+//     used in the current Task 9 / fix-round 1
+//     shape (the route layer now generates
+//     the id, builds the transport with a
+//     matching `sessionIdGenerator`, and calls
+//     the new `register(id, transport, actor)`
+//     method synchronously — so the SDK's
+//     `onsessioninitialized` callback is a
+//     no-op). The seam stays for Task 10's
+//     explicit initialize-body parsing
+//     (override the actor on the first
+//     request) without forcing the
+//     synchronous-insert path to widen.
 import { randomUUID } from "node:crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -193,6 +200,52 @@ export class SessionManager {
    */
   get(id: string): SessionEntry | undefined {
     return this.sessions.get(id);
+  }
+
+  /**
+   * Register a transport under a caller-supplied
+   * id. Synchronous map insertion; `get(id)` is
+   * valid the moment `register()` returns. The id
+   * is the caller's — this method does NOT
+   * generate a UUID. The intended caller is the
+   * HTTP route layer (Task 9), which generates
+   * the id at the top of the new-session branch
+   * and constructs the transport with a matching
+   * `sessionIdGenerator` so the SDK's
+   * `onsessioninitialized` callback sees the
+   * same id (and is therefore a no-op rather
+   * than a re-registration).
+   *
+   * Additive alongside `create()`: `create()`
+   * stays for back-compat with the existing
+   * unit tests and the Task 8 / Task 9 callers
+   * that prefer the pre-generate-and-insert
+   * shape. `register()` is the new path that
+   * lets the route layer pin the id before the
+   * transport is wired up, eliminating the
+   * UUID-A-vs-UUID-B mismatch that a
+   * `sessionIdGenerator: () => randomUUID()`
+   * in the route layer would otherwise produce.
+   *
+   * @param id        The pre-generated session
+   *                  id (UUID-shaped, but this
+   *                  method does not validate).
+   * @param transport The per-session
+   *                  `StreamableHTTPServerTransport`.
+   * @param actor     The actor for this session;
+   *                  locked for the session's
+   *                  lifetime.
+   */
+  register(
+    id: string,
+    transport: StreamableHTTPServerTransport,
+    actor: SessionActor
+  ): void {
+    this.sessions.set(id, {
+      transport,
+      actor,
+      createdAt: new Date().toISOString()
+    });
   }
 
   /**

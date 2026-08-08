@@ -10,6 +10,10 @@
 //     for unknown ids).
 //   - close() removes the entry from the map and
 //     awaits the underlying transport's close().
+//   - register(id, transport, actor) inserts an
+//     entry under a caller-supplied id (Task 9
+//     fix-round 1 seam; the route layer generates
+//     the id and passes it in).
 //
 // The `makeServer()` mock deliberately does NOT
 // fire the SDK's `onsessioninitialized` callback
@@ -55,5 +59,25 @@ describe("SessionManager", () => {
     await mgr.close(id);
     expect(close).toHaveBeenCalled();
     expect(mgr.get(id)).toBeUndefined();
+  });
+
+  it("register(id, transport, actor) inserts an entry under a caller-supplied id", () => {
+    // Task 9 fix-round 1 seam: the route layer
+    // generates the id and passes it in so the
+    // transport's `sessionIdGenerator` and the
+    // manager's map key agree (no UUID-A-vs-UUID-B
+    // mismatch). The mock transport is a bare
+    // object — we only assert the manager's
+    // bookkeeping, not the transport's internals.
+    const mgr = new SessionManager();
+    mgrs.push(mgr);
+    const transport = { close: vi.fn().mockResolvedValue(undefined) } as unknown as { close(): Promise<void> };
+    const id = "caller-supplied-id-1";
+    mgr.register(id, transport as never, { kind: "agent", id: "agent-default" });
+    const entry = mgr.get(id);
+    expect(entry).toBeDefined();
+    expect(entry?.actor).toEqual({ kind: "agent", id: "agent-default" });
+    expect(entry?.transport).toBe(transport);
+    expect(entry?.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 });

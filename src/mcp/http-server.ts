@@ -38,15 +38,21 @@
 //       inserted into the map before
 //       `server.connect()` fires, and
 //       `get(id)` is valid the moment
-//       `create()` returns. The
-//       `onsessioninitialized` callback's id
-//       argument will always equal the
-//       pre-generated id, so the
-//       `forceRegister` fallback is a
-//       defensive no-op for `create()`-built
-//       transports; Task 10 will replace
-//       the seam with explicit initialize-
-//       body parsing.
+//       `create()` returns. The HTTP route
+//       layer does NOT use `create()` — it
+//       uses the new (Task 9 fix-round 1)
+//       `register(id, transport, actor)`
+//       method so the id is generated in
+//       this file (matching the existing
+//       `randomUUID()` import) and the
+//       transport's `sessionIdGenerator`
+//       returns the same id. That keeps the
+//       SDK's `onsessioninitialized`
+//       callback a no-op and eliminates the
+//       UUID-A-vs-UUID-B mismatch that
+//       `sessionIdGenerator: () =>
+//       randomUUID()` would otherwise
+//       introduce.
 //     * The `installServerLifecycle` call
 //       passes `transport: undefined`. The
 //       HTTP daemon is NOT a stdio transport;
@@ -262,14 +268,20 @@ export async function runHttpServer(opts: RunHttpServerOptions): Promise<void> {
  *      the session and returns 204.
  *   3. `POST` without a session id
  *      constructs a new per-session
- *      transport and registers it via
- *      `SessionManager.create`. The
- *      transport's `onsessioninitialized`
- *      callback carries a `forceRegister`
- *      fallback (defensive no-op for
- *      `create()`-built transports; the
- *      seam is for Task 10's
- *      initialize-body parsing).
+ *      transport. The id is generated HERE
+ *      (Task 9 fix-round 1 shape); the
+ *      transport's `sessionIdGenerator`
+ *      returns the same id; `register(id,
+ *      transport, actor)` inserts the
+ *      entry synchronously. The transport
+ *      is wired to the server with
+ *      `server.connect(transport)` and the
+ *      first request is routed via
+ *      `transport.handleRequest(req, res)`.
+ *      The client receives the session id
+ *      in the response's `mcp-session-id`
+ *      header and uses it for follow-up
+ *      requests.
  *   4. Otherwise, hand off to the resolved
  *      transport. If the session is
  *      unknown, return 400 + `no_session`.
@@ -328,36 +340,59 @@ async function handleHttpRequest(
   }
 
   if (req.method === "POST" && !sessionId) {
-    // Build the per-session transport. The
-    // transport's `sessionIdGenerator` is
-    // independent of the SessionManager's
-    // pre-generated id; the
+    // First POST (MCP `initialize`): build a
+    // per-session transport under a
+    // pre-generated id so the manager's
+    // `register(id, ...)` and the
+    // transport's `sessionIdGenerator` see
+    // the same id. This eliminates the
+    // UUID-A-vs-UUID-B mismatch that an
+    // independent `() => randomUUID()`
+    // generator would produce (which would
+    // leak an orphan entry per session).
+    //
+    // The id is generated here, the
+    // transport is built with a
+    // `sessionIdGenerator` that returns
+    // the same id, the entry is
+    // synchronously inserted via
+    // `register()` (NOT `create()` — the
+    // route layer owns the id, not the
+    // manager), `server.connect(transport)`
+    // is fired fire-and-forget, and the
+    // first request is routed via
+    // `handleRequest()`. The SDK's
     // `onsessioninitialized` callback is
-    // therefore the seam where Task 10
-    // will parse the initialize body to
-    // extract an actor override. For Task
-    // 9's minimum, the callback registers
-    // the default actor via `forceRegister`
-    // IF the id is not already in the map
-    // (defensive — `create()` populates
-    // the map synchronously with the
-    // default actor, so the fallback is a
-    // no-op for the current path).
+    // therefore a no-op (the id is
+    // already in the map); we omit the
+    // callback entirely. The
+    // `onsessionclosed` callback stays so
+    // the map entry is removed when the
+    // transport closes.
+    const id = randomUUID();
+    const actor: SessionActor = { kind: "agent", id: opts.defaultActor };
     const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-      onsessioninitialized: (id) => {
-        const actor: SessionActor = { kind: "agent", id: opts.defaultActor };
-        sessions.get(id) ?? sessions.forceRegister(id, transport, actor);
-      },
-      onsessionclosed: (id) => { void sessions.close(id); },
+      sessionIdGenerator: () => id,
+      onsessionclosed: (closedId) => { void sessions.close(closedId); },
       enableDnsRebindingProtection: true
     });
-    // Synchronous register per Task 8
-    // contract: the entry is in the map
-    // the moment `create()` returns, so a
-    // follow-up `get(id)` succeeds
-    // immediately.
-    sessions.create(server, { kind: "agent", id: opts.defaultActor }, { transport });
+    sessions.register(id, transport, actor);
+    // SDK typing gap (modelcontextprotocol/sdk@^1.29.0):
+    // `StreamableHTTPServerTransport.onclose` is
+    // a getter that returns `(() => void) | undefined`,
+    // but the parent `Transport` interface (under
+    // `exactOptionalPropertyTypes: true`) declares
+    // `onclose?: () => void` with no explicit
+    // `| undefined`. The two are not assignable
+    // even though the runtime contract is fine.
+    // If a future SDK release narrows the getter
+    // to `() => void | undefined`-optional, this
+    // `@ts-expect-error` will become unused and
+    // must be removed.
+    // @ts-expect-error -- SDK onclose getter vs Transport interface (see comment above)
+    void server.connect(transport);
+    await transport.handleRequest(req, res);
+    return;
   }
 
   // Hand off to the resolved transport. If
