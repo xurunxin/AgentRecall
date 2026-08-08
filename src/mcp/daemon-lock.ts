@@ -15,15 +15,30 @@
 //   - Token: 32 raw bytes (64 hex chars) — see the human-locked
 //     correction below.
 //
-// Two launchers racing on a cold start: the first one wins via
-// `wx` and writes the lock; the second one's `openSync("wx")`
-// raises `EEXIST`, so the second one falls through to the
-// "existing lock" branch and joins. (We don't catch the `EEXIST`
-// at the call site: the brief's design has the second launcher
-// read the just-written lock instead of relying on the
-// "create exclusively" failure — the write is fast and the
-// read-back gives the joiner a complete payload without a
-// retry loop.)
+// Two launchers racing on a cold start: the first one to call
+// `acquireOrJoin` reads the (absent) lock, falls through, and
+// wins the atomic create via `openSync("wx")`. The second
+// launcher's call enters a few ms later; by then the first
+// launcher has already written and closed the file, so the
+// read at the top of this function usually returns the just-
+// written payload and the second launcher takes the "joined"
+// branch. The brief's design relies on the read-back winning
+// the race rather than catching `EEXIST` at the call site.
+//
+// Caveat: the spec calls for a 250 ms × 3-retry loop on race
+// failure. THIS RETRY LOOP IS NOT IMPLEMENTED. If the second
+// launcher's `openSync("wx")` happens to land in the narrow
+// window where the first launcher has called `openSync("wx")`
+// but not yet completed the `writeFileSync` + `closeSync`, the
+// `EEXIST` propagates as an uncaught exception and the second
+// launcher dies. In practice the window is sub-millisecond and
+// we have not observed it on a local dev box, but a follow-up
+// PR should add the spec-mandated retry loop.
+//
+// FOLLOW-UP: add the spec's 250 ms × 3 retry loop around the
+// `openSync(lockPath, "wx")` call. On `EEXIST`, re-read the
+// lock and re-evaluate the acquire/join decision (up to 3
+// times at 250 ms intervals) before propagating the error.
 //
 // `acquireOrJoin` short-circuits when the existing lock
 // already points at our own PID. This covers the "fork-join"
