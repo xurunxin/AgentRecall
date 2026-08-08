@@ -650,4 +650,116 @@ describe("handleHttpRequest first-POST branch", () => {
       handleRequestSpy.mockRestore();
     }
   });
+
+  it("uses a fresh per-session McpServer for each new session (no shared 'Already connected')", async () => {
+    // 2026-08-08 / Task 11. The previous design
+    // shared a single process-level `McpServer`
+    // across all sessions; MCP SDK 1.29.0's
+    // `Server.connect(transport)` is single-shot
+    // and threw "Already connected to a
+    // transport. Call close() before connecting
+    // to a new transport, or use a separate
+    // Protocol instance per connection." on the
+    // second `initialize`. This test would have
+    // caught that bug.
+    //
+    // Strategy: spy on
+    // `StreamableHTTPServerTransport.prototype.handleRequest`
+    // to short-circuit the SDK's Hono adapter
+    // (we only care about the route layer's side
+    // effects — session map, server instance
+    // identity), then drive the route handler
+    // twice with two different `initialize`
+    // bodies. The `McpServer.connect(transport)`
+    // calls are fire-and-forget (`void`), so
+    // even with the original bug the test
+    // process would not throw — but the SECOND
+    // session's entry would share the SAME
+    // `McpServer` instance as the first. With
+    // the per-session refactor each entry gets
+    // its OWN `McpServer`. The assertion is
+    // direct: `entries[0].server !==
+    // entries[1].server`. If the factory is
+    // bypassed (e.g. a future refactor
+    // accidentally re-introduces a process-
+    // level `McpServer`), this assertion fails.
+    const { handleHttpRequest } = await import("../../src/mcp/http-server.js");
+    const { StreamableHTTPServerTransport } = await import(
+      "@modelcontextprotocol/sdk/server/streamableHttp.js"
+    );
+    const handleRequestSpy = vi.spyOn(
+      StreamableHTTPServerTransport.prototype,
+      "handleRequest"
+    ).mockResolvedValue(undefined);
+    try {
+      const sessions = new SessionManager();
+      const opts = {
+        dataHome: home(),
+        defaultActor: "default-fallback",
+        activeProfile: "core",
+        identityResolver: {} as never,
+        memoryService: {} as never,
+        capabilityStore: { hasCapability: () => false } as never,
+        authorization: { actorMaxSensitivity: "normal", profile: "core" } as never,
+        bind: { host: "127.0.0.1", port: 0 },
+        allowedHosts: ["127.0.0.1:7777"],
+        allowedOrigins: [],
+        bearerToken: "test-token"
+      };
+      const sessionCtx = makeSessionCtx();
+      // Two distinct `initialize` bodies so the
+      // route handler constructs TWO distinct
+      // per-session `McpServer` instances (one
+      // per call to `createMcpServerForSession`).
+      // If the implementation accidentally
+      // re-uses a single process-level
+      // `McpServer`, both sessions would
+      // receive the same instance and the
+      // `server !== server` assertion below
+      // would fail.
+      for (const actorId of ["alice", "bob"]) {
+        const body = Buffer.from(JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-01-01",
+            capabilities: {},
+            clientInfo: { name: "test", version: "1" },
+            actor: { kind: "user", id: actorId }
+          }
+        }));
+        const req = makeReq(body, opts.bearerToken);
+        const { res } = makeRes();
+        await handleHttpRequest(req, res, sessions, sessionCtx, opts);
+      }
+      // Both sessions must be registered.
+      const internalMap = (sessions as unknown as {
+        sessions: Map<string, { server: unknown; actor: SessionActor }>;
+      }).sessions;
+      const entries = [...internalMap.values()];
+      expect(entries).toHaveLength(2);
+      // The per-session `McpServer` MUST be a
+      // different instance per session. This is
+      // the core invariant the per-session
+      // refactor (Task 11) exists to enforce:
+      // SDK 1.29.0's `Server.connect(transport)`
+      // is single-shot, so a second
+      // `connect()` on the same `McpServer`
+      // throws "Already connected". With a
+      // per-session `McpServer` (and therefore
+      // a per-session inner `Server`), each
+      // `connect()` is the first on its
+      // instance.
+      expect(entries[0]?.server).toBeDefined();
+      expect(entries[1]?.server).toBeDefined();
+      expect(entries[0]?.server).not.toBe(entries[1]?.server);
+      // Both actors are parsed correctly
+      // (sanity check — the refactor must not
+      // regress Task 10's actor parsing).
+      expect(entries.map((e) => e.actor.id).sort()).toEqual(["alice", "bob"]);
+    } finally {
+      handleRequestSpy.mockRestore();
+    }
+  });
 });
