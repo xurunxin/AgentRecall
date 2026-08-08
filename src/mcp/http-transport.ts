@@ -73,12 +73,27 @@ export interface SessionActor {
 
 /**
  * Bookkeeping entry for one live HTTP session.
- * `transport` is the SDK transport bound to the
- * `McpServer` for this session; `actor` is locked
- * at `create()`; `createdAt` is the ISO-8601
- * timestamp the session was registered.
+ * `server` is the per-session `McpServer`. The
+ * SDK 1.29.0 `McpServer` composes a single
+ * `Server` instance internally and forwards
+ * `connect(transport)` to it; that inner
+ * `Server` is single-shot (a second
+ * `connect()` throws "Already connected").
+ * So each session gets its OWN `McpServer`
+ * instance (and therefore its own inner
+ * `Server`) while sharing the process-level
+ * `MemoryService`. The high-level `McpServer`
+ * type is used (rather than the inner
+ * `Server`) because it is the surface the
+ * route layer constructs and the SDK API
+ * consumers use. `transport` is the SDK
+ * transport bound to that server; `actor`
+ * is locked at `create()`; `createdAt` is
+ * the ISO-8601 timestamp the session was
+ * registered.
  */
 export interface SessionEntry {
+  server: McpServer;
   transport: StreamableHTTPServerTransport;
   actor: SessionActor;
   createdAt: string;
@@ -149,7 +164,7 @@ export class SessionManager {
         // callback is never fired at all.
         onsessioninitialized: (id) => {
           if (!this.sessions.has(id)) {
-            this.sessions.set(id, { transport, actor, createdAt: new Date().toISOString() });
+            this.sessions.set(id, { server, transport, actor, createdAt: new Date().toISOString() });
           }
         },
         onsessionclosed: (id) => {
@@ -167,7 +182,7 @@ export class SessionManager {
     // map) and the only way the unit test can
     // assert `mgr.get(id)?.actor.id === "claude-code"`
     // immediately after `create()`.
-    this.sessions.set(sessionId, { transport, actor, createdAt: new Date().toISOString() });
+    this.sessions.set(sessionId, { server, transport, actor, createdAt: new Date().toISOString() });
 
     // Fire-and-forget the MCP server binding.
     // Any rejection from `connect()` surfaces as
@@ -227,9 +242,29 @@ export class SessionManager {
    * `sessionIdGenerator: () => randomUUID()`
    * in the route layer would otherwise produce.
    *
+   * 2026-08-08 update (per-session McpServer):
+   * the route layer now constructs a fresh
+   * `McpServer` per session (SDK 1.29.0's
+   * `Server.connect(transport)` is single-shot;
+   * a second transport on the same `Server`
+   * throws "Already connected"). The `server`
+   * is passed in here and stored in the entry
+   * so the daemon can close it on
+   * `sessions.closeAll()`. The `create()`
+   * back-compat path also stores the
+   * `McpServer` it constructed (or received
+   * from the caller) in the same field.
+   *
    * @param id        The pre-generated session
    *                  id (UUID-shaped, but this
    *                  method does not validate).
+   * @param server    The per-session
+   *                  `McpServer` (composes
+   *                  its own `Server` internally
+   *                  — see `SessionEntry.server`
+   *                  for the SDK 1.29.0
+   *                  "Already connected"
+   *                  rationale).
    * @param transport The per-session
    *                  `StreamableHTTPServerTransport`.
    * @param actor     The actor for this session;
@@ -238,10 +273,12 @@ export class SessionManager {
    */
   register(
     id: string,
+    server: McpServer,
     transport: StreamableHTTPServerTransport,
     actor: SessionActor
   ): void {
     this.sessions.set(id, {
+      server,
       transport,
       actor,
       createdAt: new Date().toISOString()
@@ -264,13 +301,19 @@ export class SessionManager {
    * the seam to register the default actor on
    * first initialize; Task 10 will replace it
    * with explicit initialize-body parsing.
+   *
+   * 2026-08-08 update: also stores the
+   * per-session `server` so the daemon can
+   * close it on `sessions.closeAll()`.
    */
   forceRegister(
     id: string,
+    server: McpServer,
     transport: StreamableHTTPServerTransport,
     actor: SessionActor
   ): void {
     this.sessions.set(id, {
+      server,
       transport,
       actor,
       createdAt: new Date().toISOString()
@@ -280,8 +323,13 @@ export class SessionManager {
   /**
    * Tear down a single session. Deletes the
    * entry from the map first (so a re-entrant
-   * `close()` call is a no-op), then awaits the
-   * transport's `close()`. Per-session close
+   * `close()` call is a no-op), then awaits
+   * BOTH the per-session `McpServer.close()`
+   * and the transport's `close()`. The
+   * per-session server is closed first so the
+   * transport's `close()` does not race with
+   * the SDK's internal "Already connected"
+   * invariant on shutdown. Per-session close
    * errors are swallowed — `closeAll()` uses
    * `Promise.allSettled` so a failure on one
    * session does not block the others.
@@ -290,6 +338,7 @@ export class SessionManager {
     const entry = this.sessions.get(id);
     if (!entry) return;
     this.sessions.delete(id);
+    try { await entry.server.close(); } catch { /* swallow per-session errors */ }
     try { await entry.transport.close(); } catch { /* swallow per-session errors */ }
   }
 

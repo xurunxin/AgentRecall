@@ -347,6 +347,43 @@ describe("handleHttpRequest first-POST branch", () => {
     return { connect: vi.fn().mockResolvedValue(undefined) } as unknown as McpServer;
   }
 
+  function makeSessionCtx(opts: {
+    memoryService?: unknown;
+    identityResolver?: unknown;
+    dataHome?: string;
+    defaultActor?: string;
+    capabilityStore?: unknown;
+    activeProfile?: "core" | "extended";
+    authorization?: unknown;
+  } = {}) {
+    // Minimal stand-in for the
+    // `McpServerSessionContext` shape the
+    // route layer hands to
+    // `createMcpServerForSession`. The
+    // factory reads `ctx.memoryService.store`
+    // eagerly (it destructures it into the
+    // resource-context object), so the
+    // default below provides a `store`
+    // shim. The tool handlers and resource
+    // callbacks are never invoked in these
+    // tests (the SDK's `handleRequest` is
+    // spied on), so the shim's internals do
+    // not need to be real.
+    return {
+      memoryService: { store: {} },
+      identityResolver: {} as never,
+      dataHome: opts.dataHome ?? home(),
+      defaultActor: opts.defaultActor ?? "default-fallback",
+      capabilityStore: { hasCapability: () => false },
+      activeProfile: opts.activeProfile ?? "core",
+      authorization: { max_sensitivity: "normal", actorMaxSensitivity: "normal" } as never,
+      ...(opts.memoryService ? { memoryService: opts.memoryService } : {}),
+      ...(opts.identityResolver ? { identityResolver: opts.identityResolver } : {}),
+      ...(opts.capabilityStore ? { capabilityStore: opts.capabilityStore } : {}),
+      ...(opts.authorization ? { authorization: opts.authorization } : {})
+    } as Parameters<typeof import("../../src/mcp/http-server.js").handleHttpRequest>[3];
+  }
+
   it("registers the session with the parsed actor from initialize.params.actor", async () => {
     // Task 10: the first POST to /mcp is the MCP
     // `initialize` request. The route layer MUST
@@ -387,7 +424,6 @@ describe("handleHttpRequest first-POST branch", () => {
     ).mockResolvedValue(undefined);
     try {
       const sessions = new SessionManager();
-      const server = makeServer();
       const opts = {
         dataHome: home(),
         defaultActor: "default-fallback",
@@ -401,6 +437,7 @@ describe("handleHttpRequest first-POST branch", () => {
         allowedOrigins: [],
         bearerToken: "test-token"
       };
+      const sessionCtx = makeSessionCtx();
       const body = Buffer.from(JSON.stringify({
         jsonrpc: "2.0",
         id: 1,
@@ -414,7 +451,7 @@ describe("handleHttpRequest first-POST branch", () => {
       }));
       const req = makeReq(body, opts.bearerToken);
       const { res } = makeRes();
-      await handleHttpRequest(req, res, server, sessions, opts);
+      await handleHttpRequest(req, res, sessions, sessionCtx, opts);
       // The session map must have exactly one entry,
       // and the actor must be the parsed value
       // (NOT the daemon-wide default).
@@ -463,7 +500,6 @@ describe("handleHttpRequest first-POST branch", () => {
     // MUST NOT insert the session into the manager.
     const { handleHttpRequest } = await import("../../src/mcp/http-server.js");
     const sessions = new SessionManager();
-    const server = makeServer();
     const opts = {
       dataHome: home(),
       defaultActor: "default-fallback",
@@ -477,6 +513,7 @@ describe("handleHttpRequest first-POST branch", () => {
       allowedOrigins: [],
       bearerToken: "test-token"
     };
+    const sessionCtx = makeSessionCtx();
     const body = Buffer.from(JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
@@ -489,7 +526,7 @@ describe("handleHttpRequest first-POST branch", () => {
     }));
     const req = makeReq(body, opts.bearerToken);
     const { res, writeHead, end } = makeRes();
-    await handleHttpRequest(req, res, server, sessions, opts);
+    await handleHttpRequest(req, res, sessions, sessionCtx, opts);
     // 400 + missing_actor body.
     expect(writeHead).toHaveBeenCalledWith(400, expect.objectContaining({ "content-type": "application/json" }));
     const endArg = end.mock.calls[0]?.[0] as string | undefined;
@@ -535,16 +572,16 @@ describe("handleHttpRequest first-POST branch", () => {
     ).mockResolvedValue(undefined);
     try {
       const sessions = new SessionManager();
-      const server = makeServer();
       // Pre-register a session under a fixed
       // id so the follow-up branch can resolve
       // it via `sessions.get(id)`.
       const followUpSessionId = "00000000-0000-0000-0000-000000000001";
+      const followUpServer = makeServer();
       const followUpTransport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => followUpSessionId,
         enableDnsRebindingProtection: true
       });
-      sessions.register(followUpSessionId, followUpTransport, { kind: "user", id: "alice" });
+      sessions.register(followUpSessionId, followUpServer, followUpTransport, { kind: "user", id: "alice" });
       const opts = {
         dataHome: home(),
         defaultActor: "default-fallback",
@@ -558,6 +595,7 @@ describe("handleHttpRequest first-POST branch", () => {
         allowedOrigins: [],
         bearerToken: "test-token"
       };
+      const sessionCtx = makeSessionCtx();
       // A `tools/list` JSON-RPC body. NOT an
       // `initialize` — the follow-up branch
       // already has the session id from the
@@ -571,7 +609,7 @@ describe("handleHttpRequest first-POST branch", () => {
       }));
       const req = makeReqWithSessionId(body, opts.bearerToken, followUpSessionId);
       const { res } = makeRes();
-      await handleHttpRequest(req, res, server, sessions, opts);
+      await handleHttpRequest(req, res, sessions, sessionCtx, opts);
       // The follow-up branch must have called
       // the pre-registered transport's
       // `handleRequest` (NOT the first-POST

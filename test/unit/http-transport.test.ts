@@ -61,7 +61,7 @@ describe("SessionManager", () => {
     expect(mgr.get(id)).toBeUndefined();
   });
 
-  it("register(id, transport, actor) inserts an entry under a caller-supplied id", () => {
+  it("register(id, server, transport, actor) inserts an entry under a caller-supplied id", () => {
     // Task 9 fix-round 1 seam: the route layer
     // generates the id and passes it in so the
     // transport's `sessionIdGenerator` and the
@@ -69,15 +69,29 @@ describe("SessionManager", () => {
     // mismatch). The mock transport is a bare
     // object — we only assert the manager's
     // bookkeeping, not the transport's internals.
+    //
+    // 2026-08-08: the signature widens to accept
+    // the per-session `McpServer` (Task 11 fix
+    // for SDK 1.29.0's "Already connected" on
+    // shared `Server`). The mock is cast to
+    // `McpServer` via `unknown` so the structural
+    // type is accepted without enumerating
+    // every private field the SDK declares on
+    // the `Server` superclass.
     const mgr = new SessionManager();
     mgrs.push(mgr);
     const transport = { close: vi.fn().mockResolvedValue(undefined) } as unknown as { close(): Promise<void> };
+    const server = {
+      connect: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn().mockResolvedValue(undefined)
+    } as unknown as McpServer;
     const id = "caller-supplied-id-1";
-    mgr.register(id, transport as never, { kind: "agent", id: "agent-default" });
+    mgr.register(id, server, transport as never, { kind: "agent", id: "agent-default" });
     const entry = mgr.get(id);
     expect(entry).toBeDefined();
     expect(entry?.actor).toEqual({ kind: "agent", id: "agent-default" });
     expect(entry?.transport).toBe(transport);
+    expect(entry?.server).toBe(server);
     expect(entry?.createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 });

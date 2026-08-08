@@ -10,6 +10,25 @@
 // `StreamableHTTPServerTransport` registered
 // with the Task 8 `SessionManager`.
 //
+// 2026-08-08 (Task 11 fix): per-session
+// `McpServer`. The previous design shared a
+// single process-level `McpServer` across all
+// sessions; MCP SDK 1.29.0's
+// `Server.connect(transport)` is single-shot
+// and threw "Already connected" on the second
+// session. The first-POST branch now
+// constructs a fresh `McpServer` per session
+// via `createMcpServerForSession` and passes
+// it to `SessionManager.register(id, server,
+// transport, actor)`. The `MemoryService`
+// stays a process-level singleton (shared);
+// only the SDK `McpServer` instance is fresh.
+// The `installServerLifecycle` call receives
+// a SENTINEL `McpServer` whose `close()` is
+// a no-op for our per-session servers (the
+// real per-session teardown happens in
+// `sessions.closeAll()`).
+//
 // Design notes:
 //
 //   - All cross-task handoffs are honoured:
@@ -40,8 +59,9 @@
 //       `get(id)` is valid the moment
 //       `create()` returns. The HTTP route
 //       layer does NOT use `create()` — it
-//       uses the new (Task 9 fix-round 1)
-//       `register(id, transport, actor)`
+//       uses the new (Task 9 fix-round 1 +
+//       Task 11 per-session refactor)
+//       `register(id, server, transport, actor)`
 //       method so the id is generated in
 //       this file (matching the existing
 //       `randomUUID()` import) and the
@@ -52,16 +72,24 @@
 //       UUID-A-vs-UUID-B mismatch that
 //       `sessionIdGenerator: () =>
 //       randomUUID()` would otherwise
-//       introduce.
+//       introduce. The per-session
+//       `McpServer` is the second argument
+//       so the daemon can close it on
+//       `sessions.closeAll()`.
 //     * The `installServerLifecycle` call
-//       passes `transport: undefined`. The
-//       HTTP daemon is NOT a stdio transport;
-//       it manages its own `httpServer` +
+//       passes a SENTINEL `McpServer` (a
+//       fresh instance with no tools or
+//       resources). The HTTP daemon is NOT
+//       a stdio transport; it manages its
+//       own `httpServer` + per-session
+//       `McpServer`s via
 //       `SessionManager.closeAll()`. The
-//       lifecycle's `server.close()` and the
-//       caller-supplied `onShutdown` hook
-//       (which closes the SQLite store) are
-//       the relevant teardown steps.
+//       lifecycle's `server.close()` call
+//       on the sentinel is a documented
+//       no-op; the caller-supplied
+//       `onShutdown` hook (which closes
+//       the SQLite store) is the relevant
+//       teardown step.
 //     * No `idleTimeoutMs` is passed: the
 //       HTTP daemon runs until SIGINT /
 //       SIGTERM, not on idle residency.
@@ -138,7 +166,7 @@ import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { MemoryService } from "../memory-service.js";
-import { registerCoreTools, registerExtendedTools } from "../tools/register-tools.js";
+import { registerCoreTools, registerExtendedTools, type RequestTracker } from "../tools/register-tools.js";
 import { registerMemoryResources } from "./resources.js";
 import type { ToolProfile } from "../tools/profile.js";
 import { ProjectIdentityResolver } from "../scope-resolver.js";
@@ -313,6 +341,108 @@ function readAndParseBody(
 }
 
 /**
+ * The bundle of process-level state a
+ * per-session `McpServer` needs to wire its
+ * tools and resources. Extracted from
+ * `RunHttpServerOptions` so the per-session
+ * factory takes a single argument (the route
+ * layer calls `createMcpServerForSession(ctx)`
+ * for every new session) and so the process-
+ * level wiring in `runHttpServer` and the
+ * per-session wiring in the route handler
+ * stay in lock-step — if a new option is
+ * added to either, the other needs to be
+ * updated, and the type system makes that
+ * explicit.
+ *
+ * 2026-08-08: this is the bundle the
+ * `createMcpServerForSession` factory
+ * receives. The HTTP daemon stays a singleton
+ * (`MemoryService` is shared), but each new
+ * MCP session gets its own `McpServer` because
+ * SDK 1.29.0 `Server.connect(transport)` is
+ * single-shot.
+ */
+export interface McpServerSessionContext {
+  memoryService: MemoryService;
+  identityResolver: ProjectIdentityResolver;
+  dataHome: string;
+  defaultActor: string;
+  capabilityStore: CapabilityStore;
+  activeProfile: ToolProfile;
+  authorization: AuthorizationDecision;
+  /**
+   * Optional per-request in-flight tracker. The
+   * stdio idle timer needs the counter; the
+   * HTTP daemon does not (it runs until
+   * SIGINT / SIGTERM, not on idle residency),
+   * so this is omitted on the HTTP path.
+   * Mirrored from `RunHttpServerOptions` for
+   * type symmetry — if a future HTTP feature
+   * needs idle-equivalent observability, the
+   * tracker can be threaded through here.
+   * The explicit `| undefined` is required by
+   * `exactOptionalPropertyTypes: true`: an
+   * optional `?:` does NOT accept `undefined`
+   * as a value in that mode.
+   */
+  registerInFlight?: RequestTracker | undefined;
+}
+
+/**
+ * Build a fresh `McpServer` for one HTTP
+ * session, wired to the daemon-wide tools,
+ * resources, and request tracker. The session
+ * lifecycle owns the returned instance —
+ * the caller passes it to
+ * `SessionManager.register(id, server, transport, actor)`
+ * and `sessions.closeAll()` closes it on
+ * shutdown.
+ *
+ * 2026-08-08: the factory exists because MCP
+ * SDK 1.29.0's `Server.connect(transport)` is
+ * single-shot. The previous design shared a
+ * single process-level `McpServer` across all
+ * sessions; a second `connect()` would throw
+ * "Already connected". The fix is to
+ * construct a fresh `McpServer` per session
+ * and share only the `MemoryService`.
+ *
+ * The tool / resource registration body is
+ * byte-equivalent to the original
+ * `runHttpServer` block (this function is a
+ * straight extraction, not a refactor of the
+ * call sites).
+ */
+function createMcpServerForSession(
+  ctx: McpServerSessionContext
+): McpServer {
+  const server = new McpServer({ name: "agent-recall", version: serverVersion() });
+  if (ctx.activeProfile === "core") {
+    registerCoreTools(server, ctx.memoryService, ctx.registerInFlight);
+  } else {
+    registerExtendedTools(server, ctx.memoryService, ctx.registerInFlight);
+  }
+  registerMemoryResources(server, {
+    store: ctx.memoryService.store,
+    dataHome: ctx.dataHome,
+    defaultActor: ctx.defaultActor,
+    identityResolver: ctx.identityResolver,
+    activeProfile: ctx.activeProfile,
+    capabilityStore: ctx.capabilityStore,
+    authorization: ctx.authorization,
+    // `MemoryServerContext.actorMaxSensitivity` is
+    // a derived helper; the canonical decision is
+    // `authorization.max_sensitivity`. The
+    // resource layer keeps both fields
+    // consistent at the call site, so passing
+    // through is safe.
+    actorMaxSensitivity: ctx.authorization.max_sensitivity
+  });
+  return server;
+}
+
+/**
  * Start the shared-HTTP MCP daemon. The
  * function resolves only after the daemon's
  * shutdown sequence completes (typically
@@ -340,28 +470,52 @@ export async function runHttpServer(opts: RunHttpServerOptions): Promise<void> {
     throw new Error("allowedHosts must be non-empty");
   }
   const sessions = new SessionManager();
-  const server = new McpServer({ name: "agent-recall", version: serverVersion() });
-  if (opts.activeProfile === "core") {
-    registerCoreTools(server, opts.memoryService, opts.registerInFlight);
-  } else {
-    registerExtendedTools(server, opts.memoryService, opts.registerInFlight);
-  }
-  registerMemoryResources(server, {
-    store: opts.memoryService.store,
+  // 2026-08-08: per-session McpServer. The MCP
+  // SDK 1.29.0 `Server.connect(transport)` is
+  // single-shot — a second transport on the same
+  // `Server` throws "Already connected" — so the
+  // process-level `McpServer` is replaced with a
+  // fresh instance PER session. The
+  // `MemoryService` stays a process-level
+  // singleton (shared) because the SDK constraint
+  // is per-transport, not per-MemoryService.
+  // The factory below is invoked from the
+  // first-POST branch in `handleHttpRequest`
+  // once the per-session actor is known.
+  //
+  // `installServerLifecycle` still wants a
+  // `Server` argument. We pass a SENTINEL
+  // `McpServer` (a fresh instance whose
+  // `close()` is a no-op for our per-session
+  // servers; the real per-session teardown
+  // happens in `sessions.closeAll()`). The
+  // lifecycle's `server.close()` call is
+  // documented as a no-op for this sentinel.
+  const sessionFactoryContext: McpServerSessionContext = {
+    memoryService: opts.memoryService,
+    identityResolver: opts.identityResolver,
     dataHome: opts.dataHome,
     defaultActor: opts.defaultActor,
-    identityResolver: opts.identityResolver,
-    activeProfile: opts.activeProfile,
     capabilityStore: opts.capabilityStore,
+    activeProfile: opts.activeProfile,
     authorization: opts.authorization,
-    // `MemoryServerContext.actorMaxSensitivity` is
-    // a derived helper; the canonical decision is
-    // `authorization.max_sensitivity`. The
-    // resource layer keeps both fields
-    // consistent at the call site, so passing
-    // through is safe.
-    actorMaxSensitivity: opts.authorization.max_sensitivity
-  });
+    registerInFlight: opts.registerInFlight
+  };
+  const server = new McpServer({ name: "agent-recall", version: serverVersion() });
+  // SENTINEL for the lifecycle. With
+  // per-session `McpServer` (see the comment
+  // above `createMcpServerForSession`), the
+  // process-level `server` is no longer a
+  // "server that actually serves requests" —
+  // it exists only because
+  // `installServerLifecycle` requires a
+  // `Server` argument. Its `close()` is a
+  // no-op (the lifecycle's `server.close()`
+  // call resolves immediately on an empty
+  // server); the real per-session teardown
+  // happens in `sessions.closeAll()` (which
+  // closes both per-session transports and
+  // per-session servers).
   // v1.1.5 (Stage 4, task 9): wire the
   // shared shutdown sequence. The `transport`
   // option is omitted (rather than passed as
@@ -399,7 +553,7 @@ export async function runHttpServer(opts: RunHttpServerOptions): Promise<void> {
   });
 
   const httpServer = createServer((req, res) => {
-    handleHttpRequest(req, res, server, sessions, opts).catch((err) => {
+    handleHttpRequest(req, res, sessions, sessionFactoryContext, opts).catch((err) => {
       if (!res.headersSent) {
         res.writeHead(500, { "content-type": "application/json" });
       }
@@ -417,10 +571,16 @@ export async function runHttpServer(opts: RunHttpServerOptions): Promise<void> {
   // The local shutdown closure is the
   // daemon's own teardown: stop accepting
   // new connections, drain the per-session
-  // transports, then hand off to the
-  // lifecycle for the final
-  // `server.close` + `onShutdown` (SQLite
-  // release) sequence plus the 1.5s
+  // transports AND per-session `McpServer`
+  // instances (via `sessions.closeAll()` —
+  // each session's `server.close()` runs
+  // first so the transport's `close()` does
+  // not race the SDK's "Already connected"
+  // invariant on shutdown), then hand off to
+  // the lifecycle for the final
+  // `server.close` (the sentinel — no-op for
+  // per-session servers) + `onShutdown`
+  // (SQLite release) sequence plus the 1.5s
   // ceiling.
   const shutdown = async (): Promise<void> => {
     httpServer.close();
@@ -444,15 +604,17 @@ export async function runHttpServer(opts: RunHttpServerOptions): Promise<void> {
  *      the session and returns 204.
  *   3. `POST` without a session id
  *      constructs a new per-session
- *      transport. The id is generated HERE
- *      (Task 9 fix-round 1 shape); the
- *      transport's `sessionIdGenerator`
- *      returns the same id; `register(id,
+ *      transport AND a new per-session
+ *      `McpServer` (Task 11 / 2026-08-08
+ *      per-session refactor). The id is
+ *      generated HERE; the transport's
+ *      `sessionIdGenerator` returns the
+ *      same id; `register(id, server,
  *      transport, actor)` inserts the
  *      entry synchronously. The transport
- *      is wired to the server with
- *      `server.connect(transport)` and the
- *      first request is routed via
+ *      is wired to the per-session server
+ *      with `mcpServer.connect(transport)`
+ *      and the first request is routed via
  *      `transport.handleRequest(req, res)`.
  *      The client receives the session id
  *      in the response's `mcp-session-id`
@@ -471,8 +633,8 @@ export async function runHttpServer(opts: RunHttpServerOptions): Promise<void> {
 export async function handleHttpRequest(
   req: IncomingMessage,
   res: ServerResponse,
-  server: McpServer,
   sessions: SessionManager,
+  sessionCtx: McpServerSessionContext,
   opts: RunHttpServerOptions
 ): Promise<void> {
   try {
@@ -517,15 +679,31 @@ export async function handleHttpRequest(
 
   if (req.method === "POST" && !sessionId) {
     // First POST (MCP `initialize`): build a
-    // per-session transport under a
-    // pre-generated id so the manager's
-    // `register(id, ...)` and the
-    // transport's `sessionIdGenerator` see
-    // the same id. This eliminates the
-    // UUID-A-vs-UUID-B mismatch that an
-    // independent `() => randomUUID()`
-    // generator would produce (which would
-    // leak an orphan entry per session).
+    // per-session transport AND a per-session
+    // `McpServer` under a pre-generated id so
+    // the manager's `register(id, server,
+    // transport, actor)` and the transport's
+    // `sessionIdGenerator` see the same id.
+    // This eliminates the UUID-A-vs-UUID-B
+    // mismatch that an independent `() =>
+    // randomUUID()` generator would produce
+    // (which would leak an orphan entry per
+    // session).
+    //
+    // 2026-08-08: per-session McpServer. MCP
+    // SDK 1.29.0's `Server.connect(transport)`
+    // is single-shot — a second transport on
+    // the same `Server` throws "Already
+    // connected". A fresh `McpServer` is
+    // built via `createMcpServerForSession`
+    // once the per-session actor is known.
+    // The `MemoryService` stays shared at the
+    // process level because the SDK
+    // constraint is per-transport, not
+    // per-service. The per-session server is
+    // stored in `SessionEntry.server` and
+    // closed by `sessions.closeAll()` on
+    // shutdown.
     //
     // Task 10 (Stage 4): the request body
     // is buffered BEFORE the transport sees
@@ -552,7 +730,7 @@ export async function handleHttpRequest(
     // synchronously inserted via
     // `register()` (NOT `create()` — the
     // route layer owns the id, not the
-    // manager), `server.connect(transport)`
+    // manager), `mcpServer.connect(transport)`
     // is fired fire-and-forget, and the
     // first request is routed via
     // `handleRequest()`. The SDK's
@@ -582,12 +760,21 @@ export async function handleHttpRequest(
       ? parsed.actor
       : { kind: "agent", id: opts.defaultActor };
     const id = randomUUID();
+    // Per-session `McpServer`. The factory
+    // re-uses the process-level
+    // `MemoryService` and tools; only the
+    // SDK instance is fresh. The session's
+    // actor is the per-session value parsed
+    // above (Task 10); the daemon-wide
+    // `defaultActor` is the fallback for
+    // non-initialize first POSTs.
+    const mcpServer = createMcpServerForSession(sessionCtx);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => id,
       onsessionclosed: (closedId) => { void sessions.close(closedId); },
       enableDnsRebindingProtection: true
     });
-    sessions.register(id, transport, actor);
+    sessions.register(id, mcpServer, transport, actor);
     // SDK typing gap (modelcontextprotocol/sdk@^1.29.0):
     // `StreamableHTTPServerTransport.onclose` is
     // a getter that returns `(() => void) | undefined`,
@@ -601,7 +788,7 @@ export async function handleHttpRequest(
     // `@ts-expect-error` will become unused and
     // must be removed.
     // @ts-expect-error -- SDK onclose getter vs Transport interface (see comment above)
-    void server.connect(transport);
+    void mcpServer.connect(transport);
     // Pass the pre-parsed JSON object as the
     // third `parsedBody` argument so the SDK's
     // Zod schema can validate it directly. The
