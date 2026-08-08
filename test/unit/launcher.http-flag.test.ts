@@ -74,6 +74,47 @@ describe("decideMode with --http (v1.1.5)", () => {
     ).toBe("mcp");
   });
 
+  it("compat-name wins over explicit --http flag", () => {
+    // v1.1.4 compat-name contract: the
+    // basename `agent-recall-mcp` always
+    // routes to MCP stdio. The `--http`
+    // flag is accepted ONLY when basename
+    // is not the compat name. Pinning
+    // this case here so a future
+    // re-ordering of `decideMode` cannot
+    // silently break the v1.1.4 contract.
+    expect(decideMode("agent-recall-mcp", ["--http"])).toBe("mcp");
+  });
+
+  it("compat-name wins over AGENT_RECALL_MCP_TRANSPORT=http", () => {
+    // Same as the previous test but for
+    // the env override: the compat name
+    // is not influenced by env either.
+    // Mirrors the v1.1.4 contract that
+    // "the compat name always wins".
+    expect(
+      decideMode(
+        "agent-recall-mcp",
+        [],
+        { AGENT_RECALL_MCP_TRANSPORT: "http" }
+      )
+    ).toBe("mcp");
+  });
+
+  it("path-form compat-name wins over explicit --http flag", () => {
+    // Same precedence on a path-form
+    // basename, matching the v1.1.4
+    // regression test "routes a path-form
+    // `agent-recall-mcp.exe` to MCP". The
+    // `.exe` strip + basename comparison
+    // must still resolve to the compat
+    // name and short-circuit the
+    // dispatch.
+    expect(
+      decideMode("C:\\bin\\agent-recall-mcp.exe", ["--http"])
+    ).toBe("mcp");
+  });
+
   it("env value other than 'http' (exact match) does not select http", () => {
     // Match is case-sensitive and exact:
     // "HTTP", "stdio", empty, undefined all

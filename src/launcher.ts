@@ -19,18 +19,20 @@
 //
 // Dispatch contract (see
 // `docs/superpowers/specs/2026-08-04-unified-cli-mcp-executable-design.md`
-// and Stage 3 Task 7 brief):
+// and Stage 3 Task 7 brief).
 //
-//   - args[0] === "--http"          → HTTP.
-//     (Explicit opt-in; wins over every
-//     other rule, including the compat
-//     name, so wrappers and supervisors
-//     can force HTTP without renaming the
-//     binary.)
-//   - argv[0] basename matches `agent-recall-mcp`
-//     → MCP, regardless of arguments or
-//     env.
-//   - argv[0] basename matches `agent-recall`:
+// Precedence (highest first):
+//
+//   1. argv[0] basename matches `agent-recall-mcp`
+//      → MCP, regardless of arguments or
+//      env. The v1.1.4 compat-name contract
+//      always wins; `--http` and the env
+//      override do NOT apply.
+//   2. args[0] === "--http"          → HTTP.
+//      (Explicit opt-in for any non-
+//      compat-name invocation; wins over
+//      env and the canonical-name alias.)
+//   3. argv[0] basename matches `agent-recall`:
 //       - env.AGENT_RECALL_MCP_TRANSPORT
 //         === "http"               → HTTP.
 //         (Exact-match on the literal
@@ -39,7 +41,7 @@
 //       - no args                   → MCP.
 //       - args[0] === "mcp"         → MCP (explicit alias).
 //       - else                      → CLI (forward args).
-//   - anything else                 → CLI (forward args).
+//   4. anything else                 → CLI (forward args).
 //
 // The launcher identifies the binary by
 // the basename of `process.argv[0]`, with
@@ -122,20 +124,22 @@ export function decideMode(
   args: readonly string[],
   env: NodeJS.ProcessEnv = process.env
 ): DispatchMode {
-  // Explicit `--http` flag wins over
-  // everything: the compat name, the env
-  // override, and the canonical-name
-  // dispatch. Wrappers and supervisors
-  // can therefore force HTTP without
-  // renaming the binary or polluting the
-  // environment. Stage 3 / Task 7; the
-  // HTTP path itself is a stub until
+  const base = basenameOf(argv0);
+  // The compatibility name always wins —
+  // v1.1.4 contract. The `--http` flag and
+  // the env override do NOT apply to the
+  // compat name; it routes to MCP stdio
+  // regardless of arguments or env. This is
+  // the highest-priority rule.
+  if (base === "agent-recall-mcp") return "mcp";
+  // Explicit `--http` flag: only reached
+  // for non-compat-name basenames. Wrappers
+  // and supervisors can force HTTP without
+  // renaming the binary. Stage 3 / Task 7;
+  // the HTTP path itself is a stub until
   // Stage 4 wires in the real
   // `runHttpServer` (Task 9).
   if (args[0] === "--http") return "http";
-  const base = basenameOf(argv0);
-  // The compatibility name always wins.
-  if (base === "agent-recall-mcp") return "mcp";
   // The canonical name dispatches on
   // argument presence. A single leading
   // `mcp` token is the explicit alias.
