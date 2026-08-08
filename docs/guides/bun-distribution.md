@@ -206,10 +206,13 @@ SIGTERM, and clean up the temp `AGENT_RECALL_HOME`.
   `AGENT_RECALL_HTTP_PORT`, not the actually-bound port;
   clients following the recorded endpoint will not connect.
   Pin a fixed port in production.
-- **Network-share data home.** If the lockfile's parent
-  directory lands on NFS / SMB, the launcher prints a stderr
-  warning but does not refuse to start. Put
-  `AGENT_RECALL_HOME` on a local filesystem.
+- **Network-share data home.** A soft `fs.lstat` check on
+  the lockfile's parent directory is planned (per spec § 错误处理)
+  to print a stderr warning on NFS / SMB without refusing startup.
+  It is not yet implemented in v1.1.5. Putting
+  `AGENT_RECALL_HOME` on a local filesystem is the safe choice
+  either way (today's behaviour just doesn't warn, so mitigate
+  upstream).
 
 ## Capabilities
 

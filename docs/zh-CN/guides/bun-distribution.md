@@ -159,7 +159,7 @@ const sessionId = res.headers.get("mcp-session-id");
 
 - **lockfile 不在干净退出时 unlink**。守护进程在 shutdown 序列末尾调用 `process.exit(0)`，绕过 launcher 包裹 `runHttpServer` 的 `try/finally release()` 块。下次启动的 `acquireOrJoin` 通过 pid 探活 + 端口探活自动回收旧锁；新守护进程接管，token 轮换。
 - **OS-assigned 端口（`port=0`）不支持**。lockfile 的 `endpoint` 写入的是 `AGENT_RECALL_HTTP_PORT` 的请求值，**不会**反映实际绑定的端口；客户端按请求值连不上。生产环境固定端口即可。
-- **网络盘 data home**。锁文件 `fs.lstat` 父目录若命中 NFS / SMB 会有 stderr 警告（不强制退化）。建议把 `AGENT_RECALL_HOME` 放在本机文件系统。
+- **网络盘 data home**。spec 规划在 lockfile 父目录命中 NFS / SMB 时打印 stderr 警告（不强制退化），v1.1.5 尚未实装。届时把 `AGENT_RECALL_HOME` 放在本机文件系统是更稳的选择（当前实现未做软检查，提前规避即可）。
 
 ## 能力矩阵
 
