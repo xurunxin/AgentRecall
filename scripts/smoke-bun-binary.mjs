@@ -143,10 +143,24 @@ try {
     // `params.actor`; the brief's body omitted it,
     // which would have been rejected with 400
     // `missing_actor`).
+    //
+    // The `accept: application/json,
+    // text/event-stream` header is REQUIRED by
+    // the MCP SDK's `StreamableHTTPServerTransport`:
+    // without it the SDK's pre-flight 406s with
+    // "Not Acceptable: Client must accept both
+    // application/json and text/event-stream"
+    // (the Bun smoke discovered this gap on
+    // 2026-08-08; the Node test setup was lucky
+    // because the SDK's Hono adapter is more
+    // lenient for the initialize case on some
+    // Node versions — but the contract is
+    // explicit and the smoke should follow it).
     const res = await fetch(endpoint, {
       method: "POST",
       headers: {
         "content-type": "application/json",
+        accept: "application/json, text/event-stream",
         authorization: `Bearer ${token}`
       },
       body: JSON.stringify({
@@ -163,6 +177,42 @@ try {
     });
     if (res.status !== 200) {
       fail(7, `HTTP init status ${res.status} (expected 200)`);
+    }
+    // Follow-up probe (Task 11 / 2026-08-08):
+    // the per-session `McpServer` fix must be
+    // exercised end-to-end against the Bun
+    // binary. We capture the `mcp-session-id`
+    // header from the initialize response and
+    // POST a `tools/list` on the same session
+    // id; a 200 (or any 2xx — the SDK may
+    // answer as JSON or SSE for `tools/list`)
+    // proves the second `connect` did NOT
+    // throw "Already connected" (the bug that
+    // prompted the per-session refactor). The
+    // previous smoke only verified the first
+    // request, which passed even with the
+    // shared-server bug.
+    const sessionId = res.headers.get("mcp-session-id");
+    if (typeof sessionId !== "string" || sessionId.length === 0) {
+      fail(7, `initialize response missing mcp-session-id header (headers: ${JSON.stringify(Object.fromEntries(res.headers))})`);
+    }
+    const followUp = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        authorization: `Bearer ${token}`,
+        "mcp-session-id": sessionId
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/list",
+        params: {}
+      })
+    });
+    if (followUp.status < 200 || followUp.status >= 300) {
+      fail(7, `HTTP follow-up tools/list status ${followUp.status} (expected 2xx; per-session McpServer bug?)`);
     }
   } finally {
     // Best-effort cleanup of the daemon. The
