@@ -2,6 +2,7 @@
 
 > 日期：2026-08-06
 > 状态：已批准（2026-08-08 用户复核通过，沿用现有 spec 进入 writing-plans）
+> 修订：2026-08-08 Task 11 烟测发现 MCP SDK 1.29.0 `Server.connect(transport)` 是一次性的（多 transport 共享 server 抛 "Already connected"）。spec 改为"per-session McpServer,共享 MemoryService"以支持多客户端并发；详见组件节 http-server bullet 与 runHttpServer 节。
 > 作者：brainstorming 工作流
 
 ## 背景与问题
@@ -71,14 +72,16 @@
 │   │   session map: Map<sessionId, {transport, actor, sessionSecret}>             │               │
 │   │                ▼                                                           │               │
 │   │   ┌──────────────────────────────────────────────────────┐                    │               │
-│   │   │ 一个 McpServer (进程级)                                │                    │               │
+│   │   │ per-session McpServer（每个 MCP session 一个,        │                    │               │
+│   │   │   SDK 1.29.0 `Server.connect(transport)` 一次性,      │                    │               │
+│   │   │   不可在多 session 间共享同一 server）                 │                    │               │
 │   │   │   tools = registerCore|registerExtended              │                    │               │
 │   │   │   resources = registerMemoryResources               │                    │               │
 │   │   └────────────────────┬─────────────────────────────────┘                    │               │
 │   │                        ▼                                                   │               │
-│   │   一个 MemoryService (data_home + profile 锁)                                 │               │
+│   │   一个 MemoryService（进程级共享,data_home + profile 锁）                   │               │
 │   │   └─ read / write / maintenance 子服务                                       │               │
-│   │   └─ SQLite (WAL, busy_timeout=5000)                                          │               │
+│   │   └─ SQLite (WAL, busy_timeout=5000,单例)                                    │               │
 │   └──────────────────────────────────────────────────────────┘                    │               │
 │                                                                                              │
 │   锁文件: ${AGENT_RECALL_HOME}/.mcp-<profile>.lock  (JSON)                                     │
@@ -97,11 +100,18 @@
 - `src/mcp/http-server.ts` — 共享 HTTP daemon 入口。
   `runHttpServer({memoryService, identityResolver, dataHome, defaultActor,
   capabilityStore, activeProfile, authorization, bind: {host, port}})`。
-  内部构建一个 `McpServer`，按 profile 注册 `core`/`extended` 工具与
-  `registerMemoryResources`，挂载 `node:http`（Node）或 `Bun.serve`（Bun runtime）
-  路由，校验 `Host`/`Origin`/Bearer，登记 `StreamableHTTPServerTransport`
-  会话映射，调用 `installServerLifecycle({server, transport: undefined,
-  onShutdown, onShutdownError, onShutdownStart, shutdownTimeoutMs: 1500})`。
+  **2026-08-08 修订**：MCP SDK 1.29.0 的 `Server.connect(transport)` 是一次性的（抛
+  "Already connected"）。HTTP daemon 在每个新 MCP session 的 first-POST 分支
+  **新建一个 `McpServer` 实例**，按 profile 注册 `core`/`extended` 工具与
+  `registerMemoryResources`，然后 `server.connect(transport)`。MemoryService
+  保持进程级单例（共享）。SessionEntry 增加 `server` 字段，follow-up 请求
+  从 `sessions.get(id).server` 找到对应 server。
+  挂载 `node:http`（Node）或 `Bun.serve`（Bun runtime）路由，校验
+  `Host`/`Origin`/Bearer，登记 `StreamableHTTPServerTransport` 会话映射，
+  调用 `installServerLifecycle({server: <a per-session sentinel or any>,
+  transport: undefined, onShutdown, onShutdownError, onShutdownStart,
+  shutdownTimeoutMs: 1500})`。生命周期不拥有 server — daemon 在自己的
+  `httpServer.close()` + `sessions.closeAll()` 序列里收尾。
 - `src/mcp/http-transport.ts` — 会话层封装。`onSessionInit` → 新建 transport →
   注入 actor → `server.connect(transport)`；`onSessionClose` / `DELETE` →
   `transport.close()` → 从 map 移除。会话过期由“客户端发 DELETE + 进程退出”
@@ -163,17 +173,18 @@ decideMode → mcp + http flag → acquireOrJoin({dataHome, profile, buildEndpoi
    └─ 锁存在但 pid 死 / 探活失败 → fs.unlink 旧锁 → fs.open('wx') 写新锁 → runHttpServer
    ↓
 runHttpServer:
-   创建 McpServer（profile 工具 + resources）+ 一份 MemoryService
+   创建进程级 MemoryService（共享）+ 注册 profile-aware tool/resource factories
    ↓
    bind 127.0.0.1:<port>（port=0 随机；优先用锁文件里的旧 port）
    ↓
    启动 node:http.Server：
      • 任何 /mcp 请求 → validateRequest (Host/Origin/Bearer)
-     • POST 无 session → 新建 StreamableHTTPServerTransport(sessionIdGenerator, dns-rebinding-on, allowedHosts/Origins, onsessioninitialized, onsessionclosed)
-        → transport.start()，解析 initialize.params.actor，登记 map<sessionId, {transport, actor}>
+     • POST 无 session → 新建 StreamableHTTPServerTransport + 新建 McpServer（per-session）
+        → 按 profile 注册 core/extended 工具 + registerMemoryResources
         → server.connect(transport)
-     • POST 带 session → 路由已有 transport
-     • DELETE → transport.close()，从 map 移除
+        → 解析 initialize.params.actor，登记 map<sessionId, {server, transport, actor, createdAt}>
+     • POST 带 session → 从 map 拿到 (server, transport)，transport.handleRequest(req, res, parsed)
+     • DELETE → sessions.close(sessionId)：关闭 transport、释放 server
    ↓
    installServerLifecycle({server, transport: undefined, onShutdown: store.close, …})
    ↓
