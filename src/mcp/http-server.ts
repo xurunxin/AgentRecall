@@ -77,17 +77,31 @@
 //     § 错误处理 ("MCP `initialize` 缺 `actor` →
 //     400 + 关闭 transport（不入 map）") and the
 //     session is NOT inserted into the manager's
-//     map. The buffered body is passed to the
-//     SDK as `parsedBody` (the third argument to
-//     `transport.handleRequest`) so the transport
-//     can re-parse the same JSON without
+//     map. The pre-parsed JSON object is passed to
+//     the SDK as `parsedBody` (the third argument
+//     to `transport.handleRequest`) so the SDK's
+//     Zod schema can validate it directly without
 //     re-reading the (now-consumed) `req` data
 //     events. This is the canonical
 //     `modelcontextprotocol/sdk@^1.29.0` path for
 //     pre-buffered request bodies — the JSDoc on
 //     `StreamableHTTPServerTransport.handleRequest`
-//     documents the `parsedBody` parameter
-//     explicitly.
+//     (`node_modules/@modelcontextprotocol/sdk/dist
+//     /esm/server/streamableHttp.d.ts:105`)
+//     documents the `parsedBody` parameter as
+//     "Optional pre-parsed body from body-parser
+//     middleware" (i.e. a JS object, NOT a raw
+//     Buffer). The follow-up POST branch mirrors
+//     the same body-buffering + `parsedBody`
+//     pattern for symmetry: the SDK always gets
+//     the pre-parsed object, never re-reads from
+//     `req`. If `JSON.parse` fails, the raw Buffer
+//     is passed as the fallback (the SDK's Zod
+//     schema rejects both shapes with a clean
+//     JSON-RPC 400, but a Buffer is a safer
+//     fallback than `undefined` because the
+//     latter would make the SDK re-read from
+//     `req` — which has been consumed).
 //
 //   - The minimum-viable surface from the
 //     brief: the daemon does NOT manage the
@@ -257,19 +271,43 @@ export function parseInitializeBody(body: Buffer): InitializeParseResult {
 
 /**
  * Buffer the request body into a single
- * `Buffer`. The Node `IncomingMessage` emits
- * `data` chunks followed by a single `end`
- * event; the helper listens for both and
- * resolves with the concatenated buffer. The
- * `error` event rejects the promise so an
- * early socket error propagates to the route
- * handler's outer `.catch`.
+ * `Buffer` AND `JSON.parse` it. The Node
+ * `IncomingMessage` emits `data` chunks followed
+ * by a single `end` event; the helper listens for
+ * both and resolves with the concatenated buffer
+ * (also pre-parsed as a JS object so the route
+ * layer can pass it straight to the SDK as
+ * `parsedBody` without re-reading from `req`,
+ * whose `data` events have been consumed). The
+ * `error` event rejects the promise so an early
+ * socket error propagates to the route handler's
+ * outer `.catch`. `parsed` is `undefined` on
+ * parse failure (e.g. empty body or non-JSON
+ * bytes) — the route layer passes
+ * `parsed ?? body` to the SDK so the fallback
+ * shape is the raw Buffer (the SDK's Zod schema
+ * will reject it with a clean JSON-RPC 400
+ * rather than re-reading from a consumed `req`).
  */
-function readBody(req: IncomingMessage): Promise<Buffer> {
-  return new Promise<Buffer>((resolve, reject) => {
+function readAndParseBody(
+  req: IncomingMessage
+): Promise<{ body: Buffer; parsed: unknown }> {
+  return new Promise<{ body: Buffer; parsed: unknown }>((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => { chunks.push(chunk); });
-    req.on("end", () => { resolve(Buffer.concat(chunks)); });
+    req.on("end", () => {
+      const body = Buffer.concat(chunks);
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(body.toString("utf8"));
+      } catch {
+        // Unparseable body — leave `parsed` as
+        // `undefined` so the caller falls back to
+        // passing the raw `body` to the SDK.
+        parsed = undefined;
+      }
+      resolve({ body, parsed });
+    });
     req.on("error", (err) => { reject(err); });
   });
 }
@@ -499,12 +537,13 @@ export async function handleHttpRequest(
     // without a valid `params.actor` is
     // rejected with 400 and the session is
     // NOT inserted into the map. The
-    // buffered body is passed to the SDK
-    // as the third `parsedBody` argument to
-    // `transport.handleRequest` so the
-    // transport re-parses the same JSON
-    // without re-reading the (now-consumed)
-    // `req` data events.
+    // pre-parsed JSON object (`parsed` from
+    // `readAndParseBody`) is passed to the
+    // SDK as the third `parsedBody`
+    // argument to `transport.handleRequest`
+    // so the SDK's Zod schema can validate
+    // it directly without re-reading the
+    // (now-consumed) `req` data events.
     //
     // The id is generated here, the
     // transport is built with a
@@ -524,7 +563,7 @@ export async function handleHttpRequest(
     // `onsessionclosed` callback stays so
     // the map entry is removed when the
     // transport closes.
-    const body = await readBody(req);
+    const { body, parsed: parsedJson } = await readAndParseBody(req);
     const parsed = parseInitializeBody(body);
     if (parsed.outcome === "reject") {
       // Spec § 错误处理: "MCP `initialize`
@@ -563,16 +602,26 @@ export async function handleHttpRequest(
     // must be removed.
     // @ts-expect-error -- SDK onclose getter vs Transport interface (see comment above)
     void server.connect(transport);
-    // Pass the buffered body as the third
-    // argument so the SDK uses the parsed
-    // JSON directly. The SDK's
-    // `StreamableHTTPServerTransport.handleRequest`
-    // JSDoc documents the `parsedBody` parameter
-    // as the canonical "pre-parsed body from
-    // body-parser middleware" path; the transport
-    // does NOT re-read from `req` when this is
-    // provided.
-    await transport.handleRequest(req, res, body);
+    // Pass the pre-parsed JSON object as the
+    // third `parsedBody` argument so the SDK's
+    // Zod schema can validate it directly. The
+    // SDK's `StreamableHTTPServerTransport.
+    // handleRequest` JSDoc
+    // (`node_modules/@modelcontextprotocol/sdk/
+    // dist/esm/server/streamableHttp.d.ts:105`)
+    // documents the `parsedBody` parameter as
+    // "Optional pre-parsed body from body-parser
+    // middleware" — i.e. a JS object, NOT a raw
+    // Buffer. Passing a Buffer would fail
+    // `JSONRPCMessageSchema.parse()` and the SDK
+    // would write 400 "Parse error: Invalid
+    // JSON-RPC message". The `parsedJson ?? body`
+    // fallback handles the parse-failure case:
+    // the raw Buffer is the safer fallback than
+    // `undefined` (which would make the SDK
+    // re-read from `req`, whose data events
+    // have been consumed by `readAndParseBody`).
+    await transport.handleRequest(req, res, parsedJson ?? body);
     return;
   }
 
@@ -583,7 +632,22 @@ export async function handleHttpRequest(
   // silent hang.
   const resolvedSession = sessionId ? sessions.get(sessionId) : undefined;
   if (resolvedSession) {
-    await resolvedSession.transport.handleRequest(req, res);
+    // Same body-buffering contract as the
+    // first-POST branch: buffer + JSON-parse
+    // BEFORE the transport sees `req`, then
+    // pass the pre-parsed JS object as
+    // `parsedBody`. This is the canonical SDK
+    // pattern documented on
+    // `StreamableHTTPServerTransport.handleRequest`'s
+    // JSDoc and ensures the SDK's Zod schema
+    // can validate the message without
+    // re-reading from `req`. `parsed ?? body`
+    // falls back to the raw Buffer on
+    // `JSON.parse` failure (see the
+    // `readAndParseBody` JSDoc for the
+    // rationale).
+    const { body, parsed: parsedJson } = await readAndParseBody(req);
+    await resolvedSession.transport.handleRequest(req, res, parsedJson ?? body);
     return;
   }
   res.writeHead(400, { "content-type": "application/json" });

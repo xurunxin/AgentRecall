@@ -254,12 +254,21 @@ describe("handleHttpRequest first-POST branch", () => {
   function makeReq(body: Buffer, bearerToken: string): IncomingMessage {
     // Minimal `IncomingMessage` mock. The route
     // layer only reads `method`, `headers`, `url`,
-    // and (via `readBody`) the `data` / `end` events.
-    // We emit a single `data` chunk with the body,
-    // then `end`, so `readBody` resolves to the
-    // provided buffer. The Bearer token must match
-    // `opts.bearerToken` (the route layer's
-    // `validateRequest` runs first).
+    // and (via `readAndParseBody`) the `data` / `end`
+    // events. We emit a single `data` chunk with
+    // the body, then `end`, so `readAndParseBody`
+    // resolves to the provided buffer. The Bearer
+    // token must match `opts.bearerToken` (the
+    // route layer's `validateRequest` runs first).
+    //
+    // The test spies on
+    // `StreamableHTTPServerTransport.prototype.handleRequest`
+    // (see below) so the SDK's Hono-based
+    // response writer is NOT actually invoked.
+    // This keeps the mock minimal — we only
+    // assert on the `parsedBody` argument the
+    // route layer passes to the SDK, not on the
+    // SDK's own response writing.
     const req = new EventEmitter() as unknown as IncomingMessage;
     (req as { method: string }).method = "POST";
     (req as { headers: Record<string, string> }).headers = {
@@ -269,8 +278,34 @@ describe("handleHttpRequest first-POST branch", () => {
     };
     (req as { url: string }).url = "/mcp";
     // Emit on the next tick so the listener
-    // attached inside `readBody` is in place
-    // before the `data` and `end` events fire.
+    // attached inside `readAndParseBody` is in
+    // place before the `data` and `end` events
+    // fire.
+    process.nextTick(() => {
+      req.emit("data", body);
+      req.emit("end");
+    });
+    return req;
+  }
+
+  function makeReqWithSessionId(
+    body: Buffer,
+    bearerToken: string,
+    sessionId: string
+  ): IncomingMessage {
+    // Same as `makeReq` but with an `mcp-session-id`
+    // header so the route layer's follow-up branch
+    // resolves the session via `sessions.get(id)`.
+    // See `makeReq` for the mock's rationale.
+    const req = new EventEmitter() as unknown as IncomingMessage;
+    (req as { method: string }).method = "POST";
+    (req as { headers: Record<string, string> }).headers = {
+      host: "127.0.0.1:7777",
+      "content-type": "application/json",
+      authorization: `Bearer ${bearerToken}`,
+      "mcp-session-id": sessionId
+    };
+    (req as { url: string }).url = "/mcp";
     process.nextTick(() => {
       req.emit("data", body);
       req.emit("end");
@@ -288,7 +323,11 @@ describe("handleHttpRequest first-POST branch", () => {
     // `setHeader`, `writeHead(status, headers)`, and
     // `end(body?)`. The mock records each call so
     // the test can assert the response status and
-    // body without a real socket.
+    // body without a real socket. The transport's
+    // `handleRequest` is spied on (see below), so
+    // the Hono adapter's response writer is NOT
+    // actually invoked — the mock doesn't need a
+    // `write` method for SSE streaming.
     const setHeader = vi.fn();
     const writeHead = vi.fn().mockReturnThis();
     const end = vi.fn();
@@ -317,57 +356,104 @@ describe("handleHttpRequest first-POST branch", () => {
     // ("每客户端的 actor 从 initialize 中提取") plus
     // the shared-HTTP row in § 错误处理
     // ("缺 actor → 400").
+    //
+    // Task 10 fix round 2: the test MUST also
+    // assert on the `parsedBody` argument the
+    // route layer passes to
+    // `transport.handleRequest`. A raw Buffer
+    // here means the SDK's Zod schema would
+    // reject it with 400 "Parse error: Invalid
+    // JSON-RPC message" — the original task-10
+    // bug. A pre-parsed JS object passes the
+    // Zod validation. The test spies on
+    // `StreamableHTTPServerTransport.prototype.
+    // handleRequest` to capture the call
+    // arguments directly, bypassing the SDK's
+    // Hono-based response writer (which is hard
+    // to mock fully in a unit test — the mock
+    // `ServerResponse` is too minimal for SSE
+    // streaming, and the Hono adapter's body
+    // drain fails on a plain `EventEmitter`
+    // IncomingMessage, writing a 500 from
+    // `handleFetchError` regardless of whether
+    // the route layer's `parsedBody` is correct).
     const { handleHttpRequest } = await import("../../src/mcp/http-server.js");
-    const sessions = new SessionManager();
-    const server = makeServer();
-    const opts = {
-      dataHome: home(),
-      defaultActor: "default-fallback",
-      activeProfile: "core",
-      identityResolver: {} as never,
-      memoryService: {} as never,
-      capabilityStore: { hasCapability: () => false } as never,
-      authorization: { actorMaxSensitivity: "normal", profile: "core" } as never,
-      bind: { host: "127.0.0.1", port: 0 },
-      allowedHosts: ["127.0.0.1:7777"],
-      allowedOrigins: [],
-      bearerToken: "test-token"
-    };
-    const body = Buffer.from(JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "initialize",
-      params: {
-        protocolVersion: "2025-01-01",
-        capabilities: {},
-        clientInfo: { name: "test", version: "1" },
-        actor: { kind: "user", id: "alice" }
-      }
-    }));
-    const req = makeReq(body, opts.bearerToken);
-    const { res } = makeRes();
-    // The transport's `handleRequest` will throw
-    // (no real `McpServer` connected; the transport
-    // is constructed but its `onmessage` handler is
-    // never wired up by the mock). The route layer
-    // awaits the transport, so we wrap the call
-    // to swallow the expected error and let the
-    // test assert on the side effects that already
-    // happened.
+    const { StreamableHTTPServerTransport } = await import(
+      "@modelcontextprotocol/sdk/server/streamableHttp.js"
+    );
+    const handleRequestSpy = vi.spyOn(
+      StreamableHTTPServerTransport.prototype,
+      "handleRequest"
+    ).mockResolvedValue(undefined);
     try {
+      const sessions = new SessionManager();
+      const server = makeServer();
+      const opts = {
+        dataHome: home(),
+        defaultActor: "default-fallback",
+        activeProfile: "core",
+        identityResolver: {} as never,
+        memoryService: {} as never,
+        capabilityStore: { hasCapability: () => false } as never,
+        authorization: { actorMaxSensitivity: "normal", profile: "core" } as never,
+        bind: { host: "127.0.0.1", port: 0 },
+        allowedHosts: ["127.0.0.1:7777"],
+        allowedOrigins: [],
+        bearerToken: "test-token"
+      };
+      const body = Buffer.from(JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-01-01",
+          capabilities: {},
+          clientInfo: { name: "test", version: "1" },
+          actor: { kind: "user", id: "alice" }
+        }
+      }));
+      const req = makeReq(body, opts.bearerToken);
+      const { res } = makeRes();
       await handleHttpRequest(req, res, server, sessions, opts);
-    } catch {
-      // Expected — see comment above.
+      // The session map must have exactly one entry,
+      // and the actor must be the parsed value
+      // (NOT the daemon-wide default).
+      const internalMap = (sessions as unknown as {
+        sessions: Map<string, { actor: SessionActor }>;
+      }).sessions;
+      const entries = [...internalMap.values()];
+      expect(entries).toHaveLength(1);
+      expect(entries[0]?.actor).toEqual({ kind: "user", id: "alice" });
+      // The route layer MUST have called the
+      // SDK's `handleRequest` with a pre-parsed
+      // JS object as the third `parsedBody`
+      // argument (NOT a raw Buffer). The SDK's
+      // JSDoc documents `parsedBody` as
+      // "Optional pre-parsed body from
+      // body-parser middleware" — a JS object.
+      // A Buffer would fail the SDK's
+      // `JSONRPCMessageSchema.parse()` and
+      // return 400 "Parse error: Invalid
+      // JSON-RPC message". The fix passes the
+      // pre-parsed JS object.
+      expect(handleRequestSpy).toHaveBeenCalledTimes(1);
+      const thirdArg = handleRequestSpy.mock.calls[0]?.[2];
+      // The third argument must be a JS object
+      // (the pre-parsed JSON), NOT a Buffer.
+      expect(Buffer.isBuffer(thirdArg)).toBe(false);
+      expect(thirdArg).toBeTypeOf("object");
+      expect(thirdArg).not.toBeNull();
+      // The pre-parsed object must have the
+      // JSON-RPC `initialize` shape — the SDK
+      // validates this via Zod.
+      expect(thirdArg).toMatchObject({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize"
+      });
+    } finally {
+      handleRequestSpy.mockRestore();
     }
-    // The session map must have exactly one entry,
-    // and the actor must be the parsed value
-    // (NOT the daemon-wide default).
-    const internalMap = (sessions as unknown as {
-      sessions: Map<string, { actor: SessionActor }>;
-    }).sessions;
-    const entries = [...internalMap.values()];
-    expect(entries).toHaveLength(1);
-    expect(entries[0]?.actor).toEqual({ kind: "user", id: "alice" });
   });
 
   it("returns 400 + does not register when initialize lacks params.actor", async () => {
@@ -415,5 +501,115 @@ describe("handleHttpRequest first-POST branch", () => {
       sessions: Map<string, unknown>;
     }).sessions;
     expect(internalMap.size).toBe(0);
+  });
+
+  it("delivers follow-up POST to the resolved session transport with parsedBody", async () => {
+    // Task 10 fix round 2: a follow-up POST
+    // (with an `mcp-session-id` header) must
+    // reach the session's transport AND the
+    // route layer must pass the pre-parsed JS
+    // object as `parsedBody`. The original
+    // implementation called
+    // `transport.handleRequest(req, res)`
+    // without a `parsedBody` — the SDK would
+    // read from `req` (whose data events may
+    // be consumed in some flows), and even if
+    // it read fresh bytes, the SDK's Zod
+    // schema would still process them. The
+    // fix buffers the body and passes the
+    // pre-parsed JS object as `parsedBody`,
+    // mirroring the first-POST branch's
+    // contract. The test spies on
+    // `StreamableHTTPServerTransport.prototype.
+    // handleRequest` to capture the call
+    // arguments (see the first-POST test for
+    // the rationale on bypassing the Hono
+    // adapter's response writer).
+    const { handleHttpRequest } = await import("../../src/mcp/http-server.js");
+    const { StreamableHTTPServerTransport } = await import(
+      "@modelcontextprotocol/sdk/server/streamableHttp.js"
+    );
+    const handleRequestSpy = vi.spyOn(
+      StreamableHTTPServerTransport.prototype,
+      "handleRequest"
+    ).mockResolvedValue(undefined);
+    try {
+      const sessions = new SessionManager();
+      const server = makeServer();
+      // Pre-register a session under a fixed
+      // id so the follow-up branch can resolve
+      // it via `sessions.get(id)`.
+      const followUpSessionId = "00000000-0000-0000-0000-000000000001";
+      const followUpTransport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => followUpSessionId,
+        enableDnsRebindingProtection: true
+      });
+      sessions.register(followUpSessionId, followUpTransport, { kind: "user", id: "alice" });
+      const opts = {
+        dataHome: home(),
+        defaultActor: "default-fallback",
+        activeProfile: "core",
+        identityResolver: {} as never,
+        memoryService: {} as never,
+        capabilityStore: { hasCapability: () => false } as never,
+        authorization: { actorMaxSensitivity: "normal", profile: "core" } as never,
+        bind: { host: "127.0.0.1", port: 0 },
+        allowedHosts: ["127.0.0.1:7777"],
+        allowedOrigins: [],
+        bearerToken: "test-token"
+      };
+      // A `tools/list` JSON-RPC body. NOT an
+      // `initialize` — the follow-up branch
+      // already has the session id from the
+      // header, so this exercises the second-
+      // request path.
+      const body = Buffer.from(JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/list",
+        params: {}
+      }));
+      const req = makeReqWithSessionId(body, opts.bearerToken, followUpSessionId);
+      const { res } = makeRes();
+      await handleHttpRequest(req, res, server, sessions, opts);
+      // The follow-up branch must have called
+      // the pre-registered transport's
+      // `handleRequest` (NOT the first-POST
+      // branch, which would create a NEW
+      // transport).
+      expect(handleRequestSpy).toHaveBeenCalledTimes(1);
+      const thirdArg = handleRequestSpy.mock.calls[0]?.[2];
+      // The third argument must be a JS
+      // object (the pre-parsed JSON), NOT a
+      // Buffer and NOT `undefined`. Passing
+      // `undefined` would make the SDK re-read
+      // from `req` (whose data events have
+      // been consumed by `readAndParseBody`).
+      // Passing a Buffer would fail the SDK's
+      // Zod validation with 400 "Parse error".
+      expect(Buffer.isBuffer(thirdArg)).toBe(false);
+      expect(thirdArg).toBeTypeOf("object");
+      expect(thirdArg).not.toBeNull();
+      expect(thirdArg).not.toBeUndefined();
+      // The pre-parsed object must have the
+      // JSON-RPC `tools/list` shape.
+      expect(thirdArg).toMatchObject({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/list"
+      });
+      // The session map still has exactly one
+      // entry (the pre-registered one) — the
+      // follow-up branch did NOT create a new
+      // session.
+      const internalMap = (sessions as unknown as {
+        sessions: Map<string, { actor: SessionActor }>;
+      }).sessions;
+      const entries = [...internalMap.values()];
+      expect(entries).toHaveLength(1);
+      expect(entries[0]?.actor).toEqual({ kind: "user", id: "alice" });
+    } finally {
+      handleRequestSpy.mockRestore();
+    }
   });
 });
