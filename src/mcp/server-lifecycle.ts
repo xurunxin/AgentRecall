@@ -135,7 +135,8 @@ export type ShutdownReason =
   | "stdio_end"
   | "stdio_close"
   | "SIGINT"
-  | "SIGTERM";
+  | "SIGTERM"
+  | "stdio_idle_timeout";
 
 export type ServerLifecycleOptions = {
   /**
@@ -243,6 +244,38 @@ export type ServerLifecycleOptions = {
    * is ignored.
    */
   process?: NodeJS.Process;
+
+  /**
+   * Idle residency ceiling in milliseconds.
+   * When set to a positive value, the lifecycle
+   * starts an internal `unref`'d timer on every
+   * `data` event on `stdin` (and on install);
+   * if the timer fires AND `isMessageInFlight`
+   * reports `false`, the lifecycle triggers
+   * shutdown with reason `"stdio_idle_timeout"`.
+   * When `0` (or omitted), idle residency is
+   * preserved: the server only exits when the
+   * stdio pipe is genuinely gone, matching the
+   * pre-idle behaviour. Task 3 wires the
+   * `idle-timer.ts` `IdleTimerHandle` into this
+   * option from the MCP entry; the lifecycle
+   * itself owns the trigger wiring.
+   */
+  idleTimeoutMs?: number;
+
+  /**
+   * Caller-supplied gate consulted when the
+   * idle timer fires. Returning `true` means a
+   * request is mid-flight: the timer is
+   * re-armed (NOT lost) so the deadline is
+   * pushed out and the server keeps running.
+   * Returning `false` (or `undefined`) lets the
+   * idle trigger fire. Optional; when omitted
+   * the idle trigger fires unconditionally at
+   * the deadline. Ignored when `idleTimeoutMs`
+   * is `0` or omitted.
+   */
+  isMessageInFlight?: () => boolean;
 };
 
 export type ServerLifecycleHandle = {
@@ -514,9 +547,60 @@ export function installServerLifecycle(
     target.addListener("SIGTERM", onSigterm);
   }
 
+  // Idle wiring (Stage 1 of the lifecycle plan):
+  // when `idleTimeoutMs > 0` the lifecycle arms an
+  // unref'd timer. On the deadline it consults
+  // `isMessageInFlight` and either re-arms (a
+  // request is mid-flight, so the deadline is
+  // pushed out) or triggers
+  // `stdio_idle_timeout`. Every `data` event on
+  // `stdin` re-arms the timer so a chatty client
+  // never sees a spurious exit. The same
+  // re-arm-on-stall fix from `src/mcp/idle-timer.ts`
+  // (Task 1) applies here: a one-shot `setTimeout`
+  // would lose the deadline when a request is
+  // mid-flight, leaving the server unable to exit
+  // for the rest of its residency.
+  let idlePending: NodeJS.Timeout | undefined;
+  const idleClearTimer = (): void => {
+    if (idlePending !== undefined) {
+      clearTimeout(idlePending);
+      idlePending = undefined;
+    }
+  };
+  const idleOnData = (): void => {
+    // Traffic on stdin pushes the deadline out.
+    idleSchedule();
+  };
+  const idleSchedule = (): void => {
+    if (options.idleTimeoutMs === undefined || options.idleTimeoutMs <= 0) {
+      return;
+    }
+    idleClearTimer();
+    idlePending = setTimeout(() => {
+      idlePending = undefined;
+      if (options.isMessageInFlight?.() === true) {
+        // Stalled: a request is mid-flight. Re-arm
+        // so the deadline is pushed out instead of
+        // being lost. Mirrors `idle-timer.ts`.
+        idleSchedule();
+        return;
+      }
+      triggerExternal("stdio_idle_timeout");
+    }, options.idleTimeoutMs);
+    // `unref()` so a pending timer never blocks
+    // the event loop from draining (e.g. when
+    // the stdio pipe closes the same tick).
+    idlePending.unref();
+  };
+  stdin.on("data", idleOnData);
+  idleSchedule();
+
   const cleanup = (): void => {
     stdin.off("end", onStdinEnd);
     stdin.off("close", onStdinClose);
+    stdin.off("data", idleOnData);
+    idleClearTimer();
     for (const target of targets) {
       target.removeListener("SIGINT", onSigint);
       target.removeListener("SIGTERM", onSigterm);
