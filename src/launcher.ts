@@ -211,20 +211,156 @@ async function loadMcpMain(): Promise<() => Promise<void>> {
   return mod.main;
 }
 
-// Placeholder for the shared-HTTP daemon
-// runtime. Stage 3 / Task 7 wires the
-// launcher to detect HTTP mode; the real
-// implementation — which will reuse
-// `src/mcp/daemon-lock.ts` (acquireOrJoin)
-// and `src/mcp/auth.ts` (validateRequest)
-// — lands in Stage 4 / Task 9. Throwing a
-// clearly labelled TODO keeps the wiring
-// honest: any code that accidentally
-// reaches HTTP mode in this task fails
-// fast with an actionable message rather
-// than silently starting the stdio path.
+// Stage 4 / Task 9: the shared-HTTP daemon
+// runtime. The previous stub (Task 7)
+// threw a TODO so the dispatch wiring
+// stayed honest; this task replaces it
+// with the real entry. The wrapper
+// (1) resolves the per-process context
+// (data home, active profile, bind
+// address, host / origin whitelists) from
+// env vars and the helper exports of
+// `src/index.ts`, (2) calls
+// `acquireOrJoin` to derive the bearer
+// token + the canonical endpoint, and
+// (3) hands the bundle to the real
+// `runHttpServer` in
+// `src/mcp/http-server.ts`. The wrapper
+// preserves the Task 7 signature
+// (no-arg) so the dispatch call site
+// stays stable; future tasks that want
+// to pass argv-sourced config can extend
+// the signature without breaking the
+// routing tests.
+//
+// Lockfile release note: the daemon's
+// `installServerLifecycle` calls
+// `process.exit(0)` after the shutdown
+// sequence, so the wrapper's `finally`
+// block does not run on a clean exit.
+// The next launcher's `acquireOrJoin`
+// reclaims the stale lockfile via the
+// pid-alive probe + network probe in
+// `src/mcp/daemon-lock.ts`. A future
+// task can pass the `lockPath` into the
+// daemon (or wrap the lifecycle) so the
+// release happens before `process.exit`
+// if a stricter contract is required.
 async function runHttpServer(): Promise<void> {
-  throw new Error("TODO: implement runHttpServer (stage 4)");
+  // v1.1.5 (Stage 4, task 9): lazy
+  // import so the stdio / CLI dispatch
+  // path is not slowed by the HTTP-only
+  // modules. The launcher's `decideMode`
+  // helper stays pure and import-free.
+  const indexMod = await import("./index.js") as {
+    resolveDataHome: (env?: NodeJS.ProcessEnv) => string;
+    createService: (
+      dataHome: string,
+      opts: { capabilityStore?: unknown },
+      profile: "core" | "extended" | "admin"
+    ) => unknown;
+  };
+  const { resolveActiveProfile } = await import("./tools/profile.js");
+  const { resolveActor } = await import("./actor.js");
+  const { ProjectIdentityResolver } = await import("./scope-resolver.js");
+  const { CapabilityStore } = await import("./admin/capability.js");
+  const { resolveAuthorization } = await import("./services/auth-context.js");
+  const { acquireOrJoin, release } = await import("./mcp/daemon-lock.js");
+  const { runHttpServer: realRunHttpServer } = await import("./mcp/http-server.js");
+
+  const dataHome = indexMod.resolveDataHome();
+  const activeProfile = resolveActiveProfile();
+  const capabilityStore = new CapabilityStore(dataHome, { persistent: true });
+  // v1.1.2 (issue #23, ADR-0001): the
+  // admin profile refuses to start without
+  // a valid operator capability. The stdio
+  // entry surfaces a stderr line + non-zero
+  // exit; the HTTP entry does the same so
+  // an admin-bound supervisor sees the
+  // matching failure mode.
+  if (activeProfile === "admin" && !capabilityStore.hasCapability()) {
+    throw new Error(
+      "agent-recall: HTTP daemon requires AGENT_RECALL_PROFILE=admin " +
+        "AND a valid operator capability; run `agent-recall admin grant` " +
+        "to install one"
+    );
+  }
+  const memoryService = indexMod.createService(
+    dataHome,
+    { capabilityStore },
+    activeProfile
+  ) as Parameters<typeof realRunHttpServer>[0]["memoryService"];
+  const defaultActor = resolveActor(undefined);
+  const identityResolver = new ProjectIdentityResolver(
+    (memoryService as { store: { close: () => void } }).store as never,
+    defaultActor
+  );
+  // v1.1.5 (Stage 4, task 9): bind config
+  // is sourced from env vars so a wrapper
+  // supervisor can pin the host / port
+  // without changing the launcher. Default
+  // is loopback + ephemeral (port 0) for
+  // safety. The endpoint is built from the
+  // requested port; the actual bound port
+  // (when 0) is recorded by the lockfile
+  // reclaim path on the next launcher.
+  const host = process.env.AGENT_RECALL_HTTP_HOST ?? "127.0.0.1";
+  const port = Number.parseInt(
+    process.env.AGENT_RECALL_HTTP_PORT ?? "7777",
+    10
+  );
+  const bind = { host, port };
+  // v1.1.5 (Stage 4, task 9): the host
+  // whitelist is derived from the bind
+  // address (loopback + bound port). The
+  // origin whitelist is read from a
+  // comma-separated env var so an operator
+  // can add a trusted browser origin
+  // without rebuilding the binary.
+  const allowedHosts = [`${host}:${port}`];
+  const allowedOrigins = (process.env.AGENT_RECALL_HTTP_ALLOWED_ORIGINS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  const hasCapability = capabilityStore.hasCapability();
+  const authorization = resolveAuthorization(
+    { activeProfile, hasCapability },
+    { kind: "read", restrictedAllowed: false }
+  );
+
+  const lock = await acquireOrJoin({
+    dataHome,
+    profile: activeProfile,
+    buildEndpoint: () => `http://${host}:${port}/mcp`,
+    probe: async () => false
+  });
+
+  try {
+    await realRunHttpServer({
+      dataHome,
+      defaultActor,
+      activeProfile,
+      identityResolver,
+      memoryService,
+      capabilityStore,
+      authorization,
+      bind,
+      allowedHosts,
+      allowedOrigins,
+      bearerToken: lock.token
+    });
+  } finally {
+    // The daemon's `process.exit(0)` on
+    // a clean shutdown prevents this
+    // branch from running in the happy
+    // path. It DOES run if the daemon
+    // throws before registering the
+    // SIGINT/SIGTERM handlers (e.g. the
+    // `allowedHosts` precondition). See
+    // the lockfile-release note above
+    // for the stale-reclaim follow-up.
+    await release({ lockPath: lock.lockPath, expectedPid: process.pid });
+  }
 }
 
 /**
