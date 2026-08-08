@@ -84,6 +84,21 @@ describe("daemon-lock", () => {
     expect(fresh.pid).toBe(process.pid);
   });
 
+  it("treats corrupt lock as missing and reclaims", async () => {
+    const h = home();
+    const p = pathFor({ dataHome: h, profile: "core" });
+    writeFileSync(p, "{not valid json");
+    const r = await acquireOrJoin({
+      dataHome: h,
+      profile: "core",
+      buildEndpoint: () => "http://127.0.0.1:7777/mcp"
+    });
+    expect(r.joined).toBe(false);
+    expect(r.endpoint).toBe("http://127.0.0.1:7777/mcp");
+    const fresh = JSON.parse(readFileSync(p, "utf8"));
+    expect(fresh.pid).toBe(process.pid);
+  });
+
   it("release deletes the lock when pid matches", async () => {
     const h = home();
     const r = await acquireOrJoin({

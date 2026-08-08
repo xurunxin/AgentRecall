@@ -137,6 +137,9 @@ function readLock(p: string): LockPayload | undefined {
   try {
     return JSON.parse(readFileSync(p, "utf8")) as LockPayload;
   } catch {
+    // Corrupt lockfile: spec § 锁文件 "视为无锁、回退重写". Unlink so the
+    // follow-up `openSync(p, "wx")` in acquireOrJoin does not hit EEXIST.
+    try { unlinkSync(p); } catch { /* already gone */ }
     return undefined;
   }
 }
