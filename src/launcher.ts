@@ -1,26 +1,45 @@
 // src/launcher.ts
 //
-// v1.1.4 unified CLI and MCP executable.
+// v1.1.5 unified CLI and MCP executable.
 //
 // A small dispatcher that routes
-// `process.argv` to either the CLI
-// implementation (`src/cli/index.ts` —
-// `runCli`) or the MCP stdio server
-// (`src/index.ts` — `main`). The launcher
-// owns the routing decision only; the CLI
-// and MCP service modules remain the
-// canonical source of behaviour.
+// `process.argv` to one of three runtimes:
+// the CLI implementation
+// (`src/cli/index.ts` — `runCli`), the MCP
+// stdio server (`src/index.ts` — `main`),
+// or the MCP shared-HTTP daemon (a
+// placeholder `runHttpServer` stub in
+// this task; the real implementation in
+// Task 9 / Stage 4 will reuse the
+// `daemon-lock` and `auth` modules). The
+// launcher owns the routing decision
+// only; the CLI, MCP, and HTTP service
+// modules remain the canonical source of
+// behaviour.
 //
 // Dispatch contract (see
-// `docs/superpowers/specs/2026-08-04-unified-cli-mcp-executable-design.md`):
+// `docs/superpowers/specs/2026-08-04-unified-cli-mcp-executable-design.md`
+// and Stage 3 Task 7 brief):
 //
+//   - args[0] === "--http"          → HTTP.
+//     (Explicit opt-in; wins over every
+//     other rule, including the compat
+//     name, so wrappers and supervisors
+//     can force HTTP without renaming the
+//     binary.)
 //   - argv[0] basename matches `agent-recall-mcp`
-//     → MCP, regardless of arguments.
+//     → MCP, regardless of arguments or
+//     env.
 //   - argv[0] basename matches `agent-recall`:
-//       - no args              → MCP.
-//       - args[0] === "mcp"    → MCP (explicit alias).
-//       - else                 → CLI (forward args).
-//   - anything else            → CLI (forward args).
+//       - env.AGENT_RECALL_MCP_TRANSPORT
+//         === "http"               → HTTP.
+//         (Exact-match on the literal
+//         string "http"; "HTTP" or
+//         "stdio" do not opt in.)
+//       - no args                   → MCP.
+//       - args[0] === "mcp"         → MCP (explicit alias).
+//       - else                      → CLI (forward args).
+//   - anything else                 → CLI (forward args).
 //
 // The launcher identifies the binary by
 // the basename of `process.argv[0]`, with
@@ -30,7 +49,7 @@
 // directory or any absolute path
 // component.
 
-export type DispatchMode = "cli" | "mcp";
+export type DispatchMode = "cli" | "mcp" | "http";
 
 export interface DispatchRequest {
   /** The invoked executable path, i.e.
@@ -98,14 +117,34 @@ export interface DispatchDecision {
   forwardedArgs: string[];
 }
 
-export function decideMode(argv0: string, args: readonly string[]): DispatchMode {
+export function decideMode(
+  argv0: string,
+  args: readonly string[],
+  env: NodeJS.ProcessEnv = process.env
+): DispatchMode {
+  // Explicit `--http` flag wins over
+  // everything: the compat name, the env
+  // override, and the canonical-name
+  // dispatch. Wrappers and supervisors
+  // can therefore force HTTP without
+  // renaming the binary or polluting the
+  // environment. Stage 3 / Task 7; the
+  // HTTP path itself is a stub until
+  // Stage 4 wires in the real
+  // `runHttpServer` (Task 9).
+  if (args[0] === "--http") return "http";
   const base = basenameOf(argv0);
   // The compatibility name always wins.
   if (base === "agent-recall-mcp") return "mcp";
   // The canonical name dispatches on
   // argument presence. A single leading
   // `mcp` token is the explicit alias.
+  // The env override is checked first so
+  // a wrapper script can set the env
+  // once and have every invocation route
+  // to HTTP without re-flagging.
   if (base === "agent-recall") {
+    if (env.AGENT_RECALL_MCP_TRANSPORT === "http") return "http";
     if (args.length === 0) return "mcp";
     if (args[0] === "mcp") return "mcp";
     return "cli";
@@ -125,9 +164,13 @@ export function decideMode(argv0: string, args: readonly string[]): DispatchMode
  * `decideMode` + `dispatch`; the test
  * suite only exercises the routing table.
  */
-export function decide(argv0: string, args: readonly string[]): DispatchDecision {
-  const mode = decideMode(argv0, args);
-  if (mode === "mcp") {
+export function decide(
+  argv0: string,
+  args: readonly string[],
+  env: NodeJS.ProcessEnv = process.env
+): DispatchDecision {
+  const mode = decideMode(argv0, args, env);
+  if (mode === "mcp" || mode === "http") {
     return { mode, forwardedArgs: [] };
   }
   return { mode, forwardedArgs: args.slice() };
@@ -164,6 +207,22 @@ async function loadMcpMain(): Promise<() => Promise<void>> {
   return mod.main;
 }
 
+// Placeholder for the shared-HTTP daemon
+// runtime. Stage 3 / Task 7 wires the
+// launcher to detect HTTP mode; the real
+// implementation — which will reuse
+// `src/mcp/daemon-lock.ts` (acquireOrJoin)
+// and `src/mcp/auth.ts` (validateRequest)
+// — lands in Stage 4 / Task 9. Throwing a
+// clearly labelled TODO keeps the wiring
+// honest: any code that accidentally
+// reaches HTTP mode in this task fails
+// fast with an actionable message rather
+// than silently starting the stdio path.
+async function runHttpServer(): Promise<void> {
+  throw new Error("TODO: implement runHttpServer (stage 4)");
+}
+
 /**
  * Production dispatch. Runs the chosen
  * runtime to completion and returns the
@@ -178,6 +237,21 @@ async function loadMcpMain(): Promise<() => Promise<void>> {
  */
 export async function dispatch(req: DispatchRequest): Promise<DispatchMode> {
   const decision = decide(req.argv0, req.args);
+  if (decision.mode === "http") {
+    // HTTP mode: the stub in this task
+    // throws a TODO. Task 9 replaces the
+    // stub with the real
+    // `acquireOrJoin` + `validateRequest`
+    // + Node http.createServer path. The
+    // rejection propagates to the
+    // `main().catch(...)` handler at the
+    // bottom of this file, which surfaces
+    // it on stderr with a non-zero exit
+    // code — the existing launch-failure
+    // contract.
+    await runHttpServer();
+    return "http";
+  }
   if (decision.mode === "mcp") {
     const mcpMain = await loadMcpMain();
     await mcpMain();
