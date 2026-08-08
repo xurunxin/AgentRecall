@@ -66,6 +66,29 @@
 //       HTTP daemon runs until SIGINT /
 //       SIGTERM, not on idle residency.
 //
+//   - The first-POST branch buffers the request
+//     body BEFORE the transport sees it, parses
+//     the JSON to extract `params.actor` from
+//     the MCP `initialize` request, and uses the
+//     parsed actor (or the daemon-wide default for
+//     non-initialize first POSTs) to register the
+//     session. An `initialize` without a valid
+//     `params.actor` is rejected with 400 per spec
+//     § 错误处理 ("MCP `initialize` 缺 `actor` →
+//     400 + 关闭 transport（不入 map）") and the
+//     session is NOT inserted into the manager's
+//     map. The buffered body is passed to the
+//     SDK as `parsedBody` (the third argument to
+//     `transport.handleRequest`) so the transport
+//     can re-parse the same JSON without
+//     re-reading the (now-consumed) `req` data
+//     events. This is the canonical
+//     `modelcontextprotocol/sdk@^1.29.0` path for
+//     pre-buffered request bodies — the JSDoc on
+//     `StreamableHTTPServerTransport.handleRequest`
+//     documents the `parsedBody` parameter
+//     explicitly.
+//
 //   - The minimum-viable surface from the
 //     brief: the daemon does NOT manage the
 //     lockfile itself. The launcher calls
@@ -134,6 +157,121 @@ export interface RunHttpServerOptions {
   allowedOrigins: string[];
   bearerToken: string;
   registerInFlight?: { onStart: () => void; onEnd: () => void };
+}
+
+/**
+ * Outcome of `parseInitializeBody`. The
+ * first-POST branch in `handleHttpRequest` uses
+ * this to decide which actor to register the
+ * session under (or whether to reject the
+ * request outright).
+ *
+ *   - `"actor"`: a valid `initialize` body with
+ *     a parseable `params.actor`. The session is
+ *     registered with `actor` and the actor is
+ *     locked for the session's lifetime per spec
+ *     § actor 锁定.
+ *   - `"default-actor"`: a non-`initialize`
+ *     first POST, or an unparseable body. The
+ *     daemon-wide `opts.defaultActor` is used
+ *     (the SDK will reject the request because
+ *     the stateful transport requires
+ *     `initialize` first).
+ *   - `"reject"`: an `initialize` body without
+ *     a valid `params.actor`. The route layer
+ *     writes 400 per spec § 错误处理 and does
+ *     NOT insert the session into the map.
+ */
+export type InitializeParseResult =
+  | { outcome: "actor"; actor: SessionActor }
+  | { outcome: "default-actor" }
+  | { outcome: "reject"; reason: "missing_actor" | "invalid_actor" };
+
+// Canonical set of valid `SessionActor.kind`
+// values. Mirrored from `SessionActor` (in
+// `./http-transport.ts`) to keep the parser
+// self-contained: a future kind added to the
+// union without updating this set would silently
+// be rejected as `invalid_actor`, which is the
+// safer failure mode.
+const VALID_ACTOR_KINDS: ReadonlySet<SessionActor["kind"]> = new Set([
+  "agent",
+  "user",
+  "service"
+]);
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Parse a buffered request body to extract
+ * `params.actor` for the MCP `initialize`
+ * request. The shape is:
+ *
+ *   `{"jsonrpc":"2.0","id":...,"method":"initialize","params":{"protocolVersion":...,"capabilities":...,"clientInfo":{...},"actor":{"kind":"agent|user|service","id":"<non-empty string>"}}}`
+ *
+ * per the spec § 错误处理 table row
+ * "MCP `initialize` 缺 `actor`" and the per-
+ * spec extension that `actor` is the canonical
+ * session-actor field. The helper is pure
+ * (no I/O, no state) and exported so the unit
+ * suite can exercise the parse + validate
+ * branch in isolation from the route handler.
+ */
+export function parseInitializeBody(body: Buffer): InitializeParseResult {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body.toString("utf8"));
+  } catch {
+    // Unparseable body: not an initialize.
+    return { outcome: "default-actor" };
+  }
+  if (!isPlainObject(parsed)) {
+    return { outcome: "default-actor" };
+  }
+  if (parsed["method"] !== "initialize") {
+    return { outcome: "default-actor" };
+  }
+  const params = parsed["params"];
+  if (!isPlainObject(params)) {
+    return { outcome: "reject", reason: "missing_actor" };
+  }
+  const actor = params["actor"];
+  if (actor === undefined || actor === null) {
+    return { outcome: "reject", reason: "missing_actor" };
+  }
+  if (!isPlainObject(actor)) {
+    return { outcome: "reject", reason: "invalid_actor" };
+  }
+  const kind = actor["kind"];
+  const id = actor["id"];
+  if (typeof kind !== "string" || !VALID_ACTOR_KINDS.has(kind as SessionActor["kind"])) {
+    return { outcome: "reject", reason: "invalid_actor" };
+  }
+  if (typeof id !== "string" || id.length === 0) {
+    return { outcome: "reject", reason: "invalid_actor" };
+  }
+  return { outcome: "actor", actor: { kind: kind as SessionActor["kind"], id } };
+}
+
+/**
+ * Buffer the request body into a single
+ * `Buffer`. The Node `IncomingMessage` emits
+ * `data` chunks followed by a single `end`
+ * event; the helper listens for both and
+ * resolves with the concatenated buffer. The
+ * `error` event rejects the promise so an
+ * early socket error propagates to the route
+ * handler's outer `.catch`.
+ */
+function readBody(req: IncomingMessage): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    req.on("data", (chunk: Buffer) => { chunks.push(chunk); });
+    req.on("end", () => { resolve(Buffer.concat(chunks)); });
+    req.on("error", (err) => { reject(err); });
+  });
 }
 
 /**
@@ -292,7 +430,7 @@ export async function runHttpServer(opts: RunHttpServerOptions): Promise<void> {
  * unhandled error does not leave the
  * connection hanging.
  */
-async function handleHttpRequest(
+export async function handleHttpRequest(
   req: IncomingMessage,
   res: ServerResponse,
   server: McpServer,
@@ -351,6 +489,23 @@ async function handleHttpRequest(
     // generator would produce (which would
     // leak an orphan entry per session).
     //
+    // Task 10 (Stage 4): the request body
+    // is buffered BEFORE the transport sees
+    // it, so we can parse `params.actor`
+    // from the MCP `initialize` body and
+    // register the session with the parsed
+    // actor (NOT the daemon-wide default).
+    // Per spec § 错误处理, an `initialize`
+    // without a valid `params.actor` is
+    // rejected with 400 and the session is
+    // NOT inserted into the map. The
+    // buffered body is passed to the SDK
+    // as the third `parsedBody` argument to
+    // `transport.handleRequest` so the
+    // transport re-parses the same JSON
+    // without re-reading the (now-consumed)
+    // `req` data events.
+    //
     // The id is generated here, the
     // transport is built with a
     // `sessionIdGenerator` that returns
@@ -369,8 +524,25 @@ async function handleHttpRequest(
     // `onsessionclosed` callback stays so
     // the map entry is removed when the
     // transport closes.
+    const body = await readBody(req);
+    const parsed = parseInitializeBody(body);
+    if (parsed.outcome === "reject") {
+      // Spec § 错误处理: "MCP `initialize`
+      // 缺 `actor` → 400 + 关闭 transport
+      // （不入 map）". The transport was
+      // never created in this branch (the
+      // session is not registered, so
+      // there is nothing to close), so the
+      // "关闭 transport" half of the spec
+      // text is trivially satisfied.
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: parsed.reason }));
+      return;
+    }
+    const actor: SessionActor = parsed.outcome === "actor"
+      ? parsed.actor
+      : { kind: "agent", id: opts.defaultActor };
     const id = randomUUID();
-    const actor: SessionActor = { kind: "agent", id: opts.defaultActor };
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => id,
       onsessionclosed: (closedId) => { void sessions.close(closedId); },
@@ -391,7 +563,16 @@ async function handleHttpRequest(
     // must be removed.
     // @ts-expect-error -- SDK onclose getter vs Transport interface (see comment above)
     void server.connect(transport);
-    await transport.handleRequest(req, res);
+    // Pass the buffered body as the third
+    // argument so the SDK uses the parsed
+    // JSON directly. The SDK's
+    // `StreamableHTTPServerTransport.handleRequest`
+    // JSDoc documents the `parsedBody` parameter
+    // as the canonical "pre-parsed body from
+    // body-parser middleware" path; the transport
+    // does NOT re-read from `req` when this is
+    // provided.
+    await transport.handleRequest(req, res, body);
     return;
   }
 
