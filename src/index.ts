@@ -12,6 +12,7 @@ import {
   registerExtendedTools
 } from "./tools/register-tools.js";
 import { registerMemoryResources } from "./mcp/resources.js";
+import { startIdleTimer } from "./mcp/idle-timer.js";
 import { resolveActiveProfile, type ToolProfile } from "./tools/profile.js";
 import { resolveActor } from "./actor.js";
 import { ProjectIdentityResolver } from "./scope-resolver.js";
@@ -120,6 +121,21 @@ export async function main(): Promise<void> {
     name: serverName(),
     version: serverVersion()
   });
+  // v1.1.5 (Stage 1, task 3): shared in-flight
+  // request counter. Mutated by the per-tool
+  // tracker hooks the registration helpers wrap
+  // around their callbacks, and read by
+  // `isMessageInFlight` when the stdio idle-exit
+  // timer (below) fires so the deadline is held
+  // while a tool handler is mid-flight. Wrapped
+  // in an object so both call sites (the
+  // registration hooks + the timer predicate)
+  // share the same value via closure capture;
+  // a plain `number` `let` would also work, but
+  // the object keeps the read-site (`inFlightCount.value`)
+  // and the write-sites (`inFlightCount.value++/--`)
+  // visually symmetric.
+  const inFlightCount = { value: 0 };
   // v1.1.2 (issue #22) + Stage 18 v1.1.2
   // (issue #23): the per-profile tool registration.
   // `core` is the packaged default (the safe,
@@ -138,9 +154,15 @@ export async function main(): Promise<void> {
   // `registerCoreTools` / `registerExtendedTools`
   // boundary.
   if (activeProfile === "core") {
-    registerCoreTools(server, service);
+    registerCoreTools(server, service, {
+      onStart: () => inFlightCount.value++,
+      onEnd: () => inFlightCount.value--
+    });
   } else {
-    registerExtendedTools(server, service);
+    registerExtendedTools(server, service, {
+      onStart: () => inFlightCount.value++,
+      onEnd: () => inFlightCount.value--
+    });
   }
   registerMemoryResources(server, {
     store: service.store,
@@ -208,7 +230,12 @@ export async function main(): Promise<void> {
   const { installServerLifecycle } = await import(
     "./mcp/server-lifecycle.js"
   );
-  installServerLifecycle({
+  // v1.1.5 (Stage 1, task 3): capture the
+  // handle so the idle-timer trigger (below) can
+  // call `shutdown("stdio_idle_timeout")` and
+  // reuse the same verbose-reason log + 1.5s
+  // ceiling as the stdin/signal paths.
+  const lifecycleHandle = installServerLifecycle({
     server,
     transport,
     onShutdown: () => service.store.close(),
@@ -227,7 +254,8 @@ export async function main(): Promise<void> {
       // (PR-8, issue #16) so the hot path stays
       // silent unless the operator opts in. The
       // reason string is one of "stdio_end",
-      // "stdio_close", "SIGINT", "SIGTERM".
+      // "stdio_close", "SIGINT", "SIGTERM",
+      // "stdio_idle_timeout".
       if (process.env.AGENT_RECALL_VERBOSE_STDIO === "1") {
         const label =
           reason === "stdio_end" ? "stdin EOF" :
@@ -239,6 +267,39 @@ export async function main(): Promise<void> {
       }
     }
   });
+  // v1.1.5 (Stage 1, task 3): wire the
+  // call-site idle timer from
+  // `src/mcp/idle-timer.ts` so an idle stdio
+  // session eventually exits without operator
+  // action. Default 600_000 ms (10 min) when
+  // `AGENT_RECALL_STDIO_IDLE_MS` is unset; set
+  // to `0` to disable (matches the lifecycle's
+  // idle-residency contract — the v1.1.4 fix
+  // promised "no exit on mere inactivity", so
+  // operators must opt in to the timer
+  // explicitly). The `trigger` reuses the
+  // lifecycle's `shutdown()` so the verbose
+  // reason log (`AGENT_RECALL_VERBOSE_STDIO=1`)
+  // and 1.5s ceiling apply unchanged. We do
+  // NOT pass the `idleTimeoutMs` / `isMessageInFlight`
+  // options on `installServerLifecycle` itself:
+  // that wiring path is reserved for a future
+  // HTTP transport (Stage 2+); the stdio path
+  // owns its timer end-to-end.
+  const idleMs = Number.parseInt(
+    process.env.AGENT_RECALL_STDIO_IDLE_MS ?? "600000",
+    10
+  );
+  if (Number.isFinite(idleMs) && idleMs > 0) {
+    startIdleTimer({
+      stdin: process.stdin,
+      idleMs,
+      isMessageInFlight: () => inFlightCount.value > 0,
+      trigger: (reason) => {
+        lifecycleHandle.shutdown(reason);
+      }
+    });
+  }
   // Stage 16 v1.1.1 PR-8 (issue #16, spec § 11.2):
   // the connected-on-stdio status hint is gated
   // behind `AGENT_RECALL_VERBOSE_STDIO` so the

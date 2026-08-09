@@ -99,6 +99,7 @@
 // Zero new dependencies: Node stdlib only.
 
 import type { ReadStream } from "node:tty";
+import { PassThrough } from "node:stream";
 
 /**
  * Minimal contract every "closeable" collaborator
@@ -135,7 +136,8 @@ export type ShutdownReason =
   | "stdio_end"
   | "stdio_close"
   | "SIGINT"
-  | "SIGTERM";
+  | "SIGTERM"
+  | "stdio_idle_timeout";
 
 export type ServerLifecycleOptions = {
   /**
@@ -221,8 +223,40 @@ export type ServerLifecycleOptions = {
    * `close`. Defaults to `process.stdin`. Tests
    * pass a mock `Readable` so they can drive the
    * events without touching the real stdio.
+   *
+   * Ignored when `disableStdin: true` is set
+   * (the v1.1.5 HTTP daemon opts in so a
+   * supervisor-launched daemon with closed /
+   * redirected stdin — `agent-recall --http
+   * </dev/null` — does not trip a spurious
+   * stdio-EOF shutdown on the first event-loop
+   * tick after `listen`).
    */
   stdin?: NodeJS.ReadStream;
+
+  /**
+   * v1.1.5 (review by chatgpt-codex-connector on
+   * PR #40): opt-out switch for the `end` / `close`
+   * / `data` listeners on the stdin stream. The
+   * shared-HTTP daemon is NOT a stdio transport;
+   * it runs until SIGINT / SIGTERM, not on EOF.
+   * Installing the default stdin listeners caused
+   * supervisors and `</dev/null` launches to
+   * trigger the stdio-EOF shutdown path
+   * immediately and tear the daemon down before
+   * the first HTTP request. When `true`, the
+   * lifecycle skips installing the stdin listeners
+   * AND skips the idle-timer wiring (the idle
+   * timer re-arms on `data` events, so a stdin-less
+   * install has no input stream to observe). The
+   * stdio idle-exit feature is therefore mutually
+   * exclusive with this flag; callers wanting both
+   * must wire the idle timer themselves. The HTTP
+   * daemon does not use the idle timer, so the
+   * combination is the canonical "HTTP lifecycle
+   * mode".
+   */
+  disableStdin?: boolean;
 
   /**
    * The `EventEmitter`-shaped target the module
@@ -243,6 +277,38 @@ export type ServerLifecycleOptions = {
    * is ignored.
    */
   process?: NodeJS.Process;
+
+  /**
+   * Idle residency ceiling in milliseconds.
+   * When set to a positive value, the lifecycle
+   * starts an internal `unref`'d timer on every
+   * `data` event on `stdin` (and on install);
+   * if the timer fires AND `isMessageInFlight`
+   * reports `false`, the lifecycle triggers
+   * shutdown with reason `"stdio_idle_timeout"`.
+   * When `0` (or omitted), idle residency is
+   * preserved: the server only exits when the
+   * stdio pipe is genuinely gone, matching the
+   * pre-idle behaviour. Task 3 wires the
+   * `idle-timer.ts` `IdleTimerHandle` into this
+   * option from the MCP entry; the lifecycle
+   * itself owns the trigger wiring.
+   */
+  idleTimeoutMs?: number;
+
+  /**
+   * Caller-supplied gate consulted when the
+   * idle timer fires. Returning `true` means a
+   * request is mid-flight: the timer is
+   * re-armed (NOT lost) so the deadline is
+   * pushed out and the server keeps running.
+   * Returning `false` (or `undefined`) lets the
+   * idle trigger fire. Optional; when omitted
+   * the idle trigger fires unconditionally at
+   * the deadline. Ignored when `idleTimeoutMs`
+   * is `0` or omitted.
+   */
+  isMessageInFlight?: () => boolean;
 };
 
 export type ServerLifecycleHandle = {
@@ -302,7 +368,28 @@ const DEFAULT_SHUTDOWN_TIMEOUT_MS = 1500;
 export function installServerLifecycle(
   options: ServerLifecycleOptions
 ): ServerLifecycleHandle {
-  const stdin: NodeJS.ReadStream = options.stdin ?? process.stdin;
+  // v1.1.5 (review by chatgpt-codex-connector on
+  // PR #40, item "Stop treating HTTP daemon stdin
+  // EOF as shutdown"): the HTTP daemon opts out of
+  // stdin listening so a closed / redirected stdin
+  // (e.g. `agent-recall --http </dev/null`) does
+  // not trip the stdio-EOF shutdown path. The flag
+  // also gates the idle-timer wiring (the timer
+  // re-arms on `data` events, so a stdin-less
+  // install has no input stream to observe). The
+  // `disableStdin: true` path is therefore the
+  // canonical "HTTP lifecycle mode" — a sentinel
+  // `PassThrough` stdin stream is constructed so
+  // the optional `stdin` argument can still be
+  // passed by tests for type compatibility, but no
+  // listeners are installed on it. The cast is
+  // safe: a `PassThrough` is a `Readable` (the
+  // structural supertype of `NodeJS.ReadStream`)
+  // and the lifecycle only invokes the
+  // `EventEmitter` surface (`on` / `off`).
+  const stdin: NodeJS.ReadStream = (options.disableStdin
+    ? (options.stdin ?? new PassThrough())
+    : options.stdin ?? process.stdin) as unknown as NodeJS.ReadStream;
   // v1.1.4 (graceful shutdown fix): honour both
   // `signalTargets` (the explicit list) and the
   // legacy `process` shortcut. When neither is
@@ -507,16 +594,117 @@ export function installServerLifecycle(
     triggerExternal("SIGTERM");
   };
 
-  stdin.on("end", onStdinEnd);
-  stdin.on("close", onStdinClose);
+  // v1.1.5 (review by chatgpt-codex-connector on
+  // PR #40, item "Stop treating HTTP daemon stdin
+  // EOF as shutdown"): the `disableStdin: true`
+  // install path skips the stdin `end` / `close`
+  // listeners so a closed / redirected stdin
+  // (e.g. `agent-recall --http </dev/null`) does
+  // not trip the stdio-EOF shutdown path on the
+  // first event-loop tick after `listen`. The
+  // HTTP daemon owns its own signal-draining
+  // shutdown path (`runHttpServer` calls
+  // `lifecycle.shutdown("SIGTERM")` after closing
+  // the `httpServer` + per-session transports /
+  // McpServers), so the lifecycle's own signal
+  // listeners would race the HTTP daemon's local
+  // drain — the HTTP call site passes
+  // `signalTargets: []` to opt out of those too.
+  // The two opt-outs are independent so a future
+  // caller can keep one and drop the other if it
+  // needs a mixed-mode install.
+  if (!options.disableStdin) {
+    stdin.on("end", onStdinEnd);
+    stdin.on("close", onStdinClose);
+  }
   for (const target of targets) {
     target.addListener("SIGINT", onSigint);
     target.addListener("SIGTERM", onSigterm);
   }
 
+  // Idle wiring (Stage 1 of the lifecycle plan):
+  // when `idleTimeoutMs > 0` the lifecycle arms an
+  // unref'd timer. On the deadline it consults
+  // `isMessageInFlight` and either re-arms (a
+  // request is mid-flight, so the deadline is
+  // pushed out) or triggers
+  // `stdio_idle_timeout`. Every `data` event on
+  // `stdin` re-arms the timer so a chatty client
+  // never sees a spurious exit. The same
+  // re-arm-on-stall fix from `src/mcp/idle-timer.ts`
+  // (Task 1) applies here: a one-shot `setTimeout`
+  // would lose the deadline when a request is
+  // mid-flight, leaving the server unable to exit
+  // for the rest of its residency.
+  let idlePending: NodeJS.Timeout | undefined;
+  const idleClearTimer = (): void => {
+    if (idlePending !== undefined) {
+      clearTimeout(idlePending);
+      idlePending = undefined;
+    }
+  };
+  const idleOnData = (): void => {
+    // Traffic on stdin pushes the deadline out.
+    idleSchedule();
+  };
+  const idleSchedule = (): void => {
+    if (options.idleTimeoutMs === undefined || options.idleTimeoutMs <= 0) {
+      return;
+    }
+    idleClearTimer();
+    idlePending = setTimeout(() => {
+      idlePending = undefined;
+      if (options.isMessageInFlight?.() === true) {
+        // Stalled: a request is mid-flight. Re-arm
+        // so the deadline is pushed out instead of
+        // being lost. Mirrors `idle-timer.ts`.
+        idleSchedule();
+        return;
+      }
+      triggerExternal("stdio_idle_timeout");
+    }, options.idleTimeoutMs);
+    // `unref()` so a pending timer never blocks
+    // the event loop from draining (e.g. when
+    // the stdio pipe closes the same tick).
+    idlePending.unref();
+  };
+  stdin.on("data", idleOnData);
+  idleSchedule();
+
+  // v1.1.5 (review by chatgpt-codex-connector on
+  // PR #40): when `disableStdin: true` the
+  // `data` listener + the initial `idleSchedule`
+  // are skipped. The idle timer re-arms on
+  // `data` events, so a stdin-less install has no
+  // input stream to observe; the HTTP daemon
+  // pairs this flag with `idleTimeoutMs` omitted
+  // (the canonical "HTTP lifecycle mode" — no
+  // stdio EOF, no idle timer, no signal
+  // listeners).
+  if (options.disableStdin) {
+    stdin.off("data", idleOnData);
+  }
+
   const cleanup = (): void => {
-    stdin.off("end", onStdinEnd);
-    stdin.off("close", onStdinClose);
+    // v1.1.5 (review by chatgpt-codex-connector
+    // on PR #40): `stdin.off(...)` on a
+    // `PassThrough` stream that never had a
+    // `data` listener attached is a safe no-op
+    // (Node matches by reference). The
+    // `disableStdin` install path therefore
+    // tears down the same way; the only
+    // difference is that no `end` / `close` /
+    // `data` listeners were ever attached to
+    // begin with. Guarding each `off` on the
+    // flag keeps the cleanup symmetric and
+    // makes a future flag-flip visible in
+    // code review.
+    if (!options.disableStdin) {
+      stdin.off("end", onStdinEnd);
+      stdin.off("close", onStdinClose);
+      stdin.off("data", idleOnData);
+    }
+    idleClearTimer();
     for (const target of targets) {
       target.removeListener("SIGINT", onSigint);
       target.removeListener("SIGTERM", onSigterm);

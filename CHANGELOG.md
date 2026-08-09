@@ -208,6 +208,37 @@ a personal tool, but the file structure is here for future contributors).
 - `docs/guides/bun-distribution.md` — canonical recipe
   covering build, install, smoke test, capability matrix,
   and release channel.
+- **MCP stdio idle exit** (`AGENT_RECALL_STDIO_IDLE_MS`,
+  default `600_000` ms / 10 min, `0` disables). Reuses the
+  `server-lifecycle` 1.5 s ceiling + second-signal escape
+  via a new `ShutdownReason: "stdio_idle_timeout"`. Stdio
+  child processes now self-reap when a parent agent holds
+  the pipe idle past the threshold.
+- **Shared HTTP daemon** (`agent-recall --http`, also via
+  `AGENT_RECALL_MCP_TRANSPORT=http` on the canonical name).
+  `agent-recall-mcp` remains stdio-only (v1.1.4 dispatch
+  contract preserved). New env vars: `AGENT_RECALL_HTTP_HOST`
+  (default `127.0.0.1`), `AGENT_RECALL_HTTP_PORT` (default
+  `7777`), `AGENT_RECALL_HTTP_ALLOWED_ORIGINS` (comma-
+  separated browser origin allow-list), `AGENT_RECALL_HTTP_VERBOSE`
+  (HTTP-specific verbose gate for `[mcp-http] …` stderr
+  lines). Lockfile at `${AGENT_RECALL_HOME}/.mcp-${profile}.lock`
+  carries a 64-hex-char bearer token (32 random bytes).
+  Per-session `McpServer` is created on first POST (MCP SDK
+  1.29.0 `Server.connect(transport)` is single-shot);
+  `params.actor` is required on the first `initialize` and
+  is locked for the session's lifetime. `Accept:
+  application/json, text/event-stream` is required on every
+  request (SDK 406s in pre-flight without it). See
+  `docs/guides/bun-distribution.md` § Shared HTTP daemon
+  for the full contract, the lockfile layout, and the
+  client example.
+- `scripts/smoke-bun-binary.mjs` step 7 — end-to-end HTTP
+  probe: spawn `agent-recall --http`, read the lockfile,
+  send `initialize` (with `actor`), capture
+  `mcp-session-id`, send `tools/list` on the same session
+  to verify the per-session `McpServer` (Task 11 fix), then
+  SIGTERM.
 
 ### Verified
 
