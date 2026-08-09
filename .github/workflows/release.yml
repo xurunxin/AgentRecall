@@ -359,6 +359,23 @@ jobs:
         # round-trip cleanly when the env vars +
         # capability flip, and clean shutdown
         # produces zero stderr.
+        #
+        # v1.1.5 (v1.1.5 release): the v1.1.3 GATE-06
+        # refactor moved the packaged-install lifecycle
+        # into the per-suite
+        # `vitest.packaged-artifact.config.ts` (the
+        # default config excludes it because the
+        # lifecycle requires
+        # `AGENT_RECALL_EXTRACTED_ARTIFACT` + a real
+        # extracted archive on disk). The previous
+        # `npx vitest run
+        # test/blackbox/packaged-install.test.ts`
+        # invocation used the default config which
+        # excludes the test, so vitest reported
+        # `No test files found` and the lifecycle
+        # job failed on every OS leg. Use the
+        # dedicated per-suite config (matches
+        # `npm run test:packaged-artifact`).
         shell: bash
         env:
           CI: "true"
@@ -366,7 +383,7 @@ jobs:
           AGENT_RECALL_EXTRACTED_ARTIFACT: ${{ runner.temp }}/agent-recall-extracted-${{ steps.platform.outputs.SUFFIX }}
         run: |
           set -euo pipefail
-          npx vitest run test/blackbox/packaged-install.test.ts
+          npx vitest run --config vitest.packaged-artifact.config.ts
 
   smoke:
     name: Smoke ${{ matrix.os }}
