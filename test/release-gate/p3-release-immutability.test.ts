@@ -694,24 +694,26 @@ describe("release-gate p3-release-immutability (Stage 18 #29, Task 10)", () => {
     }
   });
 
-  it("p0-cleanup and p0-release-v1 version assertions are updated to 1.1.3 (no || true, no relaxation)", () => {
-    // v1.1.3 GATE-07 (issue #37): the v1.1.3 patch
-    // release over v1.1.2. Both p0-cleanup and p0-release-v1
-    // now lock on the v1.1.3 version; the test description
-    // + assertions track the v1.1.3 bump (the v1.1.2-era
-    // assertions are now `.toBe("1.1.3")`). The
+  it("p0-cleanup and p0-release-v1 version assertions are updated to 1.1.5 (no || true, no relaxation)", () => {
+    // v1.1.5 (rc-1.1.5-candidate gate): the v1.1.5 patch
+    // release over v1.1.4. Both p0-cleanup and p0-release-v1
+    // now lock on the v1.1.5 version; the test description
+    // + assertions track the v1.1.5 bump (the v1.1.3-era
+    // assertions are now `.toBe("1.1.5")`). The
     // `no || true, no relaxation` invariant is preserved —
     // a future maintainer who weakens the assertion (e.g.
-    // `.toBe("1.1.3" || "1.1.2")`) is caught by the
+    // `.toBe("1.1.5" || "1.1.3")`) is caught by the
     // `doesNotMatch(/\|\|\s*true/)` line.
     const cleanup = read(join(repoRoot, "test", "release-gate", "p0-cleanup.test.ts"));
     const releaseV1 = read(join(repoRoot, "test", "release-gate", "p0-release-v1.test.ts"));
-    assert.match(cleanup, /1\.1\.3/);
-    assert.match(cleanup, /\.toBe\("1\.1\.3"\)/);
+    assert.match(cleanup, /1\.1\.5/);
+    assert.match(cleanup, /\.toBe\("1\.1\.5"\)/);
+    assert.doesNotMatch(cleanup, /\.toBe\("1\.1\.3"\)/);
     assert.doesNotMatch(cleanup, /\.toBe\("1\.1\.2"\)/);
     assert.doesNotMatch(cleanup, /\.toBe\("1\.1\.1"\)/);
     assert.doesNotMatch(cleanup, /\|\|\s*true/);
-    assert.match(releaseV1, /\.toBe\("1\.1\.3"\)/);
+    assert.match(releaseV1, /\.toBe\("1\.1\.5"\)/);
+    assert.doesNotMatch(releaseV1, /\.toBe\("1\.1\.3"\)/);
     assert.doesNotMatch(releaseV1, /\.toBe\("1\.1\.2"\)/);
     assert.doesNotMatch(releaseV1, /\.toBe\("1\.1\.1"\)/);
     assert.doesNotMatch(releaseV1, /\|\|\s*true/);
