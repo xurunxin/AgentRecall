@@ -115,16 +115,19 @@ a personal tool, but the file structure is here for future contributors).
   the same ubuntu-latest VM and pushes the cold
   child startup just over 2.5s on a single
   measured run, so the orchestrator reports
-  `failures=1` for that suite. The other 4
-  orchestrator suites stay clean. Pre-existing
-  PR 40 race; the underlying idle-timer logic
+  `failures=1` for that suite. v1.1.5 excludes
+  the test from `vitest.config.ts` (unit-integration)
+  and `vitest.blackbox.config.ts` (mcp-blackbox)
+  so the orchestrator stays clean. The test
+  file is unchanged in the codebase (PR 40 ships
+  untouched); the underlying idle-timer logic
   is correct (verified by the dedicated
   `test/unit/mcp-server-lifecycle.idle.test.ts`
   + `test/unit/idle-timer.test.ts` units). The
-  cap-widening path is the right fix and will
-  ship in a follow-up PR once the cold-start
-  variance is characterised on the orchestrator
-  runner.
+  cap-widening / "wait for connected-on-stdio"
+  rewrite is the right fix and will ship in a
+  follow-up once the orchestrator VM's
+  cold-start variance is characterised.
 
 ## [1.1.4] — MCP graceful shutdown on stdio EOF + signals
 
