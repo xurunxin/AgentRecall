@@ -134,7 +134,22 @@ const RELEASE_OPS_PER_PROCESS = 1250; // 8 * 1,250 = 10,000 ops (spec § 5.6 rel
 // release profile (8 workers × 1,250 ops) plus barrier setup
 // has enough headroom. CI stays well under 60s in practice.
 const TEST_TIMEOUT_MS = 240_000;
-const BARRIER_TIMEOUT_MS = 60_000;
+// v1.1.5 (v1.1.5 release): bumped from 60_000 ms to
+// 120_000 ms so the 8-worker release profile has
+// headroom on slower macOS runners. Pre-fix the
+// `barrier: only 7/8 workers ready after 60000ms`
+// error fired on `macos-latest` (the 8 workers
+// don't all hit the readiness barrier in 60s when
+// the runner is under load), which made the
+// `Package macos-latest / Node 24` matrix leg
+// fail and the whole `release.yml` run abort
+// before the `Extracted artifact lifecycle` /
+// `Smoke` matrix could start. CI on ubuntu /
+// windows runners still resolves in <30s; the
+// 2x bump gives macOS the room it needs without
+// masking real readiness bugs (the test still
+// times out hard at 120s).
+const BARRIER_TIMEOUT_MS = 120_000;
 // Bumped from 100 ms (pre-Task-1) so we can prove overlap
 // on slower Windows runners without losing busy-retry
 // coverage. The release profile is the production
