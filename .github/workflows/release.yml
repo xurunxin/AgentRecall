@@ -214,15 +214,20 @@ jobs:
         # (`winHandleBusy`) in
         # `src/store/sqlite-store.ts` (the v1.1.6
         # SQLite contention lane).
+        #
+        # The skip is implemented as a native
+        # GitHub Actions `if:` expression (NOT a
+        # shell `if` — the Windows runner uses
+        # PowerShell by default, which doesn't
+        # parse bash `[ "$X" = "Y" ]` syntax; the
+        # previous inline-shell short-circuit
+        # crashed with `ParserError: Missing '('
+        # after 'if' in if statement`).
+        if: matrix.os != 'windows-latest'
         env:
           TMPDIR: ${{ runner.temp }}
           STRESS_PROFILE: release
-        run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            echo "::notice title=multi-process stress skipped on windows-latest::the 8-worker release profile trips an unhandled SQLITE_BUSY assertion on Windows under load. See CHANGELOG v1.1.5 Known non-blocking limits."
-            exit 0
-          fi
-          npx vitest run --config vitest.stress.config.ts
+        run: npx vitest run --config vitest.stress.config.ts
 
       - name: Strip dev-only artefacts
         shell: bash
