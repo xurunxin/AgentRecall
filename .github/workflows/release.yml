@@ -224,7 +224,19 @@ jobs:
           if [ "${{ matrix.archive }}" = "tar" ]; then
             tar -czf "agent-recall-${VERSION}-${{ matrix.suffix }}.tar.gz" -C "$STAGE" .
           else
-            (cd "$STAGE" && zip -r "../agent-recall-${VERSION}-${{ matrix.suffix }}.zip" . > /dev/null)
+            # v1.1.5 (v1.1.5 release): the Windows
+            # runner does not have the `zip` command
+            # on PATH (Git Bash ships without it).
+            # The previous `(cd "$STAGE" && zip -r
+            # "..." .)` invocation crashed with
+            # `zip: command not found` (exit 127).
+            # Use PowerShell's `Compress-Archive`
+            # instead — the same call the
+            # release-candidate.yml `packaged-artifact`
+            # job uses (so the cross-platform pack
+            # path is identical between the rc and
+            # tag flows).
+            powershell -NoProfile -Command "Compress-Archive -Path '${STAGE}\*' -DestinationPath 'agent-recall-${VERSION}-${{ matrix.suffix }}.zip' -Force"
           fi
           ls -la "agent-recall-${VERSION}-${{ matrix.suffix }}."*
 
