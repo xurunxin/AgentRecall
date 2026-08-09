@@ -174,10 +174,25 @@ jobs:
         # the release profile is opt-in here so the
         # candidate artefacts are exercised against
         # the full spec gate.
+        #
+        # v1.1.5 (v1.1.5 release): the v1.1.3 GATE-06
+        # refactor moved the multi-process stress test
+        # out of the default `vitest.config.ts` (it's
+        # segregated into the per-suite
+        # `vitest.stress.config.ts` so the 10k-op cost
+        # is paid EXACTLY ONCE per release job — the
+        # orchestrator pins the counter via `JOB_ID`).
+        # The previous `npx vitest run
+        # test/multi-process-stress.test.ts` invocation
+        # used the default config which excludes the
+        # stress test, so vitest reported `No test
+        # files found` and the package job failed on
+        # every OS leg. Use the dedicated per-suite
+        # config (matches `npm run test:stress`).
         env:
           TMPDIR: ${{ runner.temp }}
           STRESS_PROFILE: release
-        run: npx vitest run test/multi-process-stress.test.ts
+        run: npx vitest run --config vitest.stress.config.ts
 
       - name: Strip dev-only artefacts
         shell: bash
