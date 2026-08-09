@@ -137,10 +137,25 @@ function stageDistDirectory(rootDir: string): string {
 }
 
 function packTarGz(stageDir: string, archivePath: string): void {
+  // v1.1.5 (v1.1.5 release): the previous
+  // `shell: process.platform === "win32"` flag
+  // forced the args through `cmd.exe`, which
+  // mangles the trailing `.` source-path arg
+  // (cmd treats `.` as a `cd` noop and the
+  // tar invocation exits with status 2 — `fatal
+  // error` — leaving the archive empty). Spawn
+  // tar directly via `CreateProcess` (no shell
+  // wrapper); the args pass through verbatim and
+  // GNU tar's `-czf archive -C dir .` produces
+  // the canonical gzipped tarball. POSIX
+  // behaviour is unchanged. Hit first on the
+  // v1.1.5 release: the lifecycle E2E matrix leg
+  // on `windows-latest` failed at
+  // `packTarGz` (`result.status === 2`).
   const result = spawnSync(
     "tar",
     ["-czf", archivePath, "-C", stageDir, "."],
-    { stdio: "ignore", shell: process.platform === "win32" }
+    { stdio: "ignore" }
   );
   assert.equal(result.status, 0, `tar failed: ${result.stderr ?? "no stderr"}`);
 }
