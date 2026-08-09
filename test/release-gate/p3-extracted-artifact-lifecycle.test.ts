@@ -245,20 +245,6 @@ describe("extracted-artifact lifecycle E2E (Stage 18 v1.1.2 issue #28, task 9)",
       /require\(\s*["'][a-zA-Z@][^"']*["']\s*\)/,
       "extract script must not require non-stdlib packages"
     );
-    assert.ok(existsSync(extractScriptPath), "scripts/extract-release-artifact.mjs must exist");
-    const text = read(extractScriptPath);
-    // No npm package references (require("...") or
-    // import-from-npm) outside Node's built-in modules.
-    assert.doesNotMatch(
-      text,
-      /from\s+["'](?!node:)[a-zA-Z@][^"']*["']/,
-      "extract script must not import non-stdlib packages"
-    );
-    assert.doesNotMatch(
-      text,
-      /require\(\s*["'][a-zA-Z@][^"']*["']\s*\)/,
-      "extract script must not require non-stdlib packages"
-    );
 
     const tmp = mkdtempSync(join(tmpdir(), "agent-recall-extract-tar-"));
     try {
