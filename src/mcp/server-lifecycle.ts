@@ -99,6 +99,7 @@
 // Zero new dependencies: Node stdlib only.
 
 import type { ReadStream } from "node:tty";
+import { PassThrough } from "node:stream";
 
 /**
  * Minimal contract every "closeable" collaborator
@@ -222,8 +223,40 @@ export type ServerLifecycleOptions = {
    * `close`. Defaults to `process.stdin`. Tests
    * pass a mock `Readable` so they can drive the
    * events without touching the real stdio.
+   *
+   * Ignored when `disableStdin: true` is set
+   * (the v1.1.5 HTTP daemon opts in so a
+   * supervisor-launched daemon with closed /
+   * redirected stdin — `agent-recall --http
+   * </dev/null` — does not trip a spurious
+   * stdio-EOF shutdown on the first event-loop
+   * tick after `listen`).
    */
   stdin?: NodeJS.ReadStream;
+
+  /**
+   * v1.1.5 (review by chatgpt-codex-connector on
+   * PR #40): opt-out switch for the `end` / `close`
+   * / `data` listeners on the stdin stream. The
+   * shared-HTTP daemon is NOT a stdio transport;
+   * it runs until SIGINT / SIGTERM, not on EOF.
+   * Installing the default stdin listeners caused
+   * supervisors and `</dev/null` launches to
+   * trigger the stdio-EOF shutdown path
+   * immediately and tear the daemon down before
+   * the first HTTP request. When `true`, the
+   * lifecycle skips installing the stdin listeners
+   * AND skips the idle-timer wiring (the idle
+   * timer re-arms on `data` events, so a stdin-less
+   * install has no input stream to observe). The
+   * stdio idle-exit feature is therefore mutually
+   * exclusive with this flag; callers wanting both
+   * must wire the idle timer themselves. The HTTP
+   * daemon does not use the idle timer, so the
+   * combination is the canonical "HTTP lifecycle
+   * mode".
+   */
+  disableStdin?: boolean;
 
   /**
    * The `EventEmitter`-shaped target the module
@@ -335,7 +368,28 @@ const DEFAULT_SHUTDOWN_TIMEOUT_MS = 1500;
 export function installServerLifecycle(
   options: ServerLifecycleOptions
 ): ServerLifecycleHandle {
-  const stdin: NodeJS.ReadStream = options.stdin ?? process.stdin;
+  // v1.1.5 (review by chatgpt-codex-connector on
+  // PR #40, item "Stop treating HTTP daemon stdin
+  // EOF as shutdown"): the HTTP daemon opts out of
+  // stdin listening so a closed / redirected stdin
+  // (e.g. `agent-recall --http </dev/null`) does
+  // not trip the stdio-EOF shutdown path. The flag
+  // also gates the idle-timer wiring (the timer
+  // re-arms on `data` events, so a stdin-less
+  // install has no input stream to observe). The
+  // `disableStdin: true` path is therefore the
+  // canonical "HTTP lifecycle mode" — a sentinel
+  // `PassThrough` stdin stream is constructed so
+  // the optional `stdin` argument can still be
+  // passed by tests for type compatibility, but no
+  // listeners are installed on it. The cast is
+  // safe: a `PassThrough` is a `Readable` (the
+  // structural supertype of `NodeJS.ReadStream`)
+  // and the lifecycle only invokes the
+  // `EventEmitter` surface (`on` / `off`).
+  const stdin: NodeJS.ReadStream = (options.disableStdin
+    ? (options.stdin ?? new PassThrough())
+    : options.stdin ?? process.stdin) as unknown as NodeJS.ReadStream;
   // v1.1.4 (graceful shutdown fix): honour both
   // `signalTargets` (the explicit list) and the
   // legacy `process` shortcut. When neither is
@@ -540,8 +594,29 @@ export function installServerLifecycle(
     triggerExternal("SIGTERM");
   };
 
-  stdin.on("end", onStdinEnd);
-  stdin.on("close", onStdinClose);
+  // v1.1.5 (review by chatgpt-codex-connector on
+  // PR #40, item "Stop treating HTTP daemon stdin
+  // EOF as shutdown"): the `disableStdin: true`
+  // install path skips the stdin `end` / `close`
+  // listeners so a closed / redirected stdin
+  // (e.g. `agent-recall --http </dev/null`) does
+  // not trip the stdio-EOF shutdown path on the
+  // first event-loop tick after `listen`. The
+  // HTTP daemon owns its own signal-draining
+  // shutdown path (`runHttpServer` calls
+  // `lifecycle.shutdown("SIGTERM")` after closing
+  // the `httpServer` + per-session transports /
+  // McpServers), so the lifecycle's own signal
+  // listeners would race the HTTP daemon's local
+  // drain — the HTTP call site passes
+  // `signalTargets: []` to opt out of those too.
+  // The two opt-outs are independent so a future
+  // caller can keep one and drop the other if it
+  // needs a mixed-mode install.
+  if (!options.disableStdin) {
+    stdin.on("end", onStdinEnd);
+    stdin.on("close", onStdinClose);
+  }
   for (const target of targets) {
     target.addListener("SIGINT", onSigint);
     target.addListener("SIGTERM", onSigterm);
@@ -596,10 +671,39 @@ export function installServerLifecycle(
   stdin.on("data", idleOnData);
   idleSchedule();
 
-  const cleanup = (): void => {
-    stdin.off("end", onStdinEnd);
-    stdin.off("close", onStdinClose);
+  // v1.1.5 (review by chatgpt-codex-connector on
+  // PR #40): when `disableStdin: true` the
+  // `data` listener + the initial `idleSchedule`
+  // are skipped. The idle timer re-arms on
+  // `data` events, so a stdin-less install has no
+  // input stream to observe; the HTTP daemon
+  // pairs this flag with `idleTimeoutMs` omitted
+  // (the canonical "HTTP lifecycle mode" — no
+  // stdio EOF, no idle timer, no signal
+  // listeners).
+  if (options.disableStdin) {
     stdin.off("data", idleOnData);
+  }
+
+  const cleanup = (): void => {
+    // v1.1.5 (review by chatgpt-codex-connector
+    // on PR #40): `stdin.off(...)` on a
+    // `PassThrough` stream that never had a
+    // `data` listener attached is a safe no-op
+    // (Node matches by reference). The
+    // `disableStdin` install path therefore
+    // tears down the same way; the only
+    // difference is that no `end` / `close` /
+    // `data` listeners were ever attached to
+    // begin with. Guarding each `off` on the
+    // flag keeps the cleanup symmetric and
+    // makes a future flag-flip visible in
+    // code review.
+    if (!options.disableStdin) {
+      stdin.off("end", onStdinEnd);
+      stdin.off("close", onStdinClose);
+      stdin.off("data", idleOnData);
+    }
     idleClearTimer();
     for (const target of targets) {
       target.removeListener("SIGINT", onSigint);

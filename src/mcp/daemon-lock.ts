@@ -116,7 +116,33 @@ export interface AcquireOptions {
   dataHome: string;
   profile: string;
   buildEndpoint: () => string;
-  probe?: () => Promise<boolean>;
+  /**
+   * Optional liveness probe. The function is
+   * invoked with the EXISTING lock payload
+   * (not the requested endpoint / token) so the
+   * caller can issue an HTTP request against the
+   * recorded daemon. Returning `true` means the
+   * recorded daemon is healthy and the launcher
+   * should join instead of reclaiming. The probe
+   * is ONLY called when the existing lock's PID
+   * is still alive (`process.kill(pid, 0)`)
+   * — the PID check is the fast-path gate that
+   * skips the network probe for a dead daemon.
+   *
+   * v1.1.5 (review by chatgpt-codex-connector on
+   * PR #40, item "Probe the recorded daemon
+   * instead of always reclaiming it"): the
+   * pre-PR-#40 shape accepted a no-arg probe
+   * closure. That shape cannot see the existing
+   * endpoint / token and is therefore a
+   * constant-`false` trap — the launcher
+   * reclaimed the live lock, deleted it, and
+   * bound the same port. The new shape takes
+   * the existing `LockPayload` so the caller
+   * can construct a real HTTP probe with the
+   * recorded Bearer token.
+   */
+  probe?: (existing: LockPayload) => Promise<boolean>;
   transport?: LockPayload["transport"];
   version?: string;
 }
@@ -163,7 +189,20 @@ export async function acquireOrJoin(opts: AcquireOptions): Promise<AcquireResult
   }
   if (existing) {
     const alive = await pidAlive(existing.pid);
-    const probeOk = alive ? (await opts.probe?.()) ?? false : false;
+    // v1.1.5 (review by chatgpt-codex-connector on
+    // PR #40, item "Probe the recorded daemon
+    // instead of always reclaiming it"): the
+    // probe receives the existing lock so the
+    // caller can hit the recorded endpoint with
+    // the recorded bearer token. A live PID plus
+    // a positive probe is the canonical "another
+    // launcher is already serving" signal —
+    // join it instead of reclaiming. Without
+    // this fix the previous constant-`false`
+    // probe classified every live daemon as
+    // stale, unlinked its lock, and bound the
+    // same port on a second invocation.
+    const probeOk = alive ? (await opts.probe?.(existing)) ?? false : false;
     if (alive && probeOk) {
       return { joined: true, endpoint: existing.endpoint, token: existing.token, lockPath };
     }
