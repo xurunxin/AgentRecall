@@ -314,10 +314,31 @@ function buildToolRequestContext(
   });
 }
 
+/**
+ * v1.1.5 (review by chatgpt-codex-connector on PR #40, item
+ * "Inject the parsed session actor into tool contexts"):
+ * optional per-session actor source consulted at the top of
+ * every tool call. The HTTP daemon passes a closure that
+ * returns the actor the MCP `initialize` body declared for
+ * the current session; the stdio daemon omits the
+ * resolver and falls through to the env-default actor. The
+ * shape mirrors the public `SessionActor` type the route
+ * layer uses, but the tools layer is intentionally framework-
+ * agnostic so the stdio path stays free of HTTP-only types.
+ * The full session actor (with `kind`) is preserved so the
+ * audit event can record both the structured kind and the
+ * human-readable id.
+ */
+export type ToolActorResolver = () => {
+  kind: "agent" | "user" | "service";
+  id: string;
+};
+
 function envelopeHandler<T>(
   toolName: MemoryToolName,
   schema: ZodType<T>,
-  run: (input: T, extra: HandlerExtra | undefined, ctx: RequestContext) => unknown | Promise<unknown>
+  run: (input: T, extra: HandlerExtra | undefined, ctx: RequestContext) => unknown | Promise<unknown>,
+  actorResolver?: ToolActorResolver
 ): (input: unknown, extra?: HandlerExtra) => Promise<CallToolResult> {
   return async (input: unknown, extra?: HandlerExtra) => {
     const started = Date.now();
@@ -371,12 +392,30 @@ function envelopeHandler<T>(
       });
     }
 
-    // Stage 14 PR-B1: build a per-call RequestContext from the
-    // MCP `extra` envelope. The actor is the resolved
-    // `AGENT_RECALL_ACTOR` env / fallback; the trace fields
-    // (request_id, session_id, tool_call_id, client_name,
-    // client_version) are derived from the SDK envelope.
-    const ctx = buildToolRequestContext(extra);
+    // Stage 14 PR-B1: build a per-call RequestContext from
+    // the MCP `extra` envelope. v1.1.5 (PR #40 review):
+    // a per-session actor override is applied when the
+    // caller (HTTP daemon) supplied an
+    // `actorResolver`. The resolver's value is the
+    // `params.actor` parsed from the MCP `initialize`
+    // body for the current session — a structured
+    // `kind:id` pair the audit consumer can dispatch
+    // on WITHOUT consulting the process env. Without
+    // this, two HTTP clients on the same daemon share
+    // an audit trail (both record the env-default
+    // `AGENT_RECALL_ACTOR`), defeating the spec §
+    // "actor 锁定" contract. The stdio path omits
+    // the resolver and falls through to the env-
+    // default, matching the pre-PR-#40 behaviour for
+    // the single-client surface.
+    const sessionActor = actorResolver?.();
+    const actorOverride =
+      sessionActor !== undefined
+        ? `${sessionActor.kind}:${sessionActor.id}`
+        : undefined;
+    const ctx = buildToolRequestContext(extra, {
+      ...(actorOverride !== undefined ? { actor: actorOverride } : {})
+    });
 
     try {
       const raw = await run(parsed.data, extra, ctx);
@@ -428,7 +467,8 @@ function envelopeHandler<T>(
 function textEnvelopeHandler<T>(
   toolName: MemoryToolName,
   schema: ZodType<T>,
-  run: (input: T, extra: HandlerExtra | undefined, ctx: RequestContext) => string | Promise<string>
+  run: (input: T, extra: HandlerExtra | undefined, ctx: RequestContext) => string | Promise<string>,
+  actorResolver?: ToolActorResolver
 ): (input: unknown, extra?: HandlerExtra) => Promise<CallToolResult> {
   return async (input: unknown, extra?: HandlerExtra) => {
     const started = Date.now();
@@ -479,7 +519,21 @@ function textEnvelopeHandler<T>(
       });
     }
     // Stage 14 PR-B1: build a per-call RequestContext.
-    const ctx = buildToolRequestContext(extra);
+    // v1.1.5 (PR #40 review): same per-session actor
+    // override as `envelopeHandler` (see the rationale
+    // block above). Without this, the `recall_context`
+    // and `export_memory_context` text tools would
+    // record audit rows under the env-default actor on
+    // the HTTP path, even when the per-session actor
+    // was parsed from the MCP `initialize` body.
+    const sessionActor = actorResolver?.();
+    const actorOverride =
+      sessionActor !== undefined
+        ? `${sessionActor.kind}:${sessionActor.id}`
+        : undefined;
+    const ctx = buildToolRequestContext(extra, {
+      ...(actorOverride !== undefined ? { actor: actorOverride } : {})
+    });
     try {
       const text = await run(parsed.data, extra, ctx);
       const legacy: CallToolResult = textResult(text);
@@ -520,11 +574,24 @@ function asNotFoundMemoryResult(memoryId: string): { ok: false; error: "not_foun
   };
 }
 
-export function createMemoryToolHandlers(service: MemoryService): MemoryToolHandlers {
+export function createMemoryToolHandlers(
+  service: MemoryService,
+  // v1.1.5 (review by chatgpt-codex-connector on
+  // PR #40, item "Inject the parsed session actor
+  // into tool contexts"): optional per-session
+  // actor source threaded into every tool handler.
+  // The HTTP daemon passes a closure that returns
+  // the per-session `params.actor` parsed from
+  // the MCP `initialize` body; the stdio daemon
+  // omits the resolver and falls through to the
+  // env-default. See the `ToolActorResolver`
+  // JSDoc above for the canonical contract.
+  actorResolver?: ToolActorResolver
+): MemoryToolHandlers {
   return {
     recall_context: textEnvelopeHandler("recall_context", memoryToolSchemas.recall_context, (input, _extra, ctx) =>
       service.exportMemoryContext(serviceInput<Parameters<MemoryService["exportMemoryContext"]>[0]>(input), ctx)
-    ),
+    , actorResolver),
     remember: envelopeHandler("remember", memoryToolSchemas.remember, (input, _extra, ctx) => {
       // Stage 18 v1.1.2 follow-up (review by ora-9):
       // forward `capability` and `user_confirmed`
@@ -584,10 +651,10 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
         });
       }
       return result;
-    }),
+    }, actorResolver),
     search_memories: envelopeHandler("search_memories", memoryToolSchemas.search_memories, (input) =>
       service.searchMemories(serviceInput<Parameters<MemoryService["searchMemories"]>[0]>(input))
-    ),
+    , actorResolver),
     get_memory: envelopeHandler("get_memory", memoryToolSchemas.get_memory, (input) => {
       const memoryId = memoryIdFromInput(input);
       // Stage 16 v1.1.1 PR-1 (#11): `get_memory` is now a
@@ -618,10 +685,10 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
       const visibility = service.getMemoryWithVisibility(memoryId);
       if (visibility.ok) return visibility;
       return visibility;
-    }),
+    }, actorResolver),
     list_memories: envelopeHandler("list_memories", memoryToolSchemas.list_memories, (input) =>
       service.listMemories(serviceInput<Parameters<MemoryService["listMemories"]>[0]>(input))
-    ),
+    , actorResolver),
     update_memory: envelopeHandler("update_memory", memoryToolSchemas.update_memory, (input, _extra, ctx) => {
       // Stage 15 PR-M0-2 (issue #2, spec § 5.6): forward
       // `idempotency_key` and `expected_revision` through
@@ -650,13 +717,13 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
         Object.keys(casFields).length === 0 ? patch : { ...patch, ...casFields },
         ctx
       );
-    }),
+    }, actorResolver),
     supersede_memory: envelopeHandler("supersede_memory", memoryToolSchemas.supersede_memory, (input, _extra, ctx) =>
       service.supersedeMemory(serviceInput<Parameters<MemoryService["supersedeMemory"]>[0]>(input), ctx)
-    ),
+    , actorResolver),
     merge_memories: envelopeHandler("merge_memories", memoryToolSchemas.merge_memories, (input, _extra, ctx) =>
       service.mergeMemories(serviceInput<Parameters<MemoryService["mergeMemories"]>[0]>(input), ctx)
-    ),
+    , actorResolver),
     forget_memory: envelopeHandler("forget_memory", memoryToolSchemas.forget_memory, (input, _extra, ctx) => {
       // Stage 15 PR-M0-2 (issue #2, spec § 5.6): the
       // `forget_memory` schema accepts `idempotency_key`
@@ -687,20 +754,20 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
         ctx,
         casFields
       );
-    }),
+    }, actorResolver),
     get_memory_budget: envelopeHandler("get_memory_budget", memoryToolSchemas.get_memory_budget, (input) =>
       service.getMemoryBudget(serviceInput<Parameters<MemoryService["getMemoryBudget"]>[0]>(input))
-    ),
+    , actorResolver),
     maintain_memories: envelopeHandler("maintain_memories", memoryToolSchemas.maintain_memories, (input, extra, ctx) => {
       const progress = adaptProgress(extra, "maintain_memories");
       return service.maintainMemories({
         ...serviceInput<Parameters<MemoryService["maintainMemories"]>[0]>(input),
         ...(progress !== undefined ? { onProgress: progress } : {})
       }, ctx);
-    }),
+    }, actorResolver),
     export_memory_context: textEnvelopeHandler("export_memory_context", memoryToolSchemas.export_memory_context, (input, _extra, ctx) =>
       service.exportMemoryContext(serviceInput<Parameters<MemoryService["exportMemoryContext"]>[0]>(input), ctx)
-    ),
+    , actorResolver),
     // Stage 12 PR9: plan/apply maintenance, explain, list_backups.
     plan_maintenance: envelopeHandler("plan_maintenance", memoryToolSchemas.plan_maintenance, (input, extra) => {
       const progress = adaptProgress(extra, "plan_maintenance");
@@ -708,16 +775,16 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
         ...serviceInput<Parameters<MemoryService["planMaintenance"]>[0]>(input),
         ...(progress !== undefined ? { onProgress: progress } : {})
       });
-    }),
+    }, actorResolver),
     apply_maintenance: envelopeHandler("apply_maintenance", memoryToolSchemas.apply_maintenance, (input) =>
       service.applyMaintenance(serviceInput<Parameters<MemoryService["applyMaintenance"]>[0]>(input))
-    ),
+    , actorResolver),
     explain_recall: envelopeHandler("explain_recall", memoryToolSchemas.explain_recall, (input) =>
       service.explainRecall(serviceInput<Parameters<MemoryService["explainRecall"]>[0]>(input))
-    ),
+    , actorResolver),
     list_backups: envelopeHandler("list_backups", memoryToolSchemas.list_backups, (input) =>
       service.listBackups()
-    ),
+    , actorResolver),
     // Stage 16 v1.1.1 PR-7 (issue #17, spec § 5.4):
     // the four memory-semantics tools. Each one
     // delegates to a service helper and forwards the
@@ -739,7 +806,7 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
           actor_id: ctx?.actor_id
         });
       }
-    ),
+    , actorResolver),
     record_memory_provenance: envelopeHandler(
       "record_memory_provenance",
       memoryToolSchemas.record_memory_provenance,
@@ -750,7 +817,7 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
           source_ref: input.source_ref,
           actor_id: ctx?.actor_id
         })
-    ),
+    , actorResolver),
     explain_memory_provenance: envelopeHandler(
       "explain_memory_provenance",
       memoryToolSchemas.explain_memory_provenance,
@@ -765,7 +832,7 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
         // verbatim.
         return { ok: true, value: explanation };
       }
-    ),
+    , actorResolver),
     confirm_memory_trust: envelopeHandler(
       "confirm_memory_trust",
       memoryToolSchemas.confirm_memory_trust,
@@ -798,7 +865,7 @@ export function createMemoryToolHandlers(service: MemoryService): MemoryToolHand
           // unlinkable to the originating MCP
           // request.
         }, ctx)
-    )
+    , actorResolver)
   };
 }
 
@@ -1043,9 +1110,28 @@ export function registerCoreTools(
   // hold the deadline while a tool handler is
   // running. Optional so the test helper and
   // any other caller stays backwards compatible.
-  tracker?: RequestTracker
+  tracker?: RequestTracker,
+  // v1.1.5 (review by chatgpt-codex-connector on
+  // PR #40, item "Inject the parsed session
+  // actor into tool contexts"): optional
+  // per-session actor source. The HTTP daemon
+  // passes a closure that returns the
+  // per-session `params.actor` parsed from the
+  // MCP `initialize` body. The stdio daemon
+  // omits the resolver (single-client surface —
+  // the env-default actor is sufficient). The
+  // `actorResolver` is a per-call hook (the
+  // closure is invoked on every tool call so a
+  // session that swaps its actor — not currently
+  // supported per spec § "actor 锁定" but kept
+  // future-proof) sees the new value
+  // immediately, not the value at registration
+  // time. The 4th positional arg is optional
+  // for backwards compatibility with the test
+  // helper and any external caller.
+  actorResolver?: ToolActorResolver
 ): void {
-  const handlers = createMemoryToolHandlers(service);
+  const handlers = createMemoryToolHandlers(service, actorResolver);
   for (const name of CORE_TOOL_NAMES) {
     server.registerTool(
       name,
@@ -1080,7 +1166,14 @@ export function registerExtendedTools(
   // v1.1.5 (Stage 1, task 3): see
   // `registerCoreTools` for the rationale. Same
   // optional tracker hook; same no-op default.
-  tracker?: RequestTracker
+  tracker?: RequestTracker,
+  // v1.1.5 (review by chatgpt-codex-connector on
+  // PR #40, item "Inject the parsed session
+  // actor into tool contexts"): see
+  // `registerCoreTools` for the rationale. Same
+  // optional per-session actor source; same
+  // future-proof per-call hook.
+  actorResolver?: ToolActorResolver
 ): void {
   // v1.1.2 (issue #22): Extended = Core + the
   // additional memory-semantics + administrative
@@ -1093,7 +1186,7 @@ export function registerExtendedTools(
   // v1.1.2 contract: "explicit Extended exposes
   // the documented additional set" *on top of*
   // the Core surface.
-  const handlers = createMemoryToolHandlers(service);
+  const handlers = createMemoryToolHandlers(service, actorResolver);
   for (const name of [...CORE_TOOL_NAMES, ...EXTENDED_TOOL_NAMES]) {
     server.registerTool(
       name,
