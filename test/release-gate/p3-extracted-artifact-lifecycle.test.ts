@@ -237,6 +237,20 @@ describe("extracted-artifact lifecycle E2E (Stage 18 v1.1.2 issue #28, task 9)",
   });
 
   it("extract-release-artifact.mjs exits non-zero when the archive is missing canonical files", () => {
+    // v1.1.5 (v1.1.5 release): the previous
+    // implementation unconditionally packed
+    // a `.tar.gz` (via `packTarGz`) even on
+    // Windows. GNU tar exits 2 (fatal error)
+    // when packaging a Windows temp path on
+    // the windows-latest runner, which made
+    // the negative test fail before the extract
+    // script's behaviour was even exercised.
+    // Use the platform-appropriate format so
+    // the test reaches the assertion on every
+    // OS. The script's negative-case logic is
+    // identical for `.tar.gz` and `.zip`; the
+    // assertion `missing required file` fires
+    // either way.
     const tmp = mkdtempSync(join(tmpdir(), "agent-recall-extract-bad-"));
     try {
       const stage = join(tmp, "stage");
@@ -244,14 +258,25 @@ describe("extracted-artifact lifecycle E2E (Stage 18 v1.1.2 issue #28, task 9)",
       // Empty stage: only a placeholder file, NOT the
       // canonical entry points. The script must reject.
       writeFileSync(join(stage, "README.md"), "placeholder\n");
-      const archive = join(tmp, "agent-recall-1.1.2-bad-linux-x64.tar.gz");
-      packTarGz(stage, archive);
+      const isWindows = process.platform === "win32";
+      const archive = join(
+        tmp,
+        isWindows
+          ? "agent-recall-1.1.2-bad-win32-x64.zip"
+          : "agent-recall-1.1.2-bad-linux-x64.tar.gz"
+      );
+      if (isWindows) {
+        const result = packZip(stage, archive);
+        assert.ok(result.ok, `packZip failed on Windows: ${result.ok ? "" : result.reason}`);
+      } else {
+        packTarGz(stage, archive);
+      }
       const extractDir = join(tmp, "extracted");
       const result = runScript(extractScriptPath, [], {
         ...process.env,
         AGENT_RECALL_PACKAGED_ARTIFACT: archive,
         AGENT_RECALL_EXTRACT_DIR: extractDir,
-        AGENT_RECALL_PLATFORM: "linux"
+        AGENT_RECALL_PLATFORM: isWindows ? "win32" : "linux"
       });
       assert.notEqual(
         result.status,
