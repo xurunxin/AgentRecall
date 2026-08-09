@@ -102,6 +102,23 @@ jobs:
         with:
           node-version: "24"
 
+      - name: Install dependencies
+        # v1.1.5 (v1.1.5 release): the
+        # `verify-release-evidence.mjs` script
+        # imports `zod` (and `canonical-platforms.mjs`)
+        # from `node_modules/`. Pre-fix the
+        # `verify-release-evidence` job checked out
+        # the tag commit + set up Node 24 but did NOT
+        # install the workspace's npm dependencies,
+        # so the verifier always crashed with
+        # `ERR_MODULE_NOT_FOUND: 'zod'` and the
+        # v* tag was blocked at the very first gate.
+        # The `package` / `verify-extracted-artifacts` /
+        # `smoke` matrix jobs install their own
+        # dependencies later, so this step is
+        # local to the verifier job.
+        run: npm ci
+
       - name: Run evidence verifier
         env:
           GITHUB_SHA: ${{ github.sha }}
