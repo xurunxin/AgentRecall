@@ -80,12 +80,31 @@ function spawnServer(env: Record<string, string>): ChildProcess {
   );
 }
 
-/** Wait for the child to exit, capped at 2.5s.
+/** Wait for the child to exit, capped at 5s.
  *  If the cap is hit, send SIGKILL (host escape
- *  hatch) and return the partial result. */
+ *  hatch) and return the partial result.
+ *
+ *  v1.1.5 (v1.1.5 release): bumped the cap from
+ *  2.5s to 5s. The lifecycle module's SIGINT /
+ *  SIGTERM handler does the SQLite close +
+ *  listener teardown serially; on a busy VM
+ *  (e.g. the release-candidate orchestrator
+ *  re-running all 5 vitest suites on the same
+ *  ubuntu-latest runner at once) the handler
+ *  occasionally doesn't return within 2.5s, so
+ *  the host escape hatch fires and the test
+ *  reports `expected 'SIGINT' to be null`. The
+ *  lifecycle behaviour is correct (the unit
+ *  tests in `test/unit/mcp-server-lifecycle.idle.test.ts`
+ *  + `test/unit/server-lifecycle.test.ts`
+ *  cover the contract); this is a CI-time
+ *  timing flake. 5s gives the busy runner room
+ *  to complete the shutdown without hiding
+ *  real regression bugs (the 5s hard timeout
+ *  still applies). */
 function waitForExit(
   child: ChildProcess,
-  timeoutMs = 2500
+  timeoutMs = 5000
 ): Promise<ExitedChild> {
   return new Promise<ExitedChild>((resolve) => {
     let settled = false;
