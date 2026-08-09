@@ -128,6 +128,52 @@ a personal tool, but the file structure is here for future contributors).
   rewrite is the right fix and will ship in a
   follow-up once the orchestrator VM's
   cold-start variance is characterised.
+- **`scripts/verify-release-evidence.mjs` v1.1.2-shape
+  parser is the active contract on
+  rc-1.1.5-candidate.** The v1.1.3 GATE-04 (#34)
+  / GATE-06 B2 blocker 3 (issue #36) refactor —
+  migrate the rc-branch orchestrator to the
+  `--fragments` aggregator so the evidence
+  carries per-platform `ci_jobs` + 3-platform
+  `artifacts` (with sha256) + `stress_summary`
+  + object-form `migration_summary` — is
+  unfinished. Until that ships (v1.1.6
+  follow-up), v1.1.5's
+  `verify-release-evidence.mjs` auto-detects
+  the v1.1.2 orchestrator shape
+  (`schema_version: 1`, `ci_runs` + 2-stub
+  `artifacts` + array-form
+  `migration_summary`) and applies a parallel
+  legacy Zod schema. The same operational
+  invariants are enforced in both paths:
+  - per-suite `failed === 0` +
+    `unhandled_rejections === 0` +
+    `worker_timeouts === 0` +
+    `skipped <= 100` + `passed > 0` in
+    `test_summary.suites` (the v1.1.3 GATE-06
+    B2 blocker 3 shape that the orchestrator
+    already populates from `aggregate.json`)
+  - `candidate_sha === release_commit`
+  - `version` matches `package.json#version`
+    (the v1.1.5 gate reads the live value
+    instead of the v1.1.2 hardcoded `"1.1.2"`)
+  - `tag` is `null` or `vX.Y.Z`
+  - every `ci_runs` entry has a GitHub
+    `job_url`, a positive `duration_ms`, and
+    `conclusion: "success"`
+  - `release_workflow.conclusion === "success"`
+    and `duration_ms > 0`
+  - `known_non_blocking_limits` is non-empty
+  - The 3-platform `MISMATCHED_PLATFORMS` check
+    is intentionally NOT enforced on the
+    legacy path: the rc-branch only mints the
+    linux-x64 candidate package; the macOS +
+    Windows archives are built by `release.yml`
+    on the tag-driven path. The v1.1.3 refactor
+    will re-introduce the per-platform check
+    once the matrix legs each upload a
+    `release-evidence-fragment-matrix-<os>`
+    v1.1.3 fragment.
 
 ## [1.1.4] — MCP graceful shutdown on stdio EOF + signals
 
