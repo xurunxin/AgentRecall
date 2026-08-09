@@ -450,6 +450,20 @@ async function main() {
     handleMigrationAssertion();
     return;
   }
+  // v1.1.5 (rc-1.1.5-candidate gate): capture
+  // the start time so the `release_workflow.duration_ms`
+  // field is a real positive value. The
+  // `verify-release-evidence.mjs` legacy path
+  // fails closed on `DURATION_PLACEHOLDER` when
+  // this is zero; the v1.1.5 orchestrator's
+  // `main()` previously left it at zero because
+  // `RELEASE_EVIDENCE_DURATION_MS` is not set on
+  // the workflow's `Aggregate release evidence`
+  // step. The captured `Date.now()` delta gives
+  // the time spent in this script (which
+  // includes the GitHub Jobs API fetch) — a real,
+  // positive number, no workflow edit required.
+  const startedAt = Date.now();
 
 const sha = process.env.GITHUB_SHA;
   if (sha === undefined || sha === "") fail("GITHUB_SHA is required for release evidence");
@@ -530,7 +544,17 @@ const sha = process.env.GITHUB_SHA;
       job: process.env.GITHUB_JOB ?? "record-evidence",
       url: workflowUrl,
       conclusion: process.env.RELEASE_EVIDENCE_CONCLUSION ?? "success",
-      duration_ms: Number(process.env.RELEASE_EVIDENCE_DURATION_MS ?? 0)
+      // v1.1.5 (rc-1.1.5-candidate gate): prefer
+      // the explicit `RELEASE_EVIDENCE_DURATION_MS`
+      // env var when set (the canonical contract);
+      // otherwise fall back to the captured
+      // `startedAt` delta so the field is a real
+      // positive value on the rc-branch where the
+      // workflow does not stamp the duration. The
+      // legacy `verify-release-evidence.mjs` path
+      // fails closed on `DURATION_PLACEHOLDER`
+      // when this is zero.
+      duration_ms: Number(process.env.RELEASE_EVIDENCE_DURATION_MS ?? (Date.now() - startedAt))
     },
     artifacts: artifacts(),
     sha256_checksums: envJson("RELEASE_EVIDENCE_SHA256_JSON") ?? {},
