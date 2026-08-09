@@ -32,7 +32,15 @@ function strings(value) { if (typeof value === "string") return [value]; if (Arr
 export function verifyDocument(raw, evidencePath, stable = true) {
   if (Array.isArray(raw?.sha256_checksums) || raw?.sha256_checksums === null || typeof raw?.sha256_checksums !== "object") reject("CHECKSUM_TYPE_INVALID", "sha256_checksums must be an object");
   const suppliedPlatforms = [...(raw?.artifacts ?? []), ...(raw?.ci_jobs ?? []), raw?.release_workflow].filter(Boolean).map(x => x.platform);
-  if (suppliedPlatforms.some(p => !CANONICAL_PLATFORMS.includes(p))) reject("PLATFORM_NOT_CANONICAL", "non-canonical platform token");
+  // v1.1.5 (rc-1.1.5-candidate gate): ignore
+  // `undefined` platform entries (the legacy
+  // `ci_runs` / `release_workflow` shape does not
+  // carry a `platform` field; the canonical
+  // `--fragments` aggregator maps it). A genuine
+  // non-canonical token (e.g. `windows-x64` before
+  // migration, `darwin-arm64`, `unknown`) still
+  // fails closed.
+  if (suppliedPlatforms.some((p) => p !== undefined && !CANONICAL_PLATFORMS.includes(p))) reject("PLATFORM_NOT_CANONICAL", "non-canonical platform token");
   const parsed = ReleaseEvidence.safeParse(raw);
   if (!parsed.success) reject("SCHEMA_INVALID", parsed.error.issues.map(i => `${i.path.join(".")}: ${i.message}`).join("; "));
   const doc = parsed.data;
