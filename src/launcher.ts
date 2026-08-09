@@ -332,8 +332,90 @@ async function runHttpServer(): Promise<void> {
     dataHome,
     profile: activeProfile,
     buildEndpoint: () => `http://${host}:${port}/mcp`,
-    probe: async () => false
+    // v1.1.5 (review by chatgpt-codex-connector on
+    // PR #40, item "Probe the recorded daemon
+    // instead of always reclaiming it"): the
+    // pre-PR-#40 probe was a constant `async () =>
+    // false` — every live daemon was classified as
+    // stale, its lock was unlinked, and a second
+    // launcher bound the same port (and the stale
+    // daemon kept serving requests with an
+    // undeleteable token). The probe is now a
+    // genuine HTTP probe of the recorded endpoint
+    // with the recorded Bearer token. A 2xx or 401
+    // is "alive" (the daemon responded; auth may
+    // have failed but the socket is up); a 404, a
+    // connect-refused, or a timeout is "stale" and
+    // the launcher reclaims. `AbortSignal.timeout`
+    // is the cancellation primitive (Node 17+,
+    // matching the project's Node-version floor).
+    probe: async (existing) => {
+      // Use a fresh AbortController per probe so
+      // concurrent launchers don't share a single
+      // timeout signal. The 500 ms ceiling is
+      // tight enough to keep launch latency low
+      // and loose enough to absorb a one-tick
+      // event-loop stall on the daemon side.
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 500);
+      try {
+        const res = await fetch(existing.endpoint, {
+          method: "GET",
+          signal: ctl.signal,
+          headers: { authorization: `Bearer ${existing.token}` }
+        });
+        // 2xx = healthy MCP daemon; 401 = daemon
+        // alive but token mismatch (a different
+        // launcher overwrote the token mid-flight
+        // — let `acquireOrJoin` reclaim). 404 is
+        // a path-not-found response which still
+        // means the socket is up; the canonical
+        // MCP `initialize` POST without a token
+        // would return 401, but a `GET /mcp`
+        // without auth may return 404 from the
+        // route layer's non-`/mcp` short-circuit
+        // (PR #40 review item "Reject non-/mcp
+        // paths before dispatching MCP requests"
+        // — POSTs are 401, GETs are 404). Either
+        // proves the daemon is alive. 5xx is
+        // "sick but up" — the caller's next
+        // request may succeed; treat as alive.
+        if (res.status === 503) return false;
+        return res.status >= 200 && res.status < 500;
+      } catch {
+        // connect-refused / DNS failure / timeout.
+        return false;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
   });
+
+  // v1.1.5 (review by chatgpt-codex-connector on
+  // PR #40, item "Probe the recorded daemon
+  // instead of always reclaiming it"): if the
+  // lockfile already points at a live daemon
+  // (the probe returned `true`), the launcher
+  // is joining an existing daemon — NOT
+  // becoming one. The previous design would
+  // fall through to `realRunHttpServer`, which
+  // would try to bind the same port the joined
+  // daemon already owns and crash with
+  // `EADDRINUSE`. The fix: when `lock.joined`
+  // is true, log a one-line notice and exit
+  // cleanly. The joined daemon serves new
+  // clients; this process does not stay alive
+  // (it has no listener, no `MemoryService` of
+  // its own, and would only block the host's
+  // process table).
+  if (lock.joined) {
+    if (process.env.AGENT_RECALL_HTTP_VERBOSE === "1") {
+      console.error(
+        `[mcp-http] joining existing daemon at ${lock.endpoint} (lock ${lock.lockPath})`
+      );
+    }
+    return;
+  }
 
   try {
     await realRunHttpServer({
