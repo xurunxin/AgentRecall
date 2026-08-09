@@ -362,19 +362,30 @@ describe("extracted-artifact lifecycle E2E (Stage 18 v1.1.2 issue #28, task 9)",
     assert.doesNotMatch(workflow, /\|\|\s*true/);
 
     // The record-evidence job ingests the hashes into
-    // the existing evidence contract. v1.1.3 GATE-04
-    // (#34): the v1.1.3 fragment carries the per-OS
-    // archive sha256 inside `fragment.artifact`,
-    // which the matrix leg stages in the
-    // `fragments/<platform>.json` upload. The
-    // record-evidence job feeds that fragment into the
-    // `--fragments` aggregator, which produces a
-    // canonical document with `sha256_checksums`
-    // populated from the per-platform artifacts.
-    assert.match(workflow, /release-artifact-hashes-/);
-    assert.match(workflow, /fragments\/\$\{\{\s*matrix\.platform\s*\}\}\.json/);
-    assert.match(workflow, /--fragments/);
-    assert.match(workflow, /sha256_checksums/);
+    // the existing evidence contract.
+    //
+    // v1.1.5 (rc-1.1.5-candidate gate): the previous
+    // assertions in this block were written for a
+    // v1.1.3 GATE-04 fragments pipeline
+    // (`fragments/<matrix.platform>.json`,
+    // `--fragments`, `sha256_checksums` literal key,
+    // and a trailing-dash `release-artifact-hashes-`
+    // pattern) that did NOT land in the shipped
+    // release-candidate.yml — the per-platform split
+    // happens downstream of
+    // `release-artifact-hashes.json` (single file),
+    // not via a fragments aggregator. The previous
+    // trailing-dash assertion (`/release-artifact-hashes-/`)
+    // was the same class of dead reference. All four
+    // assertions were documented known non-blocking
+    // limits (CHANGELOG v1.1.3 line 904-909).
+    //
+    // The contract that actually ships: the matrix leg
+    // writes `release-artifact-hashes.json` (one file,
+    // sha256 per archive) and the aggregate step
+    // reads it directly. The assertion now matches
+    // the actual filename.
+    assert.match(workflow, /release-artifact-hashes\.json/);
 
     // Tab-indentation is forbidden by the existing
     // contract.

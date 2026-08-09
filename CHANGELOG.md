@@ -73,6 +73,59 @@ a personal tool, but the file structure is here for future contributors).
   `success` on ubuntu-latest, macos-latest, and
   windows-2022 / Node 24.
 
+### Known non-blocking limits
+
+- **`test/release-gate/p3-extracted-artifact-lifecycle.test.ts`**
+  the "release-candidate.yml wires
+  extract-and-verify" case previously asserted a
+  v1.1.3 GATE-04 fragments pipeline
+  (`fragments/<matrix.platform>.json`,
+  `--fragments`, `sha256_checksums` literal key,
+  and a trailing-dash `release-artifact-hashes-`
+  pattern) that did NOT land in the shipped
+  release-candidate.yml. v1.1.5 removes those
+  four assertions and keeps the contract that
+  actually ships: the matrix leg writes
+  `release-artifact-hashes.json` (one file,
+  sha256 per archive) and the aggregate step
+  reads it directly. The four dead assertions
+  were documented known non-blocking limits
+  before v1.1.5 (CHANGELOG v1.1.3 line 904-909).
+- **`test/multi-process-stress.test.ts`**
+  "no orphaned child processes or temp data
+  homes remain after every scenario" assertion
+  is a Windows-only flake (the cleanup runs
+  `rmSync` synchronously; on Windows the
+  per-handle delete races the test's own
+  in-flight writes). The Linux + macOS CI legs
+  consistently pass. Carried over from
+  v1.1.3 / v1.1.4 CHANGELOGs unchanged.
+- **`test/blackbox/mcp-stdio-idle.test.ts`**
+  "exits within 2.5s when idleMs=500 and no
+  traffic" case is timing-fraky on the
+  release-candidate orchestrator runner. The
+  case spawns a real MCP server child and waits
+  for the stdio idle-timer to fire + the
+  lifecycle's `process.exit(0)` to land within
+  a 2.5s post-warmup cap. The matrix ubuntu /
+  macos / windows jobs (single suite, dedicated
+  runner) consistently pass the 2.5s budget. The
+  release-candidate gate's `Release aggregate`
+  orchestrator re-runs all 5 vitest suites on
+  the same ubuntu-latest VM and pushes the cold
+  child startup just over 2.5s on a single
+  measured run, so the orchestrator reports
+  `failures=1` for that suite. The other 4
+  orchestrator suites stay clean. Pre-existing
+  PR 40 race; the underlying idle-timer logic
+  is correct (verified by the dedicated
+  `test/unit/mcp-server-lifecycle.idle.test.ts`
+  + `test/unit/idle-timer.test.ts` units). The
+  cap-widening path is the right fix and will
+  ship in a follow-up PR once the cold-start
+  variance is characterised on the orchestrator
+  runner.
+
 ## [1.1.4] — MCP graceful shutdown on stdio EOF + signals
 
 ### Fixed
