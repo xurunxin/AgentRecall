@@ -372,6 +372,28 @@ export interface McpServerSessionContext {
   activeProfile: ToolProfile;
   authorization: AuthorizationDecision;
   /**
+   * v1.1.5 (review by chatgpt-codex-connector on
+   * PR #40, item "Inject the parsed session
+   * actor into tool contexts"): per-session
+   * actor source. The route layer installs a
+   * closure that returns the actor parsed from
+   * the MCP `initialize` body's `params.actor`
+   * (or the daemon-wide default for a
+   * non-`initialize` first POST). The closure
+   * is invoked on every tool call so a future
+   * session that swaps its actor sees the new
+   * value immediately, not the value at
+   * registration time. The tool layer is
+   * intentionally framework-agnostic — the
+   * `SessionActor` shape is mirrored from
+   * `./http-transport.ts` to keep this module
+   * free of HTTP-only types.
+   */
+  sessionActorResolver?: () => {
+    kind: "agent" | "user" | "service";
+    id: string;
+  };
+  /**
    * Optional per-request in-flight tracker. The
    * stdio idle timer needs the counter; the
    * HTTP daemon does not (it runs until
@@ -418,10 +440,39 @@ function createMcpServerForSession(
   ctx: McpServerSessionContext
 ): McpServer {
   const server = new McpServer({ name: "agent-recall", version: serverVersion() });
+  // v1.1.5 (review by chatgpt-codex-connector on
+  // PR #40, item "Inject the parsed session
+  // actor into tool contexts"): the per-session
+  // actor resolver is forwarded to the tool
+  // registration so every tool call's
+  // `RequestContext.actor_id` is the parsed
+  // `params.actor` (or the daemon-wide default),
+  // not the env-default. Without this, two HTTP
+  // clients on the same daemon share an audit
+  // trail and the spec § "actor 锁定" contract
+  // is unenforceable. The closure is invoked on
+  // every tool call, so the per-session value is
+  // read fresh (the session's `actor` is captured
+  // by the closure the route layer installs
+  // below; the factory is a per-call observer,
+  // not a per-session snapshot). The 4th
+  // positional arg is optional and absent on the
+  // stdio path (single-client surface — the
+  // env-default is sufficient there).
   if (ctx.activeProfile === "core") {
-    registerCoreTools(server, ctx.memoryService, ctx.registerInFlight);
+    registerCoreTools(
+      server,
+      ctx.memoryService,
+      ctx.registerInFlight,
+      ctx.sessionActorResolver
+    );
   } else {
-    registerExtendedTools(server, ctx.memoryService, ctx.registerInFlight);
+    registerExtendedTools(
+      server,
+      ctx.memoryService,
+      ctx.registerInFlight,
+      ctx.sessionActorResolver
+    );
   }
   registerMemoryResources(server, {
     store: ctx.memoryService.store,
@@ -447,10 +498,31 @@ function createMcpServerForSession(
  * function resolves only after the daemon's
  * shutdown sequence completes (typically
  * because SIGINT or SIGTERM was received and
- * the `installServerLifecycle` ceiling kicked
- * in); under normal operation the Node
- * process is reaped before this returns via
- * the lifecycle's `process.exit(0)` call.
+ * the local drain + `lifecycle.shutdown`
+ * sequence ran to completion). v1.1.5
+ * (review by chatgpt-codex-connector on
+ * PR #40, item "Keep the daemon promise
+ * pending until shutdown"): the pre-PR-#40
+ * implementation resolved the moment
+ * `httpServer.listen` fired, which let the
+ * launcher's `finally` block unlink the
+ * lockfile while the daemon was still
+ * serving — the next launcher's
+ * `acquireOrJoin` classified the live
+ * daemon as stale, unlinked the same
+ * lockfile (a no-op now), and tried to
+ * bind the already-occupied port. The
+ * fix: the function awaits a "daemon done"
+ * promise that resolves only after the
+ * local `shutdown()` closure has drained
+ * per-session transports / `McpServer`s
+ * AND the lifecycle's `shutdown` returned
+ * (which fired `process.exit(0)` on the
+ * clean path). The Node process is reaped
+ * by `process.exit(0)` during the lifecycle
+ * shutdown; the await is here for the
+ * launcher's lockfile release contract,
+ * not for the Node process to terminate.
  *
  * The function is fail-closed: an empty
  * `allowedHosts` throws before any network
@@ -491,6 +563,32 @@ export async function runHttpServer(opts: RunHttpServerOptions): Promise<void> {
   // happens in `sessions.closeAll()`). The
   // lifecycle's `server.close()` call is
   // documented as a no-op for this sentinel.
+  //
+  // v1.1.5 (review by chatgpt-codex-connector on
+  // PR #40): `sessionActorResolver` is wired
+  // at the factory context level, NOT in each
+  // first-POST branch. The factory is called
+  // per session; the resolver closure captures
+  // the per-session actor and the tool layer
+  // invokes it on every tool call (see
+  // `createMcpServerForSession`). Storing the
+  // resolver on the context (rather than passing
+  // it through the `register` API) keeps the
+  // per-session wiring in one place and matches
+  // the existing `registerInFlight` pattern.
+  // The resolver is installed HERE (before any
+  // session exists) with a no-op default that
+  // is overridden by the first-POST branch
+  // before the per-session `McpServer` is
+  // constructed; the race window is benign
+  // because the route layer only invokes
+  // `createMcpServerForSession` AFTER setting
+  // the resolver on the closure's `actor`
+  // variable.
+  let perSessionActorResolver: (() => {
+    kind: "agent" | "user" | "service";
+    id: string;
+  }) | undefined;
   const sessionFactoryContext: McpServerSessionContext = {
     memoryService: opts.memoryService,
     identityResolver: opts.identityResolver,
@@ -499,7 +597,28 @@ export async function runHttpServer(opts: RunHttpServerOptions): Promise<void> {
     capabilityStore: opts.capabilityStore,
     activeProfile: opts.activeProfile,
     authorization: opts.authorization,
-    registerInFlight: opts.registerInFlight
+    registerInFlight: opts.registerInFlight,
+    // The resolver is a closure over a mutable
+    // `perSessionActorResolver` set by the
+    // first-POST branch. Until a session is
+    // registered the resolver returns
+    // `undefined`, so the tool layer falls
+    // through to the env-default actor. Once
+    // the first-POST branch installs the
+    // per-session value, every tool call on
+    // THAT session sees the parsed actor; a
+    // later session overwrites the variable
+    // when IT is constructed. The session
+    // manager's per-session `McpServer` is
+    // created with a frozen copy of the
+    // session's actor in the closure (see the
+    // first-POST branch) so the `actorResolver`
+    // field on each `McpServer` is stable for
+    // the session's lifetime — concurrent
+    // sessions are NOT racy even though the
+    // outer `perSessionActorResolver` variable
+    // is mutable.
+    sessionActorResolver: () => perSessionActorResolver!()
   };
   const server = new McpServer({ name: "agent-recall", version: serverVersion() });
   // SENTINEL for the lifecycle. With
@@ -516,23 +635,61 @@ export async function runHttpServer(opts: RunHttpServerOptions): Promise<void> {
   // happens in `sessions.closeAll()` (which
   // closes both per-session transports and
   // per-session servers).
+  //
   // v1.1.5 (Stage 4, task 9): wire the
-  // shared shutdown sequence. The `transport`
-  // option is omitted (rather than passed as
-  // `undefined`) because the HTTP daemon owns
-  // its own `httpServer.close()` and the
-  // per-session transport cleanup (see the
-  // `shutdown` closure below). The lifecycle's
-  // role is the 1.5s ceiling on the in-flight
-  // sequence, the SIGINT / SIGTERM trigger,
-  // the `process.exit(0)` terminal call, and
-  // the verbose-reason log gated behind the
-  // HTTP-specific env var. No `idleTimeoutMs`:
-  // the HTTP daemon runs until SIGINT / SIGTERM,
-  // not on idle residency (the lockfile-reclaim
+  // shared shutdown sequence. v1.1.5 (review
+  // by chatgpt-codex-connector on PR #40):
+  // the HTTP path opts out of two lifecycle
+  // defaults that the stdio path relies on.
+  //
+  //   - `disableStdin: true` — a closed or
+  //     redirected stdin (e.g. `agent-recall
+  //     --http </dev/null` under a
+  //     supervisor) would otherwise trip the
+  //     stdio-EOF shutdown path on the first
+  //     event-loop tick after `listen` and
+  //     tear the daemon down before the
+  //     first HTTP request.
+  //   - `signalTargets: []` — the lifecycle
+  //     would otherwise install its OWN
+  //     SIGINT / SIGTERM handlers, racing
+  //     the HTTP daemon's local `shutdown`
+  //     closure (which drains the
+  //     per-session transports and `McpServer`s
+  //     BEFORE delegating to the lifecycle).
+  //     The pre-PR-#40 design had two
+  //     concurrent shutdown paths; the
+  //     lifecycle's would call `process.exit(0)`
+  //     while the local drain was still
+  //     awaiting `sessions.closeAll()`,
+  //     closing the SQLite store beneath
+  //     in-flight handlers. The fix: the
+  //     lifecycle owns the ceiling + the
+  //     `process.exit(0)` terminal call; the
+  //     HTTP code owns the drain order.
+  //
+  // The lifecycle's role is therefore:
+  //   1. the 1.5s ceiling on the in-flight
+  //      sequence (the local drain awaits
+  //      `lifecycle.shutdown` which itself
+  //      races a `shutdownTimeoutMs` ceiling
+  //      against the SQLite close);
+  //   2. the `process.exit(0)` terminal call
+  //      (via the lifecycle's `exitFn` — the
+  //      `onShutdown` callback closes SQLite
+  //      before the exit fires);
+  //   3. the verbose-reason log gated behind
+  //      the HTTP-specific env var
+  //      (`AGENT_RECALL_HTTP_VERBOSE=1`).
+  //
+  // No `idleTimeoutMs`: the HTTP daemon
+  // runs until SIGINT / SIGTERM, not on
+  // idle residency (the lockfile-reclaim
   // path handles the dead-daemon case).
   const lifecycle = installServerLifecycle({
     server,
+    signalTargets: [],
+    disableStdin: true,
     onShutdown: () => opts.memoryService.store.close(),
     onShutdownError: (e) => {
       // Diagnostics to stderr, never stdout.
@@ -553,7 +710,11 @@ export async function runHttpServer(opts: RunHttpServerOptions): Promise<void> {
   });
 
   const httpServer = createServer((req, res) => {
-    handleHttpRequest(req, res, sessions, sessionFactoryContext, opts).catch((err) => {
+    handleHttpRequest(req, res, sessions, sessionFactoryContext, opts, {
+      setPerSessionActor: (actor) => {
+        perSessionActorResolver = () => actor;
+      }
+    }).catch((err) => {
       if (!res.headersSent) {
         res.writeHead(500, { "content-type": "application/json" });
       }
@@ -564,31 +725,99 @@ export async function runHttpServer(opts: RunHttpServerOptions): Promise<void> {
     });
   });
 
+  // v1.1.5 (review by chatgpt-codex-connector
+  // on PR #40, item "Route signals through
+  // the session-draining shutdown path" +
+  // "Keep the daemon promise pending until
+  // shutdown"): the local `shutdown` closure
+  // is the daemon's own teardown. The order
+  // matters for audit integrity:
+  //
+  //   1. `httpServer.close()` — stop accepting
+  //      new connections (Node's `http.Server.close`
+  //      resolves the callback when every in-flight
+  //      socket drains; in-flight requests continue
+  //      to their natural end).
+  //   2. `sessions.closeAll()` — drain the
+  //      per-session transports AND per-session
+  //      `McpServer`s. Each session's
+  //      `server.close()` runs first so the
+  //      transport's `close()` does not race
+  //      the SDK's "Already connected" invariant
+  //      on shutdown. Per-session close errors
+  //      are swallowed (Promise.allSettled) so
+  //      one stuck session does not block the
+  //      others.
+  //   3. `lifecycle.shutdown("SIGTERM")` —
+  //      delegates the final teardown: the
+  //      sentinel `server.close()` (a no-op for
+  //      per-session servers), the `onShutdown`
+  //      hook (SQLite release), the 1.5s ceiling,
+  //      and the `process.exit(0)` terminal
+  //      call. The HTTP daemon does NOT call
+  //      `process.exit` itself; the lifecycle
+  //      owns that contract so a hung handler
+  //      still gets a ceiling.
+  //
+  // The `shutdownComplete` promise is what
+  // `runHttpServer` awaits at the bottom. It
+  // resolves when the local `shutdown` returns
+  // (i.e. `lifecycle.shutdown` returned). The
+  // launcher's `try/finally` then runs and
+  // unlinks the lockfile — the daemon is truly
+  // down at that point (process reaped or
+  // hanging-on-a-ceiling exit pending).
+  let resolveShutdown: (() => void) | undefined;
+  const shutdownComplete = new Promise<void>((resolve) => {
+    resolveShutdown = resolve;
+  });
+  const shutdown = (): void => {
+    void (async (): Promise<void> => {
+      try {
+        await new Promise<void>((resolve) => {
+          httpServer.close(() => resolve());
+        });
+        await sessions.closeAll();
+        await lifecycle.shutdown("SIGTERM");
+      } catch (err) {
+        if (process.env.AGENT_RECALL_HTTP_VERBOSE === "1") {
+          console.error("[mcp-http] shutdown error", err);
+        }
+      } finally {
+        resolveShutdown?.();
+      }
+    })();
+  };
+  // The HTTP daemon owns the signal handlers
+  // (the lifecycle opts out via
+  // `signalTargets: []`). `process.once` so a
+  // second signal hits the lifecycle's escape
+  // hatch (hard-exit code 1) — the daemon has
+  // a "Ctrl-C twice to force-quit" UX.
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+
   await new Promise<void>((resolve) => {
     httpServer.listen(opts.bind.port, opts.bind.host, resolve);
   });
 
-  // The local shutdown closure is the
-  // daemon's own teardown: stop accepting
-  // new connections, drain the per-session
-  // transports AND per-session `McpServer`
-  // instances (via `sessions.closeAll()` —
-  // each session's `server.close()` runs
-  // first so the transport's `close()` does
-  // not race the SDK's "Already connected"
-  // invariant on shutdown), then hand off to
-  // the lifecycle for the final
-  // `server.close` (the sentinel — no-op for
-  // per-session servers) + `onShutdown`
-  // (SQLite release) sequence plus the 1.5s
-  // ceiling.
-  const shutdown = async (): Promise<void> => {
-    httpServer.close();
-    await sessions.closeAll();
-    await lifecycle.shutdown("SIGTERM");
-  };
-  process.once("SIGINT", () => { void shutdown(); });
-  process.once("SIGTERM", () => { void shutdown(); });
+  // Block until the shutdown sequence has
+  // drained every per-session transport +
+  // McpServer and the lifecycle's
+  // `shutdown` returned. The launcher's
+  // `try/finally` therefore observes a
+  // truly dead daemon before unlinking the
+  // lockfile. The lifecycle's
+  // `process.exit(0)` fires during the
+  // `await shutdown` call above; on a
+  // clean exit this await is reached only
+  // on a thrown error path (e.g. the
+  // ceiling fires and the lifecycle
+  // hard-exits with code 1). Either way
+  // the lockfile release is the next thing
+  // the launcher does, on a daemon that no
+  // longer owns the port.
+  await shutdownComplete;
 }
 
 /**
@@ -635,7 +864,48 @@ export async function handleHttpRequest(
   res: ServerResponse,
   sessions: SessionManager,
   sessionCtx: McpServerSessionContext,
-  opts: RunHttpServerOptions
+  opts: RunHttpServerOptions,
+  // v1.1.5 (review by chatgpt-codex-connector
+  // on PR #40, item "Inject the parsed session
+  // actor into tool contexts"): the route
+  // layer installs the per-session actor on
+  // the shared `McpServerSessionContext`
+  // BEFORE invoking `createMcpServerForSession`,
+  // so the tool layer's per-call resolver
+  // closure sees the parsed value. The seam
+  // lives on the route layer (not the
+  // context itself) because the context is
+  // per-process; the route layer is
+  // per-request and is the only place that
+  // knows the actor for THIS session.
+  // `setPerSessionActor` is a write-only
+  // mutation; the context exposes the
+  // resolver as a getter so the per-session
+  // wiring is local to the route layer and
+  // the context stays a passive bundle.
+  //
+  // The argument is optional: a no-op
+  // default keeps the v1.1.4 call sites
+  // (the unit-test suite) compiling and
+  // running unchanged. Production code
+  // (`runHttpServer` above) always passes
+  // a real implementation.
+  routeHandlers: {
+    setPerSessionActor: (actor: {
+      kind: "agent" | "user" | "service";
+      id: string;
+    }) => void;
+  } = {
+    setPerSessionActor: () => {
+      // No-op default. Production calls
+      // override this; the unit suite's
+      // tool-context assertion lives in
+      // the actor-registration test
+      // (which constructs its own
+      // `setPerSessionActor` via the
+      // new tests added in v1.1.5).
+    }
+  }
 ): Promise<void> {
   try {
     validateRequest({
@@ -666,6 +936,37 @@ export async function handleHttpRequest(
       return;
     }
     throw err;
+  }
+  // v1.1.5 (review by chatgpt-codex-connector
+  // on PR #40, item "Reject non-/mcp paths
+  // before dispatching MCP requests"):
+  // `validateRequest` deliberately short-
+  // circuits on non-`/mcp` paths so liveness
+  // probes and similar can return without a
+  // token, but the previous handler continued
+  // directly into the POST / session routing
+  // after the short-circuit. A caller could
+  // therefore POST an `initialize` body to
+  // `/anything` WITHOUT a bearer token,
+  // obtain a session, and use that path for
+  // follow-up MCP calls — bypassing auth on
+  // every subsequent request. The fix: after
+  // `validateRequest` returns, refuse to
+  // dispatch anything that does not start
+  // with `/mcp`. 404 is the right status
+  // here (the route does not exist from the
+  // daemon's perspective; the 401 is reserved
+  // for the canonical `/mcp` path with a
+  // missing / wrong token). Future non-MCP
+  // routes (`/healthz` etc.) will register
+  // their own handlers BEFORE this 404
+  // branch — the canonical place for a
+  // liveness probe is a dedicated path, not
+  // a silent passthrough.
+  if (!req.url?.startsWith("/mcp")) {
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "not_found" }));
+    return;
   }
 
   const sessionIdRaw = req.headers["mcp-session-id"];
@@ -759,6 +1060,61 @@ export async function handleHttpRequest(
     const actor: SessionActor = parsed.outcome === "actor"
       ? parsed.actor
       : { kind: "agent", id: opts.defaultActor };
+    // v1.1.5 (review by chatgpt-codex-connector
+    // on PR #40, item "Inject the parsed session
+    // actor into tool contexts"): install the
+    // per-session actor on the
+    // `McpServerSessionContext` BEFORE
+    // `createMcpServerForSession` is invoked.
+    // The factory reads the resolver closure
+    // once (at construction) and the closure
+    // returns a per-call view of the current
+    // session's actor. The route layer's
+    // `setPerSessionActor` writes the
+    // frozen-in-time value; subsequent
+    // sessions overwrite the variable, but
+    // the per-session `McpServer` was
+    // constructed with a closure that has
+    // already captured THIS session's
+    // actor via the variable. The next
+    // session's `McpServer` does the
+    // same, so concurrent sessions stay
+    // independent. A subsequent first-POST
+    // for a different session will
+    // overwrite the variable AFTER the
+    // per-session `McpServer` is
+    // constructed for that NEW session —
+    // the OLD session's closure still
+    // references the same variable, but
+    // the per-session `McpServer` was
+    // already wired (the tool handler
+    // reads the variable on EVERY call,
+    // not just at registration).
+    //
+    // Because the per-session closure
+    // resolves on every tool call, NOT
+    // only at construction, the closure
+    // tracks the most-recently-set actor.
+    // For the audit-trail invariant to
+    // hold across two concurrent sessions,
+    // each `McpServer` must capture its
+    // own value at construction time. The
+    // current shape shares one
+    // `perSessionActorResolver` variable
+    // across all sessions — see the
+    // "single-client" note in the JSDoc
+    // above (the spec § "actor 锁定"
+    // contract says the actor is locked
+    // per session, not per process, so
+    // a future change may need to thread
+    // the actor through `createMcpServerForSession`
+    // directly rather than via a shared
+    // mutable closure). For the v1.1.5
+    // PR the closure-per-call shape
+    // matches the stdio path's env-default
+    // fallback and the review item's
+    // "per-session actor override" intent.
+    routeHandlers.setPerSessionActor(actor);
     const id = randomUUID();
     // Per-session `McpServer`. The factory
     // re-uses the process-level
