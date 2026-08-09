@@ -762,4 +762,207 @@ describe("handleHttpRequest first-POST branch", () => {
       handleRequestSpy.mockRestore();
     }
   });
+
+  it("rejects non-/mcp paths with 404 + does not register a session (review item: auth-shortcut bypass)", async () => {
+    // v1.1.5 (review by chatgpt-codex-connector
+    // on PR #40, item "Reject non-/mcp paths
+    // before dispatching MCP requests"):
+    // `validateRequest` deliberately short-
+    // circuits on non-`/mcp` paths so liveness
+    // probes can return without a token, but
+    // the previous handler continued directly
+    // into the POST / session routing after
+    // the short-circuit. A caller could POST
+    // an `initialize` body to `/anything`
+    // WITHOUT a bearer token, obtain a
+    // session, and use that path for follow-up
+    // MCP calls — bypassing auth on every
+    // subsequent request. The fix: the route
+    // layer returns 404 BEFORE the MCP dispatch
+    // for any URL that does not start with
+    // `/mcp`. The 404 is the right status
+    // (the route does not exist from the
+    // daemon's perspective; 401 is reserved
+    // for the canonical `/mcp` path with a
+    // missing / wrong token).
+    //
+    // The test asserts three properties:
+    //   1. The response status is 404.
+    //   2. The body is `{ error: "not_found" }`.
+    //   3. The session map is empty (no
+    //      registration happened — the path
+    //      did not reach the first-POST
+    //      branch).
+    const { handleHttpRequest } = await import("../../src/mcp/http-server.js");
+    const sessions = new SessionManager();
+    const opts = {
+      dataHome: home(),
+      defaultActor: "default-fallback",
+      activeProfile: "core",
+      identityResolver: {} as never,
+      memoryService: {} as never,
+      capabilityStore: { hasCapability: () => false } as never,
+      authorization: { actorMaxSensitivity: "normal", profile: "core" } as never,
+      bind: { host: "127.0.0.1", port: 0 },
+      allowedHosts: ["127.0.0.1:7777"],
+      allowedOrigins: [],
+      bearerToken: "test-token"
+    };
+    const sessionCtx = makeSessionCtx();
+    // Build a request that mimics the auth-bypass
+    // attempt: a valid MCP `initialize` body sent
+    // to `/not-mcp`, with a Bearer token. The
+    // URL is the only thing that should make
+    // this a 404. Note: the test deliberately
+    // includes the bearer token so the test
+    // cannot pass for the wrong reason (e.g. an
+    // auth failure on a real `/mcp` request).
+    const body = Buffer.from(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-01-01",
+        capabilities: {},
+        clientInfo: { name: "test", version: "1" },
+        actor: { kind: "user", id: "alice" }
+      }
+    }));
+    const req = new EventEmitter() as unknown as IncomingMessage;
+    (req as { method: string }).method = "POST";
+    (req as { headers: Record<string, string> }).headers = {
+      host: "127.0.0.1:7777",
+      "content-type": "application/json",
+      authorization: `Bearer ${opts.bearerToken}`
+    };
+    (req as { url: string }).url = "/not-mcp";
+    process.nextTick(() => {
+      req.emit("data", body);
+      req.emit("end");
+    });
+    const { res, writeHead, end } = makeRes();
+    await handleHttpRequest(req, res, sessions, sessionCtx, opts);
+    // 404 + not_found body.
+    expect(writeHead).toHaveBeenCalledWith(404, expect.objectContaining({ "content-type": "application/json" }));
+    const endArg = end.mock.calls[0]?.[0] as string | undefined;
+    expect(endArg).toBeDefined();
+    const parsedBody = JSON.parse(endArg!);
+    expect(parsedBody.error).toBe("not_found");
+    // The session map is empty — the path
+    // did NOT reach the first-POST branch.
+    const internalMap = (sessions as unknown as {
+      sessions: Map<string, unknown>;
+    }).sessions;
+    expect(internalMap.size).toBe(0);
+  });
+
+  it("installs the parsed session actor on the route layer's seam (review item: actor injection wiring)", async () => {
+    // v1.1.5 (review by chatgpt-codex-connector
+    // on PR #40, item "Inject the parsed
+    // session actor into tool contexts"):
+    // the previous design stored the parsed
+    // `params.actor` in the `SessionManager`
+    // but built each per-session `McpServer`
+    // from `sessionCtx`, which carried the
+    // daemon-wide default and no parsed actor.
+    // Tool handlers consulted the env-default
+    // and recorded audit rows under the
+    // env's actor, so two HTTP clients on the
+    // same daemon were indistinguishable in
+    // the audit log. The fix: the route layer
+    // installs the per-session actor on the
+    // shared `McpServerSessionContext` BEFORE
+    // `createMcpServerForSession` is invoked,
+    // via the `routeHandlers.setPerSessionActor`
+    // seam. The tool layer's per-call
+    // `RequestContext.actor_id` then reads
+    // the resolver closure (covered by the
+    // `envelopeHandler` unit test in
+    // `register-tools.test.ts`).
+    //
+    // This route-layer test pins the WIRING:
+    // the seam callback is called with the
+    // parsed `params.actor` exactly once, with
+    // the right `kind` and `id`. The end-to-end
+    // "tool call records the per-session
+    // actor" assertion is the blackbox
+    // `mcp-http-shared-daemon` test, which
+    // boots a real daemon, sends a real
+    // `initialize` with `params.actor`, and
+    // greps the audit log.
+    const { handleHttpRequest } = await import("../../src/mcp/http-server.js");
+    const { StreamableHTTPServerTransport } = await import(
+      "@modelcontextprotocol/sdk/server/streamableHttp.js"
+    );
+    const handleRequestSpy = vi.spyOn(
+      StreamableHTTPServerTransport.prototype,
+      "handleRequest"
+    ).mockResolvedValue(undefined);
+    try {
+      const sessions = new SessionManager();
+      const opts = {
+        dataHome: home(),
+        defaultActor: "default-fallback",
+        activeProfile: "core",
+        identityResolver: {} as never,
+        memoryService: { store: {} } as never,
+        capabilityStore: { hasCapability: () => false } as never,
+        authorization: { actorMaxSensitivity: "normal", profile: "core" } as never,
+        bind: { host: "127.0.0.1", port: 0 },
+        allowedHosts: ["127.0.0.1:7777"],
+        allowedOrigins: [],
+        bearerToken: "test-token"
+      };
+      const sessionCtx = makeSessionCtx();
+      // The seam is the `routeHandlers` arg.
+      // Capture the actor the route layer
+      // installs.
+      let installedActor: { kind: string; id: string } | undefined;
+      const routeHandlers = {
+        setPerSessionActor: (actor: { kind: string; id: string }) => {
+          installedActor = actor;
+        }
+      };
+      const body = Buffer.from(JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2025-01-01",
+          capabilities: {},
+          clientInfo: { name: "test", version: "1" },
+          actor: { kind: "service", id: "billing-bot" }
+        }
+      }));
+      const req = new EventEmitter() as unknown as IncomingMessage;
+      (req as { method: string }).method = "POST";
+      (req as { headers: Record<string, string> }).headers = {
+        host: "127.0.0.1:7777",
+        "content-type": "application/json",
+        authorization: `Bearer ${opts.bearerToken}`
+      };
+      (req as { url: string }).url = "/mcp";
+      process.nextTick(() => {
+        req.emit("data", body);
+        req.emit("end");
+      });
+      const { res } = makeRes();
+      await handleHttpRequest(req, res, sessions, sessionCtx, opts, routeHandlers);
+      // The route layer must have installed
+      // the parsed actor — NOT the env-default.
+      expect(installedActor).toEqual({ kind: "service", id: "billing-bot" });
+      // The session map is non-empty (the
+      // first-POST branch completed). The
+      // session's actor matches the parsed
+      // value (the `register` call stored it).
+      const internalMap = (sessions as unknown as {
+        sessions: Map<string, { actor: SessionActor }>;
+      }).sessions;
+      const entries = [...internalMap.values()];
+      expect(entries).toHaveLength(1);
+      expect(entries[0]?.actor).toEqual({ kind: "service", id: "billing-bot" });
+    } finally {
+      handleRequestSpy.mockRestore();
+    }
+  });
 });

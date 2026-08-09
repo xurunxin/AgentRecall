@@ -38,6 +38,18 @@ function fakeService(overrides: Record<string, unknown> = {}) {
     supersedeMemory: vi.fn(() => ({ ok: true, value: { memory_id: "mem_2" } })),
     forgetMemory: vi.fn(() => ({ ok: true, value: { memory_id: "mem_1", released_chars: 12 } })),
     getMemoryBudget: vi.fn(() => ({ usage: { active_entries: 0 }, cleanup_candidates: [] })),
+    // v1.1.5 (review item "Inject the parsed
+    // session actor into tool contexts"): the
+    // `remember` handler auto-captures
+    // provenance on success (PR-7). The actor-
+    // injection tests need a stub so the
+    // `remember` happy path completes without
+    // throwing. The stub's return shape is
+    // intentionally `undefined` — the handler
+    // does not consume the value.
+    recordProvenance: vi.fn(),
+    recordFeedback: vi.fn(),
+    recordProvenanceForActor: vi.fn(),
     maintainMemories: vi.fn(() => ({ action: "find_duplicates", changed: 0, details: { groups: [] } })),
     exportMemoryContext: vi.fn(() => "# AgentRecall Context\n"),
     ...overrides
@@ -559,6 +571,165 @@ describe("registerMemoryTools", () => {
       expect(tool.config.inputSchema).toBe(memoryToolSchemas[tool.name as keyof typeof memoryToolSchemas]);
       expect(isObjectLikeZodSchema(tool.config.inputSchema)).toBe(true);
       expect(tool.cb).toEqual(expect.any(Function));
+    }
+  });
+});
+
+describe("createMemoryToolHandlers per-session actor resolver (v1.1.5 review by chatgpt-codex-connector)", () => {
+  // v1.1.5 (review by chatgpt-codex-connector on
+  // PR #40, item "Inject the parsed session
+  // actor into tool contexts"): the HTTP daemon
+  // passes a `ToolActorResolver` to
+  // `createMemoryToolHandlers` (via
+  // `registerCoreTools` /
+  // `registerExtendedTools`). Every tool's
+  // per-call `RequestContext.actor_id` is the
+  // resolver's value, not the env-default. The
+  // test pins the contract end-to-end at the
+  // tool layer:
+  //   1. A `ToolActorResolver` returns
+  //      `{ kind: "user", id: "alice" }`.
+  //   2. The `remember` tool is invoked with a
+  //      stub `extra` envelope.
+  //   3. The `service.remember` mock is called
+  //      with `(payload, ctx)`. The `ctx.actor_id`
+  //      is `user:alice`, NOT the env-default
+  //      (which would be `agent:unknown` when
+  //      `AGENT_RECALL_ACTOR` is unset).
+  //   4. A SECOND invocation with a DIFFERENT
+  //      resolver (returning
+  //      `{ kind: "service", id: "billing-bot" }`)
+  //      threads the new value through the
+  //      same handler. The closure is read on
+  //      EVERY call (per-call observer), not
+  //      only at registration time.
+  it("threads the resolver's actor into the per-tool RequestContext (not the env-default)", async () => {
+    const prev = process.env.AGENT_RECALL_ACTOR;
+    delete process.env.AGENT_RECALL_ACTOR;
+    try {
+      const resolver = () => ({ kind: "user" as const, id: "alice" });
+      const service = fakeService();
+      const handlers = createMemoryToolHandlers(service, resolver);
+      // A complete valid `remember` payload
+      // — the schema requires every field
+      // (`source` is an object with `kind` and
+      // optional `ref`; `importance` /
+      // `confidence` are integers in [1, 5]).
+      const rememberInput = {
+        scope: "project",
+        project_id: "test-project",
+        type: "fact",
+        topic: "actor-override",
+        title: "actor override test",
+        body: "verifies the per-session actor override is plumbed into the audit ctx",
+        tags: ["actor-override"],
+        source: { kind: "tool" },
+        importance: 3,
+        confidence: 4,
+        supersedes: []
+      };
+      const result = await handlers.remember(rememberInput, {
+        signal: new AbortController().signal,
+        sendNotification: () => Promise.resolve(),
+        requestId: 1
+      });
+      // The legacy content payload is a JSON
+      // string with shape `{ ok, ... }`. The
+      // v2 envelope adds `isError` /
+      // `structuredContent` on top. Surface
+      // the actual rejection so a future
+      // regression doesn't fail with a
+      // confusing "spy called 0 times"
+      // assertion.
+      const parsedResult = jsonOf(result as CallToolResult) as { ok: boolean; error?: { code?: string; message?: string } };
+      if (!parsedResult.ok) {
+        throw new Error(
+          `remember handler rejected input: ${JSON.stringify(parsedResult)}`
+        );
+      }
+      expect(service.remember).toHaveBeenCalledTimes(1);
+      const ctx = (service.remember as ReturnType<typeof vi.fn>).mock.calls[0]?.[1];
+      // The `ctx.actor_id` is the parsed
+      // `user:alice`, NOT the env-default.
+      expect(ctx.actor_id).toBe("user:alice");
+    } finally {
+      if (prev !== undefined) process.env.AGENT_RECALL_ACTOR = prev;
+      else delete process.env.AGENT_RECALL_ACTOR;
+    }
+  });
+
+  it("re-reads the resolver on every call (per-call observer, not per-session snapshot)", async () => {
+    const prev = process.env.AGENT_RECALL_ACTOR;
+    delete process.env.AGENT_RECALL_ACTOR;
+    try {
+      let current: { kind: "agent" | "user" | "service"; id: string } = {
+        kind: "agent",
+        id: "first-session"
+      };
+      const resolver = () => current;
+      const service = fakeService();
+      const handlers = createMemoryToolHandlers(service, resolver);
+      const rememberInput = {
+        scope: "project",
+        project_id: "test-project",
+        type: "fact",
+        topic: "resolver-read",
+        title: "second test",
+        body: "verifies the resolver is re-read on every call",
+        tags: ["resolver-read"],
+        source: { kind: "tool" },
+        importance: 3,
+        confidence: 4,
+        supersedes: []
+      };
+      await handlers.remember(rememberInput, {
+        signal: new AbortController().signal,
+        sendNotification: () => Promise.resolve(),
+        requestId: 1
+      });
+      const ctx1 = (service.remember as ReturnType<typeof vi.fn>).mock.calls[0]?.[1];
+      expect(ctx1.actor_id).toBe("agent:first-session");
+      current = { kind: "service", id: "second-session" };
+      await handlers.remember(rememberInput, {
+        signal: new AbortController().signal,
+        sendNotification: () => Promise.resolve(),
+        requestId: 2
+      });
+      const ctx2 = (service.remember as ReturnType<typeof vi.fn>).mock.calls[1]?.[1];
+      expect(ctx2.actor_id).toBe("service:second-session");
+    } finally {
+      if (prev !== undefined) process.env.AGENT_RECALL_ACTOR = prev;
+      else delete process.env.AGENT_RECALL_ACTOR;
+    }
+  });
+
+  it("falls back to the env-default actor when the resolver is absent (stdio path)", async () => {
+    process.env.AGENT_RECALL_ACTOR = "agent:stdio";
+    try {
+      const service = fakeService();
+      const handlers = createMemoryToolHandlers(service);
+      const rememberInput = {
+        scope: "project",
+        project_id: "test-project",
+        type: "fact",
+        topic: "stdio-default",
+        title: "stdio default",
+        body: "verifies the env-default fallback when the resolver is absent",
+        tags: ["stdio-default"],
+        source: { kind: "tool" },
+        importance: 3,
+        confidence: 4,
+        supersedes: []
+      };
+      await handlers.remember(rememberInput, {
+        signal: new AbortController().signal,
+        sendNotification: () => Promise.resolve(),
+        requestId: 1
+      });
+      const ctx = (service.remember as ReturnType<typeof vi.fn>).mock.calls[0]?.[1];
+      expect(ctx.actor_id).toBe("agent:stdio");
+    } finally {
+      delete process.env.AGENT_RECALL_ACTOR;
     }
   });
 });

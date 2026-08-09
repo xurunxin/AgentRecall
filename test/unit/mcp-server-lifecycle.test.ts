@@ -488,3 +488,142 @@ describe("installServerLifecycle (MCP stdio server graceful shutdown)", () => {
     expect(exitFn).not.toHaveBeenCalled();
   });
 });
+
+describe("installServerLifecycle (HTTP daemon mode, v1.1.5 review by chatgpt-codex-connector)", () => {
+  // v1.1.5 (review by chatgpt-codex-connector on
+  // PR #40, item "Stop treating HTTP daemon
+  // stdin EOF as shutdown"): the HTTP daemon
+  // runs until SIGINT / SIGTERM, not on stdin
+  // EOF. The lifecycle module exposes a
+  // `disableStdin: true` opt-out so a
+  // supervisor-launched daemon with closed /
+  // redirected stdin (`agent-recall --http
+  // </dev/null`) does not trip the stdio-EOF
+  // shutdown path on the first event-loop
+  // tick after `listen`. The flag also gates
+  // the idle-timer wiring (the timer re-arms
+  // on `data` events, so a stdin-less install
+  // has no input stream to observe).
+  let stdin: MockStdin;
+  let proc: MockProcess;
+  let server: FakeServer;
+  let onShutdown: ReturnType<typeof vi.fn>;
+  let onShutdownError: ReturnType<typeof vi.fn>;
+  let onShutdownStart: ReturnType<typeof vi.fn>;
+  let exitFn: ReturnType<typeof vi.fn>;
+  const handles: Array<{ uninstall: () => void }> = [];
+
+  beforeEach(() => {
+    stdin = new MockStdin();
+    proc = new MockProcess();
+    server = { close: vi.fn().mockResolvedValue(undefined) };
+    onShutdown = vi.fn().mockResolvedValue(undefined);
+    onShutdownError = vi.fn();
+    onShutdownStart = vi.fn();
+    exitFn = vi.fn();
+  });
+
+  afterEach(() => {
+    for (const handle of handles) handle.uninstall();
+    handles.length = 0;
+  });
+
+  /** Local copy of the parent `settle` helper.
+   *  The outer `describe` declares `settle`
+   *  with `function`, which is hoisted to
+   *  the outer scope; the inner `describe`
+   *  lives in the same module so the
+   *  hoisted reference is reachable. The
+   *  previous failure was caused by an
+   *  inline arrow form used in a test body
+   *  that returned a `then`-chain; re-
+   *  declaring it here as a local `async`
+   *  function keeps the test self-contained
+   *  and immune to scoping surprises. */
+  async function settle(): Promise<void> {
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  it("disableStdin: true does NOT install stdin 'end' / 'close' listeners", async () => {
+    // Pre-PR-#40 the HTTP daemon was forced to
+    // accept a closed / redirected stdin (e.g.
+    // `agent-recall --http </dev/null`) and
+    // the lifecycle's `end` listener tripped
+    // a spurious shutdown on the first
+    // event-loop tick after `listen`. The fix:
+    // `disableStdin: true` skips the install
+    // entirely. The test asserts that emitting
+    // `end` on the stdin's EventEmitter after
+    // the install does NOT trigger any shutdown
+    // step.
+    const onSpy = vi.spyOn(stdin, "on");
+    try {
+      const handle = installServerLifecycle({
+        server,
+        stdin: stdin as unknown as NodeJS.ReadStream,
+        process: proc as unknown as NodeJS.Process,
+        onShutdown,
+        onShutdownError,
+        onShutdownStart,
+        exitFn,
+        disableStdin: true
+      });
+      handles.push(handle);
+      // `end` and `close` listeners must NOT
+      // be installed. The `data` listener IS
+      // installed first (the code path installs
+      // it, then removes it in the same step
+      // when `disableStdin: true`); we don't
+      // assert on `data` because the install
+      // / unregister pair is a no-op.
+      const endCalls = onSpy.mock.calls.filter((c) => c[0] === "end");
+      const closeCalls = onSpy.mock.calls.filter((c) => c[0] === "close");
+      expect(endCalls).toHaveLength(0);
+      expect(closeCalls).toHaveLength(0);
+      // Drive the stdin's `end` event: the
+      // sequence must NOT start.
+      stdin.emit("end");
+      await settle();
+      expect(server.close).not.toHaveBeenCalled();
+      expect(onShutdown).not.toHaveBeenCalled();
+      expect(handle.closed).toBe(false);
+      expect(exitFn).not.toHaveBeenCalled();
+    } finally {
+      onSpy.mockRestore();
+    }
+  });
+
+  it("disableStdin: true still honours SIGINT (the HTTP daemon's local drain calls lifecycle.shutdown directly)", async () => {
+    // The HTTP daemon passes `signalTargets: []`
+    // to the lifecycle (separate opt-out) so the
+    // HTTP code owns the signal handlers. The
+    // `disableStdin: true` flag only affects the
+    // stdin path. This test pairs the two
+    // opt-outs: the HTTP daemon's local signal
+    // handler is expected to call
+    // `lifecycle.shutdown("SIGINT")` directly
+    // (no `proc.emit("SIGINT")` involved). The
+    // public `shutdown(reason)` API is the
+    // canonical seam, so the test exercises it
+    // here to pin the contract.
+    const handle = installServerLifecycle({
+      server,
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      process: proc as unknown as NodeJS.Process,
+      onShutdown,
+      onShutdownError,
+      onShutdownStart,
+      exitFn,
+      disableStdin: true,
+      signalTargets: []
+    });
+    handles.push(handle);
+    await handle.shutdown("SIGINT");
+    await settle();
+    expect(server.close).toHaveBeenCalledTimes(1);
+    expect(onShutdown).toHaveBeenCalledTimes(1);
+    expect(handle.closed).toBe(true);
+    expect(exitFn).toHaveBeenCalledWith(0);
+  });
+});
