@@ -422,10 +422,33 @@ describe("extracted-artifact lifecycle E2E (Stage 18 v1.1.2 issue #28, task 9)",
     assert.match(workflow, /packaged-install\.test\.ts/);
     assert.match(workflow, /AGENT_RECALL_EXTRACTED_ARTIFACT/);
 
-    // Every step has fail-closed semantics (no
-    // continue-on-error, no `|| true` suppressor).
+    // Every step has fail-closed semantics EXCEPT
+    // the orchestrator's pattern-detector exit-1
+    // suppressor, which the v1.1.6 follow-up A1
+    // (Task 0) intentionally added: the
+    // orchestrator's pattern detector (UNHANDLED_REJECTION
+    // / WORKER_TIMEOUT) catches the synthetic-failure
+    // smoke and exits 1 even though 0 tests failed.
+    // The orchestrator's exit-1 is now informational
+    // (the new --fragments path below doesn't
+    // consume orchestrator-aggregate/), so the
+    // smoke continues to validate the pattern
+    // detector without aborting the aggregate step.
+    // Failures still surface in the orchestrator's
+    // own log; the verifier below is the hard gate.
     assert.doesNotMatch(workflow, /continue-on-error:\s*true/);
-    assert.doesNotMatch(workflow, /\|\|\s*true/);
+    // v1.1.6 follow-up A1 (Task 0): the `|| true`
+    // exception is the orchestrator's pattern-detector
+    // exit-1 suppressor (line 665 of
+    // release-candidate.yml). Strip that single
+    // line from the workflow content before the
+    // assertion so the rest of the workflow is
+    // checked against the `no || true` invariant.
+    const workflowMinusOrchestrator = workflow
+      .split("\n")
+      .filter((line) => !/orchestrator-aggregate.*\|\| true/.test(line))
+      .join("\n");
+    assert.doesNotMatch(workflowMinusOrchestrator, /\|\|\s*true/);
 
     // The record-evidence job ingests the hashes into
     // the existing evidence contract.
