@@ -72,6 +72,35 @@ jobs:
           name: release-evidence-${{ github.sha }}
           path: ${{ runner.temp }}/release-evidence
 
+      - name: Download per-platform matrix archives
+        # v1.1.6 (Task 11 / Phase 3 follow-up): the
+        # v1.1.3 GATE-04 strict verifier's
+        # CHECKSUM_BYTES_MISMATCH check (scripts/verify-release-evidence.mjs:123)
+        # resolves `artifact.name` relative to
+        # `dirname(evidencePath)` and reads the actual
+        # bytes to confirm the sha256. The rc-gate's
+        # matrix leg uploads the per-platform archive
+        # (`agent-recall-<canon>.<ext>`) as part of the
+        # `release-evidence-fragment-matrix-v113-<os>`
+        # artifact, NOT as part of the
+        # `release-evidence-<sha>` aggregate. Without
+        # this download, the verifier fails on the
+        # `existsSync` check with
+        # `artifact bytes differ: agent-recall-<canon>.<ext>`.
+        # We download the 3 matrix fragment artifacts
+        # into the same `${{ runner.temp }}/release-evidence/`
+        # directory so the per-platform `agent-recall-*`
+        # files land next to `release-evidence.json` and
+        # the verifier's path resolution finds them.
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.candidate.outputs.run_id }}
+          pattern: release-evidence-fragment-matrix-v113-*
+          path: ${{ runner.temp }}/release-evidence
+          merge-multiple: true
+
       - name: Verify tag commit SHA equals candidate SHA
         shell: bash
         env:
