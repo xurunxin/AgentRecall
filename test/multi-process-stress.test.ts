@@ -253,7 +253,23 @@ const TEST_TIMEOUT_MS = 240_000;
 // 2x bump gives macOS the room it needs without
 // masking real readiness bugs (the test still
 // times out hard at 120s).
-const BARRIER_TIMEOUT_MS = 120_000;
+//
+// v1.1.6 follow-up B1.1 (issue #42): the
+// v1.1.6 release.yml (run 31380507624) on
+// `macos-latest` failed at the multi-process
+// stress test with `barrier: only 7/8 workers
+// ready after 120000ms`. The 120s ceiling is
+// still not enough for the 8-worker release
+// profile on the macos-latest runner under
+// load (the arm64 startup of 8 tsx-loaded
+// child processes can take >2 minutes when
+// the runner is contended). Bumped to
+// 180_000 ms so the release profile fits
+// inside the barrier window. CI on ubuntu /
+// windows still resolves in <30s; the 1.5x
+// bump gives macOS another 60s of headroom
+// without masking real readiness bugs.
+const BARRIER_TIMEOUT_MS = 180_000;
 // Bumped from 100 ms (pre-Task-1) so we can prove overlap
 // on slower Windows runners without losing busy-retry
 // coverage. The release profile is the production

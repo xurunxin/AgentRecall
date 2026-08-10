@@ -691,15 +691,34 @@ export class SQLiteMemoryStore {
     // PRAGMAs because they have no effect on a snapshot
     // reader; busy_timeout still applies so an
     // unexpectedly-shared connection does not error.
+    //
+    // v1.1.6 follow-up B1.1 (issue #42): the v1.1.6
+    // release-candidate gate (run 31380507624) failed
+    // on windows-latest at the multi-process stress
+    // test with `survivor 1 reported unhandled
+    // SQLITE_BUSY`. The 5-worker contention after the
+    // SIGKILL-during-tx test's victim exit causes
+    // 5+ survivors to all queue on `BEGIN IMMEDIATE`
+    // while SQLite is recovering the stale WAL. The
+    // 5000ms `busy_timeout` was insufficient: the
+    // Windows file-locking semantics add overhead to
+    // WAL recovery that pushes the worst-case wait
+    // past 5s for at least 1 survivor in the
+    // 8-worker × 1,250-op release profile. Bumped
+    // to 10000ms so the recovery fits inside the
+    // PRAGMA wait window on the Windows runner. The
+    // pre-v1.1.6 default of 5000ms stays in the
+    // comment history; the CI profile (1,600 ops)
+    // never hit the 5s ceiling.
     if (!readonly) {
       this.db.exec(`
         PRAGMA journal_mode = WAL;
         PRAGMA synchronous = NORMAL;
-        PRAGMA busy_timeout = 5000;
+        PRAGMA busy_timeout = 10000;
         PRAGMA wal_autocheckpoint = 1000;
       `);
     } else {
-      this.db.exec(`PRAGMA busy_timeout = 5000;`);
+      this.db.exec(`PRAGMA busy_timeout = 10000;`);
     }
     if (openMode === "read_write_auto_migrate") {
       this.migrate();
