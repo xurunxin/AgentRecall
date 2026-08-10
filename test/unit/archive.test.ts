@@ -97,7 +97,17 @@ describe("scripts/archive.ts (v1.1.6 C1, Node-native tar.gz + zip)", () => {
         // a best-effort cross-validation.
         return;
       }
-      const listing = tar.stdout.split("\n").filter((s) => s.length > 0);
+      // v1.1.6 follow-up C1: strip CR from each
+      // line so the assertion is stable across
+      // platforms. `tar -tf` on the Git-for-Windows
+      // BSD tar binary emits CRLF; GNU tar on
+      // Linux + macOS emits LF. The cross-platform
+      // assertion is `ends-with \n` and we don't
+      // care about whether there's a CR prefix.
+      const listing = tar.stdout
+        .split("\n")
+        .map((s) => s.replace(/\r$/, ""))
+        .filter((s) => s.length > 0);
       expect(listing).toContain("hello.txt");
       expect(listing).toContain("sub/inner.txt");
       // The contents should be recoverable

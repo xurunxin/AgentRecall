@@ -88,8 +88,31 @@ function tarHeader(
   const linkname = Buffer.alloc(TAR_LINKNAME_MAX);
   const magic = Buffer.from("ustar\0", "ascii");
   const version = Buffer.from("00", "ascii");
-  const uname = Buffer.from("root\0", "ascii");
-  const gname = Buffer.from("root\0", "ascii");
+  // v1.1.6 follow-up C1 (issue #42): the uname
+  // / gname / devmajor / devminor / prefix / pad
+  // fields must be the FULL USTAR slot sizes
+  // (32 / 32 / 8 / 8 / 155 / 12 bytes
+  // respectively). The pre-fix helper
+  // concatenated shorter `Buffer.from("root\0")`
+  // (5 bytes) for uname + gname, which
+  // compressed the total header to 458 bytes.
+  // GNU tar on Linux + macOS rejects this with
+  // "This does not look like a tar archive";
+  // BSD tar on macOS is more forgiving, the
+  // Git-for-Windows BSD tar on windows-latest
+  // accepts the truncated header too. The C1
+  // unit test passed on Windows with the
+  // truncated header; the v1.1.6 release.yml
+  // `extracted-artifact lifecycle` matrix leg
+  // failed on the 3 OSes with the truncated
+  // header. The fix writes the NUL-padded
+  // full-width fields so the total header is
+  // the USTAR-spec 512 bytes regardless of
+  // platform.
+  const uname = Buffer.alloc(32);
+  Buffer.from("root", "ascii").copy(uname);
+  const gname = Buffer.alloc(32);
+  Buffer.from("root", "ascii").copy(gname);
   const devmajor = Buffer.alloc(8);
   const devminor = Buffer.alloc(8);
   const prefix = Buffer.alloc(155);
@@ -115,14 +138,30 @@ function tarHeader(
 
 /**
  * Yield the tar entry (header + body) for
- * every file + dir under `srcDir`. The yield is
- * a `{ header, body }` pair where `body` is the
- * padded file content (already zero-padded to a
- * TAR_BLOCK boundary), or `null` for directory
- * entries. The caller concatenates header +
- * body buffers in order.
+ * every file + dir under `srcDir` (recursive).
+ * The yield is a `{ header, body }` pair where
+ * `body` is the padded file content (already
+ * zero-padded to a TAR_BLOCK boundary), or
+ * `null` for directory entries. The caller
+ * concatenates header + body buffers in order.
+ *
+ * The recursion tracks the cumulative `prefix`
+ * (slash-joined relative path from the
+ * `archive()` call's `srcDir`) so each entry's
+ * `name` field is the full tar-relative path,
+ * not just the local basename. The pre-fix
+ * walker used `relative(srcDir, full)` against
+ * the per-recursion `srcDir`; that produced
+ * `inner.txt` for `sub/inner.txt` (the basename
+ * only), which left the tar with a flat layout
+ * and broke the round-trip E2E test's
+ * `existsSync(join(extractDir, "dist", "src",
+ * "index.js"))` assertion.
  */
-async function* walkTar(srcDir: string): AsyncGenerator<{ header: Buffer; body: Buffer | null }> {
+async function* walkTar(
+  srcDir: string,
+  prefix: string = ""
+): AsyncGenerator<{ header: Buffer; body: Buffer | null }> {
   const entries = await readdir(srcDir, { withFileTypes: true });
   // Sort entries to produce deterministic output
   // (helps test reproducibility; GNU tar
@@ -134,14 +173,14 @@ async function* walkTar(srcDir: string): AsyncGenerator<{ header: Buffer; body: 
   entries.sort((a, b) => a.name.localeCompare(b.name));
   for (const entry of entries) {
     const full = join(srcDir, entry.name);
-    const rel = relative(srcDir, full).split(sep).join("/");
+    const localRel = prefix.length === 0 ? entry.name : `${prefix}/${entry.name}`;
     if (entry.isDirectory()) {
-      yield { header: tarHeader(rel + "/", 0, 0o755, "5"), body: null };
-      yield* walkTar(full);
+      yield { header: tarHeader(localRel + "/", 0, 0o755, "5"), body: null };
+      yield* walkTar(full, localRel);
     } else if (entry.isFile()) {
       const s = await stat(full);
       const file = await readFile(full);
-      const header = tarHeader(rel, s.size);
+      const header = tarHeader(localRel, s.size);
       // Pad to TAR_BLOCK boundary. The body is
       // a single buffer (caller can stream; for
       // the E2E size the file is small).
