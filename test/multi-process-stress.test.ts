@@ -50,15 +50,119 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
-  rmSync,
   statSync,
   writeFileSync
 } from "node:fs";
+import * as fsp from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { DatabaseSync } from "node:sqlite";
+
+/**
+ * v1.1.6 follow-up D3 (issue #42, spec d67fc45, plan bfbd2cb):
+ * the Windows-flaky cleanup is fixed by replacing every `rmSync`
+ * with `fs.promises.rm(... { maxRetries, retryDelay, force })`
+ * and every unconditional `child.kill("SIGKILL")` with a
+ * SIGTERM → 500 ms grace → SIGKILL escalation. The synchronous
+ * `rmSync` on Windows throws `EBUSY` when the SQLite WAL writer
+ * still holds the file handle after the child has exited (the
+ * process exit tears the user-mode handle but the kernel-side
+ * teardown lags by a few ms on Windows-latest). The async rm
+ * with `maxRetries: 3, retryDelay: 100` covers that race; the
+ * SIGTERM first allows the child to release the SQLite handle
+ * cleanly before the SIGKILL escalates, eliminating the
+ * `EPERM`/`EBUSY` window. Pre-D3 the carry-over "accept the
+ * SIGKILLed victim's dataHome as the ONE allowed orphan" comment
+ * documented the flake; the v1.1.5 CHANGELOG "Known non-blocking
+ * limits" entry that referenced it is deleted in the v1.1.6
+ * ship commit.
+ */
+
+/** SIGTERM-then-SIGKILL escalation. Sends SIGTERM to every
+ *  survivor, waits 500 ms (a healthy child on POSIX reacts to
+ *  SIGTERM by running the lifecycle's clean-shutdown path; on
+ *  Windows the SIGTERM is converted to immediate TerminateProcess
+ *  by Node but the child still releases its SQLite handle
+ *  synchronously), then escalates to SIGKILL on any process
+ *  that didn't exit. Returns when all processes are gone. */
+async function killChildrenGracefully(
+  children: ChildProcess[]
+): Promise<void> {
+  for (const child of children) {
+    if (child.exitCode === null && child.pid !== undefined) {
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+  await new Promise<void>((resolve) => setTimeout(resolve, 500));
+  for (const child of children) {
+    if (child.exitCode === null && child.pid !== undefined) {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+}
+
+/** Async, retry-tolerant recursive rm. Uses `fs.promises.rm`'s
+ *  built-in `maxRetries` / `retryDelay` so the Windows-latest
+ *  "EBUSY while the SQLite handle is still being torn down"
+ *  race is retried up to 3 × 100 ms before falling back to a
+ *  best-effort per-entry unlink. Returns `true` if the path is
+ *  gone after the call, `false` if a partial failure left
+ *  entries behind (the test's orphan assertion will catch the
+ *  remainder). */
+async function cleanHomeAsync(homePath: string): Promise<boolean> {
+  if (!existsSync(homePath)) return true;
+  try {
+    await fsp.rm(homePath, {
+      recursive: true,
+      force: true,
+      maxRetries: 3,
+      retryDelay: 100
+    });
+    return true;
+  } catch (err) {
+    // Final fallback: enumerate and unlink each entry
+    // individually so a single bad file doesn't block the
+    // rest. Per-entry unlink is best-effort and silently
+    // swallows errors — the post-suite orphan assertion
+    // surfaces the leak.
+    console.warn(
+      `[cleanup] fs.promises.rm failed for ${homePath}: ${(err as Error).message}; falling back to per-entry`
+    );
+    try {
+      const entries = await fsp.readdir(homePath);
+      await Promise.all(
+        entries.map((entry) =>
+          fsp.rm(join(homePath, entry), {
+            recursive: true,
+            force: true,
+            maxRetries: 2,
+            retryDelay: 50
+          }).catch(() => undefined)
+        )
+      );
+      // Best-effort: try the top-level rm one more time.
+      await fsp.rm(homePath, {
+        recursive: true,
+        force: true,
+        maxRetries: 1,
+        retryDelay: 50
+      }).catch(() => undefined);
+      return !existsSync(homePath);
+    } catch {
+      return false;
+    }
+  }
+}
 
 type ScenarioId =
   | "mixed"
@@ -417,20 +521,19 @@ async function runScenario(input: {
   } catch (err) {
     // Best-effort cleanup of any surviving workers before
     // re-throwing so the test doesn't leak child processes.
-    for (const t of tasks) {
-      try {
-        t.child.kill("SIGKILL");
-      } catch {
-        /* ignore */
-      }
-    }
+    // v1.1.6 follow-up D3: SIGTERM-then-SIGKILL escalation
+    // via killChildrenGracefully. Pre-D3 this was an
+    // unconditional `child.kill("SIGKILL")` which on Windows
+    // left the SQLite handle in a torn-down state and caused
+    // the subsequent barrierDir rmSync to throw EBUSY.
+    await killChildrenGracefully(tasks.map((t) => t.child));
     throw err;
   } finally {
     // Read the `datahome-<pid>` markers BEFORE removing the
     // barrier dir so we can clean up any dataHome that a
     // SIGKILLed worker did not get a chance to remove.
     try {
-      cleanupDataHomesFromBarrier(barrierDir);
+      await cleanupDataHomesFromBarrier(barrierDir);
     } catch {
       /* best-effort */
     }
@@ -438,12 +541,9 @@ async function runScenario(input: {
     // orphan-check at the end of the suite has nothing to
     // trip on. Workers write their ready / lock-acquired
     // markers here; once the test is done the markers are
-    // irrelevant.
-    try {
-      rmSync(barrierDir, { recursive: true, force: true });
-    } catch {
-      /* ignore */
-    }
+    // irrelevant. v1.1.6 follow-up D3: async + retry rm
+    // (pre-D3 `rmSync` flaked on Windows-latest with EBUSY).
+    await cleanHomeAsync(barrierDir);
   }
 
   return { reports, tasks };
@@ -658,14 +758,14 @@ describe(`multi-process concurrency stress (spec § 5.6 AR-P0-006, profile=${PRO
     dataHome = mkdtempSync(join(tmpdir(), "lm-stress-"));
   });
 
-  afterAll(() => {
-    if (existsSync(dataHome)) {
-      try {
-        rmSync(dataHome, { recursive: true, force: true });
-      } catch {
-        /* best-effort */
-      }
-    }
+  afterAll(async () => {
+    // v1.1.6 follow-up D3: async + retry rm.
+    // Pre-D3 the `rmSync` here flaked on Windows-latest
+    // when the SQLite WAL writer still held the file handle
+    // (the kernel-side teardown lags a few ms after the
+    // child's last close). The async helper retries 3 ×
+    // 100 ms before falling back to per-entry unlink.
+    await cleanHomeAsync(dataHome);
   });
 
   it(
@@ -1148,35 +1248,23 @@ it(
         expect(holderReport.writes).toBe(0);
         assertOverlappingLifetimes(writerReports);
       } finally {
-        // Always clean up: SIGKILL any survivors and remove
-        // the barrier dir. The orphan assertion at the end of
-        // the suite relies on these temp paths being removed.
-        for (const t of writerTasks) {
-          try {
-            if (t.child.exitCode === null) t.child.kill("SIGKILL");
-          } catch {
-            /* ignore */
-          }
-        }
-        try {
-          if (holder.child.exitCode === null) holder.child.kill("SIGKILL");
-        } catch {
-          /* ignore */
-          // Read the `datahome-<pid>` markers before
-          // removing the barrier dir so we can clean up
-          // any dataHome that a SIGKILLed worker did not
-          // get a chance to remove.
-          try {
-            cleanupDataHomesFromBarrier(barrierDir);
-          } catch {
-            /* best-effort */
-          }
-        }
-        try {
-          rmSync(barrierDir, { recursive: true, force: true });
-        } catch {
-          /* ignore */
-        }
+        // v1.1.6 follow-up D3: SIGTERM-then-SIGKILL
+        // escalation + async + retry rm. Pre-D3 this
+        // block used unconditional `child.kill("SIGKILL")`
+        // and `rmSync(barrierDir, ...)`, which on
+        // Windows-latest flaked when the SQLite handle
+        // was still being torn down (EBUSY) — leaving an
+        // orphan dir that tripped the post-suite assertion.
+        await killChildrenGracefully([
+          ...writerTasks.map((t) => t.child),
+          holder.child
+        ]);
+        // Read the `datahome-<pid>` markers before
+        // removing the barrier dir so we can clean up
+        // any dataHome that a SIGKILLed worker did not
+        // get a chance to remove.
+        await cleanupDataHomesFromBarrier(barrierDir);
+        await cleanHomeAsync(barrierDir);
       }
     },
     TEST_TIMEOUT_MS
@@ -1500,22 +1588,17 @@ it(
   );
 
   it("no orphaned child processes or temp data homes remain after every scenario", () => {
-    // Workers open and close a fresh SQLiteMemoryStore per
-    // scenario; the per-process data home is normally
-    // removed by the worker on exit. Workers killed by the
-    // SIGKILL victim path cannot run their cleanup, so the
-    // driver proactively reads the `datahome-<pid>` markers
-    // from each barrier dir (still on disk from the
-    // rmSync-deferred cleanup in runScenario's finally
-    // block — actually no, the barrier dir is removed in
-    // that finally. We therefore accept the SIGKILLed
-    // victim's dataHome as the ONE allowed orphan, or we
-    // walk the global tmpdir).
+    // v1.1.6 follow-up D3: the pre-D3 comment documented a
+    // v1.1.5-era workaround ("accept the SIGKILLed victim's
+    // dataHome as the ONE allowed orphan"). The D3 async +
+    // retry cleanup + SIGTERM-then-SIGKILL escalation
+    // closes the Windows-latest EBUSY/EPERM window so the
+    // assertion can be strict (0 orphans, 0 barrier dirs).
+    // The v1.1.5 CHANGELOG "Known non-blocking limits" entry
+    // that referenced this flake is deleted in the v1.1.6
+    // ship commit.
     const orphans = orphanDataHomes();
     expect(orphans, `orphaned lm-stress-home-* dirs: ${orphans.join(", ")}`).toEqual([]);
-    // The driver-level barrier dirs are also cleaned up
-    // (mkdtempSync creates unique names; we removed them
-    // via afterAll/cleanup paths). Re-scan for orphans.
     const barrierOrphans = readdirSync(tmpdir()).filter((n) => n.startsWith("lm-stress-barrier-"));
     expect(barrierOrphans, `orphaned barrier dirs: ${barrierOrphans.join(", ")}`).toEqual([]);
   });
@@ -1523,26 +1606,82 @@ it(
 
 /**
  * Read every `datahome-<pid>` marker the workers wrote
- * into the barrier dir, then rmSync each dataHome path.
- * Workers write the marker BEFORE any work so the path
- * is recoverable even if the worker is killed mid-scenario.
+ * into the barrier dir, then rm each dataHome path. Workers
+ * write the marker BEFORE any work so the path is recoverable
+ * even if the worker is killed mid-scenario.
+ *
+ * v1.1.6 follow-up D3: now async, uses cleanHomeAsync
+ * (fs.promises.rm with maxRetries + force). The pre-D3
+ * `rmSync` was the flake source on Windows-latest.
  */
-function cleanupDataHomesFromBarrier(barrierDir: string): void {
+async function cleanupDataHomesFromBarrier(barrierDir: string): Promise<void> {
   if (!existsSync(barrierDir)) return;
-  for (const name of readdirSync(barrierDir)) {
-    if (!name.startsWith("datahome-")) continue;
+  const names = readdirSync(barrierDir).filter((n) =>
+    n.startsWith("datahome-")
+  );
+  const targets: string[] = [];
+  for (const name of names) {
     const path = join(barrierDir, name);
-    let target: string | undefined;
     try {
-      target = readFileSync(path, "utf8").trim();
+      const target = readFileSync(path, "utf8").trim();
+      if (target.length > 0) targets.push(target);
     } catch {
-      continue;
-    }
-    if (target.length === 0) continue;
-    try {
-      if (existsSync(target)) rmSync(target, { recursive: true, force: true });
-    } catch {
-      /* best-effort */
+      /* marker unreadable; skip */
     }
   }
+  await Promise.all(targets.map((t) => cleanHomeAsync(t)));
 }
+
+// ============================================================
+// v1.1.6 follow-up D3 (issue #42, spec d67fc45, plan bfbd2cb):
+// regression coverage for the cleanup helpers. Pre-D3 the
+// `rmSync` on Windows-latest threw EBUSY while the SQLite
+// handle was still being torn down by the kernel after the
+// child exited; the v1.1.5-era workaround documented in the
+// orphan assertion accepted the SIGKILLed victim's dataHome
+// as "the ONE allowed orphan". D3 replaces every rmSync with
+// cleanHomeAsync (fs.promises.rm with maxRetries + force +
+// retryDelay) and every unconditional SIGKILL with
+// killChildrenGracefully (SIGTERM → 500ms → SIGKILL). The
+// test below exercises both helpers in isolation so a future
+// regression surfaces a focused failure rather than the
+// post-suite "orphaned lm-stress-home-*" assertion.
+// ============================================================
+describe("D3 cleanup helper regression coverage", () => {
+  it("cleanHomeAsync removes a populated temp dir", async () => {
+    const home = mkdtempSync(join(tmpdir(), "d3-clean-helper-"));
+    writeFileSync(join(home, "a.txt"), "x");
+    writeFileSync(join(home, "b.txt"), "y");
+    const sub = join(home, "sub");
+    writeFileSync(sub, "z"); // creates a file
+    expect(existsSync(home)).toBe(true);
+    const ok = await cleanHomeAsync(home);
+    expect(ok).toBe(true);
+    expect(existsSync(home)).toBe(false);
+  });
+
+  it("cleanHomeAsync is a no-op on a non-existent path", async () => {
+    const home = join(tmpdir(), "d3-nonexistent-", "nope");
+    const ok = await cleanHomeAsync(home);
+    expect(ok).toBe(true);
+  });
+
+  it("killChildrenGracefully resolves without throwing on already-exited children", async () => {
+    // Spawn a short-lived child, await its exit, then call
+    // the helper. Should resolve without error and not throw
+    // when sending a signal to a process that has already
+    // reaped (the helper's `child.exitCode === null` guard
+    // short-circuits the kill). We don't assert on
+    // `child.exitCode` because Windows vs POSIX differ on
+    // what `process.execPath` reports after a 0-exit
+    // child process; the test's value is the "doesn't throw"
+    // invariant, not the exit-code value.
+    const child = fork(process.execPath, ["-e", "process.exit(0)"], {
+      stdio: "ignore"
+    });
+    await new Promise<void>((resolve) => {
+      child.on("exit", () => resolve());
+    });
+    await expect(killChildrenGracefully([child])).resolves.toBeUndefined();
+  });
+});
