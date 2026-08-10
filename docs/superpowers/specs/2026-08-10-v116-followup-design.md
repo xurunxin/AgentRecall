@@ -220,40 +220,133 @@ v1.1.6 = 上述 6 + 1 项全部清理：
 - `.github/workflows/release-candidate.yml`：matrix leg 上传
   `release-evidence-fragment-matrix-<os>.json`；aggregate step 读 fragments。
 - `scripts/verify-release-evidence.mjs`：删 `isLegacyDocument()` 分支 + `LegacyReleaseEvidence`
-  Zod schema；走 v1.1.3 严格 schema；恢复 `MISMATCHED_PLATFORMS` 检查（3 platform
-  都有 sha256 字段且一致）。
+  Zod schema；走 v1.1.3 GATE-04 严格 schema（per-platform ARRAY 形状）；恢复
+  `MISMATCHED_PLATFORMS` 检查（3 platform 都有 `artifacts` entry + sha256 一致）。
 - `scripts/release-evidence.mjs`：不再在 rc-branch 上合成 `tag: "v1.1.X"`（tag
-  来自 fragment 而不是 v1.1.2 hardcoded 路径）。
+  来自 fragment 而不是 v1.1.2 hardcoded 路径）；canonicalise `platform` token 用
+  `scripts/canonical-platforms.mjs`（`ubuntu-latest` → `linux-x64` 等）。
+
+**前置：A0 prep**（A1 standard 的隐含前置，原 plan 漏了）。在 A1 之前必须完成：
+- 把 `packaged-artifact` job 改成 3-OS 矩阵（当前 ubuntu-only，line 264-420）。
+  pack 逻辑现成（PowerShell `Compress-Archive` for win32-x64、`tar`/`zip` for POSIX），
+  只需把 `runs-on` 和 archive 后缀按 canonical platform 矩阵化。每个 OS 矩阵腿
+  上传 `release-evidence-fragment-packaged-<canonical-platform>.json`，含
+  该 OS 的 archive sha256。
+- 把 `stress` job 改成 3-OS 矩阵（当前 ubuntu-only，line 204）。`STRESS_PROFILE=release`。
+  Windows 沿用 v1.1.5 的 `if: matrix.os != 'windows-latest'` skip（B1 来了再撤），
+  这样 stress_summary aggregate 包含 linux + darwin 的真值 + windows 的 0/0/0。
+- 新增 `scripts/canonical-platforms.mjs`：导出 `CANONICAL_PLATFORMS` map
+  + `canonicalize(os: string): "linux-x64" | "darwin-x64" | "win32-x64"`，和 v1.1.3
+  GATE-04 原本的设计一致。
+- 新增 `scripts/release-evidence.schema.json`：Zod schema for v1.1.3 GATE-04
+  严格形状（`schema_version: "1.1.3"`、`ci_jobs: z.array(...)` per-platform、
+  `artifacts: z.array(...)` per-platform、`release_workflow` 单一 entry、
+  `test_summary.suites[]` per-suite 沿用 v1.1.5、`stress_summary` aggregate）。
 
 **新增/重写**：
-- `release-evidence-fragment-matrix-<os>.json` 形状：
+- `release-evidence-fragment-matrix-<os>.json` 形状（matrix leg 的 fragment，
+  1 条 per-leg ci_job entry；archive 不在这里）：
   ```ts
   {
-    schema_version: 2,           // 从 1 升到 2
+    schema_version: "1.1.3",      // 按 v1.1.3 GATE-04
     candidate_sha: "<A1 commit>",
-    version: "1.1.6",            // 读 package.json
-    platform: "ubuntu-latest",   // 或 macos-latest / windows-latest
-    ci_jobs: {                   // v1.1.3 GATE-04 形状
-      "unit-integration": { passed: N, failed: 0, skipped: 0, duration_ms: M },
-      "mcp-blackbox":     { ... },
-      "release-gate":     { ... },
-      "packaged-artifact":{ ... }
-    },
-    stress_summary: {
+    version: "1.1.6",             // 读 package.json
+    os: "ubuntu-latest",          // raw runner os
+    canonical_platform: "linux-x64",  // 由 canonical-platforms.mjs 算
+    ci_jobs: [
+      {
+        platform: "linux-x64",    // canonical
+        os: "ubuntu-latest",
+        node: "24",
+        job_url: "https://github.com/.../actions/runs/.../jobs/...",
+        conclusion: "success",
+        duration_ms: <real>,
+        head_sha: "<A1 commit>",
+        test_summary: {            // 沿用 v1.1.5 per-suite 形状
+          suites: [
+            { name: "default", passed: N, failed: 0, skipped: K, duration_ms: M,
+              unhandled_rejections: 0, worker_timeouts: 0 },
+            // ...
+          ]
+        }
+      }
+    ],
+    artifacts: [],                 // matrix leg 不产出 archive；archive 从 packaged-artifact 来
+    stress_summary: { profile: "ci", workers: 0, ops_per_worker: 0,
+                      unhandled_rejections: 0, worker_timeouts: 0 }
+                                     // matrix leg 不跑 release stress；stress 走 segregated job
+  }
+  ```
+- `release-evidence-fragment-packaged-<canonical-platform>.json` 形状
+  （packaged-artifact 3-OS 矩阵的每条腿）：
+  ```ts
+  {
+    schema_version: "1.1.3",
+    candidate_sha: "<A1 commit>",
+    version: "1.1.6",
+    os: "ubuntu-latest",          // raw
+    canonical_platform: "linux-x64",
+    ci_jobs: [],                  // packaged-artifact job 不跑 vitest
+    artifacts: [
+      { platform: "linux-x64",
+        name: "agent-recall-1.1.6-linux-x64.tar.gz",
+        size_bytes: <real>,
+        sha256: "<real hex>" }
+    ]
+  }
+  ```
+- aggregate step 读 3 个 matrix leg fragments + 3 个 packaged-artifact fragments
+  + 1 个 stress job 聚合输出，写出 `release-evidence.json`：
+  ```ts
+  {
+    schema_version: "1.1.3",
+    candidate_sha: "<A1 commit>",
+    version: "1.1.6",
+    tag: null,                    // rc-branch；release 时由 prepare-release 写入
+    ci_jobs: [                    // 3 entries, 来自 matrix leg fragments
+      { platform: "linux-x64",  os: "ubuntu-latest",  ... },
+      { platform: "darwin-x64", os: "macos-latest",  ... },
+      { platform: "win32-x64",  os: "windows-latest", ... }
+    ],
+    artifacts: [                  // 3 entries, 来自 packaged-artifact fragments
+      { platform: "linux-x64",  name: "agent-recall-1.1.6-linux-x64.tar.gz",  ... },
+      { platform: "darwin-x64", name: "agent-recall-1.1.6-darwin-x64.tar.gz", ... },
+      { platform: "win32-x64",  name: "agent-recall-1.1.6-win32-x64.zip",    ... }
+    ],
+    stress_summary: {             // aggregate from 3-OS stress
       profile: "release",
-      workers: 8,
-      ops_per_worker: 1250,
+      process_count: 16,          // 2 OSes × 8 workers (windows = 0)
+      operations: 20000,          // 2 OSes × 8 workers × 1250 ops
+      invariants_ok: <N>,
       unhandled_rejections: 0,
       worker_timeouts: 0
     },
-    artifacts: {                 // 该 OS 矩阵腿产出的 archive
-      "agent-recall-1.1.6-linux-x64.tar.gz": { sha256, size_bytes, path }
-    }
+    sha256_checksums: {           // key=archive name, value=sha256
+      "agent-recall-1.1.6-linux-x64.tar.gz":  "<hex>",
+      "agent-recall-1.1.6-darwin-x64.tar.gz": "<hex>",
+      "agent-recall-1.1.6-win32-x64.zip":     "<hex>"
+    },
+    test_summary: {               // 沿用 v1.1.5 per-suite 形状
+      suites: [...]
+    },
+    migration_summary: { sources_tested: [...], each_passed: true },
+    known_non_blocking_limits: [] // v1.1.6 ship 时这段会被删
   }
   ```
 
+**Verifier 验收规则**（v1.1.3 GATE-04 严格）：
+- `ci_jobs.length === 3`，每条 `platform` 是 canonical 之一
+- `artifacts.length === 3`，每条 `platform` 是 canonical 之一
+- `MISMATCHED_PLATFORMS` = `ci_jobs` 里出现但 `artifacts` 里没出现的 platform（必须空）
+- `sha256_checksums` 包含 3 个 archive 名 + 64-char hex sha256
+- per-suite `failed === 0` + `unhandled_rejections === 0` + `worker_timeouts === 0` + `skipped <= 100` + `passed > 0`
+- `release_workflow.conclusion === "success"` + `duration_ms > 0`
+- `candidate_sha === release_commit`
+- `version` 匹配 `package.json#version`
+
 **Drop-when-done 信号**：`verify-release-evidence.mjs` 里搜不到 `isLegacyDocument`
-或 `LegacyReleaseEvidence`；rc-branch CI 跑 2 次连续绿。
+或 `LegacyReleaseEvidence`；rc-branch CI 跑 2 次连续绿；`MISMATCHED_PLATFORMS`
+软警告在 rc-branch（v1.1.6 ship 时变硬 fail）。
 
 ### B1 — Windows SQLite busy retry
 
