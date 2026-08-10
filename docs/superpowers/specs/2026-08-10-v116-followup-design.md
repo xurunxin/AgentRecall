@@ -1,7 +1,7 @@
 # v1.1.6 follow-up tracker — 设计规范
 
 > 日期：2026-08-10
-> 状态：草稿（待用户复核通过后进入 writing-plans）
+> 状态：已批准（2026-08-10 用户复核通过，进入 writing-plans）
 > 修订：—
 > 作者：brainstorming 工作流（许润鑫 × Mavis）
 > 关联 issue：<https://github.com/xurunxin/AgentRecall/issues/42>
