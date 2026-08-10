@@ -141,7 +141,30 @@ function parseOctal(buf, start, end) {
   const slice = buf.subarray(start, end);
   const s = slice.toString("binary").replace(/[\0\s]/g, "");
   if (s.length === 0) return 0;
-  return Number.parseInt(s, 8);
+  const n = Number.parseInt(s, 8);
+  if (Number.isNaN(n)) {
+    // Some tar producers (Windows BSD tar via
+    // `Compress-Archive` + `Expand-Archive`) write
+    // the size as a binary little-endian uint32
+    // (the `ustar` 1988 POSIX variant with the
+    // "binary" size encoding) instead of octal.
+    // The high bit (0x80) of the first byte of the
+    // size field is the marker; the lower 7 bits
+    // of the first byte + the next 3 bytes are
+    // the big-endian size. We handle that here
+    // so the same parser works on archives made
+    // by the v1.1.6 production `tar -czf` (POSIX
+    // octal) AND the `Compress-Archive` .zip
+    // round-trip (BSD tar binary size).
+    if ((slice[0] & 0x80) !== 0) {
+      const b0 = slice[0] & 0x7f;
+      const b1 = slice[1] ?? 0;
+      const b2 = slice[2] ?? 0;
+      const b3 = slice[3] ?? 0;
+      return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+    }
+  }
+  return n;
 }
 
 function parseName(buf) {
@@ -163,6 +186,42 @@ async function extractTarGz(archivePath, outDir) {
   // The block reader consumes 512-byte tar blocks
   // and writes each file's body to disk between
   // header + body blocks.
+  //
+  // v1.1.6 (Task 11 / Phase 3 follow-up): the
+  // parser is now tolerant of both dir-body
+  // conventions. Some producers (GNU tar on
+  // ubuntu-latest) write a zero-padded 512-byte
+  // body block after every dir entry (typeflag
+  // "5"); others (BSD tar on macOS / Windows,
+  // Node-native `scripts/archive.ts`,
+  // `tarfile` in default USTAR mode) emit no
+  // body for dirs at all. The strict USTAR
+  // spec only requires `size` body bytes
+  // (rounded up to 512) — for dirs `size` is
+  // 0, so the body is optional. The pre-fix
+  // parser hard-coded `offset += TAR_BLOCK * 2`
+  // for dirs, which aligned with GNU tar but
+  // was 512 bytes off on the BSD/Node-native
+  // archives that the v1.1.6 release-gate
+  // produces via `scripts/archive.ts`. The
+  // post-fix parser:
+  //   - For dir entries: skip the 512-byte
+  //     header only (`offset += TAR_BLOCK`).
+  //   - If the next block is all zeros, it's
+  //     either a GNU tar dir body OR the start
+  //     of the end-of-archive marker. Probe the
+  //     block AFTER it: if it's a non-zero
+  //     header, the zero block was a dir body
+  //     — skip it and continue. If it's also
+  //     zero, this is end-of-archive (the spec
+  //     mandates two consecutive zero blocks).
+  //   - If the next block is non-zero, it's a
+  //     new entry header — process it directly.
+  // The result: a single parser handles every
+  // tar flavour that ships through the
+  // v1.1.6 production pipeline (the
+  // release.yml `tar -czf` archive AND the
+  // `scripts/archive.ts` test archive).
   const fileStream = createReadStream(archivePath);
   const gunzip = createGunzip();
 
@@ -184,24 +243,58 @@ async function extractTarGz(archivePath, outDir) {
   let pendingHeader = null;
   while (offset + TAR_BLOCK <= buffer.length) {
     const block = buffer.subarray(offset, offset + TAR_BLOCK);
-    if (block.equals(ZERO_BLOCK)) {
-      // End-of-archive: two zero blocks terminate.
-      offset += TAR_BLOCK;
-      if (offset + TAR_BLOCK <= buffer.length && buffer.subarray(offset, offset + TAR_BLOCK).equals(ZERO_BLOCK)) {
-        offset += TAR_BLOCK;
-      }
-      break;
-    }
     if (pendingHeader === null) {
+      // Header mode: the current block should be
+      // an entry header. Detect three cases:
+      //   1. all-zero block: end-of-archive OR
+      //      a stray dir body. Probe the next
+      //      block to disambiguate.
+      //   2. typeflag "5" (dir): create the
+      //      directory and skip the 512-byte
+      //      header. The next iteration will
+      //      see the post-dir body (if any).
+      //   3. typeflag "0" (file): record the
+      //      header; the next iteration reads
+      //      the body.
+      if (block.equals(ZERO_BLOCK)) {
+        // Two consecutive zero blocks = end-of-
+        // archive. A single zero block between
+        // a dir header and the next entry is
+        // the GNU tar dir-body convention —
+        // skip it and continue.
+        const next = offset + TAR_BLOCK;
+        if (next + TAR_BLOCK <= buffer.length) {
+          const nextBlock = buffer.subarray(next, next + TAR_BLOCK);
+          if (nextBlock.equals(ZERO_BLOCK)) {
+            // End-of-archive: 2 zero blocks in
+            // a row. Stop.
+            break;
+          }
+          // Single zero block: GNU tar dir
+          // body. Skip it and read the next
+          // entry header on the following
+          // iteration.
+          offset += TAR_BLOCK;
+          continue;
+        }
+        // Single zero block at end of buffer:
+        // treat as end-of-archive (malformed but
+        // bounded).
+        break;
+      }
       const name = parseName(block);
       const typeflag = String.fromCharCode(block[TAR_TYPEFLAG_OFFSET]);
       const size = parseOctal(block, TAR_SIZE_OFFSET, TAR_SIZE_END);
       if (typeflag === "5") {
-        // Directory entry. The body is a single
-        // (empty) 512-byte block; we just create
-        // the directory.
+        // Directory entry. The USTAR size is 0
+        // for dirs; some producers also write
+        // a zero-padded body block (GNU tar),
+        // others don't (BSD tar, archive.ts).
+        // We skip the header only and let the
+        // next iteration's ZERO_BLOCK probe
+        // absorb a GNU tar dir body if present.
         await mkdir(join(outDir, name), { recursive: true });
-        offset += TAR_BLOCK * 2; // header + empty body block
+        offset += TAR_BLOCK;
         continue;
       }
       // typeflag "0" (or legacy "\0") = regular file.
