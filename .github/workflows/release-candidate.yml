@@ -478,11 +478,18 @@ jobs:
           # ci_job.duration_ms is non-zero. The verifier
           # (verify-release-evidence.mjs:128) rejects
           # zero-duration ci_jobs entries as
-          # DURATION_PLACEHOLDER.
-          TEST_START=$(date +%s%3N)
+          # DURATION_PLACEHOLDER. Use seconds precision
+          # (`date +%s`) so the capture is portable
+          # across GNU date (ubuntu/windows) and BSD
+          # date (macos); macOS BSD `date` does not
+          # support `%N`, so `date +%s%3N` produces a
+          # literal `N` suffix that bash arithmetic
+          # silently evaluates to zero (run 31361747988
+          # DURATION_PLACEHOLDER root cause).
+          TEST_START=$(date +%s)
           npm test -- --reporter=default --reporter=json --outputFile.json="$RUNNER_TEMP/junit-matrix-${{ matrix.os }}.json"
-          TEST_END=$(date +%s%3N)
-          echo "MATRIX_DURATION_MS=$((TEST_END - TEST_START))" >> "$GITHUB_ENV"
+          TEST_END=$(date +%s)
+          echo "MATRIX_DURATION_MS=$(( (TEST_END - TEST_START) * 1000 ))" >> "$GITHUB_ENV"
           node scripts/release-evidence.mjs --assert-vitest "$RUNNER_TEMP/junit-matrix-${{ matrix.os }}.json" "$RUNNER_TEMP/test-summary-matrix-${{ matrix.os }}.json"
 
       # v1.1.6 follow-up A1 (Task 0): matrix leg
