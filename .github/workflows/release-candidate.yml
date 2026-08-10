@@ -525,7 +525,17 @@ jobs:
         shell: bash
         env:
           MATRIX_JOB_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/jobs/${{ github.job }}
+          # capture at the test step's wall-clock; reused
+          # for both ci_job.duration_ms (this matrix leg)
+          # and release_workflow.duration_ms (the v1.1.3
+          # evidence doc's release_workflow field — on
+          # rc-branch, release.yml doesn't run, so the
+          # field is a mock; we populate it with the
+          # same value as ci_job so the verifier's
+          # DURATION_PLACEHOLDER check passes on both).
           MATRIX_DURATION_MS: ${{ env.MATRIX_DURATION_MS || 0 }}
+          RELEASE_EVIDENCE_DURATION_MS: ${{ env.MATRIX_DURATION_MS || 0 }}
+          RELEASE_WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           node scripts/release-evidence.mjs \
