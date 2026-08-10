@@ -191,6 +191,32 @@ export type ServerLifecycleOptions = {
   onShutdownStart?: (reason: ShutdownReason) => void;
 
   /**
+   * v1.1.6 follow-up D1: optional one-shot sink
+   * fired immediately before the clean `exitFn(0)`
+   * (BEFORE the process is reaped). The MCP entry
+   * wires this to write `[lifecycle] idle-sentinel\n`
+   * on stderr so a blackbox test can wait for the
+   * sentinel on `child.stderr` instead of racing
+   * against a 2.5 s cap on cold-start + idle. The
+   * test then asserts both `exitCode === 0` and
+   * `stderr.includes("idle-sentinel")`. The
+   * lifecycle never writes to stderr itself; the
+   * caller owns formatting (consistent with
+   * `onShutdownStart` above). Receives the same
+   * `reason` argument `onShutdownStart` gets, so
+   * the caller can gate the sentinel on a
+   * specific reason (the MCP entry only emits
+   * when `reason === "stdio_idle_timeout"` so
+   * the "no stderr leak" blackbox assertions on
+   * the SIGTERM / EOF / SIGINT paths still pass).
+   * Not fired on the ceiling-timeout / error path
+   * — those exit with code 1 and the test's
+   * sentinel assertion is about the idle-exit
+   * happy path.
+   */
+  onShutdownComplete?: (reason: ShutdownReason) => void;
+
+  /**
    * The `process.exit`-shaped function the
    * lifecycle calls to terminate the Node
    * process after the shutdown sequence.
@@ -405,6 +431,11 @@ export function installServerLifecycle(
   const onShutdown = options.onShutdown;
   const onShutdownError = options.onShutdownError ?? ((): void => {});
   const onShutdownStart = options.onShutdownStart;
+  // v1.1.6 follow-up D1: extract the idle-sentinel
+  // sink so the runShutdown() closure can fire it
+  // immediately before the clean `exitFn(0)`. See
+  // the type-doc above for the sentinel contract.
+  const onShutdownComplete = options.onShutdownComplete;
   const exitFn = options.exitFn ?? process.exit;
   const shutdownTimeoutMs =
     options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
@@ -496,6 +527,14 @@ export function installServerLifecycle(
       // Clean exit. Code 0 signals the host
       // that the child exited on its own
       // (no SIGTERM kill was needed).
+      // v1.1.6 follow-up D1: fire the caller's
+      // `onShutdownComplete` sink so a blackbox
+      // test can wait for the sentinel on stderr
+      // instead of racing against a fixed cap.
+      if (onShutdownComplete !== undefined) {
+        try { onShutdownComplete(reason); }
+        catch { /* sentinel sink must never block the exit */ }
+      }
       exitFn(0);
     } catch (error) {
       // 4. Diagnostics route through the

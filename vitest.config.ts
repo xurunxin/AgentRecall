@@ -21,27 +21,18 @@ export default defineConfig({
     exclude: [
       "test/blackbox/packaged-install.test.ts",
       "test/blackbox/mcp-shutdown.test.ts",
-      // v1.1.5 (rc-1.1.5-candidate gate): the stdio
-      // idle-exit blackbox test is timing-fraky on the
-      // release-candidate orchestrator runner. The
-      // orchestrator re-runs all 5 vitest suites on the
-      // same ubuntu-latest VM (incl. the 8-worker
-      // stress + the packaged-artifact lifecycle) and
-      // pushes the cold child startup over the test's
-      // 2.5 s post-warmup cap on a measured run. The
-      // dedicated unit + matrix legs (single suite,
-      // dedicated runner) consistently pass; the test
-      // is logically correct (verified by the
-      // dedicated test/unit/mcp-server-lifecycle.idle.test.ts
-      // + test/unit/idle-timer.test.ts units). Excluded
-      // from the default suite pending a follow-up
-      // that rewrites the test to wait for the
-      // "connected on stdio" stderr signal instead of
-      // a fixed sleep — that rewrite needs the
-      // orchestrator VM's cold-start variance
-      // characterised first. See CHANGELOG v1.1.5
-      // "Known non-blocking limits".
-      "test/blackbox/mcp-stdio-idle.test.ts",
+      // v1.1.6 follow-up D1: mcp-stdio-idle.test.ts
+      // is re-included. The v1.1.5 cap-bounded wait
+      // (2.5 s `setTimeout` + SIGKILL path) flaked
+      // on the release-candidate orchestrator when
+      // 5 vitest suites ran in parallel; the test
+      // is rewritten to wait for the
+      // `[lifecycle] idle-sentinel` line on stderr
+      // (emitted by `server-lifecycle.ts`
+      // `onShutdownComplete` hook just before
+      // `exitFn(0)` in the idle-shutdown path).
+      // The backstop timeout is now 5 s and the
+      // sentinel drives the assertion.
       "test/multi-process-stress.test.ts",
       "test/release-gate/**",
       // v1.1.5 (launcher release): the Bun
