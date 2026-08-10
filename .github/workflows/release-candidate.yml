@@ -491,16 +491,26 @@ jobs:
             macos-latest)   SUFFIX=tar.gz; CANON=darwin-x64 ;;
             windows-latest) SUFFIX=zip;   CANON=win32-x64  ;;
           esac
+          # Write directly to $RUNNER_TEMP/ — the v1.1.3
+          # GATE-04 verifier's CHECKSUM_BYTES_MISMATCH
+          # check (scripts/verify-release-evidence.mjs:135-138)
+          # resolves archive.name relative to
+          # dirname(evidencePath) which is
+          # $RUNNER_TEMP/release-evidence.json → $RUNNER_TEMP.
           ARCHIVE="agent-recall-${CANON}.${SUFFIX}"
+          DEST="$RUNNER_TEMP/${ARCHIVE}"
           case "${{ matrix.os }}" in
             windows-latest)
-              powershell.exe -NoProfile -Command "Compress-Archive -Path 'dist/*' -DestinationPath '${ARCHIVE}' -Force"
+              powershell.exe -NoProfile -Command "Compress-Archive -Path 'dist/*' -DestinationPath '${DEST}' -Force"
               ;;
             *)
-              tar -C dist -czf "${ARCHIVE}" .
+              tar -C dist -czf "${DEST}" .
               ;;
           esac
-          echo "ARCHIVE_PATH=$(pwd)/${ARCHIVE}" >> "$GITHUB_ENV"
+          echo "ARCHIVE_PATH=${DEST}" >> "$GITHUB_ENV"
+          # Also write to the working dir so
+          # upload-artifact can pick it up
+          cp "${DEST}" "${ARCHIVE}"
 
       - name: Write v1.1.3 GATE-04 matrix fragment
         shell: bash
@@ -521,7 +531,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: release-evidence-fragment-matrix-v113-${{ matrix.os }}
-          path: release-evidence-fragment-matrix-v113-${{ matrix.os }}.json
+          path: |
+            release-evidence-fragment-matrix-v113-${{ matrix.os }}.json
+            agent-recall-*
           if-no-files-found: error
           retention-days: 14
 
@@ -570,7 +582,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           pattern: release-evidence-fragment-*
-          path: ${{ runner.temp }}/evidence-fragments
+          path: ${{ runner.temp }}
           merge-multiple: true
 
       - name: Synthetic-failure smoke (issue #36)
@@ -639,10 +651,9 @@ jobs:
           # release-evidence-fragment-matrix-v113-*
           # + the orchestrator-aggregate per-suite
           # data + packaged-artifact fragments from
-          # $RUNNER_TEMP/evidence-fragments/ and
-          # emits a v1.1.3 GATE-04 strict shape
-          # release-evidence.json.
-          node scripts/release-evidence.mjs --fragments "$RUNNER_TEMP/evidence-fragments"
+          # $RUNNER_TEMP/ and emits a v1.1.3 GATE-04
+          # strict shape release-evidence.json.
+          node scripts/release-evidence.mjs --fragments "$RUNNER_TEMP"
           node scripts/verify-release-evidence.mjs "$RUNNER_TEMP/release-evidence.json"
           cp "$RUNNER_TEMP/release-evidence.json" release-evidence.json
           cp "$RUNNER_TEMP/release-candidate.json" release-candidate.json
