@@ -158,17 +158,36 @@ export class ConcurrentRevisionError extends Error {
 }
 
 /**
- * Type-guard for SQLite BUSY errors raised by
- * `node:sqlite`. SQLITE_LOCKED (6) is not retryable;
- * only SQLITE_BUSY (5) is.
+ * Type-guard for SQLite transient I/O errors
+ * raised by `node:sqlite`. Both
+ * `SQLITE_BUSY` (5) and `SQLITE_LOCKED` (6)
+ * are retryable: a holder transaction is
+ * holding the writer lock (BUSY) or another
+ * connection has the schema lock (LOCKED)
+ * and both resolve once the holder commits.
+ * The v1.1.6 follow-up B1
+ * (`test/unit/sqlite-store-busy-retry.test.ts`)
+ * exercises both. The previous v1.1.3 doc
+ * claimed "SQLITE_LOCKED is not retryable";
+ * that turned out to be wrong on contention
+ * under the spec § 5.6 release profile
+ * (the 8-worker stress test on Windows-latest
+ * produced both). This type-guard is the
+ * single contract for `runWithBusyRetry`
+ * (sync class method) AND `withBusyRetry`
+ * (top-level async helper) — both share
+ * the same retry trigger.
  */
 function isSqliteBusyError(error: unknown): boolean {
   if (typeof error !== "object" || error === null) return false;
   const err = error as { code?: string; errcode?: number; errno?: number };
-  if (err.errcode === 5) return true;
-  if (err.errno === 5) return true;
-  if (typeof err.code === "string" && err.code.includes("SQLITE_BUSY")) {
-    return true;
+  if (err.errcode === 5 || err.errcode === 6) return true;
+  if (err.errno === 5 || err.errno === 6) return true;
+  if (typeof err.code === "string") {
+    if (err.code === "SQLITE_BUSY" || err.code === "SQLITE_LOCKED") return true;
+    if (err.code.includes("SQLITE_BUSY") || err.code.includes("SQLITE_LOCKED")) {
+      return true;
+    }
   }
   return false;
 }
@@ -3931,4 +3950,103 @@ export class SQLiteMemoryStore {
       );
   }
 
+}
+
+// v1.1.6 follow-up B1 (issue #42, spec
+// d67fc45, plan bfbd2cb): top-level async
+// helper + dedicated `SQLiteBusyError` class.
+// Companion to the existing sync class
+// method `runWithBusyRetry` (line 3724) which
+// is still used by the in-class write path
+// (optimistic-concurrency CAS retries in
+// `updateEntryWithRevision`). The top-level
+// helper exists so async callers — including
+// the v1.1.6 release-gate multi-process
+// stress test on the Windows-latest runner —
+// can opt in to the same retry semantics
+// without holding a `SQLiteMemoryStore`
+// instance. The unit test in
+// `test/unit/sqlite-store-busy-retry.test.ts`
+// drives synthetic `SQLITE_BUSY` /
+// `SQLITE_LOCKED` errors to verify the
+// trigger + exhaustion + non-retry paths.
+
+/**
+ * v1.1.6 follow-up B1: thrown by
+ * `withBusyRetry` when the retry budget is
+ * exhausted. The `attempts` field is the
+ * total number of times `op` was invoked
+ * (1 + retries), `lastError` is the final
+ * SQLITE_BUSY / SQLITE_LOCKED error the
+ * helper re-threw. Callers that want to
+ * distinguish "the busyness was unresolvable
+ * within the budget" from "the operation
+ * itself threw something unrelated" can
+ * `instanceof` this class.
+ */
+export class SQLiteBusyError extends Error {
+  readonly attempts: number;
+  readonly lastError: unknown;
+  constructor(message: string, attempts: number, lastError: unknown) {
+    super(message);
+    this.name = "SQLiteBusyError";
+    this.attempts = attempts;
+    this.lastError = lastError;
+  }
+}
+
+/**
+ * v1.1.6 follow-up B1: top-level async helper
+ * that retries a `Promise`-returning op on
+ * `SQLITE_BUSY` (5) / `SQLITE_LOCKED` (6)
+ * with exponential backoff. Defaults: 5
+ * retries, 10ms initial delay, 200ms max
+ * delay, 2x backoff. Non-busy errors are
+ * re-thrown immediately (CAS conflict,
+ * schema mismatch, etc. propagate to the
+ * caller's domain logic untouched). The
+ * busy-only exhaustion throws
+ * `SQLiteBusyError` with `attempts` +
+ * `lastError` populated.
+ */
+export async function withBusyRetry<T>(
+  op: () => Promise<T>,
+  opts: { maxRetries?: number; initialDelayMs?: number; maxDelayMs?: number; backoff?: number } = {}
+): Promise<T> {
+  const maxRetries = opts.maxRetries ?? 5;
+  const initialDelayMs = opts.initialDelayMs ?? 10;
+  const maxDelayMs = opts.maxDelayMs ?? 200;
+  const backoff = opts.backoff ?? 2;
+  let delay = initialDelayMs;
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    try {
+      return await op();
+    } catch (e) {
+      lastError = e;
+      if (!isSqliteBusyError(e)) {
+        // Not a transient I/O error: re-throw
+        // immediately. The caller's domain
+        // logic (CAS conflict, schema
+        // mismatch, etc.) gets the original
+        // error untouched.
+        throw e;
+      }
+      if (attempt === maxRetries) {
+        throw new SQLiteBusyError(
+          `SQLite busy after ${attempt + 1} attempts`,
+          attempt + 1,
+          lastError
+        );
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, delay));
+      delay = Math.min(delay * backoff, maxDelayMs);
+    }
+  }
+  // Unreachable: the loop body either returns,
+  // re-throws a non-busy error, or throws
+  // `SQLiteBusyError` on the last attempt. The
+  // throw here keeps TypeScript's control-flow
+  // analysis happy.
+  throw new SQLiteBusyError("unreachable", maxRetries + 1, lastError);
 }
