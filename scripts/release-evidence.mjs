@@ -155,6 +155,20 @@ function handleMatrixFragmentWrite() {
       : `v${pkg.version}`,
     candidate_sha: candidateSha,
     subissues: [],
+    // v1.1.3 GATE-04 aggregator (aggregateFragments,
+    // line 532-533) reads `test_summary.passed /
+    // .failed / .skipped / .filtered / .totals_from`
+    // from the TOP-LEVEL `test_summary` field on
+    // each fragment, not from ci_job.test_summary.
+    // The v1.1.3 strict schema requires
+    // `test_summary` at the top level of the evidence
+    // document; the aggregator sums the per-OS
+    // values from the per-fragment top-level
+    // test_summary fields. The same testSummary is
+    // also embedded in ci_job.test_summary so the
+    // evidence document's per-platform ci_jobs entry
+    // has the test data inline.
+    test_summary: testSummary,
     platform,
     ci_job: {
       platform,
