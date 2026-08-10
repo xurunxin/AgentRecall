@@ -177,8 +177,7 @@ function handleMatrixFragmentWrite() {
       job_url: process.env.MATRIX_JOB_URL ?? "https://github.com/local/local/actions/runs/0/jobs/0",
       conclusion: "success",
       duration_ms: Number(process.env.MATRIX_DURATION_MS ?? 0),
-      head_sha: candidateSha,
-      test_summary: testSummary
+      head_sha: candidateSha
     },
     artifact: { platform, name: archiveName, size_bytes: sizeBytes, sha256 },
     release_workflow: {
