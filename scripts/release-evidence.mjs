@@ -546,7 +546,25 @@ function handleAggregation() {
   const fragmentsDir = argument("--fragments");
   const output = argument("--output") ?? outputPath;
   if (!fragmentsDir) fail("usage: --fragments <directory> [--output <path>]");
-  const paths = walkFiles(fragmentsDir).filter(path => path.endsWith(".json"));
+  // v1.1.6 follow-up A1 (Task 0): the download step
+  // pulls every `release-evidence-fragment-*` artifact
+  // into the fragments dir (legacy v1.1.2 matrix leg
+  // fragments, per-suite segregated-job fragments, the
+  // orchestrator's per-suite data, plus the new
+  // v1.1.3 matrix-v113 fragments). The v1.1.3 GATE-04
+  // aggregator (aggregateFragments above) only consumes
+  // the matrix-v113 fragments; the other fragments are
+  // for human inspection via the workflow artifacts
+  // tab. Filtering by the `matrix-v113-` token (which
+  // is only on the new fragments) keeps the
+  // aggregator's invariant `length === 3` honest.
+  const paths = walkFiles(fragmentsDir)
+    .filter(path => path.endsWith(".json"))
+    .filter(path => /matrix-v113-[^/]+\.json$/.test(path))
+    .sort();
+  if (paths.length !== CANONICAL_PLATFORMS.length) {
+    fail(`MISMATCHED_PLATFORMS: expected ${CANONICAL_PLATFORMS.length} matrix-v113 fragments, found ${paths.length}: ${paths.join(", ")}`);
+  }
   const evidence = aggregateFragments(paths);
   // v1.1.3 GATE-04 (#34): the candidate workflow
   // tag guard (`release.yml`) reads
