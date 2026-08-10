@@ -132,6 +132,37 @@ v1.1.6 = 上述 6 + 1 项全部清理：
 
 不卡 `release.yml` / tag / gh release；Phase 1 不发版。
 
+## Phase 1 gate（已通过）
+
+2026-08-10 在 `rc-1.1.6-candidate` 上跑通 ≥ 2 次连续干净 `release-candidate.yml`，
+Phase 1 → Phase 2 门正式打开。两次 run 的关键信息：
+
+| Run | databaseId | HEAD | Conclusion | 备注 |
+|---|---|---|---|---|
+| Run 1 | 31364347406 | `00b81fa` | success | Task 1（`feat(verify-release-evidence): drop v1.1.2 legacy shim; v1.1.3 GATE-04 strict path is the only path`）触发的首次 v1.1.3 严格路径全绿。 |
+| Run 2 | 31365400436 | `aa4ea0b` | success | 空 commit（`chore(ci): trigger Phase 1 gate Run 2 for v1.1.6 A1`）re-push 同 ref，验证 Run 1 不是偶发。 |
+
+**通过的实质条件**（plan Task 3 验收）：
+- 3 条 OS matrix leg 都成功上传 `release-evidence-fragment-matrix-v113-<os>.json`。
+- `release-aggregate` 步骤通过 v1.1.3 GATE-04 strict 路径的 `verify-release-evidence.mjs`：
+  `MISMATCHED_PLATFORMS`（3 canonical platforms）、`DURATION_PLACEHOLDER`
+  （`ci_job.duration_ms` + `release_workflow.duration_ms` 三个 OS 都非 0）、
+  `CHECKSUM_BYTES_MISMATCH`（`$RUNNER_TEMP/` 下的 archive 字节一致）全部过。
+- 两次都触发同一份代码（Task 1 的 verifier drop legacy + 修复 macOS BSD `date`
+  duration capture），无 flake 复现。
+
+**未在 Phase 1 范围**（按 plan 不卡）：
+- `release.yml` 标签路径未跑（`verify-extracted-artifacts` 仍未消费
+  `RELEASE_ARTIFACT_HASHES_PATH`，那是 Task 12 范围）。
+- `MISMATCHED_PLATFORMS` 在 rc-branch 仍 hard 校验；tag 路径变 hard + 与
+  `release-artifact-hashes.json` 交叉校验 = Task 12。
+- v1.1.5-era 留下的 `p3-release-candidate-gate.test.ts` +
+  `p3-release-immutability.test.ts` 10 个 pre-existing 失败（`package.json@1.1.5`
+  vs 旧 fixture `1.1.3` + `|| true` regex）——不属于 release-gate 债，跟 Phase 1 gate
+  无关；列入 #42 follow-up（v1.1.6 ship 之前的清理项）。
+
+Phase 2 启动信号：可以并行 6 个 worktree（B1/C1/D1/D2/D3/E1）。
+
 ### Phase 2 — 6 个 worktree 并行（4-5 周）
 
 ```
