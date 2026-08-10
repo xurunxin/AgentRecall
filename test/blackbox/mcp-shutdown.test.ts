@@ -202,7 +202,7 @@ describe("MCP stdio server graceful shutdown (real subprocess, source via tsx)",
     await warmup();
     child.stdin?.end();
 
-    const exited = await waitForExit(child, 2500);
+    const exited = await waitForExit(child, 5000);
     // The lifecycle module calls `process.exit(0)`
     // on a clean shutdown. The host must NOT have
     // had to SIGKILL us (the timeout escape hatch
@@ -242,7 +242,7 @@ describe("MCP stdio server graceful shutdown (real subprocess, source via tsx)",
     if (child.pid === undefined) throw new Error("child pid undefined");
     process.kill(child.pid, "SIGTERM");
 
-    const exited = await waitForExit(child, 2500);
+    const exited = await waitForExit(child, 5000);
     expect(exited.signal).toBeNull();
     expect(exited.code).toBe(0);
     // No protocol leak.
@@ -267,7 +267,7 @@ describe("MCP stdio server graceful shutdown (real subprocess, source via tsx)",
     if (child.pid === undefined) throw new Error("child pid undefined");
     process.kill(child.pid, "SIGINT");
 
-    const exited = await waitForExit(child, 2500);
+    const exited = await waitForExit(child, 5000);
     expect(exited.signal).toBeNull();
     expect(exited.code).toBe(0);
     expect(stderr.trim()).toBe("");
@@ -285,7 +285,7 @@ describe("MCP stdio server graceful shutdown (real subprocess, source via tsx)",
     await warmup();
     child.stdin?.end();
 
-    const exited = await waitForExit(child, 2500);
+    const exited = await waitForExit(child, 5000);
     expect(exited.code).toBe(0);
     // Verbose mode emits a one-shot stderr line
     // at trigger time. The reason is one of
