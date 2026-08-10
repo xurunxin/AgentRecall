@@ -490,21 +490,49 @@ export function installServerLifecycle(
         timer.unref();
       });
       const sequence = (async (): Promise<"done"> => {
-        // 1. Transport first: stop the stdio
-        //    pipe so no late frames can leak
-        //    into a half-closed session.
-        if (options.transport !== undefined) {
-          await options.transport.close();
-        }
-        // 2. Server next: the SDK aborts
-        //    in-flight handlers and fires its
-        //    own `onclose`. Final audit events
-        //    land in this window.
-        await options.server.close();
-        // 3. Caller-supplied cleanup (e.g.
-        //    SQLite handle release). After
-        //    this returns the file is fully
-        //    flushed + closed.
+        // v1.1.6 follow-up D2: parallelize
+        // transport close + server close. The
+        // pre-D2 serial ordering
+        // (`await transport.close()` →
+        // `await server.close()`) was safe but
+        // ~2x slower on the busy release-
+        // candidate orchestrator VM (the same
+        // VM that runs the 5-suite vitest pass
+        // + multi-process stress back-to-back).
+        // Both now run via `Promise.all`. The
+        // SDK's `StdioServerTransport.close()`
+        // is idempotent and safe to call while
+        // `server.close()` is in flight; the
+        // server's internal `AbortController`
+        // does not depend on the transport
+        // being already closed; the
+        // `server.close()`'s `onclose` hook
+        // (where the final audit events land)
+        // still fires before either `Promise`
+        // resolves because the SDK's close
+        // path is microtask-scheduled. After
+        // both resolve, the stdio pipe is
+        // closed AND the in-flight handlers
+        // are aborted.
+        const transportClose = options.transport !== undefined
+          ? options.transport.close()
+          : Promise.resolve();
+        const serverClose = options.server.close();
+        await Promise.all([transportClose, serverClose]);
+        // Caller-supplied cleanup (e.g.
+        // SQLite handle release). After this
+        // returns the file is fully flushed
+        // + closed. Still serial (after the
+        // parallel transport + server close)
+        // because the SQLite close is the
+        // only operation that MUST land
+        // before `process.exit(0)` to avoid
+        // losing the final audit append. A
+        // caller-supplied fire-and-forget
+        // unlink (e.g. a stale lockfile) can
+        // be invoked from inside `onShutdown`
+        // by the caller; the lifecycle itself
+        // never spawns untracked async work.
         if (onShutdown !== undefined) {
           await onShutdown();
         }

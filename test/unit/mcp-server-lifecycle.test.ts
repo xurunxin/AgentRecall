@@ -315,11 +315,21 @@ describe("installServerLifecycle (MCP stdio server graceful shutdown)", () => {
     await settle();
     expect(onShutdownError).toHaveBeenCalledTimes(1);
     expect(handle.closed).toBe(true);
-    // The error halts the sequence: server.close
-    // and onShutdown are skipped because the
-    // transport could not flush. The handle still
-    // reports `closed` so the event loop drains.
-    expect(server.close).not.toHaveBeenCalled();
+    // v1.1.6 follow-up D2: transport close +
+    // server close now run in parallel via
+    // `Promise.all`. The pre-D2 contract
+    // ("server.close not called when transport
+    // fails") no longer holds: `server.close()`
+    // is initiated before the parallel section
+    // rejects. The new contract is that
+    // `onShutdown` is skipped (the error in the
+    // parallel section aborts before the
+    // cleanup hook is reached) AND `exitFn(1)`
+    // is still called (the catch block routes
+    // through `onShutdownError` + hard-exits).
+    // The handle still reports `closed` so the
+    // event loop drains.
+    expect(server.close).toHaveBeenCalledTimes(1);
     expect(onShutdown).not.toHaveBeenCalled();
     expect(exitFn).toHaveBeenCalledWith(1);
   });
