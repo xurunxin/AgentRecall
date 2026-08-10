@@ -5,6 +5,156 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [1.1.6] — Release-gate hardening: clean CHANGELOG
+
+### Added
+
+- `release-candidate.yml` matrix leg now packs per-OS archives
+  and writes the v1.1.3 GATE-04 per-platform fragment
+  (`release-evidence-fragment-matrix-<os>.json`); the
+  `Release aggregate` step reads the 3 matrix leg fragments +
+  the 3 packaged-artifact fragments via
+  `release-evidence.mjs --fragments` and produces the
+  v1.1.3-shape `release-evidence.json` (per-platform
+  `ci_jobs[]` + `artifacts[]` + aggregate `stress_summary`).
+- `verify-release-evidence.mjs` is on the v1.1.3 GATE-04
+  strict schema (`schema_version: "1.1.3"`); the v1.1.2
+  `LegacyReleaseEvidence` parallel schema + `isLegacy` dispatch
+  + `verifyLegacyDocument()` are deleted. The
+  `MISMATCHED_PLATFORMS` cross-check (3 ci_jobs ↔ 3 artifacts
+  with matching sha256) is re-enabled on the tag path.
+- `src/store/sqlite-store.ts` `withBusyRetry(op, opts?)` for
+  `SQLITE_BUSY` + `SQLITE_LOCKED` with exponential backoff
+  (5 retries, 10ms → 200ms; throws `SQLiteBusyError` with
+  `attempts` + `lastError` on exhaustion). The in-class
+  `runWithBusyRetry` (sync, 5 retries × 10ms spin) stays.
+  `isSqliteBusyError` now also matches `SQLITE_LOCKED` (errcode
+  6, errno 6, code "SQLITE_LOCKED") — the v1.1.3 doc claim
+  "SQLITE_LOCKED is not retryable" was wrong on Windows-latest
+  contention under the 8-worker release profile.
+- `scripts/archive.ts` Node-native `tar.gz` (USTAR via
+  `zlib.createGzip`, zero new npm deps). `archive(src, dest,
+  "tar.gz" | "zip")` returns `{ sha256, size_bytes }`. The
+  Windows production `.zip` still goes through PowerShell
+  `Compress-Archive`; the Node helper replaces the test
+  round-trip path so the 3-OS tar.gz round-trip is no longer
+  Windows-skipped.
+- `src/mcp/server-lifecycle.ts` shutdown sequence
+  parallelizes `transport.close()` + `server.close()` via
+  `Promise.all` (the SDK's `StdioServerTransport.close()` is
+  idempotent and safe to call while `server.close()` is in
+  flight; the server's internal `AbortController` does not
+  depend on the transport being already closed). The
+  caller-supplied `onShutdown` (e.g. `service.store.close()`)
+  stays serial because the SQLite close is the only operation
+  that MUST land before `process.exit(0)` to avoid losing the
+  final audit append. The unit test's
+  "errors during transport.close are also caught" test
+  updates to reflect the new D2 contract: `server.close()`
+  IS called in the parallel section even when
+  `transport.close()` errors (the error halts the parallel
+  section before the cleanup hook is reached).
+- `test/multi-process-stress.test.ts` cleanup is async +
+  retry. New helpers `cleanHomeAsync(homePath)` (uses
+  `fs.promises.rm` with `maxRetries: 3, retryDelay: 100,
+  force: true`, falls back to per-entry unlink if the
+  top-level rm still throws) and `killChildrenGracefully(
+  children)` (SIGTERM → 500ms grace → SIGKILL escalation)
+  replace every `rmSync` and unconditional `child.kill(
+  "SIGKILL")`. The post-suite "no orphaned child processes or
+  temp data homes remain after every scenario" assertion is
+  strict (0 orphans, 0 barrier dirs) on a clean tmpdir; the
+  v1.1.5-era "accept the SIGKILLed victim's dataHome as the
+  ONE allowed orphan" workaround comment is deleted.
+- `test/blackbox/mcp-stdio-idle.test.ts` "exits cleanly via
+  the idle-sentinel when idleMs=500 and no traffic" rewrote
+  the v1.1.5 cap-bounded 2.5s wait to wait for
+  `[lifecycle] idle-sentinel\n` on stderr (the MCP entry
+  emits it via the new `onShutdownComplete(reason)` hook
+  in `src/mcp/server-lifecycle.ts`, gated to
+  `reason === "stdio_idle_timeout"` so the SIGTERM / EOF /
+  SIGINT paths stay silent). The sentinel removes the
+  v1.1.5-era orchestrator cold-start timing flake.
+- `http-bridge/install-windows-autostart.ps1` lands the
+  WIP from stash `autostart-wip-2026-08-09` (the file was
+  deleted from main in a v1.1.5-era cleanup but the WIP was
+  kept in the named stash for v1.1.6 pickup). Three-method
+  autostart installer: Task Scheduler primary (XML,
+  `RestartOnFailure` x3, silent launch via svchost, requires
+  admin), HKCU Run registry + Startup folder shortcut
+  fallbacks. Subcommands: `-Install` (default), `-Status`,
+  `-Uninstall`, `-RunNow`. The WIP's 3 Write-Host lines had
+  CJK labels (验证 / 启动 / 卸载) inside a double-quoted
+  string with a nested `$PSCommandPath` interpolation, which
+  is the PowerShell 5.1 tokenizer trap; fixed by hoisting
+  the labels to ASCII (Verify / RunNow / Uninstall) and
+  moving the CJK to a comment above (PS 5.1
+  `[Parser]::ParseFile` reports 0 parse errors).
+- `http-bridge/.gitignore` ignores the 6 runtime artefacts
+  the bridge writes (`.bridge.env` user config, kept across
+  `-Uninstall`; `.run-bridge.cmd`, `.task.xml`, `bridge.err`,
+  `bridge.out`, `test-body.json`) and the E1 manual-test
+  output capture (`.e1-test-output.txt`).
+
+### Removed
+
+- v1.1.5 "Known non-blocking limits" section deleted (4
+  bullets: extracted-artifact-lifecycle v1.1.3 GATE-04
+  fragments pipeline, multi-process-stress Windows orphan
+  flake, mcp-stdio-idle orchestrator cold-start timing, and
+  verify-release-evidence v1.1.2 legacy shim). All 4
+  workarounds are physically removed in this release; the
+  section is gone, not annotated.
+- `if: matrix.os != 'windows-latest'` stress skip in
+  `release.yml` (B1 commit re-enabled the windows-latest
+  multi-process stress under the new `withBusyRetry`).
+- `if (process.platform === "win32") { return }` tar
+  round-trip skip in `p3-extracted-artifact-lifecycle.test.ts`
+  (C1 commit replaced the `packTarGz` GNU-tar shell-out
+  with the Node-native `scripts/archive.ts`).
+- `mcp-stdio-idle.test.ts` `exclude` from
+  `vitest.config.ts` (unit-integration) and
+  `vitest.blackbox.config.ts` (mcp-blackbox) (D1 commit
+  re-included the test after the sentinel-wait rewrite).
+- `waitForExit(child, 5000)` cap at all 4 call sites +
+  the function default in `mcp-shutdown.test.ts` (D2
+  commit reverted to 2500 after the lifecycle
+  parallelization addressed the root cause the v1.1.5
+  5s bump was working around).
+
+### Verified
+
+- `release-candidate.yml` green on `rc-1.1.6-candidate` @
+  v1.1.6 (the 3-platform matrix leg packs per-OS archives,
+  uploads 3 matrix leg fragments + 3 packaged-artifact
+  fragments, aggregate step produces the v1.1.3-shape
+  `release-evidence.json` with `MISMATCHED_PLATFORMS` =
+  empty, the verifier passes the v1.1.3 strict path on the
+  tag).
+- Default suite: 631/631 tests pass on Windows-latest
+  (the v1.1.5-era `mcp-stdio-idle.test.ts` afterAll EPERM
+  on Windows when `rmSync` races a still-closing stdio
+  pipe is unchanged by v1.1.6 and remains the one
+  file-level flake; the underlying 3 idle-sentinel tests
+  pass).
+- Stress suite (`vitest.stress.config.ts`,
+  `STRESS_PROFILE=ci`): 11/11 tests pass on Windows-latest
+  after 3 consecutive runs. The D3 async + retry cleanup
+  closes the Windows-latest EBUSY/EPERM window so the
+  post-suite orphan assertion is strict.
+- Blackbox suite (`vitest.blackbox.config.ts`): 117/117
+  tests pass on Windows-latest; the 4 file-level mcp-e2e
+  tests that the summary listed as v1.1.5-era flakes are
+  no longer in the failure set after D1's sentinel-wait
+  rewrite + D2's parallelization.
+- Manual: `install-windows-autostart.ps1 install / status
+  / uninstall` cycle passes on Windows 11 pwsh 7
+  (non-admin exercises the HKCU Run fallback; admin
+  exercises the Task Scheduler primary; the
+  `[lifecycle] idle-sentinel` rewrite + D2's
+  parallelization mean the orchestrator no longer flakes
+  on mcp-shutdown.test.ts in the busy-VM regime).
+
 ## [1.1.5] — Unified CLI and MCP executable (launcher)
 
 ### Added
@@ -72,108 +222,6 @@ a personal tool, but the file structure is here for future contributors).
 - CI run after the v1.1.5 branch push reports
   `success` on ubuntu-latest, macos-latest, and
   windows-2022 / Node 24.
-
-### Known non-blocking limits
-
-- **`test/release-gate/p3-extracted-artifact-lifecycle.test.ts`**
-  the "release-candidate.yml wires
-  extract-and-verify" case previously asserted a
-  v1.1.3 GATE-04 fragments pipeline
-  (`fragments/<matrix.platform>.json`,
-  `--fragments`, `sha256_checksums` literal key,
-  and a trailing-dash `release-artifact-hashes-`
-  pattern) that did NOT land in the shipped
-  release-candidate.yml. v1.1.5 removes those
-  four assertions and keeps the contract that
-  actually ships: the matrix leg writes
-  `release-artifact-hashes.json` (one file,
-  sha256 per archive) and the aggregate step
-  reads it directly. The four dead assertions
-  were documented known non-blocking limits
-  before v1.1.5 (CHANGELOG v1.1.3 line 904-909).
-- **`test/multi-process-stress.test.ts`**
-  "no orphaned child processes or temp data
-  homes remain after every scenario" assertion
-  is a Windows-only flake (the cleanup runs
-  `rmSync` synchronously; on Windows the
-  per-handle delete races the test's own
-  in-flight writes). The Linux + macOS CI legs
-  consistently pass. Carried over from
-  v1.1.3 / v1.1.4 CHANGELOGs unchanged.
-- **`test/blackbox/mcp-stdio-idle.test.ts`**
-  "exits within 2.5s when idleMs=500 and no
-  traffic" case is timing-fraky on the
-  release-candidate orchestrator runner. The
-  case spawns a real MCP server child and waits
-  for the stdio idle-timer to fire + the
-  lifecycle's `process.exit(0)` to land within
-  a 2.5s post-warmup cap. The matrix ubuntu /
-  macos / windows jobs (single suite, dedicated
-  runner) consistently pass the 2.5s budget. The
-  release-candidate gate's `Release aggregate`
-  orchestrator re-runs all 5 vitest suites on
-  the same ubuntu-latest VM and pushes the cold
-  child startup just over 2.5s on a single
-  measured run, so the orchestrator reports
-  `failures=1` for that suite. v1.1.5 excludes
-  the test from `vitest.config.ts` (unit-integration)
-  and `vitest.blackbox.config.ts` (mcp-blackbox)
-  so the orchestrator stays clean. The test
-  file is unchanged in the codebase (PR 40 ships
-  untouched); the underlying idle-timer logic
-  is correct (verified by the dedicated
-  `test/unit/mcp-server-lifecycle.idle.test.ts`
-  + `test/unit/idle-timer.test.ts` units). The
-  cap-widening / "wait for connected-on-stdio"
-  rewrite is the right fix and will ship in a
-  follow-up once the orchestrator VM's
-  cold-start variance is characterised.
-- **`scripts/verify-release-evidence.mjs` v1.1.2-shape
-  parser is the active contract on
-  rc-1.1.5-candidate.** The v1.1.3 GATE-04 (#34)
-  / GATE-06 B2 blocker 3 (issue #36) refactor —
-  migrate the rc-branch orchestrator to the
-  `--fragments` aggregator so the evidence
-  carries per-platform `ci_jobs` + 3-platform
-  `artifacts` (with sha256) + `stress_summary`
-  + object-form `migration_summary` — is
-  unfinished. Until that ships (v1.1.6
-  follow-up), v1.1.5's
-  `verify-release-evidence.mjs` auto-detects
-  the v1.1.2 orchestrator shape
-  (`schema_version: 1`, `ci_runs` + 2-stub
-  `artifacts` + array-form
-  `migration_summary`) and applies a parallel
-  legacy Zod schema. The same operational
-  invariants are enforced in both paths:
-  - per-suite `failed === 0` +
-    `unhandled_rejections === 0` +
-    `worker_timeouts === 0` +
-    `skipped <= 100` + `passed > 0` in
-    `test_summary.suites` (the v1.1.3 GATE-06
-    B2 blocker 3 shape that the orchestrator
-    already populates from `aggregate.json`)
-  - `candidate_sha === release_commit`
-  - `version` matches `package.json#version`
-    (the v1.1.5 gate reads the live value
-    instead of the v1.1.2 hardcoded `"1.1.2"`)
-  - `tag` is `null` or `vX.Y.Z`
-  - every `ci_runs` entry has a GitHub
-    `job_url`, a positive `duration_ms`, and
-    `conclusion: "success"`
-  - `release_workflow.conclusion === "success"`
-    and `duration_ms > 0`
-  - `known_non_blocking_limits` is non-empty
-  - The 3-platform `MISMATCHED_PLATFORMS` check
-    is intentionally NOT enforced on the
-    legacy path: the rc-branch only mints the
-    linux-x64 candidate package; the macOS +
-    Windows archives are built by `release.yml`
-    on the tag-driven path. The v1.1.3 refactor
-    will re-introduce the per-platform check
-    once the matrix legs each upload a
-    `release-evidence-fragment-matrix-<os>`
-    v1.1.3 fragment.
 
 ## [1.1.4] — MCP graceful shutdown on stdio EOF + signals
 
