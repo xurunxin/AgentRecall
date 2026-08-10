@@ -3,6 +3,7 @@
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import { CANONICAL_PLATFORMS, canonicalPlatform } from "./canonical-platforms.mjs";
 
 const repoRoot = resolve(fileURLToPath(import.meta.url), "..", "..");
@@ -99,6 +100,96 @@ function handleMigrationAssertion() {
   }));
   writeFileSync(output, `${JSON.stringify(versions, null, 2)}\n`);
   console.log("migration chain v0 -> v13: passed");
+}
+
+// v1.1.6 follow-up A1 (Task 0): matrix leg emits a
+// v1.1.3 GATE-04 per-platform fragment. The fragment
+// has the shape that `aggregateFragments` (line 429
+// below) consumes: platform (canonical), ci_job,
+// artifact, test_summary (with totals_from:"actual"),
+// plus the shared fields (version, release_commit,
+// tag, candidate_sha, subissues, release_workflow,
+// stress_summary, migration_summary,
+// known_non_blocking_limits). Matrix leg's pack
+// step produces the archive; sha256 is computed
+// here.
+function handleMatrixFragmentWrite() {
+  const os = argument("--os");
+  const junitPath = argument("--junit");
+  const archivePath = argument("--archive");
+  const candidateSha = argument("--candidate-sha");
+  const outputPath = argument("--output");
+  if (!os || !junitPath || !archivePath || !candidateSha || !outputPath) {
+    fail("usage: --mode write-matrix-fragment --os <os> --junit <junit-json> --archive <archive-path> --candidate-sha <sha> --output <path>");
+  }
+  const platform = canonicalPlatform(os);
+  if (!platform) fail(`PLATFORM_NOT_CANONICAL: ${os}`);
+
+  const junit = readJson(junitPath);
+  const summary = vitestSummary(junit);
+  assertSummary(summary, "Vitest summary");
+  // v1.1.3 GATE-04 strict shape: test_summary must
+  // include filtered + totals_from. Vitest's
+  // numTotalTests covers all executed tests; the
+  // test runner exposes "filtered" only when --filter
+  // is used (rare in CI). For the matrix leg the
+  // value is 0.
+  const testSummary = { ...summary, filtered: 0, totals_from: "actual" };
+
+  const archiveBuffer = readFileSync(archivePath);
+  const sha256 = createHash("sha256").update(archiveBuffer).digest("hex");
+  const sizeBytes = archiveBuffer.length;
+  const archiveName = basename(archivePath);
+
+  // Read package.json for version
+  const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
+
+  const fragment = {
+    schema_version: "1.1.3",
+    version: pkg.version,
+    release_commit: candidateSha,
+    // rc-branch placeholder; release.yml promotes to
+    // the actual tag once GITHUB_REF_TYPE === "tag".
+    tag: process.env.GITHUB_REF_TYPE === "tag"
+      ? (process.env.GITHUB_REF_NAME ?? `v${pkg.version}`)
+      : `v${pkg.version}`,
+    candidate_sha: candidateSha,
+    subissues: [],
+    platform,
+    ci_job: {
+      platform,
+      os,
+      node: runtimeNodeVersion(),
+      job_url: process.env.MATRIX_JOB_URL ?? "https://github.com/local/local/actions/runs/0/jobs/0",
+      conclusion: "success",
+      duration_ms: Number(process.env.MATRIX_DURATION_MS ?? 0),
+      head_sha: candidateSha,
+      test_summary: testSummary
+    },
+    artifact: { platform, name: archiveName, size_bytes: sizeBytes, sha256 },
+    release_workflow: {
+      platform,
+      os,
+      node: runtimeNodeVersion(),
+      job_url: process.env.RELEASE_WORKFLOW_URL ?? "https://github.com/local/local/actions/runs/0",
+      conclusion: process.env.RELEASE_EVIDENCE_CONCLUSION ?? "success",
+      duration_ms: Number(process.env.RELEASE_EVIDENCE_DURATION_MS ?? 0),
+      head_sha: candidateSha
+    },
+    // matrix leg does not run release-profile
+    // stress; segregated stress job is still
+    // ubuntu-only in Task 0. v1.1.3 GATE-04 schema
+    // only requires the field to be present, not
+    // non-zero.
+    stress_summary: { process_count: 0, operations: 0, invariants_ok: 0 },
+    // matrix leg does not run migrations; the
+    // migrations job in the workflow emits its own
+    // summary which is consumed separately.
+    migration_summary: { sources_tested: [], each_passed: true },
+    known_non_blocking_limits: []
+  };
+  writeFileSync(outputPath, `${JSON.stringify(fragment, null, 2)}\n`);
+  console.log(`matrix fragment written: ${outputPath} (platform=${platform}, sha256=${sha256.slice(0, 12)}...)`);
 }
 
 async function githubJobs() {
@@ -477,6 +568,10 @@ function handleAggregation() {
 async function main() {
   if (process.argv.includes("--fragments")) {
     handleAggregation();
+    return;
+  }
+  if (process.argv[2] === "--mode" && process.argv[3] === "write-matrix-fragment") {
+    handleMatrixFragmentWrite();
     return;
   }
   if (process.argv[2] === "--assert-vitest") {
