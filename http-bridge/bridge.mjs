@@ -37,14 +37,72 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const PROJECT_ROOT = resolve(__dirname, "..");
+
+// PROJECT_ROOT resolution chain (for the Bun single-file binary build
+// where __dirname points at the binary's install dir, not the source):
+//   1) --project-root <abs path> command-line flag
+//   2) AGENT_RECALL_PROJECT_ROOT env var
+//   3) walk upward from process.execPath looking for dist/src/index.js
+//      (covers the standard install layout: dist-bin/binary + dist/src/index.js)
+//   4) __dirname/.. (source-tree dev mode, npm run dev)
+function findProjectRoot() {
+  const flagIdx = process.argv.findIndex((a) => a === "--project-root");
+  if (flagIdx >= 0 && process.argv[flagIdx + 1]) {
+    return resolve(process.argv[flagIdx + 1]);
+  }
+  if (process.env.AGENT_RECALL_PROJECT_ROOT) {
+    return resolve(process.env.AGENT_RECALL_PROJECT_ROOT);
+  }
+  // Walk up from the binary location looking for the canonical marker
+  let cur = dirname(process.execPath);
+  for (let i = 0; i < 8; i++) {
+    if (existsSync(join(cur, "dist", "src", "index.js"))) return cur;
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  // Last resort: relative to this file (dev mode via `node bridge.mjs`)
+  return resolve(__dirname, "..");
+}
+const PROJECT_ROOT = findProjectRoot();
+if (process.env.AGENT_RECALL_VERBOSE === "1") {
+  console.error(`[http-bridge] PROJECT_ROOT = ${PROJECT_ROOT}`);
+  console.error(`[http-bridge] process.execPath = ${process.execPath}`);
+}
 const DIST_INDEX = join(PROJECT_ROOT, "dist", "src", "index.js");
 
-// Windows ESM loader 需要 file:// URL
-const fileImport = (rel) => {
-  const abs = join(PROJECT_ROOT, "dist", rel);
-  return import(pathToFileURL(abs).href);
-};
+// Make the project's node_modules reachable from dynamic-imported code
+// (dist/src/index.js) when the binary is launched from a different
+// cwd.  Bun resolves bare imports via the cwd's ancestor node_modules
+// chain; by prepending PROJECT_ROOT/node_modules to NODE_PATH and
+// chdir()-ing there, the dynamic-imported service file finds SDK
+// packages even when the bridge was started from http-bridge/ or any
+// other working directory set by the install script.
+const PROJECT_NODE_MODULES = join(PROJECT_ROOT, "node_modules");
+if (existsSync(PROJECT_NODE_MODULES)) {
+  const sep = process.platform === "win32" ? ";" : ":";
+  process.env.NODE_PATH = PROJECT_NODE_MODULES +
+    (process.env.NODE_PATH ? sep + process.env.NODE_PATH : "");
+  try {
+    const { Module } = await import("node:module");
+    if (typeof Module._initPaths === "function") Module._initPaths();
+  } catch {}
+}
+
+// fileImport is unused now; left as a no-op import helper for
+// backwards-compat with prior code paths (kept commented to avoid
+// emitting an unused-symbol warning).
+// const fileImport = (rel) => import(`../dist/${rel}`);
+
+// STATIC top-level imports of every dist module the bridge needs.
+// As with the index.js import above, these are static so bun build
+// can resolve the entire dependency graph at compile time.
+import { CapabilityStore } from "../dist/src/admin/capability.js";
+import { registerCoreTools, registerExtendedTools, memoryToolNames, CORE_TOOL_NAMES } from "../dist/src/tools/register-tools.js";
+import { registerMemoryResources } from "../dist/src/mcp/resources.js";
+import { resolveActor } from "../dist/src/actor.js";
+import { ProjectIdentityResolver } from "../dist/src/scope-resolver.js";
+import { resolveAuthorization } from "../dist/src/services/auth-context.js";
 
 // ---- 加载 .bridge.env(权威源,覆盖 process.env) ----
 const ENV_FILE = join(__dirname, ".bridge.env");
@@ -76,8 +134,17 @@ const PORT = Number.parseInt(
 );
 
 // ---- 加载已构建的 service factory ----
-const indexModule = await import(pathToFileURL(DIST_INDEX).href);
-const createService = indexModule.createService;
+// STATIC top-level import of the project's compiled MCP service entry.
+// This is critical for the bun single-file binary build: a top-level
+// static import gives the bundler a complete dependency graph at
+// compile time, so the whole dist/src/ tree (and its transitive
+// imports of @modelcontextprotocol/sdk, zod, etc.) is folded into
+// the binary.  An `await import(...)` would be a runtime dynamic
+// import that bun cannot follow, and the produced binary would then
+// try to load the dist/ files from the filesystem at run time, which
+// fails in single-binary deployments.
+import { createService, resolveDataHome } from "../dist/src/index.js";
+const indexModule = { createService, resolveDataHome };
 
 // ---- 构造 MemoryService ----
 const dataHome = indexModule.resolveDataHome();
@@ -95,8 +162,7 @@ const actor = process.env.AGENT_RECALL_ACTOR ?? "agent:http-bridge";
 // admin profile 必须有 capability
 let capabilityStore;
 if (profile === "admin") {
-  const capMod = await fileImport("src/admin/capability.js");
-  capabilityStore = new capMod.CapabilityStore(dataHome, { persistent: true });
+  capabilityStore = new CapabilityStore(dataHome, { persistent: true });
   if (!capabilityStore.hasCapability()) {
     console.error(
       `[http-bridge] AGENT_RECALL_PROFILE=admin requires a valid operator capability. ` +
@@ -112,18 +178,11 @@ console.error(
 );
 
 // ---- 工具注册 ----
-const toolsModule = await fileImport("src/tools/register-tools.js");
-const registerFn = profile === "core" ? toolsModule.registerCoreTools : toolsModule.registerExtendedTools;
+const registerFn = profile === "core" ? registerCoreTools : registerExtendedTools;
 
-// 资源注册相关模块(预先 await 一次)
-const resourcesMod = await fileImport("src/mcp/resources.js");
-const defaultActorMod = await fileImport("src/actor.js");
-const scopeMod = await fileImport("src/scope-resolver.js");
-const authMod = await fileImport("src/services/auth-context.js");
-
-const defaultActor = defaultActorMod.resolveActor(undefined);
-const identityResolver = new scopeMod.ProjectIdentityResolver(service.store, defaultActor);
-const authorization = authMod.resolveAuthorization(
+const defaultActor = resolveActor(undefined);
+const identityResolver = new ProjectIdentityResolver(service.store, defaultActor);
+const authorization = resolveAuthorization(
   { activeProfile: profile, hasCapability: capabilityStore?.hasCapability() === true },
   { kind: "read", restrictedAllowed: false }
 );
@@ -141,7 +200,7 @@ function createSession() {
     version: "1.1.5"
   });
   registerFn(server, service);
-  resourcesMod.registerMemoryResources(server, {
+  registerMemoryResources(server, {
     store: service.store,
     dataHome,
     defaultActor,
@@ -234,8 +293,8 @@ const httpServer = createServer(async (req, res) => {
 
     if (method === "GET" && path === "/tools") {
       const names = profile === "core"
-        ? Array.from(toolsModule.CORE_TOOL_NAMES)
-        : Array.from(toolsModule.memoryToolNames);
+        ? Array.from(CORE_TOOL_NAMES)
+        : Array.from(memoryToolNames);
       const body = JSON.stringify({
         ok: true,
         profile,
@@ -340,7 +399,17 @@ function readJsonBody(req) {
 }
 
 // ---- 启动 ----
-httpServer.listen(PORT, "127.0.0.1", () => {
+try {
+  // Await the listening event so the bun-compiled binary's main
+  // process doesn't fall off the end of the top-level code before the
+  // event loop has a handle on the socket.  Without this, the binary
+  // exits 0 immediately because the event loop is briefly empty
+  // between `listen()` returning and the 'listening' callback firing.
+  await new Promise((resolve, reject) => {
+    httpServer.once("error", (err) => reject(err));
+    httpServer.once("listening", () => resolve(undefined));
+    httpServer.listen(PORT, "127.0.0.1");
+  });
   console.error(
     `[http-bridge] listening on http://127.0.0.1:${PORT}\n` +
     `  transport:  streamable-http (MCP 2025-03-26)\n` +
@@ -349,7 +418,17 @@ httpServer.listen(PORT, "127.0.0.1", () => {
     `  actor:      ${actor}\n` +
     `  endpoints:  POST /mcp, GET /mcp, DELETE /mcp, GET /health, GET /info, GET /tools`
   );
-});
+} catch (e) {
+  console.error(`[http-bridge] listen failed: ${e?.message ?? e}`);
+  process.exit(1);
+}
+
+// Keep the event loop alive after the top-level awaits finish.
+// Without this, a script that has nothing else pending (no timer, no
+// keep-alive socket) would let bun exit at the next checkpoint.
+process.on("SIGINT", () => { httpServer.close(); process.exit(0); });
+process.on("SIGTERM", () => { httpServer.close(); process.exit(0); });
+await new Promise(() => {}); // never resolves; keeps event loop alive
 
 httpServer.on("error", (err) => {
   if (err && err.code === "EADDRINUSE") {

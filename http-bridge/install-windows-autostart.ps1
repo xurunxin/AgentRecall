@@ -31,6 +31,7 @@ param(
     [string]$DataHome = "$env:USERPROFILE\.agent-recall-http-bridge",
     [ValidateSet("auto", "runkey", "startup", "task")]
     [string]$Method = "auto",
+    [switch]$UseBinary,           # prefer dist-bin/agent-recall-http-bridge-<plat>.exe (if present)
     [switch]$Uninstall,
     [switch]$Status,
     [switch]$RunNow
@@ -45,6 +46,53 @@ $EnvFile = Join-Path $ScriptDir ".bridge.env"
 $ShortcutName = "agent-recall-http-bridge.lnk"
 $RunKeyName = "agent-recall-http-bridge"
 $TaskName = "agent-recall-http-bridge"
+$ProjectRoot = (Resolve-Path (Join-Path $ScriptDir "..")).Path
+$DistBinDir = Join-Path $ProjectRoot "dist-bin"
+$PlatTag = if ($IsWindows -or $env:OS -match "Windows") {
+    "win32-x64"
+} elseif ($IsLinux) {
+    "linux-x64"
+} elseif ($IsMacOS) {
+    if ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
+        "darwin-arm64"
+    } else { "darwin-x64" }
+} else { "win32-x64" }
+$BinExt = if ($PlatTag.StartsWith("win32")) { ".exe" } else { "" }
+$BridgeExe = Join-Path $DistBinDir "agent-recall-http-bridge-$PlatTag$BinExt"
+
+# Resolve which launcher to use: bun single-file binary (preferred,
+# no Node.js required on the host) or `node bridge.mjs` (dev /
+# fallback).  Both honour the same --project-root / port convention.
+#
+# Default: node.  The current `bun --compile` binary has a known
+# Windows-only "exit 0 right after listen" issue (bun runtime treats
+# empty event loop as "task finished" before HTTP server's listening
+# callback fires), so the binary path is gated behind an explicit
+# -UseBinary switch or AGENT_RECALL_BRIDGE_BINARY=1 env.  When that
+# Windows issue is fixed upstream we can flip the default back.
+function Resolve-Launcher {
+    param([int]$Port)
+    $useBinary = [bool]$UseBinary -or ($env:AGENT_RECALL_BRIDGE_BINARY -eq "1")
+    if ($useBinary -and (Test-Path $BridgeExe)) {
+        return @{
+            Mode = "binary"
+            Command = $BridgeExe
+            Arguments = @("$Port")
+            WorkingDirectory = $ScriptDir
+            CmdFile = $null
+        }
+    }
+    if ($useBinary -and -not (Test-Path $BridgeExe)) {
+        Write-Host "  [launcher] binary requested but $BridgeExe not found; using node" -ForegroundColor Yellow
+    }
+    return @{
+        Mode = "node"
+        Command = $NodeExe
+        Arguments = @($BridgeJs, "$Port")
+        WorkingDirectory = $ScriptDir
+        CmdFile = Join-Path $ScriptDir ".run-bridge.cmd"
+    }
+}
 
 # ---- 检测权限 ----
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -62,14 +110,36 @@ function Write-EnvFile {
 }
 
 function Get-Bridge-CommandLine {
-    # 简化:不写 set 指令,env 完全由 bridge.mjs 从 .bridge.env 读
-    # 这样 RunKey 触发的进程永远用最新 .env,不会和 .env 漂移
-    $cmdFile = Join-Path $ScriptDir ".run-bridge.cmd"
+    # Returns a .cmd wrapper used by RunKey / Startup shortcut /
+    # manual Start-Process.  Picks the binary launcher if available
+    # (no Node.js dependency on the host), otherwise falls back to
+    # the Node.js launcher that runs bridge.mjs.
+    $launcher = Resolve-Launcher -Port $Port
+    if ($launcher.Mode -eq "binary") {
+        # Binary mode: still emit a .cmd wrapper so the path is stable
+        # for the RunKey value, but it just exec's the binary
+        # (Windows GUI subsystem + .cmd wrapper is the same flash-free
+        # pattern as the Node.js fallback).
+        $cmdFile = $launcher.CmdFile
+        if (-not $cmdFile) { $cmdFile = Join-Path $ScriptDir ".run-bridge.cmd" }
+        $args = $launcher.Arguments -join " "
+        @"
+@echo off
+REM agent-recall HTTP MCP bridge (binary mode, no Node.js needed)
+cd /d "$ScriptDir"
+"$($launcher.Command)" $args
+"@ | Out-File -Encoding ascii $cmdFile
+        return $cmdFile
+    }
+    # Node mode: thin wrapper around `node bridge.mjs`.  No `set`
+    # instructions; env flows through .bridge.env.
+    $cmdFile = $launcher.CmdFile
+    $args = $launcher.Arguments -join " "
     @"
 @echo off
 REM agent-recall HTTP MCP bridge (env loaded from .bridge.env by bridge.mjs)
 cd /d "$ScriptDir"
-"$NodeExe" "$BridgeJs" $Port
+"$($launcher.Command)" $args
 "@ | Out-File -Encoding ascii $cmdFile
     return $cmdFile
 }
@@ -105,6 +175,16 @@ function Install-TaskScheduler {
     if (-not $isAdmin) {
         Write-Host "  [TaskScheduler] needs admin (UAC); falling back to RunKey" -ForegroundColor Yellow
         return $false
+    }
+
+    # Resolve launcher: prefer single-file binary (no Node.js needed
+    # on the host) over `node bridge.mjs`.  The same XML body works for
+    # both — only the <Command> / <Arguments> differ.
+    $launcher = Resolve-Launcher -Port $Port
+    if ($launcher.Mode -eq "binary") {
+        Write-Host "  [TaskScheduler] launcher: bun single-file binary" -ForegroundColor DarkGray
+    } else {
+        Write-Host "  [TaskScheduler] launcher: node bridge.mjs (binary not found at $BridgeExe)" -ForegroundColor DarkGray
     }
 
     # Build a complete task XML.  Going through XML (instead of schtasks
@@ -162,8 +242,8 @@ function Install-TaskScheduler {
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>$NodeExe</Command>
-      <Arguments>"$BridgeJs" $Port</Arguments>
+      <Command>$($launcher.Command)</Command>
+      <Arguments>$(($launcher.Arguments -join ' '))</Arguments>
       <WorkingDirectory>$ScriptDir</WorkingDirectory>
     </Exec>
   </Actions>
@@ -177,7 +257,8 @@ function Install-TaskScheduler {
         Write-Host "  [TaskScheduler] create failed: $output" -ForegroundColor Red
         return $false
     }
-    Write-Host "  [TaskScheduler] registered: $TaskName (LogonTrigger+30s, RestartOnFailure x3, no cmd window)" -ForegroundColor Green
+    $launcherMode = $launcher.Mode
+    Write-Host "  [TaskScheduler] registered: $TaskName (LogonTrigger+30s, RestartOnFailure x3, no cmd window, launcher=$launcherMode)" -ForegroundColor Green
 
     # When task mode is active, the previous RunKey would cause a double
     # launch (RunKey fires one bridge, then Task fires another — the
