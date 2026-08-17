@@ -27,3 +27,4 @@ test-body.json
 binary-test*
 debug-task.ps1
 
+test-task.xml

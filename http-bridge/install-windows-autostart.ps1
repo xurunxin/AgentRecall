@@ -3,21 +3,24 @@
 # 把 agent-recall HTTP 桥注册为"登录时自动启动"的服务
 #
 # 三种机制(自动选最适合的,推荐顺序):
-#   1) Task Scheduler             [推荐,需要管理员,完全静默,支持失败重启]
+#   1) Task Scheduler             [推荐,登录时触发,完全静默,支持失败重启]
 #   2) HKCU\...\Run 注册表项     [非管理员 fallback,但启动时弹一个 cmd 窗口]
 #   3) Startup folder 快捷方式     [非管理员 fallback,类似 RunKey]
 #
 # 推荐用 Task Scheduler,因为:
+#   - v1.1.6 follow-up: 注册本身已经不需要管理员
+#     (XML 用 InteractiveToken + 当前用户 SID,普通用户可以为自己注册登录触发)
 #   - Task Scheduler 通过 svchost 直接拉起指定程序,完全没有 cmd 中间层
 #   - 失败自动重启(可配 interval / count)
 #   - 可以用 schtasks /run 手动触发,跟 RunKey 一样的命令行体验
 #   - 不需要引号包 cmd /c,绝对静默
 #
 # 用法:
-#   .\install-windows-autostart.ps1                       # 注册(默认 task,如 admin)
+#   .\install-windows-autostart.ps1                       # 注册(默认 task,不再需要 admin)
 #   .\install-windows-autostart.ps1 -Port 8080
 #   .\install-windows-autostart.ps1 -Profile core
 #   .\install-windows-autostart.ps1 -Method runkey        # 强制用 RunKey
+#   .\install-windows-autostart.ps1 -Method task          # 强制用 Task Scheduler
 #   .\install-windows-autostart.ps1 -Uninstall            # 卸载
 #   .\install-windows-autostart.ps1 -Status               # 查看状态
 #   .\install-windows-autostart.ps1 -RunNow               # 立刻启动
@@ -177,14 +180,17 @@ function Install-StartupShortcut {
 }
 
 function Install-TaskScheduler {
-    if (-not $isAdmin) {
-        Write-Host "  [TaskScheduler] needs admin (UAC); falling back to RunKey" -ForegroundColor Yellow
-        return $false
-    }
-
-    # Resolve launcher: prefer single-file binary (no Node.js needed
-    # on the host) over `node bridge.mjs`.  The same XML body works for
-    # both — only the <Command> / <Arguments> differ.
+    # v1.1.6 follow-up: Task Scheduler creation works as a non-admin
+    # user when the task is for the current user's own logon and uses
+    # <LogonType>InteractiveToken</LogonType> (the previous
+    # `S4U` flavour required UAC).  The settings below are otherwise
+    # the same as before:
+    #   - LogonTrigger with 30s delay (user is settled when we fire)
+    #   - RestartOnFailure (3 retries, 1 minute apart)
+    #   - MultipleInstancesPolicy=StopExisting — a manual Start-Process
+    #     will be killed by the scheduler and the registered copy
+    #     re-launched
+    #   - Hidden=false; we never allocate a console
     $launcher = Resolve-Launcher -Port $Port
     if ($launcher.Mode -eq "binary") {
         Write-Host "  [TaskScheduler] launcher: bun single-file binary" -ForegroundColor DarkGray
@@ -192,15 +198,6 @@ function Install-TaskScheduler {
         Write-Host "  [TaskScheduler] launcher: node bridge.mjs (binary not found at $BridgeExe)" -ForegroundColor DarkGray
     }
 
-    # Build a complete task XML.  Going through XML (instead of schtasks
-    # /create with command-line flags) gives us:
-    #   - LogonTrigger with 30s delay (user is settled when we fire)
-    #   - RestartOnFailure (3 retries, 1 minute apart) — the schtasks
-    #     command-line syntax does not expose this
-    #   - RunLevel=LeastPrivilege, no UAC prompt on the user side
-    #   - MultipleInstancesPolicy=IgnoreNew so an accidental manual
-    #     launch does not fight the running bridge
-    #   - Hidden Console off (we never allocate a console)
     $user = "$env:USERDOMAIN\$env:USERNAME"
     $xmlFile = Join-Path $ScriptDir ".task.xml"
 
@@ -222,7 +219,7 @@ function Install-TaskScheduler {
   <Principals>
     <Principal id="Author">
       <UserId>$user</UserId>
-      <LogonType>S4U</LogonType>
+      <LogonType>InteractiveToken</LogonType>
       <RunLevel>LeastPrivilege</RunLevel>
     </Principal>
   </Principals>
@@ -255,15 +252,28 @@ function Install-TaskScheduler {
 </Task>
 "@
 
-    $xml | Out-File -Encoding utf8 $xmlFile
-    schtasks.exe /delete /tn $TaskName /f 2>$null | Out-Null
+    $xml | Out-File -Encoding Unicode $xmlFile
+    # Best-effort delete: ignore "task not found" so the fresh
+    # create below is the authoritative state.  Capture and
+    # discard the native stderr (which is the only output on
+    # a non-existent task); $LASTEXITCODE will reset on the
+    # next native invocation.
+    try {
+        $prev = schtasks.exe /delete /tn $TaskName /f 2>&1
+    } catch {
+        # nothing to do
+    }
     $output = schtasks.exe /create /tn $TaskName /xml $xmlFile /f 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Host "  [TaskScheduler] create failed: $output" -ForegroundColor Red
         return $false
     }
     $launcherMode = $launcher.Mode
-    Write-Host "  [TaskScheduler] registered: $TaskName (LogonTrigger+30s, RestartOnFailure x3, no cmd window, launcher=$launcherMode)" -ForegroundColor Green
+    if ($isAdmin) {
+        Write-Host "  [TaskScheduler] registered: $TaskName (LogonTrigger+30s, RestartOnFailure x3, no cmd window, launcher=$launcherMode)" -ForegroundColor Green
+    } else {
+        Write-Host "  [TaskScheduler] registered: $TaskName (LogonTrigger+30s, InteractiveToken, launcher=$launcherMode, no admin needed)" -ForegroundColor Green
+    }
 
     # When task mode is active, the previous RunKey would cause a double
     # launch (RunKey fires one bridge, then Task fires another — the
@@ -515,8 +525,12 @@ if ($Uninstall) {
     Write-Host "[2/2] registering autostart ..." -ForegroundColor Cyan
     $chosen = $Method
     if ($chosen -eq "auto") {
-        if ($isAdmin) { $chosen = "task" }
-        else { $chosen = "runkey" }
+        # v1.1.6 follow-up: Task Scheduler creation no longer needs
+        # admin (the XML uses InteractiveToken + the current user's
+        # SID, which a non-admin can register for their own logon).
+        # Always prefer it over RunKey for restart-on-failure and
+        # silent-launch reasons.
+        $chosen = "task"
     }
     switch ($chosen) {
         "runkey"  { Install-RunKey }
