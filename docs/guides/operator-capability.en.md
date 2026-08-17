@@ -1,6 +1,6 @@
 # Operator guide — admin capability
 
-> **🌏 Language**: English. 中文（摘要）: [`operator-capability.md`](./operator-capability.md).  
+> **🌏 Language**: English. 中文: [`operator-capability.md`](./operator-capability.md).  
 > **Implementation version**: v1.1.3.
 
 This guide documents how to manage the

@@ -1,6 +1,6 @@
 # Sensitivity matrix — operator guide
 
-> **🌏 Language**: English. 中文（摘要）: [`sensitivity-matrix.md`](./sensitivity-matrix.md).  
+> **🌏 Language**: English. 中文: [`sensitivity-matrix.md`](./sensitivity-matrix.md).  
 > **Implementation version**: v1.1.3.
 
 This guide documents the v1.1.3 GATE-03 (issue #33)

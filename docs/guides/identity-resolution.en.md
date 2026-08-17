@@ -1,6 +1,6 @@
 # Identity resolution — operator guide
 
-> **🌏 Language**: English. 中文（摘要）: [`identity-resolution.md`](./identity-resolution.md).  
+> **🌏 Language**: English. 中文: [`identity-resolution.md`](./identity-resolution.md).  
 > **Implementation version**: v1.1.2.
 
 This guide documents how to register a project in AgentRecall's

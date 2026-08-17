@@ -54,9 +54,6 @@
 - 英文翻译放在同目录的 `*.en.md` 兄弟文件,文首标注
   `> 🌏 Language: English. 中文(默认): [foo.md]`。
 - 仓库根的 `README.en.md` 是 README 的英文版。
-- 部分指南(`identity-resolution`、`operator-capability`、
-  `sensitivity-matrix`)只有中文摘要,完整规范在 `*.en.md`;
-  中文文件标题会显式标注"中文摘要"。
 - 单一语种的指南(目前只有 `release-test-topology.md` 是英文)
   在文首标注 "English only. 本指南暂无中文版本。"。
 - 不再使用 `docs/zh-CN/` 这样的子目录组织翻译;新增文档时
