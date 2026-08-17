@@ -64,12 +64,16 @@ $BridgeExe = Join-Path $DistBinDir "agent-recall-http-bridge-$PlatTag$BinExt"
 # no Node.js required on the host) or `node bridge.mjs` (dev /
 # fallback).  Both honour the same --project-root / port convention.
 #
-# Default: node.  The current `bun --compile` binary has a known
-# Windows-only "exit 0 right after listen" issue (bun runtime treats
-# empty event loop as "task finished" before HTTP server's listening
-# callback fires), so the binary path is gated behind an explicit
-# -UseBinary switch or AGENT_RECALL_BRIDGE_BINARY=1 env.  When that
-# Windows issue is fixed upstream we can flip the default back.
+# Default: node.  The binary is opt-in via `-UseBinary` or
+# AGENT_RECALL_BRIDGE_BINARY=1 because:
+#   - the .exe is ~99 MB on Windows vs. ~1 MB of source,
+#   - rebuilds need a local `bun` toolchain (not all hosts have it).
+# Both modes run the same MCP HTTP server; the launcher resolver only
+# affects *how* the long-lived daemon is spawned.  The earlier
+# "binary exits 0 after listen" bug was traced to `dist/src/index.js`
+# auto-invoking its `main()` (StdioServerTransport) on import, which
+# has been fixed by inlining `createService` / `resolveDataHome` in
+# bridge.mjs and not pulling the index.js module into the binary.
 function Resolve-Launcher {
     param([int]$Port)
     $useBinary = [bool]$UseBinary -or ($env:AGENT_RECALL_BRIDGE_BINARY -eq "1")

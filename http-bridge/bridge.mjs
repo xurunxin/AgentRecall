@@ -143,8 +143,64 @@ const PORT = Number.parseInt(
 // import that bun cannot follow, and the produced binary would then
 // try to load the dist/ files from the filesystem at run time, which
 // fails in single-binary deployments.
-import { createService, resolveDataHome } from "../dist/src/index.js";
-const indexModule = { createService, resolveDataHome };
+//
+// IMPORTANT: do NOT `import` from `../dist/src/index.js` here.
+// `dist/src/index.js` ends with:
+//
+//     if (isDirectExecution()) {
+//         main().catch(...)
+//     }
+//
+// In a bun-compiled single-file binary on Windows, `isDirectExecution()`
+// returns true (process.argv[1] matches the binary's own path), so the
+// `main()` call fires on module init.  `main()` creates a
+// `StdioServerTransport` and immediately connects it; with stdin/stdout
+// closed (background service), the transport drains EOF, the
+// `server-lifecycle` triggers `process.exit(0)`, and the binary exits
+// before our HTTP `listen()` can pin the event loop.  Inlining the two
+// functions we need (`createService`, `resolveDataHome`) here keeps the
+// binary's import graph out of `index.js`, which side-steps the auto-
+// invocation.  The two functions are tiny: `resolveDataHome` reads the
+// `AGENT_RECALL_HOME` / `LOCAL_MEMORY_MCP_HOME` env vars and expands a
+// leading `~`; `createService` wires a `SQLiteMemoryStore` +
+// `MarkdownExporter` + `MemoryService` together.
+import { homedir } from "node:os";
+import { SQLiteMemoryStore } from "../dist/src/sqlite-store.js";
+import { MarkdownExporter } from "../dist/src/markdown-exporter.js";
+import { MemoryService } from "../dist/src/memory-service.js";
+import { resolveActor as resolveActorHelper } from "../dist/src/actor.js";
+
+function expandBridgeHome(input) {
+  if (input === "~") return homedir();
+  if (input.startsWith("~/") || input.startsWith("~\\")) {
+    return join(homedir(), input.slice(2));
+  }
+  return input;
+}
+function resolveDataHomeBridge(env = process.env) {
+  const configured = env.AGENT_RECALL_HOME?.trim() || env.LOCAL_MEMORY_MCP_HOME?.trim();
+  return resolve(expandBridgeHome(
+    configured === undefined || configured.length === 0
+      ? "~/.agent-recall"
+      : configured
+  ));
+}
+function createServiceBridge(dataHome = resolveDataHomeBridge(), options = {}, activeProfile = "core") {
+  const store = new SQLiteMemoryStore(join(dataHome, "memory.sqlite"));
+  const exporter = new MarkdownExporter(join(dataHome, "exports"));
+  return new MemoryService(
+    store,
+    exporter,
+    resolveActorHelper(undefined),
+    dataHome,
+    options.capabilityStore,
+    activeProfile
+  );
+}
+const indexModule = {
+  createService: createServiceBridge,
+  resolveDataHome: resolveDataHomeBridge,
+};
 
 // ---- 构造 MemoryService ----
 const dataHome = indexModule.resolveDataHome();
@@ -172,7 +228,7 @@ if (profile === "admin") {
   }
 }
 
-const service = createService(dataHome, { capabilityStore }, profile);
+const service = createServiceBridge(dataHome, { capabilityStore }, profile);
 console.error(
   `[http-bridge] service ready: home=${dataHome} profile=${profile} actor=${actor}`
 );
@@ -400,11 +456,9 @@ function readJsonBody(req) {
 
 // ---- 启动 ----
 try {
-  // Await the listening event so the bun-compiled binary's main
-  // process doesn't fall off the end of the top-level code before the
-  // event loop has a handle on the socket.  Without this, the binary
-  // exits 0 immediately because the event loop is briefly empty
-  // between `listen()` returning and the 'listening' callback firing.
+  // Await the listening event so the bridge exits cleanly if the
+  // socket cannot be bound (port in use, missing permissions, etc.)
+  // instead of silently falling off the end of the top-level code.
   await new Promise((resolve, reject) => {
     httpServer.once("error", (err) => reject(err));
     httpServer.once("listening", () => resolve(undefined));
@@ -425,7 +479,9 @@ try {
 
 // Keep the event loop alive after the top-level awaits finish.
 // Without this, a script that has nothing else pending (no timer, no
-// keep-alive socket) would let bun exit at the next checkpoint.
+// keep-alive socket) would let bun exit at the next checkpoint.  The
+// never-resolved trailing await is the canonical pattern; the actual
+// signal handlers live further down.
 process.on("SIGINT", () => { httpServer.close(); process.exit(0); });
 process.on("SIGTERM", () => { httpServer.close(); process.exit(0); });
 await new Promise(() => {}); // never resolves; keeps event loop alive
@@ -440,5 +496,3 @@ httpServer.on("error", (err) => {
   }
 });
 
-process.on("SIGINT", () => { httpServer.close(); process.exit(0); });
-process.on("SIGTERM", () => { httpServer.close(); process.exit(0); });

@@ -60,3 +60,6 @@ binary.err
 binary.out
 node.err
 node.out
+
+# bridge binary test scratch (deleted after commits)
+/.bridge-test-scratch/
