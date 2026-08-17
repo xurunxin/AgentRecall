@@ -64,12 +64,16 @@ node.out
 # bridge binary test scratch (deleted after commits)
 /.bridge-test-scratch/
 
-# bridge binary env (machine-specific paths; copy from dist-bin/.env.example)
+# bridge binary env (machine-specific paths; copy from http-bridge/.env.example)
 /dist-bin/.env
-/dist-bin/.env.example
 
 
 # scratch (one-off diagnostic outputs)
 /all-tasks.txt
 /git-tree.txt
+
+
+# one-off diagnostic captures from MCP-config hunting
+/mcp-config-before.json
+/http-bridge/find-mcp-config.py
 

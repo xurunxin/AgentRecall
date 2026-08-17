@@ -3,7 +3,7 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     environment: "node",
-    include: ["test/**/*.test.ts"],
+    include: ["test/**/*.test.ts", "test/**/*.test.mjs"],
     // v1.1.3 GATE-06 (issue #36): the heavyweight
     // suites are segregated into per-suite configs +
     // runner scripts. The default config hosts the
