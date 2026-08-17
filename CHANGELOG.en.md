@@ -1,40 +1,161 @@
-# 变更日志
+# Changelog
 
-> **🌏 语言 / Language**: 中文。English: [CHANGELOG.en.md](./CHANGELOG.en.md)。
+> **🌏 Language**: English. 中文(默认): [CHANGELOG.md](./CHANGELOG.md).
 
-本文件记录 agent-recall 的所有重要变更。格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),项目遵守 [Semantic Versioning](https://semver.org/)(非正式遵守 — 这是个人工具,但保留文件结构以便未来贡献者使用)。
+All notable changes to agent-recall are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
+adheres to [Semantic Versioning](https://semver.org/) (informally — this is
+a personal tool, but the file structure is here for future contributors).
 
-> **关于历史条目**:v1.1.5 及更早的条目保留英文原文(2026-08 之前没有中文文档约定)。从 v1.1.6 起,新条目用中文记录,英文版在 [CHANGELOG.en.md](./CHANGELOG.en.md) 同步。
+## [1.1.6] — Release-gate hardening: clean CHANGELOG
 
-## [1.1.6] — 发布门强化:清理 CHANGELOG
+### Added
 
-### 新增
+- `release-candidate.yml` matrix leg now packs per-OS archives
+  and writes the v1.1.3 GATE-04 per-platform fragment
+  (`release-evidence-fragment-matrix-<os>.json`); the
+  `Release aggregate` step reads the 3 matrix leg fragments +
+  the 3 packaged-artifact fragments via
+  `release-evidence.mjs --fragments` and produces the
+  v1.1.3-shape `release-evidence.json` (per-platform
+  `ci_jobs[]` + `artifacts[]` + aggregate `stress_summary`).
+- `verify-release-evidence.mjs` is on the v1.1.3 GATE-04
+  strict schema (`schema_version: "1.1.3"`); the v1.1.2
+  `LegacyReleaseEvidence` parallel schema + `isLegacy` dispatch
+  + `verifyLegacyDocument()` are deleted. The
+  `MISMATCHED_PLATFORMS` cross-check (3 ci_jobs ↔ 3 artifacts
+  with matching sha256) is re-enabled on the tag path.
+- `src/store/sqlite-store.ts` `withBusyRetry(op, opts?)` for
+  `SQLITE_BUSY` + `SQLITE_LOCKED` with exponential backoff
+  (5 retries, 10ms → 200ms; throws `SQLiteBusyError` with
+  `attempts` + `lastError` on exhaustion). The in-class
+  `runWithBusyRetry` (sync, 5 retries × 10ms spin) stays.
+  `isSqliteBusyError` now also matches `SQLITE_LOCKED` (errcode
+  6, errno 6, code "SQLITE_LOCKED") — the v1.1.3 doc claim
+  "SQLITE_LOCKED is not retryable" was wrong on Windows-latest
+  contention under the 8-worker release profile.
+- `scripts/archive.ts` Node-native `tar.gz` (USTAR via
+  `zlib.createGzip`, zero new npm deps). `archive(src, dest,
+  "tar.gz" | "zip")` returns `{ sha256, size_bytes }`. The
+  Windows production `.zip` still goes through PowerShell
+  `Compress-Archive`; the Node helper replaces the test
+  round-trip path so the 3-OS tar.gz round-trip is no longer
+  Windows-skipped.
+- `src/mcp/server-lifecycle.ts` shutdown sequence
+  parallelizes `transport.close()` + `server.close()` via
+  `Promise.all` (the SDK's `StdioServerTransport.close()` is
+  idempotent and safe to call while `server.close()` is in
+  flight; the server's internal `AbortController` does not
+  depend on the transport being already closed). The
+  caller-supplied `onShutdown` (e.g. `service.store.close()`)
+  stays serial because the SQLite close is the only operation
+  that MUST land before `process.exit(0)` to avoid losing the
+  final audit append. The unit test's
+  "errors during transport.close are also caught" test
+  updates to reflect the new D2 contract: `server.close()`
+  IS called in the parallel section even when
+  `transport.close()` errors (the error halts the parallel
+  section before the cleanup hook is reached).
+- `test/multi-process-stress.test.ts` cleanup is async +
+  retry. New helpers `cleanHomeAsync(homePath)` (uses
+  `fs.promises.rm` with `maxRetries: 3, retryDelay: 100,
+  force: true`, falls back to per-entry unlink if the
+  top-level rm still throws) and `killChildrenGracefully(
+  children)` (SIGTERM → 500ms grace → SIGKILL escalation)
+  replace every `rmSync` and unconditional `child.kill(
+  "SIGKILL")`. The post-suite "no orphaned child processes or
+  temp data homes remain after every scenario" assertion is
+  strict (0 orphans, 0 barrier dirs) on a clean tmpdir; the
+  v1.1.5-era "accept the SIGKILLed victim's dataHome as the
+  ONE allowed orphan" workaround comment is deleted.
+- `test/blackbox/mcp-stdio-idle.test.ts` "exits cleanly via
+  the idle-sentinel when idleMs=500 and no traffic" rewrote
+  the v1.1.5 cap-bounded 2.5s wait to wait for
+  `[lifecycle] idle-sentinel\n` on stderr (the MCP entry
+  emits it via the new `onShutdownComplete(reason)` hook
+  in `src/mcp/server-lifecycle.ts`, gated to
+  `reason === "stdio_idle_timeout"` so the SIGTERM / EOF /
+  SIGINT paths stay silent). The sentinel removes the
+  v1.1.5-era orchestrator cold-start timing flake.
+- `http-bridge/install-windows-autostart.ps1` lands the
+  WIP from stash `autostart-wip-2026-08-09` (the file was
+  deleted from main in a v1.1.5-era cleanup but the WIP was
+  kept in the named stash for v1.1.6 pickup). Three-method
+  autostart installer: Task Scheduler primary (XML,
+  `RestartOnFailure` x3, silent launch via svchost, requires
+  admin), HKCU Run registry + Startup folder shortcut
+  fallbacks. Subcommands: `-Install` (default), `-Status`,
+  `-Uninstall`, `-RunNow`. The WIP's 3 Write-Host lines had
+  CJK labels (验证 / 启动 / 卸载) inside a double-quoted
+  string with a nested `$PSCommandPath` interpolation, which
+  is the PowerShell 5.1 tokenizer trap; fixed by hoisting
+  the labels to ASCII (Verify / RunNow / Uninstall) and
+  moving the CJK to a comment above (PS 5.1
+  `[Parser]::ParseFile` reports 0 parse errors).
+- `http-bridge/.gitignore` ignores the 6 runtime artefacts
+  the bridge writes (`.bridge.env` user config, kept across
+  `-Uninstall`; `.run-bridge.cmd`, `.task.xml`, `bridge.err`,
+  `bridge.out`, `test-body.json`) and the E1 manual-test
+  output capture (`.e1-test-output.txt`).
 
-- `release-candidate.yml` 的 matrix leg 现在按 OS 分别打包归档并写出 v1.1.3 GATE-04 的 per-platform fragment(`release-evidence-fragment-matrix-<os>.json`);`Release aggregate` 步骤通过 `release-evidence.mjs --fragments` 读取 3 个 matrix leg fragment + 3 个 packaged-artifact fragment,产出符合 v1.1.3 形态的 `release-evidence.json`(每平台的 `ci_jobs[]` + `artifacts[]` + 聚合 `stress_summary`)。
-- `verify-release-evidence.mjs` 切到 v1.1.3 GATE-04 严格 schema(`schema_version: "1.1.3"`);v1.1.2 的 `LegacyReleaseEvidence` 平行 schema、`isLegacy` 分派、`verifyLegacyDocument()` 全部删除。`MISMATCHED_PLATFORMS` 交叉校验(3 个 ci_jobs 与 3 个 artifacts 的 sha256 匹配)在 tag 路径上重新启用。
-- `src/store/sqlite-store.ts` 新增 `withBusyRetry(op, opts?)`,处理 `SQLITE_BUSY` + `SQLITE_LOCKED` 的指数退避(5 次重试,10ms → 200ms;耗尽时抛出 `SQLiteBusyError`,附 `attempts` + `lastError`)。类内的 `runWithBusyRetry`(同步,5 次 × 10ms 自旋)保留。`isSqliteBusyError` 现在也匹配 `SQLITE_LOCKED`(errcode 6,errno 6,code `SQLITE_LOCKED`)— v1.1.3 文档中 "SQLITE_LOCKED 不可重试" 的说法在 8-worker release profile 的 Windows-latest 争用下是错的。
-- `scripts/archive.ts` 实现 Node 原生 `tar.gz`(通过 `zlib.createGzip` 走 USTAR,**零**新增 npm 依赖)。`archive(src, dest, "tar.gz" | "zip")` 返回 `{ sha256, size_bytes }`。Windows 生产环境的 `.zip` 仍走 PowerShell `Compress-Archive`;Node 辅助函数接管测试往返路径,3 平台 tar.gz 往返不再 Windows 跳过。
-- `src/mcp/server-lifecycle.ts` 关闭序列用 `Promise.all` 并行 `transport.close()` + `server.close()`(SDK 的 `StdioServerTransport.close()` 幂等,在 `server.close()` in-flight 时安全;server 内部的 `AbortController` 不依赖 transport 已关闭)。调用方传入的 `onShutdown`(例如 `service.store.close()`)保持串行 — SQLite 关闭是唯一必须落在 `process.exit(0)` 之前的操作,否则会丢失最后一条审计追加。单元测试的 "errors during transport.close are also caught" 案例更新以反映新 D2 契约:即使 `transport.close()` 出错,`server.close()` **也**会被并行段调用(错误在到达清理钩子之前就终止了并行段)。
-- `test/multi-process-stress.test.ts` 的清理改为异步 + 重试。新增 `cleanHomeAsync(homePath)`(用 `fs.promises.rm`,参数 `maxRetries: 3, retryDelay: 100, force: true`,顶层 rm 仍抛错时回退到逐项 unlink)与 `killChildrenGracefully(children)`(`SIGTERM` → 500ms 宽限 → `SIGKILL` 升级),替换所有 `rmSync` 与无条件的 `child.kill("SIGKILL")`。suite 结束后的 "无孤儿子进程或临时数据目录" 断言在干净的 tmpdir 上是严格的(0 孤儿,0 屏障目录);v1.1.5 时代 "接受 SIGKILLed 受害者的 dataHome 作为唯一允许的孤儿" 的 workaround 注释删除。
-- `test/blackbox/mcp-stdio-idle.test.ts` 的 "在 idleMs=500、无流量时通过 idle 哨兵干净退出" 案例,把 v1.1.5 的 cap-bounded 2.5s 等待改为等待 stderr 上的 `[lifecycle] idle-sentinel\n`(MCP 入口通过 `src/mcp/server-lifecycle.ts` 中新的 `onShutdownComplete(reason)` 钩子发出,门控在 `reason === "stdio_idle_timeout"`,所以 SIGTERM / EOF / SIGINT 路径保持静默)。该哨兵消除了 v1.1.5 时代编排器冷启动的时序 flake。
-- `http-bridge/install-windows-autostart.ps1` 把 stash `autostart-wip-2026-08-09` 里的 WIP 落地(该文件在 v1.1.5 时代的清理中从 main 删除,WIP 保留在具名 stash 中等 v1.1.6 取回)。三方法自启动安装器:Task Scheduler 主路径(XML,`RestartOnFailure` ×3,通过 svchost 静默启动,需要 admin),HKCU Run 注册表 + Startup 文件夹快捷方式作为回退。子命令:`-Install`(默认)、`-Status`、`-Uninstall`、`-RunNow`。WIP 中的 3 行 `Write-Host` 在双引号字符串里写了 CJK 标签(`验证` / `启动` / `卸载`)并嵌套了 `$PSCommandPath` 插值,这是 PowerShell 5.1 的分词器陷阱;修复方法是把标签改用 ASCII(`Verify` / `RunNow` / `Uninstall`),CJK 移到上方注释中(PS 5.1 `[Parser]::ParseFile` 报告 0 个解析错误)。
-- `http-bridge/.gitignore` 忽略 bridge 写出的 6 个运行时产物(`.bridge.env` 用户配置,跨 `-Uninstall` 保留;`.run-bridge.cmd`、`.task.xml`、`bridge.err`、`bridge.out`、`test-body.json`)以及 E1 手动测试的输出捕获(`.e1-test-output.txt`)。
+### Removed
 
-### 删除
+- v1.1.5 "Known non-blocking limits" section deleted (4
+  bullets: extracted-artifact-lifecycle v1.1.3 GATE-04
+  fragments pipeline, multi-process-stress Windows orphan
+  flake, mcp-stdio-idle orchestrator cold-start timing, and
+  verify-release-evidence v1.1.2 legacy shim). All 4
+  workarounds are physically removed in this release; the
+  section is gone, not annotated.
+- `if: matrix.os != 'windows-latest'` stress skip in
+  `release.yml` (B1 commit re-enabled the windows-latest
+  multi-process stress under the new `withBusyRetry`).
+- `if (process.platform === "win32") { return }` tar
+  round-trip skip in `p3-extracted-artifact-lifecycle.test.ts`
+  (C1 commit replaced the `packTarGz` GNU-tar shell-out
+  with the Node-native `scripts/archive.ts`).
+- `mcp-stdio-idle.test.ts` `exclude` from
+  `vitest.config.ts` (unit-integration) and
+  `vitest.blackbox.config.ts` (mcp-blackbox) (D1 commit
+  re-included the test after the sentinel-wait rewrite).
+- `waitForExit(child, 5000)` cap at all 4 call sites +
+  the function default in `mcp-shutdown.test.ts` (D2
+  commit reverted to 2500 after the lifecycle
+  parallelization addressed the root cause the v1.1.5
+  5s bump was working around).
 
-- v1.1.5 的 "Known non-blocking limits" 整段删除(共 4 条:extracted-artifact-lifecycle v1.1.3 GATE-04 fragment 流水线、multi-process-stress Windows 孤儿 flake、mcp-stdio-idle 编排器冷启动时序、verify-release-evidence v1.1.2 遗留 shim)。4 个 workaround 全部在本版本中物理删除,该段是"删除"而不是"加注释"。
-- `release.yml` 中 `if: matrix.os != 'windows-latest'` 的 stress 跳过(B1 commit 在新的 `withBusyRetry` 下重新启用了 windows-latest multi-process stress)。
-- `p3-extracted-artifact-lifecycle.test.ts` 中 `if (process.platform === "win32") { return }` 的 tar 往返跳过(C1 commit 用 Node 原生 `scripts/archive.ts` 取代了 shell-out 到 GNU tar 的 `packTarGz`)。
-- `mcp-stdio-idle.test.ts` 从 `vitest.config.ts`(unit-integration)与 `vitest.blackbox.config.ts`(mcp-blackbox)的 `exclude` 中移除(D1 commit 在哨兵等待改写后重新包含该测试)。
-- `mcp-shutdown.test.ts` 全部 4 处调用点 + 函数默认值的 `waitForExit(child, 5000)` 上限(D2 commit 在 lifecycle 并行化解决根因后,回到 2500)。
+### Verified
 
-### 已验证
-
-- `release-candidate.yml` 在 `rc-1.1.6-candidate` @ v1.1.6 上为绿(3 平台 matrix leg 按 OS 打包,上传 3 个 matrix leg fragment + 3 个 packaged-artifact fragment,聚合步骤产出 v1.1.3 形态的 `release-evidence.json` 且 `MISMATCHED_PLATFORMS` 为空,验证器在 tag 上通过 v1.1.3 严格路径)。
-- 默认套件:631/631 测试在 Windows-latest 通过(v1.1.5 时代 `mcp-stdio-idle.test.ts` 的 Windows afterAll EPERM——`rmSync` 与仍关闭中的 stdio 管道竞用——v1.1.6 不变,仍是唯一的文件级 flake;底层的 3 个 idle 哨兵测试通过)。
-- 压测套件(`vitest.stress.config.ts`, `STRESS_PROFILE=ci`):11/11 测试在 Windows-latest 连续 3 次运行后通过。D3 的异步 + 重试清理关闭了 Windows-latest 的 EBUSY/EPERM 窗口,使 suite 结束后的孤儿断言严格。
-- 黑盒套件(`vitest.blackbox.config.ts`):117/117 测试在 Windows-latest 通过;摘要中列为 v1.1.5 时代 flake 的 4 个 mcp-e2e 文件级测试在 D1 的哨兵改写 + D2 的并行化之后不再出现在失败集中。
-- 手动:`install-windows-autostart.ps1 install / status / uninstall` 周期在 Windows 11 pwsh 7 上通过(非 admin 走 HKCU Run 回退;admin 走 Task Scheduler 主路径;`[lifecycle] idle-sentinel` 改写 + D2 并行化使编排器在忙 VM 环境下也不再 flake `mcp-shutdown.test.ts`)。
+- `release-candidate.yml` green on `rc-1.1.6-candidate` @
+  v1.1.6 (the 3-platform matrix leg packs per-OS archives,
+  uploads 3 matrix leg fragments + 3 packaged-artifact
+  fragments, aggregate step produces the v1.1.3-shape
+  `release-evidence.json` with `MISMATCHED_PLATFORMS` =
+  empty, the verifier passes the v1.1.3 strict path on the
+  tag).
+- Default suite: 631/631 tests pass on Windows-latest
+  (the v1.1.5-era `mcp-stdio-idle.test.ts` afterAll EPERM
+  on Windows when `rmSync` races a still-closing stdio
+  pipe is unchanged by v1.1.6 and remains the one
+  file-level flake; the underlying 3 idle-sentinel tests
+  pass).
+- Stress suite (`vitest.stress.config.ts`,
+  `STRESS_PROFILE=ci`): 11/11 tests pass on Windows-latest
+  after 3 consecutive runs. The D3 async + retry cleanup
+  closes the Windows-latest EBUSY/EPERM window so the
+  post-suite orphan assertion is strict.
+- Blackbox suite (`vitest.blackbox.config.ts`): 117/117
+  tests pass on Windows-latest; the 4 file-level mcp-e2e
+  tests that the summary listed as v1.1.5-era flakes are
+  no longer in the failure set after D1's sentinel-wait
+  rewrite + D2's parallelization.
+- Manual: `install-windows-autostart.ps1 install / status
+  / uninstall` cycle passes on Windows 11 pwsh 7
+  (non-admin exercises the HKCU Run fallback; admin
+  exercises the Task Scheduler primary; the
+  `[lifecycle] idle-sentinel` rewrite + D2's
+  parallelization mean the orchestrator no longer flakes
+  on mcp-shutdown.test.ts in the busy-VM regime).
 
 ## [1.1.5] — Unified CLI and MCP executable (launcher)
 
