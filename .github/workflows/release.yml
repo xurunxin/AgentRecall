@@ -72,6 +72,35 @@ jobs:
           name: release-evidence-${{ github.sha }}
           path: ${{ runner.temp }}/release-evidence
 
+      - name: Download per-platform matrix archives
+        # v1.1.6 (Task 11 / Phase 3 follow-up): the
+        # v1.1.3 GATE-04 strict verifier's
+        # CHECKSUM_BYTES_MISMATCH check (scripts/verify-release-evidence.mjs:123)
+        # resolves `artifact.name` relative to
+        # `dirname(evidencePath)` and reads the actual
+        # bytes to confirm the sha256. The rc-gate's
+        # matrix leg uploads the per-platform archive
+        # (`agent-recall-<canon>.<ext>`) as part of the
+        # `release-evidence-fragment-matrix-v113-<os>`
+        # artifact, NOT as part of the
+        # `release-evidence-<sha>` aggregate. Without
+        # this download, the verifier fails on the
+        # `existsSync` check with
+        # `artifact bytes differ: agent-recall-<canon>.<ext>`.
+        # We download the 3 matrix fragment artifacts
+        # into the same `${{ runner.temp }}/release-evidence/`
+        # directory so the per-platform `agent-recall-*`
+        # files land next to `release-evidence.json` and
+        # the verifier's path resolution finds them.
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.candidate.outputs.run_id }}
+          pattern: release-evidence-fragment-matrix-v113-*
+          path: ${{ runner.temp }}/release-evidence
+          merge-multiple: true
+
       - name: Verify tag commit SHA equals candidate SHA
         shell: bash
         env:
@@ -190,40 +219,25 @@ jobs:
         # every OS leg. Use the dedicated per-suite
         # config (matches `npm run test:stress`).
         #
-        # v1.1.5 (v1.1.5 release) — windows-latest
-        # skip: the 8-worker × 1,250-op release
-        # profile trips an `unhandled SQLITE_BUSY`
-        # assertion on the Windows runner under
-        # load (`survivor N reported unhandled
-        # SQLITE_BUSY: expected 1 to be +0`). The
-        # assertion is a release-profile
-        # invariant; on Windows the SQLite
-        # file-locking semantics are more aggressive
+        # v1.1.6 follow-up B1 (issue #42, spec
+        # d67fc45, plan bfbd2cb): the v1.1.5
+        # windows-latest skip is REMOVED. The
+        # `withBusyRetry` async retry helper in
+        # `src/sqlite-store.ts` covers the 8-worker
+        # × 1,250-op release profile on every OS
+        # (5 retries with 10ms → 200ms exponential
+        # backoff, plus the existing 5000ms
+        # `busy_timeout` PRAGMA absorbs the
+        # single-writer wait). The Windows file
+        # locking semantics are more aggressive
         # about short-lived `busy` returns during
-        # 8-process contention. Windows still gets
-        # stress coverage via `ci.yml` (which runs
-        # the CI profile + 4-process contention on
-        # every push) and the candidate gate's
-        # standalone `Multi-process stress / Node
-        # 24` job (ubuntu-only). The mac + linux
-        # legs of the release.yml matrix run the
-        # spec § 5.6 profile and gate the
-        # `busyErrors === 0` invariant. Documented
-        # known non-blocking limit; the follow-up
-        # is to add a Windows-aware retry
-        # (`winHandleBusy`) in
-        # `src/store/sqlite-store.ts` (the v1.1.6
-        # SQLite contention lane).
-        #
-        # The skip is implemented as a native
-        # GitHub Actions `if:` expression (NOT a
-        # shell `if` — the Windows runner uses
-        # PowerShell by default, which doesn't
-        # parse bash `[ "$X" = "Y" ]` syntax; the
-        # previous inline-shell short-circuit
-        # crashed with `ParserError: Missing '('
-        # after 'if' in if statement`).
-        if: matrix.os != 'windows-latest'
+        # 8-process contention, so the retry
+        # budget is the right knob — the 1.5s
+        # release.sh SHUTDOWN ceiling in the
+        # v1.1.5 v1.1.5 release cycle stays
+        # unchanged. Documented in the v1.1.6
+        # CHANGELOG entry; this is the same-commit
+        # revert of the v1.1.5 workaround.
         env:
           TMPDIR: ${{ runner.temp }}
           STRESS_PROFILE: release

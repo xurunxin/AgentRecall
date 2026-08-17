@@ -1,5 +1,8 @@
 # Release test topology — operator guide
 
+> **🌏 Language**: English only. 本指南暂无中文版本。  
+> **Implementation version**: v1.1.3.
+
 This guide documents the v1.1.3 GATE-06 (issue #36)
 release-test topology. It is the operator-facing
 companion to `docs/adr/0008-deterministic-orchestration.md`

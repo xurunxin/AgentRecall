@@ -33,26 +33,64 @@ function spawnChild(idleMs: number) {
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 describe("stdio idle exit", () => {
-  it("exits within 2.5s when idleMs=500 and no traffic", async () => {
+  it("exits cleanly via the idle-sentinel when idleMs=500 and no traffic", async () => {
+    // v1.1.6 follow-up D1: replace the v1.1.5
+    // cap-bounded wait (the 2.5 s `setTimeout` + SIGKILL
+    // path that flaked on the release-candidate
+    // orchestrator when 5 vitest suites ran in
+    // parallel) with a sentinel-wait. The MCP entry
+    // emits `[lifecycle] idle-sentinel\n` on stderr
+    // immediately before `process.exit(0)` in the
+    // idle-shutdown path (src/mcp/server-lifecycle.ts
+    // `onShutdownComplete` hook). The test:
+    //   1. spawns the MCP server with idleMs=500,
+    //   2. waits 500 ms for startup + idle-timer arm,
+    //   3. waits for the sentinel on stderr (the
+    //      timeout is a CI-safety backstop, not the
+    //      assertion — the sentinel drives exit),
+    //   4. asserts exit code 0 AND sentinel seen.
+    // The other two tests in this file (re-arm on
+    // post-warmup traffic; idleMs=0 keeps the
+    // process alive) still use cap-bounded timing
+    // because they assert the process is STILL ALIVE
+    // past a deadline, not that it exited.
     const child = spawnChild(500);
     const stderr: string[] = [];
-    child.stderr.on("data", (c) => stderr.push(c.toString()));
-    // 500 ms warmup: let the child finish startup so the
-    // idle timer is armed and counting. The idleMs=500
-    // window is measured from server start; with no
-    // traffic it fires once and re-arms never happen.
+    let sentinelSeen = false;
+    child.stderr.on("data", (c) => {
+      const s = c.toString();
+      stderr.push(s);
+      if (s.includes("idle-sentinel")) sentinelSeen = true;
+    });
+    // 500 ms warmup: let the child finish startup so
+    // the idle timer is armed and counting. The
+    // idleMs=500 window is measured from server
+    // start; with no traffic it fires once and
+    // re-arms never happen.
     await sleep(500);
     const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+      // Backstop timeout: 5 s. The sentinel
+      // should fire ~500 ms after startup so this
+      // is a 10× safety margin. If the sentinel
+      // never lands, the test fails with the
+      // collected stderr in the assertion
+      // message.
       const t = setTimeout(() => {
         child.kill("SIGKILL");
         resolve({ code: -1, signal: "SIGKILL" });
-      }, 2500);
+      }, 5000);
       child.on("close", (code, signal) => {
         clearTimeout(t);
         resolve({ code, signal });
       });
     });
-    expect(exit.code).toBe(0);
+    expect(exit.code, `stderr: ${stderr.join("")}`).toBe(0);
+    expect(sentinelSeen, `stderr: ${stderr.join("")}`).toBe(true);
+    // The verbose-reason log is still emitted under
+    // AGENT_RECALL_VERBOSE_STDIO=1 (set in
+    // `spawnChild`); the sentinel doesn't replace
+    // it, the test just stops relying on the 2.5 s
+    // cap.
     expect(stderr.join("")).toMatch(/stdio_idle_timeout/);
   });
 

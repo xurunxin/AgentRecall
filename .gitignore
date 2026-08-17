@@ -49,3 +49,31 @@ Thumbs.db
 # Local-only memory-mcp scratch (the agent runs
 # its own .codegraph + similar tools here).
 .codegraph/
+
+
+# http-bridge debug / runtime logs
+http-bridge/binary.err
+http-bridge/binary.out
+http-bridge/node.err
+http-bridge/node.out
+binary.err
+binary.out
+node.err
+node.out
+
+# bridge binary test scratch (deleted after commits)
+/.bridge-test-scratch/
+
+# bridge binary env (machine-specific paths; copy from http-bridge/.env.example)
+/dist-bin/.env
+
+
+# scratch (one-off diagnostic outputs)
+/all-tasks.txt
+/git-tree.txt
+
+
+# one-off diagnostic captures from MCP-config hunting
+/mcp-config-before.json
+/http-bridge/find-mcp-config.py
+

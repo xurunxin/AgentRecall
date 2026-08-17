@@ -265,6 +265,25 @@ export async function main(): Promise<void> {
           `${serverName()} shutting down (${label})`
         );
       }
+    },
+    // v1.1.6 follow-up D1: emit the
+    // `[lifecycle] idle-sentinel` line on stderr
+    // immediately before the clean `exitFn(0)` so
+    // the blackbox test (mcp-stdio-idle.test.ts)
+    // can wait for the sentinel on `child.stderr`
+    // instead of racing a 2.5 s cap. The line is
+    // ONLY emitted on the `stdio_idle_timeout`
+    // reason — every other shutdown reason
+    // (stdio_end, stdio_close, SIGINT, SIGTERM)
+    // keeps the "no stderr leak" invariant that
+    // mcp-shutdown.test.ts + mcp-all-tools-e2e
+    // .test.ts assert. The lifecycle module itself
+    // never touches stderr; this callback is the
+    // boundary where stderr emission is allowed.
+    onShutdownComplete: (reason) => {
+      if (reason === "stdio_idle_timeout") {
+        process.stderr.write("[lifecycle] idle-sentinel\n");
+      }
     }
   });
   // v1.1.5 (Stage 1, task 3): wire the

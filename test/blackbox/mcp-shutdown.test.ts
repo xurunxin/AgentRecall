@@ -80,31 +80,31 @@ function spawnServer(env: Record<string, string>): ChildProcess {
   );
 }
 
-/** Wait for the child to exit, capped at 5s.
+/** Wait for the child to exit, capped at 2.5s.
  *  If the cap is hit, send SIGKILL (host escape
  *  hatch) and return the partial result.
  *
- *  v1.1.5 (v1.1.5 release): bumped the cap from
- *  2.5s to 5s. The lifecycle module's SIGINT /
- *  SIGTERM handler does the SQLite close +
- *  listener teardown serially; on a busy VM
- *  (e.g. the release-candidate orchestrator
- *  re-running all 5 vitest suites on the same
- *  ubuntu-latest runner at once) the handler
- *  occasionally doesn't return within 2.5s, so
- *  the host escape hatch fires and the test
- *  reports `expected 'SIGINT' to be null`. The
- *  lifecycle behaviour is correct (the unit
- *  tests in `test/unit/mcp-server-lifecycle.idle.test.ts`
- *  + `test/unit/server-lifecycle.test.ts`
- *  cover the contract); this is a CI-time
- *  timing flake. 5s gives the busy runner room
- *  to complete the shutdown without hiding
- *  real regression bugs (the 5s hard timeout
- *  still applies). */
+ *  v1.1.6 (D2 follow-up): the cap is back to
+ *  2.5s. v1.1.5 (v1.1.5 release) had bumped it
+ *  to 5s as a workaround for a busy-VM timing
+ *  flake: the SIGINT / SIGTERM handler did
+ *  transport close + server close + SQLite close
+ *  serially, and on the release-candidate
+ *  orchestrator (which re-runs all 5 vitest
+ *  suites on the same ubuntu-latest runner
+ *  back-to-back) the handler occasionally
+ *  didn't return within 2.5s. v1.1.6 D2
+ *  parallelizes transport close + server close
+ *  (the two largest contributors to the wall-
+ *  clock time) so the sequence now completes
+ *  in well under 2.5s even on the busy VM. The
+ *  2.5s cap matches the unit test's
+ *  `shutdownTimeoutMs` default (1500 ms) plus
+ *  a 1s margin for OS-level scheduling + child
+ *  process reap. */
 function waitForExit(
   child: ChildProcess,
-  timeoutMs = 5000
+  timeoutMs = 2500
 ): Promise<ExitedChild> {
   return new Promise<ExitedChild>((resolve) => {
     let settled = false;

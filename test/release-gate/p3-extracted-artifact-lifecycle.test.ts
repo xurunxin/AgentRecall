@@ -83,6 +83,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "vitest";
 
+import { archive } from "../../scripts/archive.js";
+
 const repoRoot = join(import.meta.dirname, "..", "..");
 const extractScriptPath = join(repoRoot, "scripts", "extract-release-artifact.mjs");
 const hashScriptPath = join(repoRoot, "scripts", "compute-artifact-hashes.mjs");
@@ -136,28 +138,22 @@ function stageDistDirectory(rootDir: string): string {
   return stage;
 }
 
-function packTarGz(stageDir: string, archivePath: string): void {
-  // v1.1.5 (v1.1.5 release): the previous
-  // `shell: process.platform === "win32"` flag
-  // forced the args through `cmd.exe`, which
-  // mangles the trailing `.` source-path arg
-  // (cmd treats `.` as a `cd` noop and the
-  // tar invocation exits with status 2 — `fatal
-  // error` — leaving the archive empty). Spawn
-  // tar directly via `CreateProcess` (no shell
-  // wrapper); the args pass through verbatim and
-  // GNU tar's `-czf archive -C dir .` produces
-  // the canonical gzipped tarball. POSIX
-  // behaviour is unchanged. Hit first on the
-  // v1.1.5 release: the lifecycle E2E matrix leg
-  // on `windows-latest` failed at
-  // `packTarGz` (`result.status === 2`).
-  const result = spawnSync(
-    "tar",
-    ["-czf", archivePath, "-C", stageDir, "."],
-    { stdio: "ignore" }
-  );
-  assert.equal(result.status, 0, `tar failed: ${result.stderr ?? "no stderr"}`);
+async function packTarGz(stageDir: string, archivePath: string): Promise<void> {
+  // v1.1.6 follow-up C1 (issue #42, spec
+  // d67fc45, plan bfbd2cb): the v1.1.5 helper
+  // shell'd out to GNU `tar` and failed on
+  // Windows-latest (cmd.exe's `shell: true`
+  // wrapper mangled the trailing `.` source
+  // arg, tar exit 2). Replaced with
+  // `scripts/archive.ts` — a dependency-free
+  // Node-native tar.gz (USTAR through
+  // `zlib.createGzip`). The test cases that
+  // call this helper are now `async function`
+  // so the await propagates. The `zip` pack
+  // path still defers to PowerShell
+  // `Compress-Archive` on Windows / `zip` on
+  // POSIX (unchanged).
+  await archive(stageDir, archivePath, "tar.gz");
 }
 
 function packZip(stageDir: string, archivePath: string): { ok: true } | { ok: false; reason: string } {
@@ -208,29 +204,19 @@ describe("extracted-artifact lifecycle E2E (Stage 18 v1.1.2 issue #28, task 9)",
   // test in this block (the dependency-free
   // assertions + the script-path existence
   // check run unconditionally).
-  it("extract-release-artifact.mjs is dependency-free and exits 0 on a mock .tar.gz", function () {
-    if (process.platform === "win32") {
-      // The dependency-free + script-path
-      // existence checks run on every
-      // platform; the tar.gz pack + extract
-      // round-trip is exercised on Linux +
-      // macOS only (where GNU tar's
-      // `-czf` works reliably on the runner
-      // image).
-      assert.ok(existsSync(extractScriptPath), "scripts/extract-release-artifact.mjs must exist");
-      const text = read(extractScriptPath);
-      assert.doesNotMatch(
-        text,
-        /from\s+["'](?!node:)[a-zA-Z@][^"']*["']/,
-        "extract script must not import non-stdlib packages"
-      );
-      assert.doesNotMatch(
-        text,
-        /require\(\s*["'][a-zA-Z@][^"']*["']\s*\)/,
-        "extract script must not require non-stdlib packages"
-      );
-      return;
-    }
+  it("extract-release-artifact.mjs is dependency-free and exits 0 on a mock .tar.gz", async function () {
+    // v1.1.6 follow-up C1 (issue #42, spec
+    // d67fc45, plan bfbd2cb): the v1.1.5
+    // Windows short-circuit at the top of
+    // this test is removed; the tar.gz
+    // round-trip now runs on all 3 OSes via
+    // `scripts/archive.ts` (Node-native
+    // USTAR through `zlib.createGzip`). The
+    // dependency-free + script-path checks
+    // were the only Windows-side coverage
+    // before; they stay as the first two
+    // asserts, then the round-trip runs
+    // unconditionally.
     assert.ok(existsSync(extractScriptPath), "scripts/extract-release-artifact.mjs must exist");
     const text = read(extractScriptPath);
     // No npm package references (require("...") or
@@ -250,7 +236,7 @@ describe("extracted-artifact lifecycle E2E (Stage 18 v1.1.2 issue #28, task 9)",
     try {
       const stage = stageDistDirectory(tmp);
       const archive = join(tmp, "agent-recall-1.1.2-linux-x64.tar.gz");
-      packTarGz(stage, archive);
+      await packTarGz(stage, archive);
       const extractDir = join(tmp, "extracted");
       const result = runScript(extractScriptPath, [], {
         ...process.env,
@@ -276,7 +262,7 @@ describe("extracted-artifact lifecycle E2E (Stage 18 v1.1.2 issue #28, task 9)",
     }
   });
 
-  it("extract-release-artifact.mjs exits non-zero when the archive is missing canonical files", () => {
+  it("extract-release-artifact.mjs exits non-zero when the archive is missing canonical files", async () => {
     // v1.1.5 (v1.1.5 release): the previous
     // implementation unconditionally packed
     // a `.tar.gz` (via `packTarGz`) even on
@@ -309,7 +295,7 @@ describe("extracted-artifact lifecycle E2E (Stage 18 v1.1.2 issue #28, task 9)",
         const result = packZip(stage, archive);
         assert.ok(result.ok, `packZip failed on Windows: ${result.ok ? "" : result.reason}`);
       } else {
-        packTarGz(stage, archive);
+        await packTarGz(stage, archive);
       }
       const extractDir = join(tmp, "extracted");
       const result = runScript(extractScriptPath, [], {
@@ -436,10 +422,33 @@ describe("extracted-artifact lifecycle E2E (Stage 18 v1.1.2 issue #28, task 9)",
     assert.match(workflow, /packaged-install\.test\.ts/);
     assert.match(workflow, /AGENT_RECALL_EXTRACTED_ARTIFACT/);
 
-    // Every step has fail-closed semantics (no
-    // continue-on-error, no `|| true` suppressor).
+    // Every step has fail-closed semantics EXCEPT
+    // the orchestrator's pattern-detector exit-1
+    // suppressor, which the v1.1.6 follow-up A1
+    // (Task 0) intentionally added: the
+    // orchestrator's pattern detector (UNHANDLED_REJECTION
+    // / WORKER_TIMEOUT) catches the synthetic-failure
+    // smoke and exits 1 even though 0 tests failed.
+    // The orchestrator's exit-1 is now informational
+    // (the new --fragments path below doesn't
+    // consume orchestrator-aggregate/), so the
+    // smoke continues to validate the pattern
+    // detector without aborting the aggregate step.
+    // Failures still surface in the orchestrator's
+    // own log; the verifier below is the hard gate.
     assert.doesNotMatch(workflow, /continue-on-error:\s*true/);
-    assert.doesNotMatch(workflow, /\|\|\s*true/);
+    // v1.1.6 follow-up A1 (Task 0): the `|| true`
+    // exception is the orchestrator's pattern-detector
+    // exit-1 suppressor (line 665 of
+    // release-candidate.yml). Strip that single
+    // line from the workflow content before the
+    // assertion so the rest of the workflow is
+    // checked against the `no || true` invariant.
+    const workflowMinusOrchestrator = workflow
+      .split("\n")
+      .filter((line) => !/orchestrator-aggregate.*\|\| true/.test(line))
+      .join("\n");
+    assert.doesNotMatch(workflowMinusOrchestrator, /\|\|\s*true/);
 
     // The record-evidence job ingests the hashes into
     // the existing evidence contract.

@@ -1,0 +1,30 @@
+# v1.1.6 follow-up E1 (issue #42, plan bfbd2cb): the bridge
+# writes six runtime artefacts when it runs. None are part of
+# the source tree; all are per-machine state that should never
+# land in git. .bridge.env is the user's configuration (port,
+# profile, actor) and survives a -Uninstall; the other five
+# are generated on each -Install and removed on -Uninstall.
+
+# user config (kept across uninstall)
+.bridge.env
+
+# generated install artefacts
+.run-bridge.cmd
+.task.xml
+
+# bridge stdout / stderr
+bridge.err
+bridge.out
+
+# ad-hoc test artefacts
+test-body.json
+
+# v1.1.6 follow-up E1: the E1 manual-test output capture
+# (saved before commit per plan R7) also lives in this dir
+# and is gitignored.
+.e1-test-output.txt
+
+binary-test*
+debug-task.ps1
+
+test-task.xml

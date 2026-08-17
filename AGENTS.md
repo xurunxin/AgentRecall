@@ -44,3 +44,20 @@
 3. 必要时阻塞合并,直到修复。
 
 新增条款请走 PR + 评审,不要单方面追加。
+
+## 文档多语言约定(2026-08 起)
+
+仓库默认文档语言是**中文**。`README.md`、`docs/guides/*.md` 等面向用户的文档以中文为主,英文作为翻译链接。
+
+- 主文件(`README.md`、`docs/guides/foo.md`)写中文,在文首标注
+  `> 🌏 语言 / Language: 中文。English: [foo.en.md]`。
+- 英文翻译放在同目录的 `*.en.md` 兄弟文件,文首标注
+  `> 🌏 Language: English. 中文(默认): [foo.md]`。
+- 仓库根的 `README.en.md` 是 README 的英文版。
+- 部分指南(`identity-resolution`、`operator-capability`、
+  `sensitivity-matrix`)只有中文摘要,完整规范在 `*.en.md`;
+  中文文件标题会显式标注"中文摘要"。
+- 单一语种的指南(目前只有 `release-test-topology.md` 是英文)
+  在文首标注 "English only. 本指南暂无中文版本。"。
+- 不再使用 `docs/zh-CN/` 这样的子目录组织翻译;新增文档时
+  默认中文,需要英文时再补 `*.en.md`。
