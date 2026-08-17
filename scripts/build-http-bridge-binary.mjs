@@ -131,6 +131,33 @@ for (const plat of PLATFORMS) {
     const size = statSync(outfile).size;
     const sha256 = sha256File(outfile);
     entries.push({ platform: plat, kind: KIND, path: outfile, size, sha256, status: "ok" });
+
+    // v1.1.6 follow-up: bun's --windows-hide-console flag does not
+    // actually flip the PE subsystem to GUI on bun 1.3.14, so the
+    // Task Scheduler launch still flashes a console window.  We
+    // patch the subsystem byte ourselves post-build; the patcher
+    // is a no-op on non-Windows targets and on binaries bun may
+    // eventually emit with the correct subsystem.
+    if (plat.startsWith("win32")) {
+      try {
+        execFileSync(
+          process.execPath,
+          [join("scripts", "patch-windows-subsystem.mjs"), outfile],
+          { stdio: "inherit" }
+        );
+        // Refresh size + sha256 after the in-place patch
+        const newSize = statSync(outfile).size;
+        const newSha = sha256File(outfile);
+        const entry = entries[entries.length - 1];
+        entry.size = newSize;
+        entry.sha256 = newSha;
+        entry.subsystem = "windows-gui";
+      } catch (e) {
+        console.error(
+          `build-http-bridge-binary: subsystem patch FAILED for ${outfile}: ${e.message ?? e}`
+        );
+      }
+    }
   } catch (err) {
     const message = err && err.message ? err.message : String(err);
     console.error(`build-http-bridge-binary: ${bunTarget} FAILED: ${message}`);
