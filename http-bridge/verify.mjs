@@ -193,14 +193,23 @@ async function main() {
 
   // ---- WRITE ----
   console.log("\n[write path]");
+  // Per-run unique stamp + salt so the same body string never collides
+  // with a memory left behind by a previous verify run.  The
+  // duplicate-check is "same title or body", so every write needs its
+  // own unique body, and the "near-dup advisory" test must rephrase
+  // the FIRST write's body (not invent a new one) to exercise the
+  // similarity warning.
   const stamp = Date.now();
-  const tag = `verify-${stamp}`;
+  const salt = Math.random().toString(36).slice(2, 8);
+  const tag = `verify-${stamp}-${salt}`;
+  const factBody1 = `primary datastore is postgres (run=${stamp}, salt=${salt})`;
+  const prefBody1 = `default log level is info (run=${stamp}, salt=${salt})`;
 
   let mem1, mem2;
   try {
     const r = await client.callTool("remember", {
       scope: "global", type: "fact", topic: "http-verify",
-      title: `${tag}-pg`, body: "primary datastore is postgres",
+      title: `${tag}-pg`, body: factBody1,
       tags: [tag, "stack"], source: { kind: "agent" },
       importance: 3, confidence: 4
     });
@@ -211,7 +220,7 @@ async function main() {
   try {
     const r = await client.callTool("remember", {
       scope: "global", type: "preference", topic: "http-verify",
-      title: `${tag}-log`, body: "default log level is info",
+      title: `${tag}-log`, body: prefBody1,
       tags: [tag], source: { kind: "agent" },
       importance: 2, confidence: 5
     });
@@ -220,9 +229,15 @@ async function main() {
   } catch (e) { bad("remember (preference)", e.message); }
 
   try {
+    // Rephrase the FIRST fact's body (sub-string overlap, NOT an exact
+    // match) to exercise the near_duplicate advisory warning.  Adding
+    // a different suffix to the body keeps it unique vs. the prior run
+    // while preserving enough overlap that the ranker's near-dup
+    // detector fires.
     const r = await client.callTool("remember", {
       scope: "global", type: "fact", topic: "http-verify",
-      title: `${tag}-pg-rephrased`, body: "primary datastore is postgres for the api",
+      title: `${tag}-pg-rephrased`,
+      body: `primary datastore is postgres for the api (rephrase=${salt})`,
       tags: [tag], source: { kind: "agent" },
       importance: 3, confidence: 4
     });

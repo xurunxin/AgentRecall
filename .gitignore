@@ -63,3 +63,13 @@ node.out
 
 # bridge binary test scratch (deleted after commits)
 /.bridge-test-scratch/
+
+# bridge binary env (machine-specific paths; copy from dist-bin/.env.example)
+/dist-bin/.env
+/dist-bin/.env.example
+
+
+# scratch (one-off diagnostic outputs)
+/all-tasks.txt
+/git-tree.txt
+

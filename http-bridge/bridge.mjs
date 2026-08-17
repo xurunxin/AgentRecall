@@ -104,27 +104,84 @@ import { resolveActor } from "../dist/src/actor.js";
 import { ProjectIdentityResolver } from "../dist/src/scope-resolver.js";
 import { resolveAuthorization } from "../dist/src/services/auth-context.js";
 
-// ---- 加载 .bridge.env(权威源,覆盖 process.env) ----
-const ENV_FILE = join(__dirname, ".bridge.env");
+// ---- 加载 env 文件(权威源,覆盖 process.env) ----
+// 查找顺序(后者被前者覆盖):
+//   1) AGENT_RECALL_BRIDGE_ENV_FILE 显式指定路径
+//   2) <exe-dir>/.env                 二进制模式标准 .env(KEY=VALUE)
+//   3) <exe-dir>/.bridge.env          二进制模式 JSON 变体
+//   4) <__dirname>/.bridge.env        dev (node bridge.mjs) JSON 变体
+// "exe-dir" 是 process.execPath 的目录;在 `node bridge.mjs` 模式下
+// process.execPath 是 node.exe,我们跳过步骤 2/3(否则会从 node 的
+// 安装目录读 .env,毫无意义)。判断方法:process.execPath 的 basename
+// 是否包含 "agent-recall-http-bridge"。
 const VERBOSE = process.env.AGENT_RECALL_VERBOSE === "1";
+const IS_BINARY_MODE = /agent-recall-http-bridge/.test(process.execPath);
 
-if (process.env.AGENT_RECALL_BRIDGE_ENV_FILE) {
-  loadEnvFile(process.env.AGENT_RECALL_BRIDGE_ENV_FILE);
-} else if (existsSync(ENV_FILE)) {
-  loadEnvFile(ENV_FILE);
+function isBinaryEnvCandidate(p) {
+  if (!existsSync(p)) return false;
+  return true;
 }
 
 function loadEnvFile(path) {
   try {
     const raw = readFileSync(path, "utf8");
-    const data = JSON.parse(raw);
-    for (const [k, v] of Object.entries(data)) {
-      process.env[k] = String(v);
+    const trimmed = raw.trimStart();
+    let entries = {};
+    if (trimmed.startsWith("{")) {
+      // JSON variant — explicit object with quoted keys.
+      const data = JSON.parse(raw);
+      for (const [k, v] of Object.entries(data)) entries[k] = String(v);
+    } else {
+      // Standard .env (KEY=VALUE lines; # comments; optional export;
+      // bare value is a string; "..." or '...' quotes are stripped).
+      for (const rawLine of raw.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith("#")) continue;
+        const m = line.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+        if (!m) continue;
+        let v = m[2];
+        if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+          v = v.slice(1, -1);
+        }
+        // Strip trailing inline comments for unquoted values.
+        if (!m[2].startsWith('"') && !m[2].startsWith("'")) {
+          const hashIdx = v.indexOf(" #");
+          if (hashIdx >= 0) v = v.slice(0, hashIdx).trim();
+        }
+        entries[m[1]] = v;
+      }
     }
-    if (VERBOSE) console.error(`[http-bridge] loaded env from ${path} (${Object.keys(data).length} keys)`);
+    let count = 0;
+    for (const [k, v] of Object.entries(entries)) {
+      // Env file is authoritative: it OVERRIDES whatever was set
+      // before (dotenv semantics).  We log the new key even if
+      // process.env already had a value, so the operator can see
+      // that the env file has taken effect.
+      process.env[k] = v;
+      count++;
+    }
+    console.error(`[http-bridge] loaded env from ${path} (${count} key(s))`);
   } catch (e) {
     console.error(`[http-bridge] failed to load env from ${path}: ${e.message}`);
   }
+}
+
+if (process.env.AGENT_RECALL_BRIDGE_ENV_FILE) {
+  loadEnvFile(process.env.AGENT_RECALL_BRIDGE_ENV_FILE);
+} else if (IS_BINARY_MODE) {
+  const exeDir = dirname(process.execPath);
+  const dotenv = join(exeDir, ".env");
+  const jsonenv = join(exeDir, ".bridge.env");
+  if (isBinaryEnvCandidate(dotenv)) {
+    loadEnvFile(dotenv);
+  } else if (isBinaryEnvCandidate(jsonenv)) {
+    loadEnvFile(jsonenv);
+  } else {
+    console.error(`[http-bridge] no env file next to ${process.execPath} (.env / .bridge.env)`);
+  }
+} else {
+  const devEnv = join(__dirname, ".bridge.env");
+  if (existsSync(devEnv)) loadEnvFile(devEnv);
 }
 
 // 命令行 port 优先, 然后 process.env(已被 .env 覆盖), 最后默认

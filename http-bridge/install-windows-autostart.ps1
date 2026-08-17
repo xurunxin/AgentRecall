@@ -31,7 +31,7 @@ param(
     [string]$DataHome = "$env:USERPROFILE\.agent-recall-http-bridge",
     [ValidateSet("auto", "runkey", "startup", "task")]
     [string]$Method = "auto",
-    [switch]$UseBinary,           # prefer dist-bin/agent-recall-http-bridge-<plat>.exe (if present)
+    [switch]$UseNode,             # force the node bridge.mjs launcher (skips the binary)
     [switch]$Uninstall,
     [switch]$Status,
     [switch]$RunNow
@@ -60,34 +60,35 @@ $PlatTag = if ($IsWindows -or $env:OS -match "Windows") {
 $BinExt = if ($PlatTag.StartsWith("win32")) { ".exe" } else { "" }
 $BridgeExe = Join-Path $DistBinDir "agent-recall-http-bridge-$PlatTag$BinExt"
 
-# Resolve which launcher to use: bun single-file binary (preferred,
+# Resolve which launcher to use: bun single-file binary (default,
 # no Node.js required on the host) or `node bridge.mjs` (dev /
-# fallback).  Both honour the same --project-root / port convention.
+# opt-out).  Both honour the same --project-root / port convention.
 #
-# Default: node.  The binary is opt-in via `-UseBinary` or
-# AGENT_RECALL_BRIDGE_BINARY=1 because:
-#   - the .exe is ~99 MB on Windows vs. ~1 MB of source,
-#   - rebuilds need a local `bun` toolchain (not all hosts have it).
-# Both modes run the same MCP HTTP server; the launcher resolver only
-# affects *how* the long-lived daemon is spawned.  The earlier
-# "binary exits 0 after listen" bug was traced to `dist/src/index.js`
-# auto-invoking its `main()` (StdioServerTransport) on import, which
-# has been fixed by inlining `createService` / `resolveDataHome` in
-# bridge.mjs and not pulling the index.js module into the binary.
+# Default: binary.  The binary is the production launcher because
+# it's a self-contained ~99 MB .exe that can be launched by Task
+# Scheduler / RunKey / Startup-folder shortcuts with no host-level
+# Node.js dependency.  Use `-UseNode` (or AGENT_RECALL_BRIDGE_NODE=1)
+# to fall back to `node bridge.mjs` for live-edits of the source.
+# The bridge.mjs env-file loader now also reads `.env` / `.bridge.env`
+# from the binary's install directory when running in binary mode, so
+# a "drop the .exe + .env into a folder" install is fully supported.
 function Resolve-Launcher {
     param([int]$Port)
-    $useBinary = [bool]$UseBinary -or ($env:AGENT_RECALL_BRIDGE_BINARY -eq "1")
-    if ($useBinary -and (Test-Path $BridgeExe)) {
-        return @{
-            Mode = "binary"
-            Command = $BridgeExe
-            Arguments = @("$Port")
-            WorkingDirectory = $ScriptDir
-            CmdFile = $null
+    $useNode = [bool]$UseNode -or ($env:AGENT_RECALL_BRIDGE_NODE -eq "1")
+    if (-not $useNode) {
+        if (Test-Path $BridgeExe) {
+            return @{
+                Mode = "binary"
+                Command = $BridgeExe
+                Arguments = @("$Port")
+                WorkingDirectory = $ScriptDir
+                CmdFile = $null
+            }
         }
-    }
-    if ($useBinary -and -not (Test-Path $BridgeExe)) {
-        Write-Host "  [launcher] binary requested but $BridgeExe not found; using node" -ForegroundColor Yellow
+        # No binary on disk: dev environment, fall back to node.
+        Write-Host "  [launcher] binary not found at $BridgeExe; falling back to node" -ForegroundColor Yellow
+    } else {
+        Write-Host "  [launcher] -UseNode set; using node bridge.mjs (binary skipped)" -ForegroundColor Yellow
     }
     return @{
         Mode = "node"
@@ -397,8 +398,20 @@ function Start-BridgeNow {
     # 如果 task 已注册,直接用 schtasks /run 触发 — 让 task 来拉起 node,
     # 这样它仍然在 task 的 RestartOnFailure 保护下;也避免我们手动启的进程
     # 跟 task 冲突。
-    $taskExists = schtasks.exe /query /tn $TaskName 2>$null
-    if ($LASTEXITCODE -eq 0) {
+    # IMPORTANT: capture the schtasks exit code into a local — the
+    # previous Stop-Bridge call's netstat would leave $LASTEXITCODE=0
+    # and make the next check incorrectly believe the task exists.
+    # Use the [void](schtasks.exe ...) trick: the result is discarded
+    # so the native-command error stream doesn't bubble up, and we
+    # read $LASTEXITCODE immediately after the call.
+    $taskExists = $false
+    try {
+        $null = schtasks.exe /query /tn $TaskName *>&1
+        $taskExists = ($LASTEXITCODE -eq 0)
+    } catch {
+        $taskExists = $false
+    }
+    if ($taskExists) {
         Write-Host "[run-now] triggering Task Scheduler task $TaskName ..." -ForegroundColor Cyan
         $r = schtasks.exe /run /tn $TaskName 2>&1
         if ($LASTEXITCODE -ne 0) {

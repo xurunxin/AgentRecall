@@ -23,3 +23,7 @@ test-body.json
 # (saved before commit per plan R7) also lives in this dir
 # and is gitignored.
 .e1-test-output.txt
+
+binary-test*
+debug-task.ps1
+
