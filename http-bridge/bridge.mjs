@@ -314,6 +314,69 @@ function createSession() {
   return { server, transport };
 }
 
+// ---- Accept-header tolerance patch ----
+// The MCP SDK's StreamableHTTPServerTransport.handlePostRequest
+// rejects any request whose `Accept` header does not list BOTH
+// `application/json` AND `text/event-stream`.  In practice many
+// MCP HTTP clients — including some that target Claude Desktop /
+// Cursor / MiniMax Code variants — only send `application/json`
+// (or `*/*`) because they expect the JSON response and don't
+// negotiate SSE.  Strictly that's a client bug (the spec says to
+// list both), but the failure mode is loud: every such request
+// is rejected with `-32000 Not Acceptable` and the operator
+// sees the bundled SDK error in stderr.
+//
+// We pre-flight: if the Accept header doesn't include both required
+// types, we add the missing one(s) on the Node.js IncomingMessage
+// BEFORE handing the request to the SDK.  Note: the SDK's request
+// conversion goes through `@hono/node-server` which builds the
+// WHATWG Headers from `req.rawHeaders` (NOT `req.headers`!), so
+// we have to patch the rawHeaders array as well.
+const REQUIRED_ACCEPT_TYPES = ["application/json", "text/event-stream"];
+function ensureAcceptHeader(req) {
+  const raw = req.headers["accept"];
+  const accept = typeof raw === "string" ? raw.toLowerCase() : "*/*";
+  const hasJson = accept.includes("application/json") || accept.includes("*/*");
+  const hasSse = accept.includes("text/event-stream") || accept.includes("*/*");
+  if (hasJson && hasSse) return;
+  const augmented = [];
+  if (!hasJson) augmented.push("application/json");
+  if (!hasSse) augmented.push("text/event-stream");
+  const newAccept = augmented.join(", ") + (raw ? ", " + raw : "");
+  // 1) Update the canonical headers object (some callers / SDK code
+  //    path reads this).
+  req.headers["accept"] = newAccept;
+  // 2) Update the rawHeaders flat array (hono's getRequestListener
+  //    builds WHATWG Headers from this and never looks at
+  //    `req.headers`).  rawHeaders layout: [name, value, name, value, ...].
+  if (Array.isArray(req.rawHeaders)) {
+    for (let i = 0; i < req.rawHeaders.length; i += 2) {
+      if (req.rawHeaders[i].toLowerCase() === "accept") {
+        req.rawHeaders[i + 1] = newAccept;
+        // Don't break — there may be duplicate Accept headers from
+        // weird clients, but patching all of them is the safe call.
+      }
+    }
+    // No Accept header at all: append one.  This shouldn't happen
+    // (Node IncomingMessage always populates rawHeaders for any
+    // header the client sent, and Accept is almost universal), but
+    // if it does we want the SDK to see something rather than
+    // undefined.
+    const hasAnyAccept = req.rawHeaders.some(
+      (h, i) => i % 2 === 0 && h.toLowerCase() === "accept"
+    );
+    if (!hasAnyAccept) {
+      req.rawHeaders.push("Accept", newAccept);
+    }
+  }
+  console.error(
+    `[http-bridge] note: client sent Accept='${raw ?? "<missing>"}'; ` +
+    `augmented to '${newAccept}' so the SDK can route the response. ` +
+    `(MCP spec requires both application/json and text/event-stream; ` +
+    `fix the client to send 'Accept: ${REQUIRED_ACCEPT_TYPES.join(", ")}')`
+  );
+}
+
 // ---- HTTP server ----
 const httpServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
@@ -399,6 +462,7 @@ const httpServer = createServer(async (req, res) => {
           res.writeHead(404, { "content-type": "application/json" });
           return res.end(JSON.stringify({ error: "session not found" }));
         }
+        ensureAcceptHeader(req);
         await session.transport.handleRequest(req, res);
         return;
       }
@@ -410,6 +474,7 @@ const httpServer = createServer(async (req, res) => {
           res.writeHead(400, { "content-type": "application/json" });
           return res.end(JSON.stringify({ error: "mcp-session-id header required" }));
         }
+        ensureAcceptHeader(req);
         await session.transport.handleRequest(req, res);
         return;
       }
@@ -419,6 +484,7 @@ const httpServer = createServer(async (req, res) => {
         const hasHeader = typeof sessionHeader === "string" && sessionHeader.length > 0;
         const sessionValid = hasHeader && sessions.has(sessionHeader);
         const body = await readJsonBody(req);
+        ensureAcceptHeader(req);
 
         if (sessionValid) {
           const session = sessions.get(sessionHeader);

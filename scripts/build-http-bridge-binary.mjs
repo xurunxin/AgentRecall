@@ -104,6 +104,22 @@ for (const plat of PLATFORMS) {
         // surfaces can report it without a sidecar
         "--define",
         `process.env.AGENT_RECALL_VERSION='${pkg.version}'`,
+        // v1.1.6 follow-up: hide the console window when the binary
+        // is launched by Task Scheduler / RunKey / Startup shortcut.
+        // Sets the PE subsystem to WINDOWS so Windows doesn't
+        // allocate a console for the child; the bridge's stderr
+        // (where the env-load line, request logs, and errors go) is
+        // still written — it just doesn't open a visible window.
+        // (No-op on non-Windows targets.)
+        ...(plat.startsWith("win32")
+          ? [
+              "--windows-hide-console",
+              // Title the binary so it shows up with a sensible name
+              // in Task Manager / schtasks /query, not "Bun".
+              "--windows-title=agent-recall HTTP MCP bridge",
+              "--windows-description=agent-recall HTTP MCP bridge (Streamable HTTP, localhost)",
+            ]
+          : []),
         // bridge reads from ./.bridge.env; baking CWD is unsafe (the
         // install script sets WorkingDirectory on Task Scheduler), so
         // leave it dynamic
