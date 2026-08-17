@@ -1,40 +1,31 @@
-# Bun single-file binary distribution
+# Bun 单文件二进制分发
 
-The Bun path is an **additive** distribution channel. The Node
-npm package (`agent-recall`) is still primary. The Bun binary
-exists for operators who need a single-file drop-in and can
-accept the smaller surface coverage (smoke-tested, not
-vitest-tested). **Current implementation: v1.1.5.**
+> **🌏 语言 / Language**: 中文。English: [`bun-distribution.en.md`](./bun-distribution.en.md).  
+> **当前实现版本 / Implementation version**: v1.1.5.
 
-## Prerequisites
+Bun 分发路径是**附加的**分发渠道。Node 的 npm 包（`agent-recall`）仍然是主路径。Bun 二进制面向需要单文件 drop-in、且能接受较小覆盖面的运维者（已做 smoke 测试，但未跑完整 vitest）。
 
-- **Build host:** Bun ≥ 1.3.0 on PATH (`bun --version`).
-- **Consumer host:** nothing. The binary is self-contained.
+## 前置条件
 
-## Build
+- **构建主机**：PATH 上需有 Bun ≥ 1.3.0（`bun --version`）。
+- **消费主机**：无。Bun 二进制是自包含的。
+
+## 构建
 
 ```bash
 npm run build:bun
 ```
 
-The script writes `dist-bin/agent-recall-<plat>[.exe]` and
-`dist-bin/agent-recall-mcp-<plat>[.exe]` for each canonical
-platform (`linux-x64`, `darwin-x64`, `darwin-arm64`,
-`win32-x64`), plus `dist-bin/MANIFEST.json` with per-binary
-SHA-256 hashes.
+脚本会为每个正式平台（`linux-x64`、`darwin-x64`、`darwin-arm64`、`win32-x64`）在 `dist-bin/` 下写出 `agent-recall-<plat>[.exe]` 和 `agent-recall-mcp-<plat>[.exe]`，并生成 `dist-bin/MANIFEST.json`（含每个二进制的 SHA-256）。
 
-The script asserts `bun --version >= 1.3.0` before any work
-and exits non-zero with a clear message if the host Bun is
-too old.
+脚本在任何工作前会断言 `bun --version >= 1.3.0`，若主机 Bun 版本过老会以清晰消息退出非零。
 
-## Install
+## 安装
 
-Pick the binary for the consumer platform from the GitHub
-release for the desired version. Verify its SHA-256 against
-the release's `MANIFEST.json`, then drop it onto `PATH`:
+从对应版本 GitHub Release 中挑选适配消费端平台的二进制。对照 Release 的 `MANIFEST.json` 校验 SHA-256，然后放入 `PATH`：
 
 ```bash
-# linux-x64 example
+# linux-x64 示例
 curl -L -o agent-recall https://github.com/xurunxin/AgentRecall/releases/download/v1.1.5/agent-recall-linux-x64
 curl -L -o MANIFEST.json https://github.com/xurunxin/AgentRecall/releases/download/v1.1.5/MANIFEST.json
 sha256sum -c <(jq -r '.entries[] | select(.platform=="linux-x64" and .kind=="cli") | "agent-recall  " + .sha256' MANIFEST.json)
@@ -42,78 +33,55 @@ chmod +x agent-recall
 sudo mv agent-recall /usr/local/bin/agent-recall
 ```
 
-The MCP server binary follows the same recipe
-(`agent-recall-mcp-<plat>`).
+MCP 服务二进制走相同配方（`agent-recall-mcp-<plat>`）。
 
-## Smoke test
+## Smoke 测试
 
 ```bash
 npm run smoke:bun
 ```
 
-Seven-step smoke (`--version`, `help`, `doctor`, export+import
-round-trip, `backup`, post-backup `doctor`, HTTP daemon
-end-to-end probe) against the host-platform binary. Exits 0
-on all passing; emits `[smoke_failed]` on any failure. Skips
-cleanly when the binary is missing. The HTTP probe is
-covered in the next section.
+针对主机平台二进制跑 7 步 smoke（`--version`、`help`、`doctor`、export+import 往返、`backup`、备份后 `doctor`、HTTP daemon 端到端 probe）。全部通过退出 0；任一失败输出 `[smoke_failed]`。二进制缺失时干净跳过。HTTP probe 见下一节。
 
-## Shared HTTP daemon
+## 共享 HTTP daemon
 
-v1.1.5 adds an `agent-recall --http` mode: a local HTTP
-daemon that multiple HTTP-capable agents (Bun-friendly
-sub-agents included) share via a single process, a single
-`MemoryService`, and a single SQLite connection, with
-per-MCP-session actor isolation. The mode is the answer to
-"dozens of idle stdio child processes on a busy host": one
-daemon, many clients. The stdio path is unchanged (the
-v1.1.4 `server-lifecycle` contract still applies), and a
-new stdio idle-exit covers the long-tail cleanup case (see
-`AGENT_RECALL_STDIO_IDLE_MS` below).
+v1.1.5 起，agent-recall 二进制新增 `agent-recall --http` 模式：启动一个本地 HTTP 守护进程，多个 HTTP 客户端（HTTP-capable agent、Bun 友好的子代理）通过 Bearer token 共享同一进程、同一 `MemoryService`、同一 SQLite 连接，按 MCP 会话隔离 actor。该模式专门解决多 agent 客户端各自 spawn stdio 进程造成的资源膨胀问题（同一 host 跑几十个 idle stdio 子进程）；stdio 路径继续保留（v1.1.4 的 `server-lifecycle` 合同不变），并新增了 stdio 空闲退出（见 `AGENT_RECALL_STDIO_IDLE_MS`）。
 
-> **Important:** `agent-recall-mcp --http` does **not** enter
-> HTTP mode. The compatibility name `agent-recall-mcp` is
-> always stdio (the v1.1.4 dispatch contract is preserved;
-> both `--http` and `AGENT_RECALL_MCP_TRANSPORT` are ignored).
-> HTTP mode is reachable only from `agent-recall`.
+> **重要**：`agent-recall-mcp --http` **不会**进入 HTTP 模式。兼容名 `agent-recall-mcp` 始终是 stdio（v1.1.4 的 dispatch 合同不变，`--http` 与 `AGENT_RECALL_MCP_TRANSPORT` 都被忽略）。HTTP 模式只能从 `agent-recall` 进入。
 
-### Launch
+### 启动
 
 ```bash
 agent-recall --http
 ```
 
-A soft env-var switch is also available (when `agent-recall`
-sees `AGENT_RECALL_MCP_TRANSPORT=http` it behaves the same
-as `--http`; other values like `HTTP` / `stdio` are no-ops):
+也可通过环境变量软切换（`agent-recall` 收到 `AGENT_RECALL_MCP_TRANSPORT=http` 时等价于 `--http`；其它取值如 `HTTP` / `stdio` 不触发）：
 
 ```bash
 AGENT_RECALL_MCP_TRANSPORT=http agent-recall list
 ```
 
-`agent-recall` with neither `--http` nor
-`AGENT_RECALL_MCP_TRANSPORT=http` falls back to the v1.1.5
-default (no arguments → stdio, `<subcommand>` → CLI).
+`agent-recall` 没有 `--http`、没有 `AGENT_RECALL_MCP_TRANSPORT=http` 时仍按 v1.1.5 默认行为走（无参数 → stdio，`<subcommand>` → CLI）。
 
-### Environment variables
+### 环境变量
 
-| Variable | Default | Purpose |
+| 变量 | 默认值 | 作用 |
 | --- | --- | --- |
-| `AGENT_RECALL_HTTP_HOST` | `127.0.0.1` | Bind interface. Keep it on loopback; there is no auth fallback for a public interface. |
-| `AGENT_RECALL_HTTP_PORT` | `7777` | Listen port. Setting `0` to ask the OS for a free port is **not supported** (see "Known limitations" below). |
-| `AGENT_RECALL_HTTP_ALLOWED_ORIGINS` | (empty) | Comma-separated browser origin allow-list (e.g. `http://localhost:5173`). Empty accepts only non-browser clients with no `Origin` header. |
-| `AGENT_RECALL_HTTP_VERBOSE` | (off) | Set to `1` to emit `[mcp-http] …` diagnostic lines on stderr (start / shutdown / handler errors). Leave off in production. |
-| `AGENT_RECALL_MCP_TRANSPORT` | (unset) | `agent-recall` switches to HTTP when the value is the literal `http`; other values are no-ops. |
-| `AGENT_RECALL_PROFILE` | `core` | Decides which MCP tool set is registered. `admin` also requires a local `admin.cap` capability; missing it causes the daemon to fail to start with a non-zero exit. |
-| `AGENT_RECALL_HOME` | platform default | Data home; the lockfile and SQLite live under it. |
-| `AGENT_RECALL_STDIO_IDLE_MS` | `600000` (10 min) | **stdio-only** idle-exit threshold (no MCP message and no in-flight request for N ms → exit), reusing the `server-lifecycle` 1.5 s ceiling + second-signal escape. `0` disables. HTTP mode does not read this variable. |
+| `AGENT_RECALL_HTTP_HOST` | `127.0.0.1` | 守护进程绑定接口。保持 `127.0.0.1`；公网接口无鉴权兜底，禁止放开。 |
+| `AGENT_RECALL_HTTP_PORT` | `7777` | 监听端口。设 `0` 想让 OS 分配端口（**当前不支持**，见下方“已知限制”）。 |
+| `AGENT_RECALL_HTTP_ALLOWED_ORIGINS` | （空） | 逗号分隔的浏览器 origin 白名单（例：`http://localhost:5173`）。空时只接受无 `Origin` 头的非浏览器客户端。 |
+| `AGENT_RECALL_HTTP_VERBOSE` | （关） | 设为 `1` 在 stderr 打 `[mcp-http] …` 诊断行（启动 / 关停 / handler 错误）。生产环境保持关闭。 |
+| `AGENT_RECALL_MCP_TRANSPORT` | （未设置） | `agent-recall` 收到值 `http` 时走 HTTP；其它值不触发。 |
+| `AGENT_RECALL_PROFILE` | `core` | 决定注册的 MCP 工具集。`admin` 还需要本机 `admin.cap` capability；缺则 daemon 启动失败并以非零退出。 |
+| `AGENT_RECALL_HOME` | 平台默认 | 数据根目录；lockfile 与 SQLite 都位于其下。 |
+| `AGENT_RECALL_STDIO_IDLE_MS` | `600000`（10 min） | **stdio 端**空闲退出阈值（无 MCP 消息且无 in-flight 请求持续 N ms 后退出），沿用 `server-lifecycle` 的 1.5 s 上限 + 二次信号逃生。设为 `0` 关闭。HTTP 模式不读此变量。 |
 
-### Lockfile and bearer token
+### 锁文件与 token
 
-The launcher calls `acquireOrJoin` at startup:
+启动时 launcher 调用 `acquireOrJoin`：
 
-- Lockfile path: `${AGENT_RECALL_HOME}/.mcp-${AGENT_RECALL_PROFILE}.lock`.
-- First start: `fs.open('wx')` atomic create, then write the JSON payload:
+- 锁文件路径：`${AGENT_RECALL_HOME}/.mcp-${AGENT_RECALL_PROFILE}.lock`。
+- 首次启动：`fs.open('wx')` 原子建锁，写入 JSON 负载：
   ```json
   {
     "pid": 12345,
@@ -126,24 +94,24 @@ The launcher calls `acquireOrJoin` at startup:
     "profile": "core"
   }
   ```
-- Existing lock: check whether the recorded `pid` is alive + TCP probe the port; either failure unlinks the old lock and the launcher takes over.
-- Token length is 64 hex chars (32 random bytes; same entropy budget as `admin.cap`). On POSIX the file mode is tightened to `0o600`.
-- **Same `pid` calling twice joins** (returns the existing endpoint + token) instead of overwriting.
+- 已有锁：检查 `pid` 是否存活 + 端口 TCP 探活；任一失败即 unlink 旧锁并接管。
+- Token 长度 64 hex 字符（32 字节随机；与 `admin.cap` 同熵预算）。POSIX 上文件 mode 紧到 `0o600`。
+- **同进程内同 `pid` 重复调用会 join**（返回现有 endpoint + token），不会重写。
 
-Clients **must** present the token as a Bearer:
+客户端**必须**在 HTTP 请求中带上 token 作为 Bearer：
 
 ```
 Authorization: Bearer <64 hex chars>
 ```
 
-### Client connection contract
+### 客户端连接
 
-Every MCP client must satisfy:
+每个 MCP 客户端必须满足：
 
-1. `Authorization: Bearer <token>` is required. Missing → 401 + `WWW-Authenticate: Bearer`.
-2. `Accept: application/json, text/event-stream` is required. Missing → the SDK 406s in pre-flight with `Not Acceptable: Client must accept both application/json and text/event-stream`.
-3. `Content-Type: application/json`.
-4. The first `initialize` request's `params` **must** include `actor` (missing → 400 `missing_actor`; malformed → 400 `invalid_actor`):
+1. 必带 `Authorization: Bearer <token>`；不带 → 401 + `WWW-Authenticate: Bearer`。
+2. 必带 `Accept: application/json, text/event-stream`；不带 → SDK 在 pre-flight 阶段直接 406（`Not Acceptable: Client must accept both application/json and text/event-stream`）。
+3. `Content-Type: application/json`。
+4. **首次 `initialize` 请求**的 `params` 字段**必须**包含 `actor`（缺 → 400 `missing_actor`；结构非法 → 400 `invalid_actor`）：
    ```json
    {
      "jsonrpc": "2.0",
@@ -157,10 +125,10 @@ Every MCP client must satisfy:
      }
    }
    ```
-   `actor.kind` must be one of `"agent"` / `"user"` / `"service"`; `actor.id` is a non-empty string. Once the session registers its `actor`, the value is locked for the session's lifetime (spec § actor 锁定).
-5. The `initialize` response carries an `mcp-session-id` header. Subsequent POSTs echo it; DELETE with `mcp-session-id` closes the session.
+   `actor.kind` 必须是 `"agent"` / `"user"` / `"service"` 之一；`actor.id` 为非空字符串。`actor` 一旦登记到 session，后续请求不可更改（spec § actor 锁定）。
+5. `initialize` 响应带 `mcp-session-id` 头；后续 POST 必须回带该头，DELETE 带 `mcp-session-id` 关闭会话。
 
-Minimal Node / Bun `fetch` example after the token is read from the lockfile:
+Node / Bun `fetch` 最小示例（取 token 后）：
 
 ```ts
 const res = await fetch(endpoint, {
@@ -183,72 +151,49 @@ const res = await fetch(endpoint, {
   }),
 });
 const sessionId = res.headers.get("mcp-session-id");
-// Subsequent tools/list / tools/call must echo mcp-session-id
+// 后续 tools/list / tools/call 回带 mcp-session-id
 ```
 
-`scripts/smoke-bun-binary.mjs` step 7 is the end-to-end
-reference: spawn `agent-recall --http`, wait for the
-lockfile, read `endpoint` + `token`, send `initialize` (with
-`actor`), capture `mcp-session-id`, send `tools/list` to
-verify the per-session `McpServer` (the Task 11 fix), send
-SIGTERM, and clean up the temp `AGENT_RECALL_HOME`.
+`scripts/smoke-bun-binary.mjs` 步骤 7 是端到端参考实现：spawn `agent-recall --http`、等 lockfile 出现、读 `endpoint`+`token`、发 `initialize`（带 actor）、捕获 `mcp-session-id`、发 `tools/list` 验证 per-session `McpServer`（Task 11 修复）、SIGTERM 关停、清理临时 `AGENT_RECALL_HOME`。
 
-### Known limitations (v1.1.5 deferrals)
+### 已知限制（v1.1.5 推迟项）
 
-- **Lockfile is not unlinked on clean shutdown.** The daemon
-  finishes its shutdown sequence with `process.exit(0)`,
-  which skips the launcher's `try/finally release()` wrapper
-  around `runHttpServer`. The next launcher's `acquireOrJoin`
-  reclaims the stale lock via the pid-alive + port probes;
-  the new daemon takes over and the token rotates.
-- **OS-assigned port (`port=0`) is not supported.** The
-  lockfile's `endpoint` is the *requested*
-  `AGENT_RECALL_HTTP_PORT`, not the actually-bound port;
-  clients following the recorded endpoint will not connect.
-  Pin a fixed port in production.
-- **Network-share data home.** A soft `fs.lstat` check on
-  the lockfile's parent directory is planned (per spec § 错误处理)
-  to print a stderr warning on NFS / SMB without refusing startup.
-  It is not yet implemented in v1.1.5. Putting
-  `AGENT_RECALL_HOME` on a local filesystem is the safe choice
-  either way (today's behaviour just doesn't warn, so mitigate
-  upstream).
+- **lockfile 不在干净退出时 unlink**。守护进程在 shutdown 序列末尾调用 `process.exit(0)`，绕过 launcher 包裹 `runHttpServer` 的 `try/finally release()` 块。下次启动的 `acquireOrJoin` 通过 pid 探活 + 端口探活自动回收旧锁；新守护进程接管，token 轮换。
+- **OS-assigned 端口（`port=0`）不支持**。lockfile 的 `endpoint` 写入的是 `AGENT_RECALL_HTTP_PORT` 的请求值，**不会**反映实际绑定的端口；客户端按请求值连不上。生产环境固定端口即可。
+- **网络盘 data home**。spec 规划在 lockfile 父目录命中 NFS / SMB 时打印 stderr 警告（不强制退化），v1.1.5 尚未实装。届时把 `AGENT_RECALL_HOME` 放在本机文件系统是更稳的选择（当前实现未做软检查，提前规避即可）。
 
-## Capabilities
+## 能力矩阵
 
-| Capability | Node binary | Bun binary |
+| 能力 | Node 二进制 | Bun 二进制 |
 | --- | --- | --- |
-| `--version` / `help` / `doctor` | yes | yes (smoke-tested) |
-| `list` / `show` / `search` / `audit` | yes | yes (smoke-tested) |
-| `export` / `import` | yes | yes (smoke-tested) |
-| `backup` / `restore` | yes | yes (smoke-tested) |
-| `migrate --yes` | yes | yes (covered by Node tests; Bun runtime not exercised) |
-| `admin grant/status/revoke` | yes | yes (smoke-tested) |
-| MCP stdio (10/20 tools) | yes | yes (same `dist/src/index.js` plus Bun runtime) |
-| MCP stdio idle exit (`AGENT_RECALL_STDIO_IDLE_MS`, default 10 min, `0` disables; v1.1.5) | yes | yes |
-| Shared HTTP daemon (`agent-recall --http`, Bearer + per-session actor; v1.1.5) | yes | yes (smoke step 7) |
-| All 24 `doctor` checks | yes (vitest on Node) | smoke-tested on Bun (3 + 6) |
-| `AGENT_RECALL_HOME` env var | yes | yes |
-| `AGENT_RECALL_PROFILE` env var | yes | yes |
-| `AGENT_RECALL_HTTP_HOST` / `AGENT_RECALL_HTTP_PORT` env vars (v1.1.5) | yes | yes |
-| `AGENT_RECALL_HTTP_ALLOWED_ORIGINS` env var (v1.1.5) | yes | yes |
-| `AGENT_RECALL_HTTP_VERBOSE` env var (v1.1.5; HTTP diagnostic stderr) | yes | yes |
-| `AGENT_RECALL_MCP_TRANSPORT` env var (v1.1.5; `http` soft switch) | yes | yes |
-| `AGENT_RECALL_VERBOSE_STDIO` env var (v1.1.4) | yes | yes |
+| `--version` / `help` / `doctor` | 是 | 是（已 smoke） |
+| `list` / `show` / `search` / `audit` | 是 | 是（已 smoke） |
+| `export` / `import` | 是 | 是（已 smoke） |
+| `backup` / `restore` | 是 | 是（已 smoke） |
+| `migrate --yes` | 是 | 是（Node 测试覆盖；Bun 运行期未直接跑） |
+| `admin grant/status/revoke` | 是 | 是（已 smoke） |
+| MCP stdio（10/20 工具） | 是 | 是（同一份 `dist/src/index.js` + Bun 运行期） |
+| MCP stdio 空闲退出（`AGENT_RECALL_STDIO_IDLE_MS`，默认 10 min，`0` 关闭；v1.1.5） | 是 | 是 |
+| 共享 HTTP daemon（`agent-recall --http`，Bearer + per-session actor；v1.1.5） | 是 | 是（已 smoke 步骤 7） |
+| 全部 24 项 `doctor` 检查 | 是（Node 上 vitest） | Bun 上 smoke（3 + 6） |
+| `AGENT_RECALL_HOME` 环境变量 | 是 | 是 |
+| `AGENT_RECALL_PROFILE` 环境变量 | 是 | 是 |
+| `AGENT_RECALL_HTTP_HOST` / `AGENT_RECALL_HTTP_PORT` 环境变量（v1.1.5） | 是 | 是 |
+| `AGENT_RECALL_HTTP_ALLOWED_ORIGINS` 环境变量（v1.1.5） | 是 | 是 |
+| `AGENT_RECALL_HTTP_VERBOSE` 环境变量（v1.1.5，HTTP 诊断 stderr 日志） | 是 | 是 |
+| `AGENT_RECALL_MCP_TRANSPORT` 环境变量（v1.1.5，`http` 软切换） | 是 | 是 |
+| `AGENT_RECALL_VERBOSE_STDIO` 环境变量（v1.1.4） | 是 | 是 |
 
-## Release channel
+> v1.1.4 起的 MCP 优雅退出（`src/mcp/server-lifecycle.ts`）保证 Bun 二进制在 stdin EOF 或收到终止信号后干净退出，`AGENT_RECALL_VERBOSE_STDIO=1` 时会在 stderr 输出原因行。
+>
+> v1.1.5 的 stdio 空闲退出复用同一 `server-lifecycle` 通道（`AGENT_RECALL_STDIO_IDLE_MS=0` 关闭），HTTP 模式另有 `AGENT_RECALL_HTTP_VERBOSE=1` 门控的 `[mcp-http] …` 诊断行。详见上一节。
 
-Bun binaries are GitHub release artifacts, **not npm
-artifacts**. The npm package continues to ship the Node
-path only. Rationale:
+## 发布渠道
 
-- Keeps the npm package size unchanged.
-- Keeps `package.json` `bin` simple (no platform-matrix
-  postinstall).
-- Decouples Bun-binary publication from the npm publish
-  cadence — Bun binaries can ship ahead of, alongside, or
-  independently of an npm release.
+Bun 二进制是 GitHub Release 产物，**不是** npm 产物。npm 包继续只发 Node 路径。理由：
 
-The release-pipeline that consumes `dist-bin/MANIFEST.json`
-is the subject of the follow-up ADR (`docs/adr/0007-bun-binary-release.md`),
-out of scope for the design and this guide.
+- 保持 npm 包体积不变。
+- 保持 `package.json` `bin` 简单（不需要 platform-matrix postinstall）。
+- 解耦 Bun 二进制发布与 npm publish 节奏——Bun 二进制可以提前于、伴随或独立于 npm 发布。
+
+消费 `dist-bin/MANIFEST.json` 的发布流水线由后续 ADR（`docs/adr/0007-bun-binary-release.md`）规定，不在本文档范围内。

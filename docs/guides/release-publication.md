@@ -1,30 +1,33 @@
-# Release publication
+# 发布流程
 
-## Produce candidate evidence
+> **🌏 语言 / Language**: 中文。English: [`release-publication.en.md`](./release-publication.en.md).  
+> **当前实现版本 / Implementation version**: v1.1.4.
 
-1. Run the release-candidate workflow for the exact candidate SHA.
-2. Each matrix leg records its canonical platform token, actual Vitest JSON totals, job metadata, and artifact hash.
-3. The record-evidence job merges exactly three fragments with `scripts/release-evidence.mjs`.
-4. Run `node scripts/verify-release-evidence.mjs --stable --evidence release-evidence.json`.
+## 产出候选证据
 
-Evidence and all referenced artifact files must remain together while verifying checksums.
+1. 对精确的候选 SHA 跑 release-candidate workflow。
+2. 每个 matrix leg 记录：正式平台 token、实际 Vitest JSON 汇总、job 元数据、产物哈希。
+3. `record-evidence` job 用 `scripts/release-evidence.mjs` 合并**正好三份**片段。
+4. 跑 `node scripts/verify-release-evidence.mjs --stable --evidence release-evidence.json`。
 
-## Prepare a release
+校验 SHA 时，证据与所有被引用的产物文件必须保持在同一目录。
 
-Place the three archives, hash manifest, staging documents, and verified `release-evidence.json` in `ARTIFACT_DIR`. Set `GITHUB_SHA` to the checked-out candidate and run:
+## 准备发布
+
+把三份归档、哈希清单、暂存文档、以及已校验的 `release-evidence.json` 都放进 `ARTIFACT_DIR`。将 `GITHUB_SHA` 设为已 checkout 的候选，然后跑：
 
 ```sh
 DRY_RUN=1 ARTIFACT_DIR=/path/to/artifacts GITHUB_SHA=<40-hex-sha> node scripts/prepare-release.mjs
 ```
 
-Review generated notes before using `DRY_RUN=0`. Preparation fails before tag creation when evidence is absent, the stable verifier rejects it, either recorded SHA differs, or the recorded tag-only workflow is not successful.
+审阅生成的发布说明，确认无误后用 `DRY_RUN=0` 重跑。当证据缺失、稳定校验器拒绝、任一记录的 SHA 不一致、或记录的 tag-only workflow 未成功时，准备动作会在创建 tag 之前失败。
 
-## Publish the tag
+## 发布 Tag
 
-The Release workflow runs only for tags. It downloads evidence from the successful candidate workflow, runs the stable verifier again, and requires both `release_commit` and `candidate_sha` to equal the tag's `head_sha`. Any mismatch blocks packaging.
+Release workflow 仅在 tag 上触发。它从成功的候选 workflow 下载证据，再跑一次稳定校验器，并要求 `release_commit` 与 `candidate_sha` 都等于该 tag 的 `head_sha`。任一不匹配都会阻塞打包。
 
-## Development diagnostics
+## 开发诊断
 
-`--dev` permits `local://` URLs and `totals_from: "constant"` for local fixture work. It still requires canonical platforms, complete artifact coverage, a valid schema, and matching bytes. Development evidence must never be used by preparation or publication.
+`--dev` 允许 `local://` URL 与 `totals_from: "constant"`，便于本地 fixture 工作。它仍然要求正式平台、完整的产物覆盖、合法的 Schema 与字节一致。开发证据**不可**被准备或发布动作使用。
 
-Verifier failures are JSON on stderr. Use the `code` field for automation; the `detail` field is explanatory and may evolve.
+校验器失败时把 JSON 输出到 stderr。脚本化场景使用 `code` 字段；`detail` 字段仅供说明，可能演进。
