@@ -69,7 +69,7 @@ pub enum GraphFilterScope {
     Global,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphFilter {
     #[serde(default)]
     pub scope: GraphFilterScope,
@@ -86,6 +86,28 @@ pub struct GraphFilter {
     pub include_co_topic: bool,
     #[serde(default)]
     pub include_co_scope: bool,
+}
+
+impl Default for GraphFilter {
+    /// v0.1: 必须与每个字段的 `#[serde(default = "...")]` 注解保持一致。
+    ///
+    /// 历史 bug:`#[derive(Default)]` 只对字段类型本身的 `Default` 起作用,
+    /// 会给出 `max_nodes: 0, status: vec![], include_co_topic: false`,
+    /// 落到 `get_graph` 上等同于 `LIMIT 0` 且不生成 co_topic 边。
+    /// 这里手写实现,让 `Default::default()` 与 Serde 反序列化的默认值对齐。
+    fn default() -> Self {
+        Self {
+            scope: GraphFilterScope::default(),
+            project_id: None,
+            topic: None,
+            node_type: None,
+            status: default_status(),
+            min_importance: None,
+            max_nodes: default_max_nodes(),
+            include_co_topic: default_true(),
+            include_co_scope: false,
+        }
+    }
 }
 
 fn default_status() -> Vec<MemoryStatus> {

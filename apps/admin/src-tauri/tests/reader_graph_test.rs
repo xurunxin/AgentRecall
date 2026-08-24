@@ -5,14 +5,11 @@
 //! contract: empty DB, topic pairing, scope filter default, truncation,
 //! status filter, schema version guard, missing file.
 //!
-//! Note: `GraphFilter::default()` uses `#[derive(Default)]` which does
-//! **not** honor the `#[serde(default = "fn")]` annotations on its
-//! fields. The derive gives `max_nodes: 0`, `status: vec![]`, and
-//! `include_co_topic: false`, which makes the literal default filter
-//! useless (it would `LIMIT 0` and skip the topic edges). We use
-//! `test_default_filter()` instead to mirror the production defaults
-//! documented on the type. Tracking the fix is out of scope for the
-//! test task; see the Task 10 report.
+//! Note: `GraphFilter::default()` is hand-written to mirror the per-field
+//! `#[serde(default = "fn")]` annotations. `test_default_filter()` here
+//! exists for historical reasons; with the fix landed, `Default::default()`
+//! is the source of truth and the helper is kept only for readability in
+//! each test case. See the regression test at the bottom of this file.
 
 mod common;
 
@@ -143,4 +140,26 @@ fn nonexistent_db_errors() {
     let db_path = dir.path().join("nope.db");
     let r = SQLiteReader::open(&db_path);
     assert!(r.is_err());
+}
+
+/// Regression test for the `GraphFilter::default()` fix.
+///
+/// `#[derive(Default)]` only invokes each field's own `Default` impl, so it
+/// ignored the `#[serde(default = "fn")]` annotations and produced the
+/// "give me nothing" filter (`max_nodes: 0`, `status: vec![]`,
+/// `include_co_topic: false`). The hand-written `Default` impl must match
+/// the documented production defaults so that `Default::default()` is
+/// usable as a `GraphFilter` value (for tests, internal calls, and any
+/// Tauri command that accepts an omitted filter argument).
+#[test]
+fn graph_filter_default_matches_serde_defaults() {
+    let f = GraphFilter::default();
+    assert_eq!(f.max_nodes, 500, "max_nodes should default to 500");
+    assert_eq!(f.status, vec![MemoryStatus::Active], "status should default to [Active]");
+    assert!(f.include_co_topic, "include_co_topic should default to true");
+    assert!(!f.include_co_scope, "include_co_scope should default to false");
+    assert_eq!(f.project_id, None);
+    assert_eq!(f.topic, None);
+    assert_eq!(f.node_type, None);
+    assert_eq!(f.min_importance, None);
 }
