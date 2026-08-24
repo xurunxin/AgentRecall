@@ -70,4 +70,11 @@ impl SQLiteReader {
     pub fn get_graph(&self, filter: GraphFilter) -> Result<GraphResponse, AppError> {
         get_graph_impl(&self.conn, &filter).map_err(AppError::Sqlite)
     }
+
+    /// 暴露只读 `Connection` 引用,给 Tauri commands(`list_memories` /
+    /// `get_memory` / `get_memory_stats`)用。reader 内部仍以 read-only +
+    /// no-mutex 打开,调用方拿到的也是只读句柄。
+    pub fn conn_ref(&self) -> &Connection {
+        &self.conn
+    }
 }
