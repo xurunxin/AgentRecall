@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod polling;
 pub mod reader;
 
 use reader::SQLiteReader;
@@ -73,6 +74,15 @@ pub fn run() {
                 Ok(r) => *state.reader.lock().unwrap() = Some(r),
                 Err(e) => eprintln!("[admin] failed to open DB at startup: {}", e),
             }
+            // 启动 polling task: 每隔 AGENT_RECALL_POLL_INTERVAL 秒(默认 5s)
+            // 检查 db_path 的 mtime,变化时 emit `db:changed` 事件。
+            let db_path = state.db_path.clone();
+            let app_handle = app.handle().clone();
+            let interval_secs = std::env::var("AGENT_RECALL_POLL_INTERVAL")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5);
+            crate::polling::start(app_handle, db_path, interval_secs);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
