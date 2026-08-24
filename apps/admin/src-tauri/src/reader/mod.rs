@@ -1,6 +1,8 @@
+pub mod graph;
 pub mod schema_version;
 pub mod types;
 
+use crate::reader::graph::get_graph as get_graph_impl;
 use crate::reader::schema_version::check;
 use crate::reader::types::{DbStatus, GraphFilter, GraphResponse};
 use rusqlite::{Connection, OpenFlags};
@@ -64,14 +66,8 @@ impl SQLiteReader {
         })
     }
 
-    /// v0.1: 返回空 graph(具体 SQL 在 Task 9 实现)
-    pub fn get_graph(&self, _filter: GraphFilter) -> Result<GraphResponse, AppError> {
-        Ok(GraphResponse {
-            nodes: vec![],
-            edges: vec![],
-            total: 0,
-            truncated: false,
-            generated_at: chrono::Utc::now(),
-        })
+    /// v0.1: 真实 SQL 实现(详见 `reader::graph::get_graph`)。
+    pub fn get_graph(&self, filter: GraphFilter) -> Result<GraphResponse, AppError> {
+        get_graph_impl(&self.conn, &filter).map_err(AppError::Sqlite)
     }
 }
