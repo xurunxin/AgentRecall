@@ -2,6 +2,7 @@
 // and Task 18 (GraphCanvas + common + legend + poll indicator).
 import { useState } from "react";
 import { useGraph } from "../lib/useGraph.js";
+import { usePolling } from "../lib/usePolling.js";
 import type { GraphFilter } from "@agent-recall/contracts";
 import GraphCanvas from "../components/graph/GraphCanvas.js";
 import FilterBar from "../components/graph/FilterBar.js";
@@ -19,12 +20,13 @@ export default function GraphPage() {
     include_co_scope: false,
   });
   const { data, error, isLoading, refetch } = useGraph(filter);
+  const { status } = usePolling(refetch);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh" }}>
       <div style={{ display: "flex", alignItems: "center", background: "var(--bg-elev)" }}>
         <FilterBar filter={filter} onChange={setFilter} onRefresh={refetch} />
-        <PollIndicator status="idle" />
+        <PollIndicator status={status} />
       </div>
       <EdgeLegend />
       {error && <ErrorBanner error={error} />}
