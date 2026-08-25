@@ -1,4 +1,4 @@
-import { Handle, Position, type NodeProps } from "@xyflow/react";
+import type { NodeProps } from "@xyflow/react";
 import type { GraphNode } from "@agent-recall/contracts";
 
 export interface MemoryNodeData {
@@ -6,15 +6,16 @@ export interface MemoryNodeData {
   onClick?: (id: string) => void;
 }
 
-// Importance (1..5) → visual size scales. These are inline-style based, not
-// React props, per design. Tuple indexed by (importance - 1) keeps the
-// lookup safe even with `noUncheckedIndexedAccess`.
-const SIZE_BY_IMPORTANCE: ReadonlyArray<{ width: number; fontSize: number; padding: number; borderWidth: number }> = [
-  { width: 140, fontSize: 10, padding: 6, borderWidth: 1 }, // 1
-  { width: 160, fontSize: 11, padding: 7, borderWidth: 1.5 }, // 2
-  { width: 180, fontSize: 12, padding: 8, borderWidth: 2 }, // 3
-  { width: 200, fontSize: 13, padding: 9, borderWidth: 2.5 }, // 4
-  { width: 220, fontSize: 14, padding: 10, borderWidth: 3 }, // 5
+// Importance (1..5) → visual size. Tuple indexed by (importance - 1) keeps the
+// lookup safe even with `noUncheckedIndexedAccess`. The same scale is shared
+// with GraphCanvas so dagre lays out nodes using the real per-node size
+// instead of one max-size box.
+const SIZE_BY_IMPORTANCE: ReadonlyArray<{ diameter: number; fontSize: number; borderWidth: number }> = [
+  { diameter: 56, fontSize: 18, borderWidth: 1 }, // 1
+  { diameter: 68, fontSize: 20, borderWidth: 1.5 }, // 2
+  { diameter: 80, fontSize: 24, borderWidth: 2 }, // 3
+  { diameter: 96, fontSize: 28, borderWidth: 2.5 }, // 4
+  { diameter: 112, fontSize: 32, borderWidth: 3 }, // 5
 ];
 
 function sizeForImportance(imp: number) {
@@ -22,74 +23,64 @@ function sizeForImportance(imp: number) {
   return SIZE_BY_IMPORTANCE[clamped - 1]!;
 }
 
+/**
+ * Pick a 1- or 2-character label that fits inside the circle. We use the
+ * first letter of the topic; if the topic is a single character we keep it,
+ * otherwise we fall back to the first two characters. The full topic is
+ * always available via the native `title` attribute on hover.
+ */
+function glyphForTopic(topic: string): string {
+  const trimmed = topic.trim();
+  if (trimmed.length === 0) return "?";
+  return trimmed.length === 1 ? trimmed : trimmed.slice(0, 2);
+}
+
 export default function MemoryNode({ data }: NodeProps) {
   const { node, onClick } = data as unknown as MemoryNodeData;
   const statusColor = `var(--status-${node.status})`;
-  const { width, fontSize, padding, borderWidth } = sizeForImportance(node.importance);
+  const { diameter, fontSize, borderWidth } = sizeForImportance(node.importance);
+  const glyph = glyphForTopic(node.topic);
 
   return (
     <div
       onClick={() => onClick?.(node.id)}
+      title={node.topic}
+      role="button"
+      tabIndex={0}
       style={{
-        width,
-        padding,
-        borderRadius: 6,
+        width: diameter,
+        height: diameter,
+        // 50% keeps the box a true circle (width === height).
+        borderRadius: "50%",
         background: "var(--bg-elev)",
         border: `${borderWidth}px solid ${statusColor}`,
         cursor: "pointer",
+        // Center the glyph both axes; flex is the cheapest cross-browser way
+        // to do it without an extra wrapper.
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        fontWeight: 700,
         fontSize,
+        color: "var(--text)",
         // Subtle hover affordance. xyflow wraps custom nodes in its own
         // container; the transition lives here so it stays scoped.
         transition: "transform 120ms ease, box-shadow 120ms ease",
+        // Topic filter is shown via the title attribute; the only visible
+        // glyph is 1-2 chars, so overflow can't happen.
+        userSelect: "none",
       }}
       onMouseEnter={(e) => {
-        (e.currentTarget as HTMLDivElement).style.transform = "scale(1.02)";
+        (e.currentTarget as HTMLDivElement).style.transform = "scale(1.06)";
         (e.currentTarget as HTMLDivElement).style.boxShadow =
-          "0 2px 8px rgba(0, 0, 0, 0.15)";
+          "0 2px 8px rgba(0, 0, 0, 0.18)";
       }}
       onMouseLeave={(e) => {
         (e.currentTarget as HTMLDivElement).style.transform = "scale(1)";
         (e.currentTarget as HTMLDivElement).style.boxShadow = "none";
       }}
     >
-      <Handle type="target" position={Position.Top} />
-      <div
-        style={{
-          fontWeight: 600,
-          marginBottom: 4,
-          // Truncate very long labels rather than wrap (xyflow nodes are
-          // single-line by default; a multi-line wrap would push the box
-          // taller than the dagre layout budget and overlap neighbors).
-          whiteSpace: "nowrap",
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-        }}
-        title={node.label}
-      >
-        {node.label}
-      </div>
-      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-        <span
-          style={{
-            fontSize: Math.max(9, fontSize - 2),
-            padding: "2px 6px",
-            background: "var(--bg)",
-            borderRadius: 3,
-            color: "var(--text-dim)",
-            maxWidth: width * 0.6,
-            whiteSpace: "nowrap",
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-          }}
-          title={node.topic}
-        >
-          {node.topic}
-        </span>
-        <span style={{ fontSize: Math.max(9, fontSize - 2), color: "var(--text-dim)" }}>
-          ★{node.importance}
-        </span>
-      </div>
-      <Handle type="source" position={Position.Bottom} />
+      {glyph}
     </div>
   );
 }

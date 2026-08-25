@@ -17,10 +17,6 @@ const sampleNode: GraphNode = {
   created_at: "2026-08-24T10:00:00.000Z",
 };
 
-// MemoryNode uses xyflow's <Handle />, which requires a ReactFlowProvider
-// (Handle reads from HandleConfigContext via useHandleConfig; without the
-// provider it throws "useHandleConfig must be used within a
-// HandleConfigProvider"). Render custom nodes inside a provider in tests.
 function renderInFlow(ui: ReactElement): ReturnType<typeof render> {
   return render(<ReactFlowProvider>{ui}</ReactFlowProvider>);
 }
@@ -34,16 +30,32 @@ function nodePropsFor(data: { node: GraphNode; onClick: (id: string) => void }):
 }
 
 describe("MemoryNode", () => {
-  it("renders label and topic", () => {
+  it("renders the topic's first-letter glyph and exposes the topic via title", () => {
     renderInFlow(<MemoryNode {...nodePropsFor({ node: sampleNode, onClick: vi.fn() })} />);
-    expect(screen.getByText("Use JWT for auth")).toBeDefined();
-    expect(screen.getByText("auth")).toBeDefined();
+    // topic = "auth" → first 2 chars rendered as the circle glyph.
+    expect(screen.getByText("au")).toBeDefined();
+    // Full topic is still discoverable via the native title attribute.
+    const node = screen.getByTitle("auth");
+    expect(node).toBeDefined();
   });
 
-  it("calls onClick with node id when clicked", () => {
+  it("calls onClick with node id when the circle is clicked", () => {
     const onClick = vi.fn();
     renderInFlow(<MemoryNode {...nodePropsFor({ node: sampleNode, onClick })} />);
-    fireEvent.click(screen.getByText("Use JWT for auth"));
+    fireEvent.click(screen.getByTitle("auth"));
     expect(onClick).toHaveBeenCalledWith(sampleNode.id);
+  });
+
+  it("uses a single-character glyph for single-letter topics", () => {
+    const singleLetter: GraphNode = { ...sampleNode, topic: "x" };
+    renderInFlow(<MemoryNode {...nodePropsFor({ node: singleLetter, onClick: vi.fn() })} />);
+    expect(screen.getByText("x")).toBeDefined();
+    expect(screen.getByTitle("x")).toBeDefined();
+  });
+
+  it("falls back to a question mark for empty topics", () => {
+    const empty: GraphNode = { ...sampleNode, topic: "" };
+    renderInFlow(<MemoryNode {...nodePropsFor({ node: empty, onClick: vi.fn() })} />);
+    expect(screen.getByText("?")).toBeDefined();
   });
 });
