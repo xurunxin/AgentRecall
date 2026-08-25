@@ -15,6 +15,7 @@ export const cmds = {
   listMemories: (filter: unknown, page: number, pageSize: number) =>
     invoke<unknown>("list_memories", { filter, page, pageSize }),
   getMemory: (id: string) => invoke<unknown>("get_memory", { id }),
+  getMemoryDetail: (id: string) => invoke<unknown>("get_memory", { id }),
   getMemoryStats: () => invoke<unknown>("get_memory_stats"),
   getDbStatus: () => invoke<unknown>("get_db_status"),
   openDb: () => invoke<void>("open_db"),
