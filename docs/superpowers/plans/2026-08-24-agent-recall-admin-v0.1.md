@@ -160,7 +160,7 @@ git -c user.name='Mavis' -c user.email='Mavis@local' commit -m "chore(monorepo):
 - Create: `packages/contracts/src/index.ts`
 
 **Interfaces:**
-- Produces: `import { MemorySchema, Memory, type SourceKind } from "agent-recall:contracts"`
+- Produces: `import { MemorySchema, Memory, type SourceKind } from "@agent-recall/contracts"`
 - 字段集**严格镜像** `src/domain.ts:1-50` 的 `Memory` 类型(commit `a4cde6b`)
 - v0.1 不实现 `GraphNode` / `GraphEdge`,留给 Task 3
 
@@ -168,7 +168,7 @@ git -c user.name='Mavis' -c user.email='Mavis@local' commit -m "chore(monorepo):
 
 ```json
 {
-  "name": "agent-recall:contracts",
+  "name": "@agent-recall/contracts",
   "version": "0.0.1",
   "private": true,
   "type": "module",
@@ -193,7 +193,7 @@ git -c user.name='Mavis' -c user.email='Mavis@local' commit -m "chore(monorepo):
 }
 ```
 
-> **注**:workspace 包的 `name` 用 `"agent-recall:contracts"`(冒号是 npm 允许的非 URL safe 字符,在 workspaces 协议下稳定);后续 task 7 / 11 中 `apps/admin` 引用此包用 `"agent-recall:contracts": "*"`。
+> **注**:workspace 包用 npm 标准 scoped name `"@agent-recall/contracts"`(npm 不允许冒号;scoped 是 monorepo 共享子包的标准做法)。后续 task 7 / 11 中 `apps/admin` 引用此包用 `"@agent-recall/contracts": "*"`。
 
 - [ ] **Step 2: 写 `packages/contracts/tsconfig.json`**
 
@@ -251,7 +251,7 @@ export const MemorySourceSchema = z.object({
 });
 
 export const MemorySchema = z.object({
-  id: z.string().uuid(),
+  id: z.string().min(1),
   scope: z.enum(MEMORY_SCOPES),
   project_id: z.string().nullable(),
   type: z.enum(MEMORY_TYPES),
@@ -263,7 +263,7 @@ export const MemorySchema = z.object({
   confidence: z.number().int().min(1).max(5),
   sensitivity: z.enum(["normal", "private", "restricted"]).default("normal"),
   status: z.enum(MEMORY_STATUSES).default("active"),
-  supersedes: z.array(z.string().uuid()).default([]),
+  supersedes: z.array(z.string().min(1)).default([]),
   source: MemorySourceSchema,
   created_at: z.string().datetime(),
   updated_at: z.string().datetime(),
@@ -306,14 +306,14 @@ cd G:\Projects\MetronX\local-memory-mcp
 npm install
 ```
 
-Expected: 看到 `packages/contracts` 被链接(`ls -la node_modules/agent-recall:contracts` 应指向 `packages/contracts`)。
+Expected: 看到 `packages/contracts` 被链接(`ls -la node_modules/@agent-recall/contracts` 应指向 `packages/contracts`)。
 
 - [ ] **Step 7: 验证 typecheck 通过**
 
 Run:
 ```bash
 cd G:\Projects\MetronX\local-memory-mcp
-npm run typecheck -w agent-recall:contracts
+npm run typecheck -w @agent-recall/contracts
 ```
 
 Expected: 0 errors(脚本 `typecheck` 在 `packages/contracts/package.json` 里定义)。
@@ -337,8 +337,8 @@ git -c user.name='Mavis' -c user.email='Mavis@local' commit -m "feat(contracts):
 
 **Interfaces:**
 - Produces:
-  - `import { GraphNodeSchema, GraphEdgeSchema, GraphFilterSchema, GraphResponseSchema, EdgeKind } from "agent-recall:contracts"`
-  - `import { ErrorCode, ErrorCodeSchema } from "agent-recall:contracts"`
+  - `import { GraphNodeSchema, GraphEdgeSchema, GraphFilterSchema, GraphResponseSchema, EdgeKind } from "@agent-recall/contracts"`
+  - `import { ErrorCode, ErrorCodeSchema } from "@agent-recall/contracts"`
 
 - [ ] **Step 1: 写 `packages/contracts/src/graph.ts`**
 
@@ -350,7 +350,7 @@ export const EDGE_KINDS = ["supersede", "merge", "co_topic", "co_scope"] as cons
 export type EdgeKind = (typeof EDGE_KINDS)[number];
 
 export const GraphNodeSchema = z.object({
-  id: z.string().uuid(),
+  id: z.string().min(1),
   label: z.string(),         // 截断到 ~60 字符的 title
   type: z.enum(MEMORY_TYPES),
   topic: z.string(),
@@ -362,8 +362,8 @@ export const GraphNodeSchema = z.object({
 });
 
 export const GraphEdgeSchema = z.object({
-  source: z.string().uuid(),
-  target: z.string().uuid(),
+  source: z.string().min(1),
+  target: z.string().min(1),
   kind: z.enum(EDGE_KINDS),
   weight: z.number().min(0).max(1),
 });
@@ -446,7 +446,7 @@ export * from "./errors.js";
 Run:
 ```bash
 cd G:\Projects\MetronX\local-memory-mcp
-npm run typecheck -w agent-recall:contracts
+npm run typecheck -w @agent-recall/contracts
 ```
 
 Expected: 0 errors。
@@ -668,7 +668,7 @@ describe("AppErrorSchema", () => {
 Run:
 ```bash
 cd G:\Projects\MetronX\local-memory-mcp
-npm run test -w agent-recall:contracts
+npm run test -w @agent-recall/contracts
 ```
 
 Expected: 所有测试通过,16+ assertions。
@@ -860,7 +860,7 @@ git -c user.name='Mavis' -c user.email='Mavis@local' commit -m "chore(scripts): 
 
 **Interfaces:**
 - Produces: `apps/admin` 前端可以 `npm run dev` 启动 Vite 开发服务器(暂未挂 Tauri,仅 React 渲染)
-- 顶层依赖 workspace 协议引用 `agent-recall:contracts`
+- 顶层依赖 workspace 协议引用 `@agent-recall/contracts`
 
 - [ ] **Step 1: 写 `apps/admin/package.json`**
 
@@ -881,7 +881,7 @@ git -c user.name='Mavis' -c user.email='Mavis@local' commit -m "chore(scripts): 
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
     "@xyflow/react": "^12.0.0",
-    "agent-recall:contracts": "*",
+    "@agent-recall/contracts": "*",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",
     "react-router-dom": "^6.26.0",
@@ -2465,7 +2465,7 @@ git -c user.name='Mavis' -c user.email='Mavis@local' commit -m "test(admin): Tau
 - [ ] **Step 1: 写 `apps/admin/src/lib/errors.ts`**
 
 ```ts
-import type { AppError as ContractAppError, ErrorCode } from "agent-recall:contracts";
+import type { AppError as ContractAppError, ErrorCode } from "@agent-recall/contracts";
 
 export type AppError = ContractAppError;
 
@@ -2533,7 +2533,7 @@ import type {
   GraphFilter as ContractGraphFilter,
   GraphResponse as ContractGraphResponse,
   Memory as ContractMemory,
-} from "agent-recall:contracts";
+} from "@agent-recall/contracts";
 import type { components } from "../bindings/types.js"; // Tauri specta 类型, v0.2 引入
 
 export type GraphFilter = ContractGraphFilter;
@@ -2692,7 +2692,7 @@ git -c user.name='Mavis' -c user.email='Mavis@local' commit -m "feat(admin): use
 ```tsx
 import { useState } from "react";
 import { useGraph } from "../lib/useGraph.js";
-import type { GraphFilter } from "agent-recall:contracts";
+import type { GraphFilter } from "@agent-recall/contracts";
 import GraphCanvas from "../components/graph/GraphCanvas.js";
 import FilterBar from "../components/graph/FilterBar.js";
 import EmptyState from "../components/common/EmptyState.js";
@@ -2782,7 +2782,7 @@ git -c user.name='Mavis' -c user.email='Mavis@local' commit -m "feat(admin): gra
 
 ```tsx
 import { Handle, Position, type NodeProps } from "@xyflow/react";
-import type { GraphNode } from "agent-recall:contracts";
+import type { GraphNode } from "@agent-recall/contracts";
 
 export interface MemoryNodeData {
   node: GraphNode;
@@ -2835,7 +2835,7 @@ export default function MemoryNode({ data }: NodeProps) {
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import MemoryNode from "./MemoryNode.js";
-import type { GraphNode } from "agent-recall:contracts";
+import type { GraphNode } from "@agent-recall/contracts";
 
 const sampleNode: GraphNode = {
   id: "11111111-1111-1111-1111-111111111111",
@@ -2899,7 +2899,7 @@ git -c user.name='Mavis' -c user.email='Mavis@local' commit -m "feat(admin): Mem
 
 ```tsx
 import { useState, useEffect } from "react";
-import type { GraphFilter, MemoryType, MemoryStatus } from "agent-recall:contracts";
+import type { GraphFilter, MemoryType, MemoryStatus } from "@agent-recall/contracts";
 
 interface Props {
   filter: GraphFilter;
@@ -3079,7 +3079,7 @@ git -c user.name='Mavis' -c user.email='Mavis@local' commit -m "feat(admin): Fil
 import { ReactFlow, Background, Controls, type Node, type Edge } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { useMemo } from "react";
-import type { GraphEdge, GraphNode } from "agent-recall:contracts";
+import type { GraphEdge, GraphNode } from "@agent-recall/contracts";
 import MemoryNode from "./MemoryNode.js";
 
 interface Props {
@@ -3156,7 +3156,7 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
 - [ ] **Step 2: 写 `apps/admin/src/components/graph/EdgeLegend.tsx`**
 
 ```tsx
-import type { GraphEdge } from "agent-recall:contracts";
+import type { GraphEdge } from "@agent-recall/contracts";
 
 const items: Array<{ kind: GraphEdge["kind"]; label: string; color: string; dashed: boolean }> = [
   { kind: "supersede", label: "supersede(版本演进)", color: "var(--edge-supersede)", dashed: false },

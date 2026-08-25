@@ -117,7 +117,7 @@ AgentRecall/
   保留所有现有 scripts 不动；`files` 字段保持 `["dist","README.md",
   "LICENSE","CHANGELOG.md"]` 不动（**确保 npm publish 仍只发 dist/**）
 - `packages/contracts` 通过 npm workspaces 协议
-  `"agent-recall:contracts": "*"` 被 `apps/admin` 引用
+  `"@agent-recall/contracts": "*"` 被 `apps/admin` 引用
 - `packages/contracts` 的 schema 与 `src/domain.ts` 手工同步；CI 校验两边
   类型一致
 
@@ -185,7 +185,7 @@ AgentRecall/
 ```ts
 // packages/contracts/src/schema.ts — 镜像 src/domain.ts 的核心形状
 export const MemorySchema = z.object({
-  id: z.string().uuid(),
+  id: z.string().min(1),
   scope: z.enum(['project', 'global']),
   project_id: z.string().nullable(),
   type: z.enum(['preference','procedure','fact','decision','lesson','debugging','constraint']),
@@ -197,7 +197,7 @@ export const MemorySchema = z.object({
   confidence: z.number().int().min(1).max(5),
   sensitivity: z.enum(['normal','private','restricted']).default('normal'),
   status: z.enum(['active','archived','superseded','forgotten']).default('active'),
-  supersedes: z.array(z.string().uuid()).default([]),
+  supersedes: z.array(z.string().min(1)).default([]),
   source: z.object({
     kind: z.enum(['user','agent','tool','file','command','external']),
     ref: z.string().optional(),
@@ -212,7 +212,7 @@ export const EdgeKindSchema = z.enum(['supersede','merge','co_topic','co_scope']
 export type EdgeKind = z.infer<typeof EdgeKindSchema>;
 
 export const GraphNodeSchema = z.object({
-  id: z.string().uuid(),
+  id: z.string().min(1),
   label: z.string(),        // 截断到 ~60 字符
   type: MemorySchema.shape.type,
   topic: z.string(),
@@ -224,8 +224,8 @@ export const GraphNodeSchema = z.object({
 });
 
 export const GraphEdgeSchema = z.object({
-  source: z.string().uuid(),
-  target: z.string().uuid(),
+  source: z.string().min(1),
+  target: z.string().min(1),
   kind: EdgeKindSchema,
   weight: z.number().min(0).max(1),  // co_topic/co_scope 时为共现强度
 });
@@ -449,7 +449,8 @@ tokio::spawn(async {
 
 - [ ] Tauri 启动后能读现有 .db
 - [ ] schema_version 故意改大 → 启动失败,提示明确
-- [ ] 改一条记忆（走 MCP 写）→ 5s 内 graph 自动更新
+- [ ] 改一条记忆(走 MCP 写)→ 5s 内 graph 自动更新
+- **注 3**(2026-08-24 update):本 spec 初版写 `id: z.string().uuid()`,但 `src/domain.ts:182` 实际 ID 格式是 `mem_<24 hex>`(`createMemoryId()` 函数)。已修正为 `z.string().min(1)`,与 `src/domain.ts` 的 `id: string` 类型契约一致。`supersedes` 数组同理。GraphNode/Edge 的 source/target id 同理。
 - [ ] 子进程手动 kill → UI 正确显示 unavailable,点击重试可恢复
 - [ ] 跨平台 smoke：Windows / macOS / Linux 各跑一次
 

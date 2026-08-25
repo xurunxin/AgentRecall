@@ -6,6 +6,36 @@
 
 > **关于历史条目**:v1.1.5 及更早的条目保留英文原文(2026-08 之前没有中文文档约定)。从 v1.1.6 起,新条目用中文记录,英文版在 [CHANGELOG.en.md](./CHANGELOG.en.md) 同步。
 
+> **关于 admin app 的版本**:本文件的主条目(1.1.x)跟踪 `agent-recall` 主体。桌面 GUI `agent-recall-admin` 单独走 0.x 版本线,见下面的 `v0.2` 条目。
+
+## v0.2 (2026-08-25) — admin app:工作栏改版 + 5 种组织模式 + 详情页增强
+
+### 新增
+
+- 工作栏 pill chips + 高级过滤弹层(`+` 按钮展开 importance / max_nodes / topic / type / status / co_topic / co_scope)
+- 5 种节点组织模式(by_topic / by_type / by_scope / by_status / none)+ `OrgModeSwitcher` 切换器(5 选 1)
+- ✨ 一键整理按钮(按当前组织模式重算布局,瞬间切换无动画)
+- 详情页加 body(等宽 + 横向滚动 + 复制)/ tags(pill chips)/ source(折叠 JSON)/ 关联记忆(supersede / superseded_by / merge / co_topic + co_scope 折叠)
+- "在图中定位" / "复制 ID" / "复制全文" 按钮 + 关联记忆跳转(同 drawer 内 swap,不关闭)
+- `packages/contracts/src/memory.ts`:`RelatedNodeSchema` / `MemoryRelationsSchema` / `MemoryDetailSchema`
+
+### 改动
+
+- `GraphFilter` 加 `organization` 字段(后端忽略,纯前端布局开关)
+- `get_memory` 命令响应改 `MemoryDetail`,含 `related: MemoryRelations`
+- 5 个 layout 函数(`layoutNone` / `layoutByTopic` / `layoutByType` / `layoutByScope` / `layoutByStatus`),从 `apps/admin/src/lib/` 抽到 `apps/admin/src/components/graph/layouts/`
+- `FilterBar` 重写为两行布局
+- `GraphCanvas` 接收 `organization` prop,dispatch 到对应 layout
+- `MemoryDrawer` 380 → 460px,加 4 sections
+- 详情页 footer 加 "在图中定位" / "复制 ID" 按钮
+
+### TODO v0.3
+
+- merge 关系持久化(GraphEdge 写库)
+- co_scope 展开后虚拟滚动
+- "在图中定位" 实现 canvas pan + 2s 高亮
+- 整理动画缓动(FLIP / spring)
+
 ## [1.1.6] — 发布门强化:清理 CHANGELOG
 
 ### 新增

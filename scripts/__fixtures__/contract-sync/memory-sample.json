@@ -1,0 +1,18 @@
+{
+  "id": "11111111-1111-1111-1111-111111111111",
+  "scope": "project",
+  "project_id": "demo",
+  "type": "fact",
+  "topic": "demo",
+  "title": "demo title",
+  "body": "demo body",
+  "tags": [],
+  "importance": 3,
+  "confidence": 3,
+  "status": "active",
+  "supersedes": [],
+  "source": { "kind": "user" },
+  "created_at": "2026-08-24T10:00:00.000Z",
+  "updated_at": "2026-08-24T10:00:00.000Z",
+  "revision": 1
+}
