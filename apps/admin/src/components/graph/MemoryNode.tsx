@@ -1,5 +1,5 @@
 import { forwardRef, type CSSProperties } from "react";
-import type { NodeProps } from "@xyflow/react";
+import type { NodeProps } from "reactflow";
 import type { GraphNode } from "@agent-recall/contracts";
 
 export interface MemoryNodeData {
@@ -52,18 +52,18 @@ export function colorForTopic(topic: string): string {
 const CIRCLE_BASE = 42;
 
 /**
- * xyflow v12 passes a `ref` to the custom node component so it can attach
+ * reactflow v11 passes a `ref` to the custom node component so it can attach
  * its own drag/selection handlers. Without `forwardRef`, that ref is dropped
  * and `nodesDraggable` silently does nothing — nodes are still clickable
  * (because onNodeClick uses a different code path) but cannot be dragged.
  *
  * The fix: wrap the component in `forwardRef<HTMLDivElement, NodeProps>` and
  * forward the ref to the outermost wrapper div. The wrapper is the single
- * element that owns the row layout, so attaching the ref there lets xyflow
+ * element that owns the row layout, so attaching the ref there lets reactflow
  * capture pointer events from anywhere on the row.
  *
  * `NodeProps` is used with its default generic (the bare `Node<...>` type)
- * because `nodeTypes` in `@xyflow/react` requires components assignable to
+ * because `nodeTypes` in `reactflow` requires components assignable to
  * `ComponentType<NodeProps & { data: any; type: any }>`. The per-node
  * `data` is widened to `any` in that signature, so we keep the existing
  * `data as unknown as MemoryNodeData` cast inside the body.

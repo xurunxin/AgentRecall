@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type { ReactElement } from "react";
 import { render, screen, fireEvent } from "@testing-library/react";
-import { ReactFlowProvider, type NodeProps } from "@xyflow/react";
+import { ReactFlowProvider, type NodeProps } from "reactflow";
 import MemoryNode, { colorForTopic } from "./MemoryNode.js";
 import type { GraphNode } from "@agent-recall/contracts";
 

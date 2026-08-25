@@ -5,8 +5,8 @@ import {
   MiniMap,
   type Node,
   type Edge,
-} from "@xyflow/react";
-import "@xyflow/react/dist/style.css";
+} from "reactflow";
+import "reactflow/dist/style.css";
 import { useMemo } from "react";
 import dagre from "@dagrejs/dagre";
 import type { GraphEdge, GraphNode } from "@agent-recall/contracts";
@@ -55,9 +55,10 @@ const NODE_HEIGHT = 42;
  * positions populated. Nodes that aren't in the dagre graph (e.g. isolates)
  * keep their previous position.
  *
- * Each box is the uniform 230×48 row; dagre centers each box on its computed
- * anchor, so we subtract width/2 and height/2 to convert to xyflow's
- * top-left position convention.
+ * Each box is the uniform 140×42 row (42px circle + 8px gap + ~90px avg
+ * label); dagre centers each box on its computed anchor, so we subtract
+ * width/2 and height/2 to convert to reactflow's top-left position
+ * convention.
  */
 function layoutWithDagre(
   nodes: Node<{ node: GraphNode }>[],
@@ -67,10 +68,10 @@ function layoutWithDagre(
   g.setDefaultEdgeLabel(() => ({}));
   g.setGraph({
     rankdir: "LR",
-    nodesep: 20,
-    ranksep: 30,
-    marginx: 30,
-    marginy: 30,
+    nodesep: 40,
+    ranksep: 60,
+    marginx: 40,
+    marginy: 40,
   });
 
   nodes.forEach((n) => {
@@ -104,7 +105,7 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
           id: `e-${i}`,
           source: e.source,
           target: e.target,
-          type: "default",
+          type: "straight",
           // zIndex:100 keeps edges above the dot/line background and above
           // xyflow's default node zIndex of 5, so the edge stroke remains
           // visible even where it crosses a node's bounding box. With the
@@ -188,13 +189,13 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
             // faithful thumbnail of the main canvas.
             return topic ? colorForTopic(topic) : "#6b7280";
           }}
-          // xyflow v12 MiniMap ignores `style.backgroundColor` for the empty
-          // area — it uses the dedicated `bgColor` prop instead. The
-          // `maskColor` is the tint laid over the whole minimap; with these
-          // two together, empty space renders as `#1a1a1a` and node pucks
+          // reactflow v11 has no `bgColor` prop — the wrapper background
+          // is driven by the `.react-flow__minimap` CSS rule. We override
+          // it in `theme.css` to `#1a1a1a`. `maskColor` is still the tint
+          // laid over the empty minimap area, so with both layers
+          // combined, empty space renders as `#1a1a1a` and node pucks
           // stand out cleanly.
           maskColor="rgba(0, 0, 0, 0.6)"
-          bgColor="#1a1a1a"
           style={{
             border: "1px solid #2a2a2a",
           }}

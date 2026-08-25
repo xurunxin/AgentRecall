@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
-    "@xyflow/react": "^12.0.0",
+    "reactflow": "^11.11.4",
     "@dagrejs/dagre": "^1.0.0",
     "@agent-recall/contracts": "*",
     "react": "^18.3.0",

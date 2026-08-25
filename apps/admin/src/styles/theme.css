@@ -43,7 +43,7 @@ body {
 
 /* ---------- UX hotfix #5 (Task 29) ---------- */
 
-/* Edge classes applied by GraphCanvas. The class is what xyflow v12 uses
+/* Edge classes applied by GraphCanvas. The class is what reactflow v11 uses
    to route styles onto the SVG path; inline style.zIndex was being applied
    to a different attribute and the path was still under the node div. */
 .primary-edge {
@@ -53,7 +53,15 @@ body {
   stroke-dasharray: 4 4 !important;
 }
 
-/* Dark Controls. xyflow v12 ignores wrapper `style` for the inner buttons,
+/* reactflow v11 has no MiniMap `bgColor` prop — the empty-area background
+   is driven entirely by the `.react-flow__minimap` CSS rule (default
+   `#fff` in `reactflow/dist/style.css`). We override it here so the
+   minimap is dark in dark mode. */
+.react-flow__minimap {
+  background-color: #1a1a1a !important;
+}
+
+/* Dark Controls. reactflow v11 ignores wrapper `style` for the inner buttons,
    so we drive the look entirely through CSS, scoped to a className set on
    <Controls className="dark-controls"> in GraphCanvas.tsx. */
 .dark-controls {
