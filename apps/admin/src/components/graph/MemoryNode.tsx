@@ -6,81 +6,102 @@ export interface MemoryNodeData {
   onClick?: (id: string) => void;
 }
 
-// Importance (1..5) → visual size. Tuple indexed by (importance - 1) keeps the
-// lookup safe even with `noUncheckedIndexedAccess`. The same scale is shared
-// with GraphCanvas so dagre lays out nodes using the real per-node size
-// instead of one max-size box.
-const SIZE_BY_IMPORTANCE: ReadonlyArray<{ diameter: number; fontSize: number; borderWidth: number }> = [
-  { diameter: 56, fontSize: 18, borderWidth: 1 }, // 1
-  { diameter: 68, fontSize: 20, borderWidth: 1.5 }, // 2
-  { diameter: 80, fontSize: 24, borderWidth: 2 }, // 3
-  { diameter: 96, fontSize: 28, borderWidth: 2.5 }, // 4
-  { diameter: 112, fontSize: 32, borderWidth: 3 }, // 5
+// 12-color qualitative palette for the most common topics, chosen to be
+// distinguishable on both light and dark backgrounds. Topics that don't match
+// an entry fall through `colorForTopic` to a hashed palette.
+const TOPIC_PALETTE: Record<string, string> = {
+  auth: "#3b82f6", // blue
+  cache: "#f97316", // orange
+  logging: "#10b981", // green
+  observability: "#a855f7", // purple
+  security: "#ef4444", // red
+  performance: "#eab308", // yellow
+  general: "#06b6d4", // cyan
+};
+
+const FALLBACK_PALETTE = [
+  "#ec4899", // pink
+  "#8b5cf6", // violet
+  "#14b8a6", // teal
+  "#f59e0b", // amber
+  "#0ea5e9", // sky
+  "#84cc16", // lime
 ];
 
-function sizeForImportance(imp: number) {
-  const clamped = Math.max(1, Math.min(5, Math.round(imp)));
-  return SIZE_BY_IMPORTANCE[clamped - 1]!;
-}
-
 /**
- * Pick a 1- or 2-character label that fits inside the circle. We use the
- * first letter of the topic; if the topic is a single character we keep it,
- * otherwise we fall back to the first two characters. The full topic is
- * always available via the native `title` attribute on hover.
+ * Pick a color for a topic. Known topics get a fixed hue so colors stay
+ * stable across sessions; unknown topics get a stable hash-mapped color so
+ * every topic still has *some* visual identity.
  */
-function glyphForTopic(topic: string): string {
-  const trimmed = topic.trim();
-  if (trimmed.length === 0) return "?";
-  return trimmed.length === 1 ? trimmed : trimmed.slice(0, 2);
+export function colorForTopic(topic: string): string {
+  const known = TOPIC_PALETTE[topic];
+  if (known) return known;
+  let h = 0;
+  for (let i = 0; i < topic.length; i++) {
+    h = (h * 31 + topic.charCodeAt(i)) >>> 0;
+  }
+  return FALLBACK_PALETTE[h % FALLBACK_PALETTE.length]!;
 }
 
 export default function MemoryNode({ data }: NodeProps) {
   const { node, onClick } = data as unknown as MemoryNodeData;
-  const statusColor = `var(--status-${node.status})`;
-  const { diameter, fontSize, borderWidth } = sizeForImportance(node.importance);
-  const glyph = glyphForTopic(node.topic);
+  const color = colorForTopic(node.topic);
+  const showGlow = node.importance >= 4;
 
   return (
     <div
       onClick={() => onClick?.(node.id)}
-      title={node.topic}
       role="button"
       tabIndex={0}
+      data-testid={`memory-node-${node.id}`}
+      data-topic={node.topic}
       style={{
-        width: diameter,
-        height: diameter,
-        // 50% keeps the box a true circle (width === height).
-        borderRadius: "50%",
-        background: "var(--bg-elev)",
-        border: `${borderWidth}px solid ${statusColor}`,
-        cursor: "pointer",
-        // Center the glyph both axes; flex is the cheapest cross-browser way
-        // to do it without an extra wrapper.
         display: "flex",
         alignItems: "center",
-        justifyContent: "center",
-        fontWeight: 700,
-        fontSize,
-        color: "var(--text)",
-        // Subtle hover affordance. xyflow wraps custom nodes in its own
-        // container; the transition lives here so it stays scoped.
-        transition: "transform 120ms ease, box-shadow 120ms ease",
-        // Topic filter is shown via the title attribute; the only visible
-        // glyph is 1-2 chars, so overflow can't happen.
+        gap: 8,
+        cursor: "pointer",
         userSelect: "none",
+        transition: "transform 120ms ease",
       }}
       onMouseEnter={(e) => {
-        (e.currentTarget as HTMLDivElement).style.transform = "scale(1.06)";
-        (e.currentTarget as HTMLDivElement).style.boxShadow =
-          "0 2px 8px rgba(0, 0, 0, 0.18)";
+        (e.currentTarget as HTMLDivElement).style.transform = "scale(1.05)";
       }}
       onMouseLeave={(e) => {
         (e.currentTarget as HTMLDivElement).style.transform = "scale(1)";
-        (e.currentTarget as HTMLDivElement).style.boxShadow = "none";
       }}
     >
-      {glyph}
+      {/* Small uniform solid circle on the left; color = topic. */}
+      <div
+        data-testid="memory-node-circle"
+        style={{
+          width: 14,
+          height: 14,
+          borderRadius: "50%",
+          background: color,
+          flexShrink: 0,
+          // Importance 4-5 gets a glow ring to keep high-importance nodes
+          // visually distinguishable without changing their size.
+          boxShadow: showGlow ? `0 0 0 2px ${color}55` : undefined,
+        }}
+      />
+      {/* Label on the right; ellipsis when it overflows 180px. */}
+      <div
+        title={node.label}
+        style={{
+          fontSize: 11,
+          color: "var(--text)",
+          background: "var(--bg-elev)",
+          padding: "2px 6px",
+          borderRadius: 3,
+          maxWidth: 180,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+          border: "1px solid var(--border)",
+        }}
+      >
+        {node.label}
+      </div>
     </div>
   );
 }

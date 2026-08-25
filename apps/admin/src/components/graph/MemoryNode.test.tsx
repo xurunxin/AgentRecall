@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import type { ReactElement } from "react";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { ReactFlowProvider, type NodeProps } from "@xyflow/react";
-import MemoryNode from "./MemoryNode.js";
+import MemoryNode, { colorForTopic } from "./MemoryNode.js";
 import type { GraphNode } from "@agent-recall/contracts";
 
 const sampleNode: GraphNode = {
@@ -30,32 +30,65 @@ function nodePropsFor(data: { node: GraphNode; onClick: (id: string) => void }):
 }
 
 describe("MemoryNode", () => {
-  it("renders the topic's first-letter glyph and exposes the topic via title", () => {
+  it("renders the label as visible text and exposes the full label via the title tooltip", () => {
     renderInFlow(<MemoryNode {...nodePropsFor({ node: sampleNode, onClick: vi.fn() })} />);
-    // topic = "auth" → first 2 chars rendered as the circle glyph.
-    expect(screen.getByText("au")).toBeDefined();
-    // Full topic is still discoverable via the native title attribute.
-    const node = screen.getByTitle("auth");
-    expect(node).toBeDefined();
+    // The label is now the visible text next to the node.
+    expect(screen.getByText("Use JWT for auth")).toBeDefined();
+    // And also reachable via the native title attribute (hover tooltip).
+    expect(screen.getByTitle("Use JWT for auth")).toBeDefined();
   });
 
-  it("calls onClick with node id when the circle is clicked", () => {
+  it("exposes the topic as a data attribute for styling and tests", () => {
+    renderInFlow(<MemoryNode {...nodePropsFor({ node: sampleNode, onClick: vi.fn() })} />);
+    const root = screen.getByTestId(`memory-node-${sampleNode.id}`);
+    expect(root.getAttribute("data-topic")).toBe("auth");
+  });
+
+  it("calls onClick with node id when the row is clicked", () => {
     const onClick = vi.fn();
     renderInFlow(<MemoryNode {...nodePropsFor({ node: sampleNode, onClick })} />);
-    fireEvent.click(screen.getByTitle("auth"));
+    fireEvent.click(screen.getByTestId(`memory-node-${sampleNode.id}`));
     expect(onClick).toHaveBeenCalledWith(sampleNode.id);
   });
 
-  it("uses a single-character glyph for single-letter topics", () => {
-    const singleLetter: GraphNode = { ...sampleNode, topic: "x" };
-    renderInFlow(<MemoryNode {...nodePropsFor({ node: singleLetter, onClick: vi.fn() })} />);
-    expect(screen.getByText("x")).toBeDefined();
-    expect(screen.getByTitle("x")).toBeDefined();
-  });
-
-  it("falls back to a question mark for empty topics", () => {
-    const empty: GraphNode = { ...sampleNode, topic: "" };
-    renderInFlow(<MemoryNode {...nodePropsFor({ node: empty, onClick: vi.fn() })} />);
-    expect(screen.getByText("?")).toBeDefined();
+  it("renders long labels and relies on CSS ellipsis (no crash on overflow)", () => {
+    const long: GraphNode = {
+      ...sampleNode,
+      label: "A very long memory label that would exceed 180px if not for CSS truncation handling",
+    };
+    renderInFlow(<MemoryNode {...nodePropsFor({ node: long, onClick: vi.fn() })} />);
+    // The full text is still in the DOM; the visual crop is done by CSS.
+    expect(screen.getByText(long.label)).toBeDefined();
   });
 });
+
+describe("colorForTopic", () => {
+  it("returns the fixed palette entry for known topics", () => {
+    expect(colorForTopic("auth")).toBe("#3b82f6");
+    expect(colorForTopic("cache")).toBe("#f97316");
+    expect(colorForTopic("logging")).toBe("#10b981");
+  });
+
+  it("returns a stable color from the fallback palette for unknown topics", () => {
+    const a = colorForTopic("custom-topic-1");
+    const b = colorForTopic("custom-topic-1");
+    const c = colorForTopic("custom-topic-2");
+    expect(a).toBe(b);
+    // Different topics usually land on different fallback hues; if by
+    // chance they collide, just assert the result is one of the known
+    // fallback colors.
+    expect(FALLBACK_COLORS).toContain(a);
+    expect(FALLBACK_COLORS).toContain(c);
+  });
+});
+
+// Mirror the FALLBACK_PALETTE from MemoryNode.tsx so the test can assert
+// membership without importing the private constant.
+const FALLBACK_COLORS = [
+  "#ec4899",
+  "#8b5cf6",
+  "#14b8a6",
+  "#f59e0b",
+  "#0ea5e9",
+  "#84cc16",
+];
