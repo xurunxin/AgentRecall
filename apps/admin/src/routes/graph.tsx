@@ -4,9 +4,11 @@
 // drawer survives GraphCanvas re-renders from polling.
 // Task 10 (v0.2): FilterBar v0.2 owns OrgModeSwitcher + OrganizeButton + refresh
 // in its second row. We pass `organization` (lifted from the filter for layout)
-// and a top-level organize handler that mirrors the one inside GraphCanvas so
-// the FilterBar trigger is wired even when the canvas's own button is hidden.
-import { useCallback, useState } from "react";
+// and a top-level organize handler.
+// Task 11 (v0.2): `handleOrganize` actually re-layouts by bumping `organizeTick`
+// and remounting GraphCanvas via `key={organizeTick}`; `useEffect` listens for
+// the `locate-node` / `jump-to-node` window events that MemoryDrawer dispatches.
+import { useCallback, useEffect, useState } from "react";
 import { useGraph } from "../lib/useGraph.js";
 import { usePolling } from "../lib/usePolling.js";
 import type { GraphFilter, GraphNode, OrgMode } from "@agent-recall/contracts";
@@ -28,18 +30,43 @@ export default function GraphPage() {
     organization: "none",
   });
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
+  // Bumped by handleOrganize; used as the key for <GraphCanvas> so React
+  // remounts the canvas, which re-runs the useMemo for the layout and resets
+  // any user-dragged positions. The route-level busy flag gives the button
+  // its spinner.
+  const [organizeTick, setOrganizeTick] = useState(0);
+  const [organizeBusy, setOrganizeBusy] = useState(false);
   const { data, error, isLoading, refetch } = useGraph(filter);
   const { status } = usePolling(refetch);
 
-  // FilterBar's OrganizeButton (Task 10 v0.2) lives at the route level so the
-  // canvas re-mount or polling doesn't disconnect the busy indicator. The
-  // actual re-layout happens inside GraphCanvas via the `organization` prop —
-  // toggling the busy flag here gives the button its spinner while the
-  // canvas re-runs the layout on the next render.
-  const [organizeBusy, setOrganizeBusy] = useState(false);
+  // 监听 MemoryDrawer 派发的 window event
+  useEffect(() => {
+    const onLocate = (_e: Event) => {
+      // v0.2 简化:只关 drawer,canvas pan/高亮留 v0.3
+      setSelectedNode(null);
+    };
+    const onJump = (e: Event) => {
+      const id = (e as CustomEvent).detail?.id as string | undefined;
+      if (!id || !data) return;
+      const node = data.nodes.find((n) => n.id === id);
+      if (node) setSelectedNode(node);
+    };
+    window.addEventListener("locate-node", onLocate);
+    window.addEventListener("jump-to-node", onJump);
+    return () => {
+      window.removeEventListener("locate-node", onLocate);
+      window.removeEventListener("jump-to-node", onJump);
+    };
+  }, [data]);
+
   const handleOrganize = useCallback(() => {
     setOrganizeBusy(true);
+    setOrganizeTick((t) => t + 1);
     setTimeout(() => setOrganizeBusy(false), 200);
+  }, []);
+
+  const handleOrganizationChange = useCallback((m: OrgMode) => {
+    setFilter((prev) => ({ ...prev, organization: m }));
   }, []);
 
   return (
@@ -49,8 +76,8 @@ export default function GraphPage() {
           filter={filter}
           onChange={setFilter}
           onRefresh={refetch}
-          organization={filter.organization as OrgMode}
-          onOrganizationChange={(m) => setFilter({ ...filter, organization: m })}
+          organization={filter.organization ?? "none"}
+          onOrganizationChange={handleOrganizationChange}
           onOrganize={handleOrganize}
           organizeBusy={organizeBusy}
         />
@@ -64,11 +91,12 @@ export default function GraphPage() {
       )}
       {data && data.nodes.length > 0 && (
         <GraphCanvas
+          key={organizeTick}
           nodes={data.nodes}
           edges={data.edges}
           truncated={data.truncated}
           total={data.total}
-          organization={filter.organization}
+          organization={filter.organization ?? "none"}
           onNodeClick={setSelectedNode}
         />
       )}

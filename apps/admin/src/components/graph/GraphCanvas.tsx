@@ -31,7 +31,6 @@ import type { GraphEdge, GraphNode, OrgMode } from "@agent-recall/contracts";
 import MemoryNode from "./MemoryNode.js";
 import Controls from "./Controls.js";
 import MiniMap from "./MiniMap.js";
-import { OrganizeButton } from "./OrganizeButton.js";
 import { layoutNone } from "./layouts/layoutNone.js";
 import { layoutByTopic } from "./layouts/layoutByTopic.js";
 import { layoutByType } from "./layouts/layoutByType.js";
@@ -140,9 +139,6 @@ export default function GraphCanvas({ nodes, edges, truncated, total, organizati
   const [panDrag, setPanDrag] = useState<
     { startScreenX: number; startScreenY: number; startPanX: number; startPanY: number } | null
   >(null);
-
-  // Whether the OrganizeButton is mid-spin (prevents rapid re-clicks).
-  const [organizeBusy, setOrganizeBusy] = useState(false);
 
   // Dispatch table: pick the layout fn for the current organization mode.
   // All 5 layout functions share the same `(nodes, edges) => Record<id, Position>`
@@ -353,22 +349,6 @@ export default function GraphCanvas({ nodes, edges, truncated, total, organizati
     });
   }, [bounds]);
 
-  // Re-run the current organization mode's layout and replace any user-dragged
-  // positions with the fresh layout. Bumps positionsTick to trigger a re-render
-  // so the new positions are visible. Sets organizeBusy for 200ms so the
-  // button's spinner shows and rapid re-clicks are suppressed.
-  const handleOrganize = useCallback(() => {
-    setOrganizeBusy(true);
-    const fresh = LAYOUTS[organization](nodes, edges);
-    const next = new Map<string, Position>();
-    for (const n of nodes) {
-      next.set(n.id, fresh[n.id] ?? baseLayout[n.id] ?? { x: 0, y: 0 });
-    }
-    positionsRef.current = next;
-    setPositionsTick((t) => t + 1);
-    setTimeout(() => setOrganizeBusy(false), 200);
-  }, [organization, nodes, edges, baseLayout]);
-
   // Build the dashed/dotted background grid pattern as a single SVG. We use
   // a <pattern> with a single dot per cell; the pattern is then painted as
   // the fill of a rect that covers the entire SVG area. This is the same
@@ -400,10 +380,11 @@ export default function GraphCanvas({ nodes, edges, truncated, total, organizati
         节点 {nodes.length} / {total}
         {truncated && " (已截断)"} · 边 {edges.length}
       </div>
-      {/* Top-right cluster: OrganizeButton + zoom indicator. The outer
+      {/* Top-right cluster: zoom indicator only. The OrganizeButton lives in
+          FilterBar (the canonical home, grouped with OrgModeSwitcher). The
           container has pointer-events: none so empty space lets the canvas
-          pan through, but the button and zoom pill each re-enable
-          pointer-events: auto so they're individually clickable/hoverable. */}
+          pan through; the zoom pill re-enables pointer-events: auto so it's
+          individually hoverable. */}
       <div
         style={{
           position: "absolute",
@@ -416,9 +397,6 @@ export default function GraphCanvas({ nodes, edges, truncated, total, organizati
           pointerEvents: "none",
         }}
       >
-        <div style={{ pointerEvents: "auto" }}>
-          <OrganizeButton onOrganize={handleOrganize} busy={organizeBusy} />
-        </div>
         <div
           style={{
             padding: "4px 8px",
