@@ -58,6 +58,14 @@ describe("GraphFilterSchema", () => {
   it("rejects max_nodes > 2000", () => {
     expect(GraphFilterSchema.safeParse({ max_nodes: 5000 }).success).toBe(false);
   });
+
+  it("defaults organization to 'none' and accepts all 5 modes", () => {
+    expect(GraphFilterSchema.parse({}).organization).toBe("none");
+    for (const m of ["none", "by_topic", "by_type", "by_scope", "by_status"]) {
+      expect(GraphFilterSchema.parse({ organization: m }).organization).toBe(m);
+    }
+    expect(GraphFilterSchema.safeParse({ organization: "by_zzz" }).success).toBe(false);
+  });
 });
 
 describe("GraphResponseSchema", () => {

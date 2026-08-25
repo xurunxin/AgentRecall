@@ -4,6 +4,9 @@ import { MEMORY_TYPES, MEMORY_STATUSES, MEMORY_SCOPES } from "./schema.js";
 export const EDGE_KINDS = ["supersede", "merge", "co_topic", "co_scope"] as const;
 export type EdgeKind = (typeof EDGE_KINDS)[number];
 
+export const ORG_MODES = ["none", "by_topic", "by_type", "by_scope", "by_status"] as const;
+export type OrgMode = (typeof ORG_MODES)[number];
+
 export const GraphNodeSchema = z.object({
   id: z.string().min(1),
   label: z.string(),         // 截断到 ~60 字符的 title
@@ -33,6 +36,7 @@ export const GraphFilterSchema = z.object({
   max_nodes: z.number().int().min(1).max(2000).default(500),
   include_co_topic: z.boolean().default(true),
   include_co_scope: z.boolean().default(false),
+  organization: z.enum(ORG_MODES).default("none"),
 });
 
 export const GraphResponseSchema = z.object({
