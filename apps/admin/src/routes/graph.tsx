@@ -21,6 +21,7 @@ export default function GraphPage() {
     max_nodes: 500,
     include_co_topic: true,
     include_co_scope: false,
+    organization: "none",
   });
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const { data, error, isLoading, refetch } = useGraph(filter);
