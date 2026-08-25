@@ -45,6 +45,7 @@ export default function GraphPage() {
           edges={data.edges}
           truncated={data.truncated}
           total={data.total}
+          organization={filter.organization}
           onNodeClick={setSelectedNode}
         />
       )}

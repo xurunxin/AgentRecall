@@ -27,17 +27,24 @@
 //   - Controls (zoom in/out, fit, reset) — bottom-left.
 //   - MiniMap (read-only overview) — bottom-right.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { GraphEdge, GraphNode } from "@agent-recall/contracts";
+import type { GraphEdge, GraphNode, OrgMode } from "@agent-recall/contracts";
 import MemoryNode from "./MemoryNode.js";
 import Controls from "./Controls.js";
 import MiniMap from "./MiniMap.js";
+import { OrganizeButton } from "./OrganizeButton.js";
 import { layoutNone } from "./layouts/layoutNone.js";
+import { layoutByTopic } from "./layouts/layoutByTopic.js";
+import { layoutByType } from "./layouts/layoutByType.js";
+import { layoutByScope } from "./layouts/layoutByScope.js";
+import { layoutByStatus } from "./layouts/layoutByStatus.js";
 
 interface Props {
   nodes: GraphNode[];
   edges: GraphEdge[];
   truncated: boolean;
   total: number;
+  /** How to organize nodes (layout selection). Required — caller must pass. */
+  organization: OrgMode;
   /** Click on a node. Receives the underlying GraphNode. */
   onNodeClick?: (node: GraphNode) => void;
 }
@@ -76,6 +83,7 @@ const CIRCLE_WIDTH = 42;
 
 type Position = { x: number; y: number };
 type Bounds = { minX: number; minY: number; maxX: number; maxY: number };
+type LayoutFn = (nodes: GraphNode[], edges: GraphEdge[]) => Record<string, Position>;
 
 function computeBounds(positions: Map<string, Position>): Bounds {
   let minX = Infinity;
@@ -109,7 +117,7 @@ interface DragState {
 
 const CLICK_THRESHOLD_PX = 5;
 
-export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClick }: Props) {
+export default function GraphCanvas({ nodes, edges, truncated, total, organization, onNodeClick }: Props) {
   // Container ref used by fit-to-view to read the visible viewport size.
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -133,10 +141,27 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
     { startScreenX: number; startScreenY: number; startPanX: number; startPanY: number } | null
   >(null);
 
-  // Recompute dagre layout whenever the upstream node/edge set changes
-  // (new server response, filter change). Memoized on identity so we don't
-  // recompute on every render.
-  const baseLayout = useMemo(() => layoutNone(nodes, edges), [nodes, edges]);
+  // Whether the OrganizeButton is mid-spin (prevents rapid re-clicks).
+  const [organizeBusy, setOrganizeBusy] = useState(false);
+
+  // Dispatch table: pick the layout fn for the current organization mode.
+  // All 5 layout functions share the same `(nodes, edges) => Record<id, Position>`
+  // signature, so we can swap them by key without conditional branches in JSX.
+  const LAYOUTS: Record<OrgMode, LayoutFn> = {
+    none: layoutNone,
+    by_topic: layoutByTopic,
+    by_type: layoutByType,
+    by_scope: layoutByScope,
+    by_status: layoutByStatus,
+  };
+
+  // Recompute the base layout whenever the upstream node/edge set or the
+  // organization mode changes (new server response, filter swap, mode switch).
+  // Memoized on identity so we don't recompute on every render.
+  const baseLayout = useMemo(
+    () => LAYOUTS[organization](nodes, edges),
+    [nodes, edges, organization]
+  );
 
   // Reset the user-drag map when the node identity set changes materially
   // (e.g. filter swap). If a node from the new set was previously dragged,
@@ -328,6 +353,22 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
     });
   }, [bounds]);
 
+  // Re-run the current organization mode's layout and replace any user-dragged
+  // positions with the fresh layout. Bumps positionsTick to trigger a re-render
+  // so the new positions are visible. Sets organizeBusy for 200ms so the
+  // button's spinner shows and rapid re-clicks are suppressed.
+  const handleOrganize = useCallback(() => {
+    setOrganizeBusy(true);
+    const fresh = LAYOUTS[organization](nodes, edges);
+    const next = new Map<string, Position>();
+    for (const n of nodes) {
+      next.set(n.id, fresh[n.id] ?? baseLayout[n.id] ?? { x: 0, y: 0 });
+    }
+    positionsRef.current = next;
+    setPositionsTick((t) => t + 1);
+    setTimeout(() => setOrganizeBusy(false), 200);
+  }, [organization, nodes, edges, baseLayout]);
+
   // Build the dashed/dotted background grid pattern as a single SVG. We use
   // a <pattern> with a single dot per cell; the pattern is then painted as
   // the fill of a rect that covers the entire SVG area. This is the same
@@ -359,23 +400,38 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
         节点 {nodes.length} / {total}
         {truncated && " (已截断)"} · 边 {edges.length}
       </div>
-      {/* Top-right zoom indicator. */}
+      {/* Top-right cluster: OrganizeButton + zoom indicator. The outer
+          container has pointer-events: none so empty space lets the canvas
+          pan through, but the button and zoom pill each re-enable
+          pointer-events: auto so they're individually clickable/hoverable. */}
       <div
         style={{
           position: "absolute",
           top: 8,
           right: 8,
           zIndex: 10,
-          padding: "4px 8px",
-          background: "var(--bg-elev)",
-          border: "1px solid var(--border)",
-          borderRadius: 4,
-          fontSize: 12,
-          fontFamily: "monospace",
+          display: "flex",
+          alignItems: "center",
+          gap: 8,
           pointerEvents: "none",
         }}
       >
-        zoom {(zoom * 100).toFixed(0)}%
+        <div style={{ pointerEvents: "auto" }}>
+          <OrganizeButton onOrganize={handleOrganize} busy={organizeBusy} />
+        </div>
+        <div
+          style={{
+            padding: "4px 8px",
+            background: "var(--bg-elev)",
+            border: "1px solid var(--border)",
+            borderRadius: 4,
+            fontSize: 12,
+            fontFamily: "monospace",
+            pointerEvents: "auto",
+          }}
+        >
+          zoom {(zoom * 100).toFixed(0)}%
+        </div>
       </div>
       {/* Canvas (listens for pan-start, wheel for zoom). */}
       <div
