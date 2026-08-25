@@ -19,10 +19,19 @@
 // The inner `<div>` applies `transform: translate(panX, panY) scale(zoom)`, so
 // `mousemove` deltas need to be divided by `zoom` to convert from screen
 // pixels to graph units.
+//
+// Components owned by this file:
+//   - Background grid (inside the transformed layer, pans/zooms with graph).
+//   - Edges (inline SVG, sized to graph extents + padding so lines never clip).
+//   - Nodes (absolute-positioned divs wrapping <MemoryNode />).
+//   - Controls (zoom in/out, fit, reset) — bottom-left.
+//   - MiniMap (read-only overview) — bottom-right.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dagre from "@dagrejs/dagre";
 import type { GraphEdge, GraphNode } from "@agent-recall/contracts";
 import MemoryNode from "./MemoryNode.js";
+import Controls from "./Controls.js";
+import MiniMap from "./MiniMap.js";
 
 interface Props {
   nodes: GraphNode[];
@@ -33,9 +42,8 @@ interface Props {
   onNodeClick?: (node: GraphNode) => void;
 }
 
-// Hex values for edges. SVG `stroke` does not resolve CSS vars, so we keep
-// these in sync with `--edge-*` in `theme.css`. (When we removed reactflow
-// the same color-mapping comment moved here.)
+// Hex values for edges. SVG `stroke` does not resolve CSS vars reliably across
+// WebView2 builds, so we keep these in sync with `--edge-*` in `theme.css`.
 const edgeKindColor: Record<GraphEdge["kind"], string> = {
   supersede: "#2563eb", // blue
   merge: "#7c3aed", // purple
@@ -50,12 +58,22 @@ const edgeKindDash: Record<GraphEdge["kind"], string | undefined> = {
   co_scope: "4 4",
 };
 
+// Background grid cell size (graph space). 20px keeps the grid visible at the
+// default zoom and doesn't get too sparse when the user zooms out.
+const GRID_SIZE = 20;
+
+// Padding around the bounding box of all node positions, in graph space.
+// The edge SVG is sized to (bounds + padding) so endpoints near the edge of
+// the canvas never get clipped.
+const EDGE_PADDING = 100;
+
 // dagre box matches the visible node footprint so edge endpoints land on the
 // actual circle boundary. 42px circle + 8px gap + ~90px avg label = 140.
 const NODE_WIDTH = 42 + 8 + 90; // 140
 const NODE_HEIGHT = 42;
 
 type Position = { x: number; y: number };
+type Bounds = { minX: number; minY: number; maxX: number; maxY: number };
 
 /**
  * Run dagre layout over the given nodes. Returns a map of nodeId → position
@@ -110,6 +128,24 @@ function layoutWithDagre(
   return out;
 }
 
+function computeBounds(positions: Map<string, Position>): Bounds {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const { x, y } of positions.values()) {
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+  }
+  if (!Number.isFinite(minX)) {
+    // Empty graph: a default 200×200 box so the SVG still has positive size.
+    return { minX: 0, minY: 0, maxX: 200, maxY: 200 };
+  }
+  return { minX, minY, maxX, maxY };
+}
+
 interface DragState {
   nodeId: string;
   /** Screen-space mouse position at drag start. */
@@ -125,6 +161,9 @@ interface DragState {
 const CLICK_THRESHOLD_PX = 5;
 
 export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClick }: Props) {
+  // Container ref used by fit-to-view to read the visible viewport size.
+  const containerRef = useRef<HTMLDivElement>(null);
+
   // Persisted drag positions survive polling re-renders. The ref lets us
   // reach the latest positions inside mousemove without re-binding the
   // global listener on every move.
@@ -155,7 +194,6 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
   // keep its position; otherwise adopt the dagre default.
   useEffect(() => {
     const next = new Map<string, Position>();
-    baseLayout; // referenced to keep lint happy; the next loop does the work
     for (const n of nodes) {
       const prev = positionsRef.current.get(n.id);
       next.set(n.id, prev ?? baseLayout[n.id] ?? { x: 0, y: 0 });
@@ -176,6 +214,24 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
     },
     [baseLayout]
   );
+
+  // Bounding box of every current node. Memoized on positionsTick so it
+  // recomputes when the user drags, but stays stable between drag events.
+  const bounds = useMemo(() => computeBounds(positionsRef.current), [
+    positionsTick,
+    // Recompute when the node set itself changes too.
+    nodes,
+  ]);
+
+  // SVG size in graph space: bounds + padding. The SVG sits at (0, 0) of
+  // the inner transformed div, so lines at absolute graph coordinates
+  // (e.g. x1=200) are drawn at (200, 200) of the SVG, which corresponds
+  // to (200, 200) in the inner div. As long as the SVG is large enough to
+  // contain every line endpoint, the lines render.
+  const svgWidth = Math.max(200, bounds.maxX - bounds.minX + 2 * EDGE_PADDING);
+  const svgHeight = Math.max(200, bounds.maxY - bounds.minY + 2 * EDGE_PADDING);
+  const svgLeft = bounds.minX - EDGE_PADDING;
+  const svgTop = bounds.minY - EDGE_PADDING;
 
   // Global mousemove / mouseup listeners for the active drag (node OR pan).
   // Using a single useEffect with both states means only one set of
@@ -227,16 +283,13 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
 
   // Wheel zoom. Bound to the container (not window) so scrolling the page
   // itself still works.
-  const handleWheel = useCallback(
-    (e: React.WheelEvent<HTMLDivElement>) => {
-      e.preventDefault();
-      setZoom((z) => {
-        const next = e.deltaY > 0 ? z * 0.9 : z * 1.1;
-        return Math.max(0.2, Math.min(3, next));
-      });
-    },
-    []
-  );
+  const handleWheel = useCallback((e: React.WheelEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setZoom((z) => {
+      const next = e.deltaY > 0 ? z * 0.9 : z * 1.1;
+      return Math.max(0.2, Math.min(3, next));
+    });
+  }, []);
 
   // Canvas mousedown starts a pan (when the user clicks empty space).
   const handleCanvasMouseDown = useCallback(
@@ -272,17 +325,59 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
     [getPosition]
   );
 
-  // Compute the SVG viewBox so the canvas can host a 1:1 background grid if
-  // we ever add one. For now we just compute extents for edge rendering.
-  // Edges are absolute-positioned SVG inside the transformed div, so they
-  // automatically share the same pan/zoom.
-  // The position read is via `getPosition` so a positionsTick bump causes
-  // re-render. (positionsTick not used directly here, but reading via the
-  // ref keeps the closure fresh enough; React re-renders on tick anyway.)
-  void positionsTick;
+  // Control button handlers.
+  const handleZoomIn = useCallback(() => {
+    setZoom((z) => Math.min(3, z * 1.2));
+  }, []);
+
+  const handleZoomOut = useCallback(() => {
+    setZoom((z) => Math.max(0.2, z / 1.2));
+  }, []);
+
+  const handleReset = useCallback(() => {
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+  }, []);
+
+  // Fit the entire graph into the visible viewport with a small margin.
+  // Reads the container's current clientWidth/clientHeight at call time.
+  const handleFit = useCallback(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const w = el.clientWidth;
+    const h = el.clientHeight;
+    if (w <= 0 || h <= 0) return;
+    const bw = Math.max(1, bounds.maxX - bounds.minX);
+    const bh = Math.max(1, bounds.maxY - bounds.minY);
+    const margin = 40;
+    const fitZoom = Math.max(
+      0.2,
+      Math.min(3, Math.min((w - 2 * margin) / bw, (h - 2 * margin) / bh))
+    );
+    setZoom(fitZoom);
+    // Center the bounds within the viewport at that zoom.
+    const cx = bounds.minX + bw / 2;
+    const cy = bounds.minY + bh / 2;
+    setPan({
+      x: w / 2 - cx * fitZoom,
+      y: h / 2 - cy * fitZoom,
+    });
+  }, [bounds]);
+
+  // Build the dashed/dotted background grid pattern as a single SVG. We use
+  // a <pattern> with a single dot per cell; the pattern is then painted as
+  // the fill of a rect that covers the entire SVG area. This is the same
+  // approach xyflow's <Background> uses, and is GPU-cheap because the
+  // pattern tile is small.
+  // The grid pans/zooms with the parent transform, no extra work.
+  const gridPatternId = "graph-grid-pattern";
 
   return (
-    <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
+    <div
+      ref={containerRef}
+      style={{ flex: 1, position: "relative", overflow: "hidden" }}
+    >
+      {/* Top-left counter. */}
       <div
         style={{
           position: "absolute",
@@ -300,6 +395,7 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
         节点 {nodes.length} / {total}
         {truncated && " (已截断)"} · 边 {edges.length}
       </div>
+      {/* Top-right zoom indicator. */}
       <div
         style={{
           position: "absolute",
@@ -343,17 +439,60 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
             // circles stay crisp on top.
           }}
         >
-          {/* Edges (SVG under nodes). */}
+          {/* Background grid (single SVG, painted with a tile pattern).
+              We position the SVG at the bounds top-left + padding so its
+              local (0,0) is at graph (svgLeft, svgTop). The rect is then
+              drawn at (0,0) within the SVG. This keeps the pattern's
+              userSpaceOnUse tile aligned to graph space (20px per cell),
+              and gives the SVG a real positive size so the pattern actually
+              paints (a 0x0 SVG silently drops children — the bug we hit
+              on the edge layer before the rewrite). */}
           <svg
             style={{
               position: "absolute",
-              left: 0,
-              top: 0,
+              left: svgLeft,
+              top: svgTop,
               overflow: "visible",
               pointerEvents: "none",
+              zIndex: 0,
             }}
-            width="0"
-            height="0"
+            width={svgWidth}
+            height={svgHeight}
+          >
+            <defs>
+              <pattern
+                id={gridPatternId}
+                width={GRID_SIZE}
+                height={GRID_SIZE}
+                patternUnits="userSpaceOnUse"
+              >
+                <circle cx={1} cy={1} r={1} fill="var(--border)" />
+              </pattern>
+            </defs>
+            <rect
+              x={0}
+              y={0}
+              width={svgWidth}
+              height={svgHeight}
+              fill={`url(#${gridPatternId})`}
+            />
+          </svg>
+          {/* Edges (SVG under nodes). Same position+size as the grid SVG,
+              so a line at graph (src.x, src.y) maps to SVG-local
+              (src.x - svgLeft, src.y - svgTop). The SVG has a real
+              positive size, and any line outside the viewport still
+              renders thanks to overflow: visible. */}
+          <svg
+            style={{
+              position: "absolute",
+              left: svgLeft,
+              top: svgTop,
+              overflow: "visible",
+              pointerEvents: "none",
+              zIndex: 0,
+            }}
+            width={svgWidth}
+            height={svgHeight}
           >
             {edges.map((e, i) => {
               const src = positionsRef.current.get(e.source);
@@ -363,10 +502,10 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
               return (
                 <line
                   key={`e-${i}`}
-                  x1={src.x}
-                  y1={src.y}
-                  x2={tgt.x}
-                  y2={tgt.y}
+                  x1={src.x - svgLeft}
+                  y1={src.y - svgTop}
+                  x2={tgt.x - svgLeft}
+                  y2={tgt.y - svgTop}
                   stroke={edgeKindColor[e.kind]}
                   strokeWidth={isAmbient ? 1 : 1.5}
                   strokeDasharray={edgeKindDash[e.kind]}
@@ -398,6 +537,15 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
           })}
         </div>
       </div>
+      {/* Floating UI (sits above the canvas, doesn't move with pan/zoom). */}
+      <Controls
+        zoom={zoom}
+        onZoomIn={handleZoomIn}
+        onZoomOut={handleZoomOut}
+        onFit={handleFit}
+        onReset={handleReset}
+      />
+      <MiniMap nodes={nodes} edges={edges} positions={positionsRef.current} />
     </div>
   );
 }
