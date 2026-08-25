@@ -36,6 +36,48 @@
 - "在图中定位" 实现 canvas pan + 2s 高亮
 - 整理动画缓动(FLIP / spring)
 
+## [1.2.0-alpha.1] — Session 证据层(#49)+ 资产注册表(#51,Phase 1)
+
+> Phase 1 并行两个工作流的合并 PR。Session 证据层把"捕获 + 证据 + 持久化"这条链路立起来,资产注册表给出 typed envelope(#51 暂只 ship `memory_ref` 类型;`skill` / `context_pack` / `external_reference` 类型特定表随 Phase 2 各自的 issue 落地 #53 / #54)。所有现有 API 保持兼容,没有破坏性改动。
+
+### 新增
+
+- **Schema v15** — `sessions` / `session_events` / `session_event_blobs` 三张 additive 表(issue #49);UNIQUE `(source_kind, source_version, source_instance_id, source_session_id)` 是 replay 契约;3 个索引;body 用内容地址化 (head/tail 1KB 入 row,full body 由 `content_digest` 寻址)。
+- **Schema v16** — `assets` / `asset_versions` / `asset_relations` 三张 envelope 表 + 唯一 v16-shipped 的 `memory_ref_bindings` 类型特定表(issue #51);CAS append on `current_version` 保证并发 append 安全;`archived` 是单向转换(`asset_already_terminal` 拒绝 un-archive)。
+- **`SessionService.ingest`** — replay-safe:同 source-identity + 同 `bundle_hash` 返回原 `session_id`;异 `bundle_hash` 抛 `bundle_hash_drift`。计划计数 (accepted / redacted / skipped / rejected) 在写 row 前由纯 walk 决定;secret scan + `risk_injection` tag + per-event (256KB) / per-session (8MB) 大小上限(超过则 head/tail 截断,原 body digest 保留)。
+- **`JsonlSessionAdapter`** — v1 参考实现:line 1 是 bundle header (events: []),后续每行一个 `SessionTraceEventV1`;zod 校验走共享 `@agent-recall/contracts` schema。
+- **`AssetService`** — `createMemoryRef` (CAS-style version append + immutable binding) / `list` / `show` / `history` / `setLifecycle`。archived 是单向转换。
+- **CLI** — `agent-recall sessions inspect | ingest | list | show | forget`(#49);`agent-recall assets list | show | history | lifecycle | create-memory-ref`(#51)。
+- **MCP resources** — `agentrecall://sessions/{session_id}`(#49);`agentrecall://assets/{asset_id}`(#51)。
+- **Contracts** — `packages/contracts/src/sessions.ts` 7 个 zod schema;`packages/contracts/src/assets.ts` 11 个 zod schema(包含 4 个类型特定 discriminated union);全部 `schema_version: "1"` literal。
+
+### 改动
+
+- `src/sqlite-store.ts`:`CURRENT_SCHEMA_VERSION` 升至 16,新增 `migrate_v14_to_v15` + `migrate_v15_to_v16`(都是 `BEGIN IMMEDIATE` + `COMMIT` / `ROLLBACK`,失败可回滚);新增 16 个 store 方法 + 7 个 row decoder + 3 个 row type (`SessionRow` / `SessionEventRow` / `SessionEventBlobRow` / `AssetRow` / `AssetVersionRow` / `AssetRelationRow` / `MemoryRefBindingRow`)。
+- `src/cli/arg-parser.ts`:`flagNumber` 工具已存在;本 Phase 1 用其解析 `--limit` / `--max-jobs`。
+- `src/cli/index.ts`:dispatch 表新增 `sessions` + `assets` 命令;`HELP_TEXT` 加两行。
+- `src/mcp/resources.ts`:新增 `session_evidence` + `asset_envelope` resource 注册。
+- `test/mcp-v2-contract.test.ts`:"registers all 6 resources" → "registers all 9 resources",断言新增的 `session_evidence` + `asset_envelope` 出现在列表里。
+
+### 测试
+
+- `test/unit/sessions-service.test.ts`(13 测试) — replay / digest-drift / 大小上限 / secret / injection / forget / JSONL 解析 / file round-trip。
+- `test/unit/assets-service.test.ts`(8 测试) — create / list / show / history / lifecycle / archive terminal / binding 校验。
+- `test/cli/sessions.test.ts`(7 测试) — help / list / show / cancel 风格覆盖 + secret / inject / 大小 端到端。
+- `test/cli/assets.test.ts`(5 测试) — help / list / show / history / lifecycle 端到端 round-trip。
+- `packages/contracts/tests/sessions.test.ts`(10 测试) — 7 个 zod schema 的 happy + rejection path。
+- `packages/contracts/tests/assets.test.ts`(17 测试) — 11 个 zod schema 的 happy + rejection path。
+- `test/mcp-v2-contract.test.ts`:1 测试更新(8 → 9 resources)。
+
+### 不在本版本范围(留待后续 Phase)
+
+- `skill` / `context_pack` / `external_reference` 的类型特定表 + executor(随 #53 / #54 落地)。
+- `bootstrap scan` / `external-ref refresh` 执行器(随 #54 落地)。
+- `run --watch` 循环(等 #54 bootstrap planner)。
+- Lifecycle evaluation / release gate(等 #55 收口)。
+- HTTP bridge 的 sessions / assets 端点(Phase 2 一并提供)。
+- Admin app 的 session 浏览器 / asset 浏览器(Phase 2 一并提供)。
+
 ## [1.2.0-alpha.0] — Derivation Job 子系统(issue #48,Phase 0)
 
 > v1.2 系列开篇:本条目只引入 derivation job 子系统,具体 kind 的执行器(session_distill / skill_extract / bootstrap_scan / external_ref_refresh)在后续 Phase 1 / 2 落地(#50、#53、#54)。本期所有现有 API 保持兼容,没有破坏性改动。
