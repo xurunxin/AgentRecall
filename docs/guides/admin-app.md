@@ -73,3 +73,56 @@ npm run tauri -- dev
 - `data-home/agent-recall.log`
 - OS + 架构 + 屏幕分辨率
 - 复现步骤
+
+## v0.2 新增
+
+### 工作栏改版
+
+- 已选 filter 用 pill chips(可点击 ✕ 移除)
+- `+` 按钮展开高级过滤弹层(importance / max_nodes / topic / type / status / co_topic / co_scope)
+- 底部第二行:组织模式切换器(5 选 1)+ ✨ 整理按钮 + 手动 refresh
+
+### 节点组织方式
+
+5 种模式可切换:
+
+- **无** — 原 dagre LR
+- **按主题** — 同 topic 节点聚成水平簇,簇间大间距
+- **按类型** — 7 种 type(preference / procedure / fact / decision / lesson / debugging / constraint)各自区域
+- **按 scope** — 左 global / 右 project
+- **按状态** — 4 行(active / archived / superseded / forgotten)
+
+切换组织模式后点 ✨ 整理按钮,所有节点按当前模式重新布局(瞬间切换,无动画)。
+
+### 详情页增强
+
+drawer 扩到 460px,新增 4 个 section:
+
+- **全文 body** — 等宽 + 横向滚动 + 复制按钮
+- **标签 tags** — pill chips,无标签显示 —
+- **来源 source** — 折叠 JSON,默认收起
+- **关联记忆**:
+  - 版本演进:supersedes / superseded_by 双向
+  - 合并:merge(留 v0.3 持久化 TODO)
+  - 相关主题:co_topic(限 5 条,显示总数)
+  - 相关 scope:co_scope(默认折叠,显示总数)
+
+点关联记忆的某行 → drawer 内容区 swap(不关闭,平滑换)。
+
+点"在图中定位" → drawer 关闭(canvas pan/高亮留 v0.3,v0.2 简化)。
+
+点"复制 ID" / "复制全文" → 调 clipboard API。
+
+### 数据模型
+
+- `GraphNode` 保持精简(不扩字段)
+- `GraphFilter.organization` 字段(后端忽略,纯前端布局开关)
+- `get_memory` 命令响应改 `MemoryDetail`,含 `related: MemoryRelations`
+- 新 `packages/contracts/src/memory.ts` 模块:`RelatedNodeSchema` / `MemoryRelationsSchema` / `MemoryDetailSchema`
+
+### v0.3 计划
+
+- merge 关系持久化(GraphEdge 写库)
+- co_scope 展开后虚拟滚动
+- "在图中定位" 实现 canvas pan + 2s 高亮
+- 整理动画缓动(FLIP / spring)
