@@ -1,3 +1,4 @@
+import { forwardRef, type CSSProperties } from "react";
 import type { NodeProps } from "@xyflow/react";
 import type { GraphNode } from "@agent-recall/contracts";
 
@@ -50,69 +51,94 @@ export function colorForTopic(topic: string): string {
 // the topic color reads as a clear dot, not a pixel-sized speck.
 const CIRCLE_BASE = 42;
 
-export default function MemoryNode({ data }: NodeProps) {
-  const { node } = data as unknown as MemoryNodeData;
-  const color = colorForTopic(node.topic);
-  const showGlow = node.importance >= 4;
+/**
+ * xyflow v12 passes a `ref` to the custom node component so it can attach
+ * its own drag/selection handlers. Without `forwardRef`, that ref is dropped
+ * and `nodesDraggable` silently does nothing — nodes are still clickable
+ * (because onNodeClick uses a different code path) but cannot be dragged.
+ *
+ * The fix: wrap the component in `forwardRef<HTMLDivElement, NodeProps>` and
+ * forward the ref to the outermost wrapper div. The wrapper is the single
+ * element that owns the row layout, so attaching the ref there lets xyflow
+ * capture pointer events from anywhere on the row.
+ *
+ * `NodeProps` is used with its default generic (the bare `Node<...>` type)
+ * because `nodeTypes` in `@xyflow/react` requires components assignable to
+ * `ComponentType<NodeProps & { data: any; type: any }>`. The per-node
+ * `data` is widened to `any` in that signature, so we keep the existing
+ * `data as unknown as MemoryNodeData` cast inside the body.
+ */
+const MemoryNode = forwardRef<HTMLDivElement, NodeProps>(
+  function MemoryNode({ data }, ref) {
+    const { node } = data as unknown as MemoryNodeData;
+    const color = colorForTopic(node.topic);
+    const showGlow = node.importance >= 4;
 
-  return (
-    <div
-      // No `onClick` here on purpose: xyflow's own click-vs-drag detection
-      // (wired through `onNodeClick` on the <ReactFlow> parent) handles
-      // drawer-open, while the row remains freely draggable. Adding a
-      // manual onClick would steal pointer events and break drag.
-      data-testid={`memory-node-${node.id}`}
-      data-topic={node.topic}
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: 8,
-        // `pointer` on the label, `grab` on the circle area to telegraph
-        // that the row is draggable. xyflow still wins pointer events for
-        // the actual drag, so the cursor is just visual feedback.
-        cursor: "grab",
-        userSelect: "none",
-        transition: "transform 120ms ease",
-      }}
-      onMouseEnter={(e) => {
-        (e.currentTarget as HTMLDivElement).style.transform = "scale(1.04)";
-      }}
-      onMouseLeave={(e) => {
-        (e.currentTarget as HTMLDivElement).style.transform = "scale(1)";
-      }}
-    >
-      {/* Solid topic-color circle. Uniform 42px regardless of importance. */}
+    return (
       <div
-        data-testid="memory-node-circle"
-        style={{
-          width: CIRCLE_BASE,
-          height: CIRCLE_BASE,
-          borderRadius: "50%",
-          background: color,
-          flexShrink: 0,
-          // Importance 4-5 gets a 3px glow ring (same color, 33% alpha) so
-          // high-importance nodes stand out without changing their size.
-          boxShadow: showGlow ? `0 0 0 3px ${color}55` : undefined,
+        ref={ref}
+        // No `onClick` here on purpose: xyflow's own click-vs-drag detection
+        // (wired through `onNodeClick` on the <ReactFlow> parent) handles
+        // drawer-open, while the row remains freely draggable. Adding a
+        // manual onClick would steal pointer events and break drag.
+        data-testid={`memory-node-${node.id}`}
+        data-topic={node.topic}
+        style={
+          {
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            // `grab` cursor signals that the row is draggable. xyflow still
+            // owns the actual pointer handling (so the cursor flips to
+            // `grabbing` while dragging) — this is just visual feedback.
+            cursor: "grab",
+            userSelect: "none",
+            transition: "transform 120ms ease",
+          } as CSSProperties
+        }
+        onMouseEnter={(e) => {
+          (e.currentTarget as HTMLDivElement).style.transform = "scale(1.04)";
         }}
-      />
-      {/* Label on the right; ellipsis when it overflows 180px. */}
-      <div
-        title={node.label}
-        style={{
-          fontSize: 11,
-          color: "var(--text)",
-          background: "var(--bg-elev)",
-          padding: "2px 6px",
-          borderRadius: 3,
-          maxWidth: 180,
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-          whiteSpace: "nowrap",
-          border: "1px solid var(--border)",
+        onMouseLeave={(e) => {
+          (e.currentTarget as HTMLDivElement).style.transform = "scale(1)";
         }}
       >
-        {node.label}
+        {/* Solid topic-color circle. Uniform 42px regardless of importance. */}
+        <div
+          data-testid="memory-node-circle"
+          style={{
+            width: CIRCLE_BASE,
+            height: CIRCLE_BASE,
+            borderRadius: "50%",
+            background: color,
+            flexShrink: 0,
+            // Importance 4-5 gets a 3px glow ring (same color, 33% alpha) so
+            // high-importance nodes stand out without changing their size.
+            boxShadow: showGlow ? `0 0 0 3px ${color}55` : undefined,
+          }}
+        />
+        {/* Label on the right; ellipsis when it overflows 180px. */}
+        <div
+          title={node.label}
+          style={{
+            fontSize: 11,
+            color: "var(--text)",
+            background: "var(--bg-elev)",
+            padding: "2px 6px",
+            borderRadius: 3,
+            maxWidth: 180,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            border: "1px solid var(--border)",
+          }}
+        >
+          {node.label}
+        </div>
       </div>
-    </div>
-  );
-}
+    );
+  }
+);
+
+export default MemoryNode;
+

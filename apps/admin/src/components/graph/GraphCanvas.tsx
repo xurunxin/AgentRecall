@@ -40,12 +40,15 @@ const edgeKindStyle: Record<GraphEdge["kind"], "solid" | "dashed"> = {
 };
 
 /**
- * All MemoryNode instances now render the same row: a 42px circle + 8px gap +
- * up to 180px label. Using a single fixed box for dagre is correct (importance
- * no longer changes size) and keeps the layout predictable.
+ * Dagre box matches the *visible* node footprint so edge endpoints land on the
+ * actual circle/label boundary instead of crossing through node centers.
+ * Visible content: 42px circle + 8px gap + ~90px avg label (labels are
+ * ellipsised at 180px, but most are well under 100px). This shrank from
+ * 230×48 (which assumed the full 180px label and pushed edge paths under
+ * the row).
  */
-const NODE_WIDTH = 42 + 8 + 180; // 230
-const NODE_HEIGHT = 48;
+const NODE_WIDTH = 42 + 8 + 90; // 140
+const NODE_HEIGHT = 42;
 
 /**
  * Run dagre layout over nodes/edges and return a copy of `nodes` with
@@ -102,10 +105,14 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
           source: e.source,
           target: e.target,
           type: "default",
-          // zIndex:1 keeps edges above the dot/line background (<0) but
-          // below xyflow's default node zIndex of 5, so nodes always win
-          // when they overlap an edge.
-          zIndex: 1,
+          // zIndex:100 keeps edges above the dot/line background and above
+          // xyflow's default node zIndex of 5, so the edge stroke remains
+          // visible even where it crosses a node's bounding box. With the
+          // shrunken dagre box (NODE_WIDTH=140, see above) most paths still
+          // land on the actual node boundary, but the high zIndex is a
+          // safety net for any case where the path runs under the row.
+          zIndex: 100,
+          className: isAmbient ? "ambient-edge" : "primary-edge",
           style: {
             stroke: edgeKindColor[e.kind],
             strokeWidth: isAmbient ? 1 : 1.5,
@@ -165,13 +172,12 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
         <Background />
         <Controls
           // xyflow's Controls ship with a white background that looks like a
-          // white block on dark mode. Force a dark wrapper via inline style
-          // — the inner buttons inherit the button color tokens.
-          style={{
-            backgroundColor: "#1a1a1a",
-            border: "1px solid #2a2a2a",
-            borderRadius: 4,
-          }}
+          // white block on dark mode. The wrapper style was being overridden
+          // by xyflow's own CSS, so we now drive the look via a className
+          // and rules in `theme.css` (`.dark-controls`). The inner buttons
+          // also need their own background; see `.dark-controls button`.
+          className="dark-controls"
+          showInteractive={false}
         />
         <MiniMap
           pannable
@@ -182,11 +188,14 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
             // faithful thumbnail of the main canvas.
             return topic ? colorForTopic(topic) : "#6b7280";
           }}
-          // Darker mask + dark background so the minimap doesn't render as
-          // a white block in dark mode.
+          // xyflow v12 MiniMap ignores `style.backgroundColor` for the empty
+          // area — it uses the dedicated `bgColor` prop instead. The
+          // `maskColor` is the tint laid over the whole minimap; with these
+          // two together, empty space renders as `#1a1a1a` and node pucks
+          // stand out cleanly.
           maskColor="rgba(0, 0, 0, 0.6)"
+          bgColor="#1a1a1a"
           style={{
-            backgroundColor: "#1a1a1a",
             border: "1px solid #2a2a2a",
           }}
           ariaLabel="Graph minimap"

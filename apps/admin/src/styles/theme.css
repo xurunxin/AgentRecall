@@ -40,3 +40,32 @@ body {
   background: var(--bg);
   color: var(--text);
 }
+
+/* ---------- UX hotfix #5 (Task 29) ---------- */
+
+/* Edge classes applied by GraphCanvas. The class is what xyflow v12 uses
+   to route styles onto the SVG path; inline style.zIndex was being applied
+   to a different attribute and the path was still under the node div. */
+.primary-edge {
+  stroke-dasharray: none !important;
+}
+.ambient-edge {
+  stroke-dasharray: 4 4 !important;
+}
+
+/* Dark Controls. xyflow v12 ignores wrapper `style` for the inner buttons,
+   so we drive the look entirely through CSS, scoped to a className set on
+   <Controls className="dark-controls"> in GraphCanvas.tsx. */
+.dark-controls {
+  background-color: #1a1a1a;
+  border: 1px solid #2a2a2a;
+  border-radius: 4px;
+}
+.dark-controls button {
+  background-color: #1a1a1a !important;
+  color: #e5e7eb !important;
+  border-bottom: 1px solid #2a2a2a !important;
+}
+.dark-controls button:hover {
+  background-color: #2a2a2a !important;
+}
