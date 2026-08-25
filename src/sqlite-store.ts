@@ -156,8 +156,18 @@ export type SearchFilters = EntryFilters & {
  * transactional; on any throw the user_version stays at
  * 14 and the database is untouched. Existing v14
  * derivation tables are not affected.
+ * v16 (v1.2.0-alpha.1, issue #51): the additive asset
+ * registry. Three envelope tables — `assets`,
+ * `asset_versions`, `asset_relations` — sit alongside
+ * the type-specific `memory_ref_bindings` table (the
+ * only type-specific table that v1.2-alpha.1 ships
+ * with; `skills` / `context_packs` / `external_references`
+ * land with their owning Phase 2 issues #53 / #54).
+ * The migration is fully transactional; on any throw
+ * the user_version stays at 15 and the database is
+ * untouched.
  */
-export const CURRENT_SCHEMA_VERSION = 15;
+export const CURRENT_SCHEMA_VERSION = 16;
 
 /**
  * Stage 12 PR9: thrown by `updateEntryWithRevision` when
@@ -527,6 +537,77 @@ export type SessionEventBlobRow = {
   stored_at: string;
 };
 
+/**
+ * v1.2.0-alpha.1 (issue #51): the row shape for
+ * `assets`. The `manifest_json` column is the
+ * type-specific payload (or, for `memory_ref` /
+ * `external_reference`, the payload is split
+ * between the envelope and a type-specific child
+ * row).
+ */
+export type AssetType =
+  | "memory_ref"
+  | "skill"
+  | "context_pack"
+  | "external_reference";
+
+export type AssetLifecycleState =
+  | "draft"
+  | "active"
+  | "deprecated"
+  | "archived";
+
+export type AssetTrustLevel =
+  | "user_confirmed"
+  | "agent_observed"
+  | "inferred";
+
+export type AssetRow = {
+  asset_id: string;
+  asset_type: AssetType;
+  scope: "global" | "project";
+  project_id: string | null;
+  owner_actor_id: string;
+  lifecycle_state: AssetLifecycleState;
+  current_version: number;
+  trust_level: AssetTrustLevel;
+  sensitivity: "normal" | "private" | "restricted";
+  metadata_json: string;
+  created_at: string;
+  updated_at: string;
+  archived_at: string | null;
+};
+
+export type AssetVersionRow = {
+  asset_id: string;
+  version: number;
+  schema_version: string;
+  content_hash: string;
+  manifest_json: string;
+  created_by_actor_id: string;
+  provenance_kind: "derivation_run" | "import_batch" | "manual" | "external" | null;
+  provenance_ref: string | null;
+  created_at: string;
+};
+
+export type AssetRelationRow = {
+  from_asset_id: string;
+  relation_type: string;
+  to_asset_id: string | null;
+  external_target_ref: string | null;
+  metadata_json: string;
+  created_at: string;
+};
+
+export type MemoryRefBindingRow = {
+  asset_id: string;
+  version: number;
+  memory_id: string;
+  memory_revision: number;
+  binding_rule: string | null;
+  note: string | null;
+};
+
 type Row = Record<string, SQLOutputValue>;
 
 function encodeJson(value: unknown): string {
@@ -694,6 +775,58 @@ function sessionEventFromRow(row: Row): SessionEventRow {
     sensitivity: stringCell(row, "sensitivity") as SessionSensitivity,
     redaction_flags_json: stringCell(row, "redaction_flags_json"),
     metadata_json: stringCell(row, "metadata_json")
+  };
+}
+
+function assetFromRow(row: Row): AssetRow {
+  return {
+    asset_id: stringCell(row, "asset_id"),
+    asset_type: stringCell(row, "asset_type") as AssetType,
+    scope: stringCell(row, "scope") as "global" | "project",
+    project_id: optionalStringCell(row, "project_id") ?? null,
+    owner_actor_id: stringCell(row, "owner_actor_id"),
+    lifecycle_state: stringCell(row, "lifecycle_state") as AssetLifecycleState,
+    current_version: numberCell(row, "current_version"),
+    trust_level: stringCell(row, "trust_level") as AssetTrustLevel,
+    sensitivity: stringCell(row, "sensitivity") as
+      | "normal"
+      | "private"
+      | "restricted",
+    metadata_json: stringCell(row, "metadata_json"),
+    created_at: stringCell(row, "created_at"),
+    updated_at: stringCell(row, "updated_at"),
+    archived_at: optionalStringCell(row, "archived_at") ?? null
+  };
+}
+
+function assetVersionFromRow(row: Row): AssetVersionRow {
+  return {
+    asset_id: stringCell(row, "asset_id"),
+    version: numberCell(row, "version"),
+    schema_version: stringCell(row, "schema_version"),
+    content_hash: stringCell(row, "content_hash"),
+    manifest_json: stringCell(row, "manifest_json"),
+    created_by_actor_id: stringCell(row, "created_by_actor_id"),
+    provenance_kind:
+      (optionalStringCell(row, "provenance_kind") as
+        | "derivation_run"
+        | "import_batch"
+        | "manual"
+        | "external"
+        | null) ?? null,
+    provenance_ref: optionalStringCell(row, "provenance_ref") ?? null,
+    created_at: stringCell(row, "created_at")
+  };
+}
+
+function memoryRefBindingFromRow(row: Row): MemoryRefBindingRow {
+  return {
+    asset_id: stringCell(row, "asset_id"),
+    version: numberCell(row, "version"),
+    memory_id: stringCell(row, "memory_id"),
+    memory_revision: numberCell(row, "memory_revision"),
+    binding_rule: optionalStringCell(row, "binding_rule") ?? null,
+    note: optionalStringCell(row, "note") ?? null
   };
 }
 
@@ -1871,6 +2004,280 @@ export class SQLiteMemoryStore {
     return result.changes > 0;
   }
 
+  // ─────────────────────────────────────────────────────────────────────
+  // v1.2.0-alpha.1 (issue #51): asset registry.
+  //
+  // The envelope tables — `assets` / `asset_versions` /
+  // `asset_relations` — and the only v16-shipped
+  // type-specific table — `memory_ref_bindings` —
+  // back the additive typed asset registry. The
+  // public service lives in `src/assets/service.ts`.
+  // ─────────────────────────────────────────────────────────────────────
+
+  /**
+   * Insert the envelope row for a new asset. The
+   * caller pre-computes `asset_id`,
+   * `current_version` (always 0 on the first
+   * insert), and the type-specific payload
+   * (manifest + bindings). Returns `false` when
+   * the unique key (`asset_id`) collides so the
+   * service can translate the violation into a
+   * stable error code.
+   */
+  insertAsset(row: AssetRow): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO assets (
+            asset_id, asset_type, scope, project_id, owner_actor_id,
+            lifecycle_state, current_version, trust_level, sensitivity,
+            metadata_json, created_at, updated_at, archived_at
+          ) VALUES (
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?
+          )`
+        )
+        .run(
+          row.asset_id,
+          row.asset_type,
+          row.scope,
+          row.project_id,
+          row.owner_actor_id,
+          row.lifecycle_state,
+          row.current_version,
+          row.trust_level,
+          row.sensitivity,
+          row.metadata_json,
+          row.created_at,
+          row.updated_at,
+          row.archived_at
+        );
+      return true;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * Read the envelope row by `asset_id`.
+   */
+  getAsset(assetId: string): AssetRow | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM assets WHERE asset_id = ?")
+      .get(assetId) as Row | undefined;
+    if (row === undefined) return undefined;
+    return assetFromRow(row);
+  }
+
+  /**
+   * List envelope rows. The `asset_type` /
+   * `lifecycle_state` / `scope` / `project_id`
+   * filters are optional; the `limit` caps the
+   * row count. Ordered newest-first by
+   * `updated_at DESC`.
+   */
+  listAssets(filter: {
+    asset_type?: AssetType;
+    lifecycle_state?: AssetLifecycleState;
+    scope?: "global" | "project";
+    project_id?: string;
+    limit: number;
+  }): AssetRow[] {
+    const clauses: string[] = [];
+    const params: SQLInputValue[] = [];
+    if (filter.asset_type !== undefined) {
+      clauses.push("asset_type = ?");
+      params.push(filter.asset_type);
+    }
+    if (filter.lifecycle_state !== undefined) {
+      clauses.push("lifecycle_state = ?");
+      params.push(filter.lifecycle_state);
+    }
+    if (filter.scope !== undefined) {
+      clauses.push("scope = ?");
+      params.push(filter.scope);
+    }
+    if (filter.project_id !== undefined) {
+      clauses.push("project_id = ?");
+      params.push(filter.project_id);
+    }
+    const where = clauses.length === 0 ? "" : " WHERE " + clauses.join(" AND ");
+    const sql = `SELECT * FROM assets${where}
+                  ORDER BY updated_at DESC LIMIT ?`;
+    params.push(filter.limit);
+    const rows = this.db.prepare(sql).all(...params) as Row[];
+    return rows.map((r) => assetFromRow(r));
+  }
+
+  /**
+   * Atomically append a new version + advance the
+   * envelope's `current_version` in a single
+   * transaction. The `version` argument is the
+   * expected new version (1-based, monotonically
+   * increasing); the update only succeeds when
+   * the row's current_version is exactly
+   * `version - 1`. Returns the updated envelope
+   * row, or `undefined` on CAS failure (caller is
+   * racing a concurrent append).
+   */
+  appendAssetVersion(args: {
+    asset_id: string;
+    expected_previous_version: number;
+    new_version: number;
+    schema_version: string;
+    content_hash: string;
+    manifest_json: string;
+    created_by_actor_id: string;
+    provenance_kind: AssetVersionRow["provenance_kind"];
+    provenance_ref: string | null;
+    now: string;
+  }): AssetRow | undefined {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO asset_versions (
+            asset_id, version, schema_version, content_hash, manifest_json,
+            created_by_actor_id, provenance_kind, provenance_ref, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          args.asset_id,
+          args.new_version,
+          args.schema_version,
+          args.content_hash,
+          args.manifest_json,
+          args.created_by_actor_id,
+          args.provenance_kind,
+          args.provenance_ref,
+          args.now
+        );
+      const updated = this.db
+        .prepare(
+          `UPDATE assets
+              SET current_version = ?, updated_at = ?
+            WHERE asset_id = ? AND current_version = ?
+            RETURNING *`
+        )
+        .get(
+          args.new_version,
+          args.now,
+          args.asset_id,
+          args.expected_previous_version
+        ) as Row | undefined;
+      this.db.exec("COMMIT");
+      if (updated === undefined) return undefined;
+      return assetFromRow(updated);
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * Read all version rows for one asset, ordered
+   * by `version ASC` so the audit trail reads in
+   * append order.
+   */
+  listAssetVersions(assetId: string): AssetVersionRow[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM asset_versions WHERE asset_id = ? ORDER BY version ASC"
+      )
+      .all(assetId) as Row[];
+    return rows.map((r) => assetVersionFromRow(r));
+  }
+
+  /**
+   * Read the type-specific binding for a single
+   * (asset_id, version). Returns `undefined` for
+   * `memory_ref` assets that have no row (the
+   * asset is the envelope only — no body is
+   * duplicated). The service uses this to surface
+   * the binding on inspection.
+   */
+  getMemoryRefBinding(
+    assetId: string,
+    version: number
+  ): MemoryRefBindingRow | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT * FROM memory_ref_bindings WHERE asset_id = ? AND version = ?"
+      )
+      .get(assetId, version) as Row | undefined;
+    if (row === undefined) return undefined;
+    return memoryRefBindingFromRow(row);
+  }
+
+  /**
+   * Insert one memory_ref binding row. The
+   * composite primary key on (asset_id, version)
+   * guarantees no duplicate binding per version;
+   * a v2 of the same asset reuses the same
+   * `asset_id` but bumps `version`, and the new
+   * row is a fresh binding.
+   */
+  insertMemoryRefBinding(row: MemoryRefBindingRow): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO memory_ref_bindings (
+            asset_id, version, memory_id, memory_revision, binding_rule, note
+          ) VALUES (?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          row.asset_id,
+          row.version,
+          row.memory_id,
+          row.memory_revision,
+          row.binding_rule,
+          row.note
+        );
+      return true;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * Flip the envelope's `lifecycle_state`. The
+   * `archived_at` column is set when the new
+   * state is `archived`, cleared when it is
+   * anything else. The operation only succeeds
+   * when the current state matches
+   * `expected_state` (CAS); concurrent lifecycle
+   * mutations are detected as `undefined`.
+   */
+  setAssetLifecycle(args: {
+    asset_id: string;
+    expected_state: AssetLifecycleState;
+    new_state: AssetLifecycleState;
+    now: string;
+  }): AssetRow | undefined {
+    const archivedAt = args.new_state === "archived" ? args.now : null;
+    const updated = this.db
+      .prepare(
+        `UPDATE assets
+            SET lifecycle_state = ?,
+                archived_at = ?,
+                updated_at = ?
+          WHERE asset_id = ? AND lifecycle_state = ?
+          RETURNING *`
+      )
+      .get(
+        args.new_state,
+        archivedAt,
+        args.now,
+        args.asset_id,
+        args.expected_state
+      ) as Row | undefined;
+    if (updated === undefined) return undefined;
+    return assetFromRow(updated);
+  }
+
   close(): void {
     this.db.close();
   }
@@ -2096,6 +2503,10 @@ export class SQLiteMemoryStore {
     }
     if (version === 15) {
       this.migrate_v14_to_v15();
+      return;
+    }
+    if (version === 16) {
+      this.migrate_v15_to_v16();
       return;
     }
     throw new Error(`No migration registered for schema version ${version}`);
@@ -3173,6 +3584,145 @@ export class SQLiteMemoryStore {
         ) STRICT;
       `);
       this.db.exec("PRAGMA user_version = 15");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * v1.2.0-alpha.1 (issue #51): v15 -> v16 schema
+   * migration. Introduces the additive asset
+   * registry. The envelope tables (`assets` /
+   * `asset_versions` / `asset_relations`) cover
+   * all four type variants; the only v16-shipped
+   * type-specific table is `memory_ref_bindings`
+   * (the `memory_ref` asset is the only type that
+   * already has a Phase 1 use case — the
+   * `memory_entries` row is the authoritative
+   * body, the binding is a typed pointer). The
+   * `skills` / `context_packs` / `external_references`
+   * type-specific tables land with their owning
+   * Phase 2 issues (#53 / #54) in subsequent
+   * migrations; the envelope schema is forward-
+   * compatible.
+   *
+   * Schema invariants (mirrored in
+   * `docs/adr/0010-asset-registry.md`):
+   *  - `assets.current_version` is the head;
+   *    new versions append monotonically and
+   *    `asset_versions.content_hash` is the
+   *    SHA-256 over the canonicalised type-
+   *    specific payload.
+   *  - `asset_relations` is directional; the
+   *    CHECK constraint ensures the relation
+   *    has exactly one of `to_asset_id` or
+   *    `external_target_ref`.
+   *  - `memory_ref_bindings` is the only v16
+   *    type-specific table. The binding is
+   *    immutable: a new version appends a row,
+   *    the previous version stays.
+   */
+  private migrate_v15_to_v16(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS assets (
+          asset_id        TEXT PRIMARY KEY,
+          asset_type      TEXT NOT NULL
+                            CHECK (asset_type IN
+                              ('memory_ref','skill','context_pack','external_reference')),
+          scope           TEXT NOT NULL
+                            CHECK (scope IN ('global','project')),
+          project_id      TEXT,
+          owner_actor_id  TEXT NOT NULL,
+          lifecycle_state TEXT NOT NULL
+                            CHECK (lifecycle_state IN
+                              ('draft','active','deprecated','archived')),
+          current_version INTEGER NOT NULL DEFAULT 0,
+          trust_level     TEXT NOT NULL
+                            CHECK (trust_level IN
+                              ('user_confirmed','agent_observed','inferred')),
+          sensitivity     TEXT NOT NULL
+                            CHECK (sensitivity IN ('normal','private','restricted')),
+          metadata_json   TEXT NOT NULL DEFAULT '{}',
+          created_at      TEXT NOT NULL,
+          updated_at      TEXT NOT NULL,
+          archived_at     TEXT,
+          CHECK (scope = 'project' AND project_id IS NOT NULL
+                 OR scope = 'global' AND project_id IS NULL),
+          CHECK (lifecycle_state != 'archived' OR archived_at IS NOT NULL)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_assets_type_state
+          ON assets(asset_type, lifecycle_state);
+        CREATE INDEX IF NOT EXISTS idx_assets_scope_project
+          ON assets(scope, project_id);
+        CREATE INDEX IF NOT EXISTS idx_assets_owner
+          ON assets(owner_actor_id, updated_at);
+
+        CREATE TABLE IF NOT EXISTS asset_versions (
+          asset_id            TEXT NOT NULL
+                                REFERENCES assets(asset_id) ON DELETE CASCADE,
+          version             INTEGER NOT NULL,
+          schema_version      TEXT NOT NULL,
+          content_hash        TEXT NOT NULL,
+          manifest_json       TEXT NOT NULL,
+          created_by_actor_id TEXT NOT NULL,
+          provenance_kind     TEXT
+                                CHECK (provenance_kind IN
+                                  ('derivation_run','import_batch','manual','external')
+                                  OR provenance_kind IS NULL),
+          provenance_ref      TEXT,
+          created_at          TEXT NOT NULL,
+          PRIMARY KEY (asset_id, version),
+          CHECK (version > 0)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_asset_versions_hash
+          ON asset_versions(content_hash);
+        CREATE INDEX IF NOT EXISTS idx_asset_versions_provenance
+          ON asset_versions(provenance_kind, provenance_ref);
+
+        CREATE TABLE IF NOT EXISTS asset_relations (
+          from_asset_id        TEXT NOT NULL
+                                 REFERENCES assets(asset_id) ON DELETE CASCADE,
+          relation_type        TEXT NOT NULL,
+          to_asset_id          TEXT
+                                 REFERENCES assets(asset_id) ON DELETE CASCADE,
+          external_target_ref  TEXT,
+          metadata_json        TEXT NOT NULL DEFAULT '{}',
+          created_at           TEXT NOT NULL,
+          CHECK ((to_asset_id IS NOT NULL) <> (external_target_ref IS NOT NULL))
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_asset_relations_from
+          ON asset_relations(from_asset_id, relation_type);
+        CREATE INDEX IF NOT EXISTS idx_asset_relations_to
+          ON asset_relations(to_asset_id);
+        CREATE INDEX IF NOT EXISTS idx_asset_relations_external
+          ON asset_relations(external_target_ref)
+          WHERE external_target_ref IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS memory_ref_bindings (
+          asset_id        TEXT NOT NULL
+                            REFERENCES assets(asset_id) ON DELETE CASCADE,
+          version         INTEGER NOT NULL,
+          memory_id       TEXT NOT NULL
+                            REFERENCES memory_entries(id) ON DELETE RESTRICT,
+          memory_revision INTEGER NOT NULL,
+          binding_rule    TEXT,
+          note            TEXT,
+          PRIMARY KEY (asset_id, version),
+          CHECK (version > 0),
+          CHECK (memory_revision > 0)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_memory_ref_bindings_memory
+          ON memory_ref_bindings(memory_id, memory_revision);
+      `);
+      this.db.exec("PRAGMA user_version = 16");
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");

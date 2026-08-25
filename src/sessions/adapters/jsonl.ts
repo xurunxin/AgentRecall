@@ -27,7 +27,10 @@ import { createReadStream } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
 
-import { SessionTraceBundleV1Schema } from "@agent-recall/contracts";
+import {
+  SessionTraceBundleV1Schema,
+  SessionTraceEventV1Schema
+} from "@agent-recall/contracts";
 
 import type { NormalisedBundle, NormalisedEvent } from "../service.js";
 import type { SessionEventType, SessionScope, SessionSensitivity } from "../../sqlite-store.js";
@@ -191,17 +194,15 @@ function normaliseEvent(value: unknown, header: NormalisedBundle):
   | { ok: false; error: string } {
   // The line is a SessionTraceEventV1 (not the
   // bundle). Use the same element schema the
-  // bundle's `events` array uses. The schema is
-  // wrapped in a ZodDefault (because the bundle
-  // declares `events: z.array(...).default([])`),
-  // so the inner type is `_def.innerType.element`.
-  const eventsDef = SessionTraceBundleV1Schema.shape.events as unknown as {
-    _def: { innerType: { element: typeof SessionTraceEventV1Schema } };
-  };
-  const elementSchema = eventsDef._def.innerType.element;
-  const parsed = elementSchema.safeParse(value);
+  // bundle's `events` array uses.
+  const parsed = SessionTraceEventV1Schema.safeParse(value);
   if (!parsed.success) {
-    return { ok: false, error: parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ") };
+    return {
+      ok: false,
+      error: parsed.error.issues
+        .map((i) => `${i.path.map(String).join(".")}: ${i.message}`)
+        .join("; ")
+    };
   }
   return { ok: true, event: toNormalisedEvent(parsed.data, header) };
 }
@@ -230,7 +231,7 @@ function toNormalisedBundle(
 }
 
 function toNormalisedEvent(
-  parsed: ReturnType<typeof SessionTraceBundleV1Schema.shape.events.element.parse>,
+  parsed: ReturnType<typeof SessionTraceEventV1Schema.parse>,
   header: NormalisedBundle
 ): NormalisedEvent {
   const content = parsed.content ?? null;

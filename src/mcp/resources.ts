@@ -36,6 +36,7 @@ import { ProjectIdentityResolver } from "../scope-resolver.js";
 import { ImportBatchStore } from "../portability/import-batch-store.js";
 import { DerivationJobStore } from "../jobs/service.js";
 import { SessionService } from "../sessions/service.js";
+import { AssetService } from "../assets/service.js";
 import type { ToolProfile } from "../tools/profile.js";
 import type { CapabilityStore } from "../admin/capability.js";
 import type { AuthorizationDecision } from "../services/auth-context.js";
@@ -586,6 +587,44 @@ export function registerMemoryResources(server: MemoryResourceServer, ctx: Memor
         session: inspection.session,
         events: inspection.events,
         plan: inspection.plan
+      });
+    }
+  );
+
+  // v1.2.0-alpha.1 (issue #51): the asset registry
+  // resource. The payload mirrors the `assets show`
+  // CLI output: the envelope row + the current
+  // head (asset_versions row) + the type-specific
+  // payload (memory_ref binding for v1.2-alpha.1).
+  // Mutations go through the `assets_lifecycle` /
+  // `assets_create_memory_ref` tools.
+  server.registerResource(
+    "asset_envelope",
+    new ResourceTemplate("agentrecall://assets/{asset_id}", { list: undefined }),
+    {
+      description:
+        "Typed asset registry inspection: envelope + current head + type-specific payload (memory_ref binding in v1.2-alpha.1). Mirrors the agent-recall assets show CLI output.",
+      mimeType: "application/json"
+    },
+    (uri: URL, variables: Variables) => {
+      const assetId = pickVariable(variables, "asset_id");
+      if (assetId === undefined || assetId.length === 0) {
+        return jsonResource(uri, { ok: false, error: "not_found", message: "missing asset_id" });
+      }
+      const service = new AssetService(ctx.store);
+      const inspection = service.show(assetId);
+      if (inspection === undefined) {
+        return jsonResource(uri, {
+          ok: false,
+          error: "not_found",
+          message: `unknown asset_id ${assetId}`
+        });
+      }
+      return jsonResource(uri, {
+        ok: true,
+        asset: inspection.asset,
+        current_version: inspection.current_version,
+        payload: inspection.payload
       });
     }
   );

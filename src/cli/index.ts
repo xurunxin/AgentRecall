@@ -8,6 +8,7 @@ import { resolveDataHome } from "../index.js";
 import { SQLiteMemoryStore } from "../sqlite-store.js";
 import { ProjectIdentityResolver } from "../scope-resolver.js";
 import { adminCommand } from "./commands/admin.js";
+import { assetsCommand } from "./commands/assets.js";
 import { auditCommand } from "./commands/audit.js";
 import { backupCommand, restoreCommand } from "./commands/backup.js";
 import { doctorCommand } from "./commands/doctor.js";
@@ -100,6 +101,7 @@ Commands:
   admin      Manage the operator capability (grant / status / revoke)
   jobs       Inspect, cancel, or run derivation jobs
   sessions   Inspect / ingest / list / show / forget captured session traces
+  assets     Manage the typed asset registry (memory_ref / skill / context_pack / external_reference)
   version    Print the server version (also: --version / -v)
   help       Show this help
 
@@ -142,7 +144,15 @@ const dispatch: Record<string, CommandHandler> = {
   // subcommand. Provides the inspect / ingest / list /
   // show / forget surface for the v1.2 session
   // evidence substrate.
-  sessions: sessionsCommand
+  sessions: sessionsCommand,
+  // v1.2.0-alpha.1 (issue #51): the typed asset
+  // registry subcommand. Provides list / show /
+  // history / lifecycle / create-memory-ref for
+  // the additive asset envelope. Skill /
+  // context_pack / external_reference creation
+  // land with their owning Phase 2 issues
+  // (#53 / #54).
+  assets: assetsCommand
 };
 
 export async function runCli(
