@@ -3,7 +3,9 @@ import type { GraphNode } from "@agent-recall/contracts";
 
 export interface MemoryNodeData {
   node: GraphNode;
-  onClick?: (id: string) => void;
+  // `onClick` is intentionally NOT on the per-node data payload: drawer-open
+  // is handled by xyflow's <ReactFlow onNodeClick={…}> on the parent, which
+  // gives correct click-vs-drag disambiguation for free.
 }
 
 // 12-color qualitative palette for the most common topics, chosen to be
@@ -43,45 +45,54 @@ export function colorForTopic(topic: string): string {
   return FALLBACK_PALETTE[h % FALLBACK_PALETTE.length]!;
 }
 
+// Uniform node circle diameter. Used for both the visible circle and the
+// dagre layout box (see GraphCanvas.tsx NODE_WIDTH). 3× the original 14px so
+// the topic color reads as a clear dot, not a pixel-sized speck.
+const CIRCLE_BASE = 42;
+
 export default function MemoryNode({ data }: NodeProps) {
-  const { node, onClick } = data as unknown as MemoryNodeData;
+  const { node } = data as unknown as MemoryNodeData;
   const color = colorForTopic(node.topic);
   const showGlow = node.importance >= 4;
 
   return (
     <div
-      onClick={() => onClick?.(node.id)}
-      role="button"
-      tabIndex={0}
+      // No `onClick` here on purpose: xyflow's own click-vs-drag detection
+      // (wired through `onNodeClick` on the <ReactFlow> parent) handles
+      // drawer-open, while the row remains freely draggable. Adding a
+      // manual onClick would steal pointer events and break drag.
       data-testid={`memory-node-${node.id}`}
       data-topic={node.topic}
       style={{
         display: "flex",
         alignItems: "center",
         gap: 8,
-        cursor: "pointer",
+        // `pointer` on the label, `grab` on the circle area to telegraph
+        // that the row is draggable. xyflow still wins pointer events for
+        // the actual drag, so the cursor is just visual feedback.
+        cursor: "grab",
         userSelect: "none",
         transition: "transform 120ms ease",
       }}
       onMouseEnter={(e) => {
-        (e.currentTarget as HTMLDivElement).style.transform = "scale(1.05)";
+        (e.currentTarget as HTMLDivElement).style.transform = "scale(1.04)";
       }}
       onMouseLeave={(e) => {
         (e.currentTarget as HTMLDivElement).style.transform = "scale(1)";
       }}
     >
-      {/* Small uniform solid circle on the left; color = topic. */}
+      {/* Solid topic-color circle. Uniform 42px regardless of importance. */}
       <div
         data-testid="memory-node-circle"
         style={{
-          width: 14,
-          height: 14,
+          width: CIRCLE_BASE,
+          height: CIRCLE_BASE,
           borderRadius: "50%",
           background: color,
           flexShrink: 0,
-          // Importance 4-5 gets a glow ring to keep high-importance nodes
-          // visually distinguishable without changing their size.
-          boxShadow: showGlow ? `0 0 0 2px ${color}55` : undefined,
+          // Importance 4-5 gets a 3px glow ring (same color, 33% alpha) so
+          // high-importance nodes stand out without changing their size.
+          boxShadow: showGlow ? `0 0 0 3px ${color}55` : undefined,
         }}
       />
       {/* Label on the right; ellipsis when it overflows 180px. */}

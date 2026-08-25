@@ -21,11 +21,15 @@ interface Props {
   onNodeClick?: (node: GraphNode) => void;
 }
 
+// Actual hex values (NOT CSS vars — SVG `stroke` attribute does not resolve
+// `var(--…)`, so we duplicate the same colors that live in `theme.css` as
+// `--edge-supersede/merge/co-topic/co-scope`. Keep these in sync if the theme
+// palette ever changes.
 const edgeKindColor: Record<GraphEdge["kind"], string> = {
-  supersede: "var(--edge-supersede)",
-  merge: "var(--edge-merge)",
-  co_topic: "var(--edge-co-topic)",
-  co_scope: "var(--edge-co-scope)",
+  supersede: "#2563eb", // blue
+  merge: "#7c3aed", // purple
+  co_topic: "#f59e0b", // amber
+  co_scope: "#9ca3af", // gray
 };
 
 const edgeKindStyle: Record<GraphEdge["kind"], "solid" | "dashed"> = {
@@ -36,19 +40,19 @@ const edgeKindStyle: Record<GraphEdge["kind"], "solid" | "dashed"> = {
 };
 
 /**
- * All MemoryNode instances now render the same row: a 14px circle + 8px gap +
+ * All MemoryNode instances now render the same row: a 42px circle + 8px gap +
  * up to 180px label. Using a single fixed box for dagre is correct (importance
  * no longer changes size) and keeps the layout predictable.
  */
-const NODE_WIDTH = 14 + 8 + 180; // 202
-const NODE_HEIGHT = 20;
+const NODE_WIDTH = 42 + 8 + 180; // 230
+const NODE_HEIGHT = 48;
 
 /**
  * Run dagre layout over nodes/edges and return a copy of `nodes` with
  * positions populated. Nodes that aren't in the dagre graph (e.g. isolates)
  * keep their previous position.
  *
- * Each box is the uniform 202×20 row; dagre centers each box on its computed
+ * Each box is the uniform 230×48 row; dagre centers each box on its computed
  * anchor, so we subtract width/2 and height/2 to convert to xyflow's
  * top-left position convention.
  */
@@ -98,6 +102,10 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
           source: e.source,
           target: e.target,
           type: "default",
+          // zIndex:1 keeps edges above the dot/line background (<0) but
+          // below xyflow's default node zIndex of 5, so nodes always win
+          // when they overlap an edge.
+          zIndex: 1,
           style: {
             stroke: edgeKindColor[e.kind],
             strokeWidth: isAmbient ? 1 : 1.5,
@@ -155,7 +163,16 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
         }
       >
         <Background />
-        <Controls />
+        <Controls
+          // xyflow's Controls ship with a white background that looks like a
+          // white block on dark mode. Force a dark wrapper via inline style
+          // — the inner buttons inherit the button color tokens.
+          style={{
+            backgroundColor: "#1a1a1a",
+            border: "1px solid #2a2a2a",
+            borderRadius: 4,
+          }}
+        />
         <MiniMap
           pannable
           zoomable
@@ -163,9 +180,16 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
             const topic = (n.data as { node?: GraphNode })?.node?.topic;
             // Reuse the same palette as MemoryNode so the minimap is a
             // faithful thumbnail of the main canvas.
-            return topic ? colorForTopic(topic) : "var(--text-dim)";
+            return topic ? colorForTopic(topic) : "#6b7280";
           }}
-          maskColor="rgba(0, 0, 0, 0.05)"
+          // Darker mask + dark background so the minimap doesn't render as
+          // a white block in dark mode.
+          maskColor="rgba(0, 0, 0, 0.6)"
+          style={{
+            backgroundColor: "#1a1a1a",
+            border: "1px solid #2a2a2a",
+          }}
+          ariaLabel="Graph minimap"
         />
       </ReactFlow>
     </div>
