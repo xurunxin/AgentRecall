@@ -72,6 +72,13 @@ const EDGE_PADDING = 100;
 const NODE_WIDTH = 42 + 8 + 90; // 140
 const NODE_HEIGHT = 42;
 
+// The visible disk (the 42px circle inside MemoryNode). Must match
+// `CIRCLE_BASE` in MemoryNode.tsx — kept as a separate const so the edge
+// anchor math lives in one place. Edge endpoints target the *center* of
+// this circle, not the center of the entire node wrapper, because the
+// label on the right biases the wrapper's center off the actual disk.
+const CIRCLE_WIDTH = 42;
+
 type Position = { x: number; y: number };
 type Bounds = { minX: number; minY: number; maxX: number; maxY: number };
 
@@ -171,6 +178,31 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
   // Bump this when we mutate positionsRef so consumers re-read them.
   const [positionsTick, setPositionsTick] = useState(0);
 
+  // Per-node rendered width of the wrapper div. Used to compute the
+  // circle-center anchor for edges (see getCircleCenter below). The label
+  // on the right varies in length per node, so the wrapper width varies
+  // and the circle's offset from the wrapper's center varies too.
+  // Populated by the measurement effect below, after the DOM is committed.
+  const nodeWidthsRef = useRef<Map<string, number>>(new Map());
+  // Live element handles, keyed by nodeId. The measurement effect reads
+  // `offsetWidth` off each of these and stores it in `nodeWidthsRef`.
+  const nodeElementsRef = useRef<Map<string, HTMLDivElement>>(new Map());
+  // Stable ref callback. React will call it with the element on mount and
+  // null on unmount. The setter just stores/clears the element in the
+  // elements map; the actual measurement (which can trigger re-render)
+  // happens in a separate useEffect so we don't loop.
+  const setNodeElement = useCallback(
+    (id: string, el: HTMLDivElement | null) => {
+      if (el) {
+        nodeElementsRef.current.set(id, el);
+      } else {
+        nodeElementsRef.current.delete(id);
+        nodeWidthsRef.current.delete(id);
+      }
+    },
+    []
+  );
+
   // Pan + zoom state. `transform-origin: 0 0` lets us anchor the inner div
   // at top-left and translate relative to that anchor.
   const [pan, setPan] = useState<Position>({ x: 0, y: 0 });
@@ -214,6 +246,34 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
     },
     [baseLayout]
   );
+
+  // After every render where the node set changes, measure each rendered
+  // node wrapper's `offsetWidth` and store it. The first measurement fills
+  // `nodeWidthsRef`; subsequent runs only bump `positionsTick` when an
+  // actual width changed (e.g. a node's label length changed), so this
+  // doesn't cause re-render churn during pan/zoom/drag.
+  useEffect(() => {
+    let changed = false;
+    for (const [id, el] of nodeElementsRef.current) {
+      const w = el.offsetWidth;
+      if (w > 0 && nodeWidthsRef.current.get(id) !== w) {
+        nodeWidthsRef.current.set(id, w);
+        changed = true;
+      }
+    }
+    if (changed) setPositionsTick((t) => t + 1);
+  }, [nodes]);
+
+  // The visible disk inside the wrapper. The wrapper div is centered at
+  // (pos.x, pos.y); inside it, the flex row is [circle 42px][gap 8px][label].
+  // The circle is flush-left, so its center in graph space is:
+  //   pos.x + 21 - wrapperWidth/2
+  // We use the measured `wrapperWidth` per node (falls back to NODE_WIDTH
+  // on the very first render before measurement runs).
+  function getCircleCenter(id: string, pos: Position): Position {
+    const width = nodeWidthsRef.current.get(id) ?? NODE_WIDTH;
+    return { x: pos.x + CIRCLE_WIDTH / 2 - width / 2, y: pos.y };
+  }
 
   // Bounding box of every current node. Memoized on positionsTick so it
   // recomputes when the user drags, but stays stable between drag events.
@@ -498,14 +558,23 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
               const src = positionsRef.current.get(e.source);
               const tgt = positionsRef.current.get(e.target);
               if (!src || !tgt) return null;
+              // Anchor at the visible disk (the 42px circle on the left of
+              // the flex row), not the wrapper center — the wrapper's center
+              // is biased by the label width and would put the line origin
+              // far from the actual disk. Line endpoints at circle centers
+              // means the line emerges from the right edge of source and
+              // enters the left edge of target (the in-circle portion is
+              // hidden by the disk, which has higher zIndex).
+              const srcCenter = getCircleCenter(e.source, src);
+              const tgtCenter = getCircleCenter(e.target, tgt);
               const isAmbient = e.kind === "co_topic" || e.kind === "co_scope";
               return (
                 <line
                   key={`e-${i}`}
-                  x1={src.x - svgLeft}
-                  y1={src.y - svgTop}
-                  x2={tgt.x - svgLeft}
-                  y2={tgt.y - svgTop}
+                  x1={srcCenter.x - svgLeft}
+                  y1={srcCenter.y - svgTop}
+                  x2={tgtCenter.x - svgLeft}
+                  y2={tgtCenter.y - svgTop}
                   stroke={edgeKindColor[e.kind]}
                   strokeWidth={isAmbient ? 1 : 1.5}
                   strokeDasharray={edgeKindDash[e.kind]}
@@ -521,6 +590,8 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
             return (
               <div
                 key={n.id}
+                data-node-id={n.id}
+                ref={(el) => setNodeElement(n.id, el)}
                 onMouseDown={(e) => handleNodeMouseDown(e, n)}
                 style={{
                   position: "absolute",
