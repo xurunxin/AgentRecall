@@ -382,7 +382,7 @@ describe("MCP resources (spec § 6.3)", () => {
     return new MemoryService(store, undefined, "agent:test", dataHome);
   }
 
-  it("registers all 7 resources (5 stable + import lineage + the v1.2 derivation job)", () => {
+  it("registers all 8 resources (5 stable + import lineage + v1.2 derivation job + v1.2 session evidence)", () => {
     const { server, calls } = captureServer();
     const service = makeService();
     registerMemoryResources(server as unknown as Parameters<typeof registerMemoryResources>[0], {
@@ -398,7 +398,8 @@ describe("MCP resources (spec § 6.3)", () => {
       "memory_global_summary",
       "memory_health",
       "memory_import_batch",
-      "derivation_job"
+      "derivation_job",
+      "session_evidence"
     ]);
     expect(calls[0]?.uriOrTemplate).toBe("memory://projects");
     expect(calls[1]?.uriOrTemplate).toBeInstanceOf(ResourceTemplate);

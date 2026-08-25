@@ -148,8 +148,16 @@ export type SearchFilters = EntryFilters & {
  * short lease (default TTL 30s), and a passive reap-on-
  * claim policy so no daemon is required. Existing v13
  * tables and contracts are untouched.
+ * v15 (v1.2.0-alpha.1, issue #49): the session evidence
+ * substrate. Three additive tables — `sessions`,
+ * `session_events`, `session_event_blobs` — capture
+ * stable, replayable session traces from any
+ * SessionTraceBundle v1 adapter. The migration is fully
+ * transactional; on any throw the user_version stays at
+ * 14 and the database is untouched. Existing v14
+ * derivation tables are not affected.
  */
-export const CURRENT_SCHEMA_VERSION = 14;
+export const CURRENT_SCHEMA_VERSION = 15;
 
 /**
  * Stage 12 PR9: thrown by `updateEntryWithRevision` when
@@ -425,6 +433,100 @@ export type DerivationOutputRow = {
   created_at: number;
 };
 
+/**
+ * v1.2.0-alpha.1 (issue #49): the row shape for
+ * `sessions`. All timestamps are ISO 8601 (matching
+ * the recall layer and the v13 portability surface).
+ */
+export type SessionScope = "global" | "project";
+export type SessionSensitivity = "normal" | "private" | "restricted";
+
+export type SessionRow = {
+  session_id: string;
+  source_kind: string;
+  source_version: string;
+  source_instance_id: string;
+  source_session_id: string;
+  scope: SessionScope;
+  project_id: string | null;
+  actor_id: string;
+  client_name: string;
+  client_version: string;
+  started_at: string;
+  ended_at: string | null;
+  sensitivity: SessionSensitivity;
+  bundle_hash: string;
+  adapter_id: string;
+  adapter_version: string;
+  ingestion_plan_json: string;
+  redaction_summary_json: string;
+  ingested_at: string;
+  retention_until: string | null;
+};
+
+/**
+ * v1.2.0-alpha.1 (issue #49): the row shape for
+ * `session_events`. The body itself lives in
+ * `session_event_blobs` keyed by `content_digest`;
+ * SQLite holds the manifest / index / metadata only.
+ */
+export type SessionEventType =
+  | "session_started"
+  | "user_message"
+  | "assistant_message"
+  | "tool_call"
+  | "tool_result"
+  | "decision_confirmed"
+  | "task_completed"
+  | "session_ended";
+
+export type SessionEventRole = "user" | "assistant" | "system" | "tool";
+
+export type SessionRedactionFlag =
+  | "contains_secret"
+  | "risk_injection"
+  | "truncated"
+  | "high_entropy_token"
+  | "policy_redacted";
+
+export type SessionEventRow = {
+  event_id: string;
+  session_id: string;
+  sequence: number;
+  turn_id: string;
+  event_type: SessionEventType;
+  role: SessionEventRole | null;
+  content_digest: string;
+  content_blob_ref: string | null;
+  tool_name: string | null;
+  tool_call_id: string | null;
+  tool_status: string | null;
+  timestamp: string;
+  sensitivity: SessionSensitivity;
+  redaction_flags_json: string;
+  metadata_json: string;
+};
+
+/**
+ * v1.2.0-alpha.1 (issue #49): the content-
+ * addressed body cache. The full body lives in
+ * the local file system under the data home;
+ * SQLite holds head / tail 1KB slices for
+ * inspection without a full file read. The
+ * `head_tail_window_json` records the policy
+ * (default 1024 / 1024) so a later version can
+ * change it without rewriting the blob table.
+ */
+export type SessionEventBlobRow = {
+  digest: string;
+  size_bytes: number;
+  media_type: string;
+  head_bytes: Buffer;
+  tail_bytes: Buffer;
+  head_tail_window_json: string;
+  stored_at: string;
+};
+
 type Row = Record<string, SQLOutputValue>;
 
 function encodeJson(value: unknown): string {
@@ -545,6 +647,53 @@ function derivationOutputFromRow(row: Row): DerivationOutputRow {
     output_id: stringCell(row, "output_id"),
     disposition: stringCell(row, "disposition") as DerivationOutputDisposition,
     created_at: numberCell(row, "created_at")
+  };
+}
+
+function sessionFromRow(row: Row): SessionRow {
+  return {
+    session_id: stringCell(row, "session_id"),
+    source_kind: stringCell(row, "source_kind"),
+    source_version: stringCell(row, "source_version"),
+    source_instance_id: stringCell(row, "source_instance_id"),
+    source_session_id: stringCell(row, "source_session_id"),
+    scope: stringCell(row, "scope") as SessionScope,
+    project_id: optionalStringCell(row, "project_id") ?? null,
+    actor_id: stringCell(row, "actor_id"),
+    client_name: stringCell(row, "client_name"),
+    client_version: stringCell(row, "client_version"),
+    started_at: stringCell(row, "started_at"),
+    ended_at: optionalStringCell(row, "ended_at") ?? null,
+    sensitivity: stringCell(row, "sensitivity") as SessionSensitivity,
+    bundle_hash: stringCell(row, "bundle_hash"),
+    adapter_id: stringCell(row, "adapter_id"),
+    adapter_version: stringCell(row, "adapter_version"),
+    ingestion_plan_json: stringCell(row, "ingestion_plan_json"),
+    redaction_summary_json: stringCell(row, "redaction_summary_json"),
+    ingested_at: stringCell(row, "ingested_at"),
+    retention_until: optionalStringCell(row, "retention_until") ?? null
+  };
+}
+
+function sessionEventFromRow(row: Row): SessionEventRow {
+  const headBytesRaw = row["head_bytes"];
+  const tailBytesRaw = row["tail_bytes"];
+  return {
+    event_id: stringCell(row, "event_id"),
+    session_id: stringCell(row, "session_id"),
+    sequence: numberCell(row, "sequence"),
+    turn_id: stringCell(row, "turn_id"),
+    event_type: stringCell(row, "event_type") as SessionEventType,
+    role: optionalStringCell(row, "role") as SessionEventRole | null ?? null,
+    content_digest: stringCell(row, "content_digest"),
+    content_blob_ref: optionalStringCell(row, "content_blob_ref") ?? null,
+    tool_name: optionalStringCell(row, "tool_name") ?? null,
+    tool_call_id: optionalStringCell(row, "tool_call_id") ?? null,
+    tool_status: optionalStringCell(row, "tool_status") ?? null,
+    timestamp: stringCell(row, "timestamp"),
+    sensitivity: stringCell(row, "sensitivity") as SessionSensitivity,
+    redaction_flags_json: stringCell(row, "redaction_flags_json"),
+    metadata_json: stringCell(row, "metadata_json")
   };
 }
 
@@ -1493,6 +1642,235 @@ export class SQLiteMemoryStore {
     return rows.map((r) => derivationJobFromRow(r));
   }
 
+  // ─────────────────────────────────────────────────────────────────────
+  // v1.2.0-alpha.1 (issue #49): session evidence substrate.
+  //
+  // The three tables — `sessions` / `session_events` /
+  // `session_event_blobs` — back the SessionTraceBundle
+  // v1 capture surface. The public API for the rows
+  // lives in `src/sessions/service.ts`; the methods
+  // below are the lowest-level row readers and
+  // writers used by the SessionService. The methods
+  // compose inside single `BEGIN IMMEDIATE`
+  // transactions so the ingest path is atomic with
+  // the per-event plan (issue #49 AC #1).
+  // ─────────────────────────────────────────────────────────────────────
+
+  /**
+   * Find a session by the source-identity tuple.
+   * Returns `undefined` if no row exists. The
+   * read side of the replay contract: an `ingest`
+   * call with the same tuple + same `bundle_hash`
+   * returns the original `session_id`.
+   */
+  getSessionBySourceIdentity(args: {
+    source_kind: string;
+    source_version: string;
+    source_instance_id: string;
+    source_session_id: string;
+  }): SessionRow | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM sessions
+           WHERE source_kind = ?
+             AND source_version = ?
+             AND source_instance_id = ?
+             AND source_session_id = ?`
+      )
+      .get(
+        args.source_kind,
+        args.source_version,
+        args.source_instance_id,
+        args.source_session_id
+      ) as Row | undefined;
+    if (row === undefined) return undefined;
+    return sessionFromRow(row);
+  }
+
+  /**
+   * Read a session by its primary key.
+   */
+  getSession(sessionId: string): SessionRow | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM sessions WHERE session_id = ?")
+      .get(sessionId) as Row | undefined;
+    if (row === undefined) return undefined;
+    return sessionFromRow(row);
+  }
+
+  /**
+   * Insert one session row. Called from
+   * `SessionService.ingest` inside a single
+   * transaction that also inserts the per-event
+   * rows and the blob rows.
+   */
+  insertSession(row: SessionRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO sessions (
+          session_id, source_kind, source_version, source_instance_id, source_session_id,
+          scope, project_id, actor_id, client_name, client_version,
+          started_at, ended_at, sensitivity, bundle_hash,
+          adapter_id, adapter_version, ingestion_plan_json, redaction_summary_json,
+          ingested_at, retention_until
+        ) VALUES (
+          ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?,
+          ?, ?, ?, ?,
+          ?, ?, ?, ?,
+          ?, ?
+        )`
+      )
+      .run(
+        row.session_id,
+        row.source_kind,
+        row.source_version,
+        row.source_instance_id,
+        row.source_session_id,
+        row.scope,
+        row.project_id,
+        row.actor_id,
+        row.client_name,
+        row.client_version,
+        row.started_at,
+        row.ended_at,
+        row.sensitivity,
+        row.bundle_hash,
+        row.adapter_id,
+        row.adapter_version,
+        row.ingestion_plan_json,
+        row.redaction_summary_json,
+        row.ingested_at,
+        row.retention_until
+      );
+  }
+
+  /**
+   * List sessions for the CLI / MCP inspector. The
+   * `state` and `kind` arguments are optional;
+   * `limit` caps the row count. Ordered
+   * newest-first.
+   */
+  listSessions(filter: {
+    scope?: SessionScope;
+    project_id?: string;
+    limit: number;
+  }): SessionRow[] {
+    const clauses: string[] = [];
+    const params: SQLInputValue[] = [];
+    if (filter.scope !== undefined) {
+      clauses.push("scope = ?");
+      params.push(filter.scope);
+    }
+    if (filter.project_id !== undefined) {
+      clauses.push("project_id = ?");
+      params.push(filter.project_id);
+    }
+    const where = clauses.length === 0 ? "" : " WHERE " + clauses.join(" AND ");
+    const sql = `SELECT * FROM sessions${where}
+                  ORDER BY ingested_at DESC LIMIT ?`;
+    params.push(filter.limit);
+    const rows = this.db.prepare(sql).all(...params) as Row[];
+    return rows.map((r) => sessionFromRow(r));
+  }
+
+  /**
+   * Read the events for a single session, ordered
+   * by `sequence ASC` so the audit trail reads in
+   * capture order.
+   */
+  listSessionEvents(sessionId: string): SessionEventRow[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM session_events WHERE session_id = ? ORDER BY sequence ASC, event_id ASC"
+      )
+      .all(sessionId) as Row[];
+    return rows.map((r) => sessionEventFromRow(r));
+  }
+
+  /**
+   * Insert one session event row. The body itself
+   * is in `session_event_blobs` keyed by
+   * `content_digest`; the row holds the manifest
+   * + metadata only.
+   */
+  insertSessionEvent(row: SessionEventRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO session_events (
+          event_id, session_id, sequence, turn_id, event_type, role,
+          content_digest, content_blob_ref, tool_name, tool_call_id, tool_status,
+          timestamp, sensitivity, redaction_flags_json, metadata_json
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?,
+          ?, ?, ?, ?
+        )`
+      )
+      .run(
+        row.event_id,
+        row.session_id,
+        row.sequence,
+        row.turn_id,
+        row.event_type,
+        row.role,
+        row.content_digest,
+        row.content_blob_ref,
+        row.tool_name,
+        row.tool_call_id,
+        row.tool_status,
+        row.timestamp,
+        row.sensitivity,
+        row.redaction_flags_json,
+        row.metadata_json
+      );
+  }
+
+  /**
+   * Insert (or replace) a session event blob.
+   * The blob row is keyed by digest; the same
+   * digest from two events reuses the same body
+   * (issue #49 storage model: content-addressed).
+   */
+  upsertSessionEventBlob(row: SessionEventBlobRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO session_event_blobs (
+          digest, size_bytes, media_type, head_bytes, tail_bytes,
+          head_tail_window_json, stored_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(digest) DO NOTHING`
+      )
+      .run(
+        row.digest,
+        row.size_bytes,
+        row.media_type,
+        row.head_bytes,
+        row.tail_bytes,
+        row.head_tail_window_json,
+        row.stored_at
+      );
+  }
+
+  /**
+   * Forget a session. The ON DELETE CASCADE on
+   * `session_events` removes all event rows in
+   * the same transaction. The blob rows are
+   * intentionally NOT cascaded: a digest is
+   * content-addressed and may be referenced by
+   * another (unrelated) session, so a session
+   * forget only removes the manifest / index
+   * rows. Blob rows that lose all referrers
+   * become eligible for the GC sweep added in
+   * #55.
+   */
+  forgetSession(sessionId: string): boolean {
+    const result = this.db
+      .prepare("DELETE FROM sessions WHERE session_id = ?")
+      .run(sessionId);
+    return result.changes > 0;
+  }
+
   close(): void {
     this.db.close();
   }
@@ -1714,6 +2092,10 @@ export class SQLiteMemoryStore {
     }
     if (version === 14) {
       this.migrate_v13_to_v14();
+      return;
+    }
+    if (version === 15) {
+      this.migrate_v14_to_v15();
       return;
     }
     throw new Error(`No migration registered for schema version ${version}`);
@@ -2673,6 +3055,124 @@ export class SQLiteMemoryStore {
           ON derivation_outputs(run_id);
       `);
       this.db.exec("PRAGMA user_version = 14");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * v1.2.0-alpha.1 (issue #49): v14 -> v15 schema
+   * migration. Introduces the session evidence
+   * substrate (`sessions` / `session_events` /
+   * `session_event_blobs`). The tables are
+   * strictly additive — no v14 column or index
+   * is altered, no derivation job row is renamed.
+   * The migration is fully transactional; on any
+   * throw the user_version stays at 14 and the
+   * database is untouched.
+   *
+   * Schema invariants (mirrored in
+   * `docs/adr/0011-session-evidence-lifecycle.md`):
+   *  - `sessions` is the canonical identity for a
+   *    captured trace. The UNIQUE constraint on
+   *    `(source_kind, source_version,
+   *    source_instance_id, source_session_id)` is
+   *    the contract that makes `ingest` a
+   *    replayable operation (issue #49 AC #1).
+   *  - `session_events.event_id` is the
+   *    adapter-stable identity supplied by the
+   *    source (OpenCode lifecycle hook, JSONL
+   *    fixture, ...); the row is the canonical
+   *    durable record.
+   *  - `session_event_blobs` is the
+   *    content-addressed body cache. SQLite is
+   *    still the authoritative manifest / index;
+   *    large bodies live in a content-addressed
+   *    local file (head + tail 1KB slices are
+   *    kept in-row for inspection; the full body
+   *    is resolved on demand).
+   *  - All three tables use `TEXT` ISO 8601 for
+   *    timestamps (matching the v13 portability
+   *    surface and the rest of the recall layer).
+   */
+  private migrate_v14_to_v15(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS sessions (
+          session_id              TEXT PRIMARY KEY,
+          source_kind             TEXT NOT NULL,
+          source_version          TEXT NOT NULL,
+          source_instance_id      TEXT NOT NULL,
+          source_session_id       TEXT NOT NULL,
+          scope                   TEXT NOT NULL
+                                     CHECK (scope IN ('global', 'project')),
+          project_id              TEXT,
+          actor_id                TEXT NOT NULL,
+          client_name             TEXT NOT NULL,
+          client_version          TEXT NOT NULL,
+          started_at              TEXT NOT NULL,
+          ended_at                TEXT,
+          sensitivity             TEXT NOT NULL
+                                     CHECK (sensitivity IN ('normal', 'private', 'restricted')),
+          bundle_hash             TEXT NOT NULL,
+          adapter_id              TEXT NOT NULL,
+          adapter_version         TEXT NOT NULL,
+          ingestion_plan_json     TEXT NOT NULL,
+          redaction_summary_json  TEXT NOT NULL,
+          ingested_at             TEXT NOT NULL,
+          retention_until         TEXT,
+          UNIQUE (source_kind, source_version, source_instance_id, source_session_id)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_project
+          ON sessions(scope, project_id);
+        CREATE INDEX IF NOT EXISTS idx_sessions_source_session
+          ON sessions(source_session_id);
+        CREATE INDEX IF NOT EXISTS idx_sessions_ingested_at
+          ON sessions(ingested_at);
+
+        CREATE TABLE IF NOT EXISTS session_events (
+          event_id                TEXT PRIMARY KEY,
+          session_id              TEXT NOT NULL
+                                     REFERENCES sessions(session_id) ON DELETE CASCADE,
+          sequence                INTEGER NOT NULL,
+          turn_id                 TEXT NOT NULL,
+          event_type              TEXT NOT NULL,
+          role                    TEXT,
+          content_digest          TEXT NOT NULL,
+          content_blob_ref        TEXT,
+          tool_name               TEXT,
+          tool_call_id            TEXT,
+          tool_status             TEXT,
+          timestamp               TEXT NOT NULL,
+          sensitivity             TEXT NOT NULL
+                                     CHECK (sensitivity IN ('normal', 'private', 'restricted')),
+          redaction_flags_json    TEXT NOT NULL DEFAULT '[]',
+          metadata_json           TEXT NOT NULL DEFAULT '{}',
+          UNIQUE (session_id, sequence)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_session_events_session_seq
+          ON session_events(session_id, sequence);
+        CREATE INDEX IF NOT EXISTS idx_session_events_ts
+          ON session_events(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_session_events_event_type
+          ON session_events(event_type);
+
+        CREATE TABLE IF NOT EXISTS session_event_blobs (
+          digest                  TEXT PRIMARY KEY,
+          size_bytes              INTEGER NOT NULL,
+          media_type              TEXT NOT NULL,
+          head_bytes              BLOB NOT NULL,
+          tail_bytes              BLOB NOT NULL,
+          head_tail_window_json   TEXT NOT NULL,
+          stored_at               TEXT NOT NULL
+        ) STRICT;
+      `);
+      this.db.exec("PRAGMA user_version = 15");
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");

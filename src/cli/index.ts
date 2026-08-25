@@ -17,6 +17,7 @@ import { jobsCommand } from "./commands/jobs.js";
 import { listCommand } from "./commands/list.js";
 import { migrateCommand } from "./commands/migrate.js";
 import { searchCommand } from "./commands/search.js";
+import { sessionsCommand } from "./commands/sessions.js";
 import { showCommand } from "./commands/show.js";
 import { parseArgs, type ParsedArgs } from "./arg-parser.js";
 import { buildRequestContext, type RequestContext } from "../request-context.js";
@@ -98,6 +99,7 @@ Commands:
   migrate    Run schema migrations
   admin      Manage the operator capability (grant / status / revoke)
   jobs       Inspect, cancel, or run derivation jobs
+  sessions   Inspect / ingest / list / show / forget captured session traces
   version    Print the server version (also: --version / -v)
   help       Show this help
 
@@ -135,7 +137,12 @@ const dispatch: Record<string, CommandHandler> = {
   // v1.2.0-alpha.0 (issue #48): the derivation job
   // subcommand. Provides the durable inspect / cancel /
   // run surface for the v1.2 derivation job substrate.
-  jobs: jobsCommand
+  jobs: jobsCommand,
+  // v1.2.0-alpha.1 (issue #49): the session trace
+  // subcommand. Provides the inspect / ingest / list /
+  // show / forget surface for the v1.2 session
+  // evidence substrate.
+  sessions: sessionsCommand
 };
 
 export async function runCli(

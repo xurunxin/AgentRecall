@@ -35,6 +35,7 @@ import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ProjectIdentityResolver } from "../scope-resolver.js";
 import { ImportBatchStore } from "../portability/import-batch-store.js";
 import { DerivationJobStore } from "../jobs/service.js";
+import { SessionService } from "../sessions/service.js";
 import type { ToolProfile } from "../tools/profile.js";
 import type { CapabilityStore } from "../admin/capability.js";
 import type { AuthorizationDecision } from "../services/auth-context.js";
@@ -545,6 +546,46 @@ export function registerMemoryResources(server: MemoryResourceServer, ctx: Memor
         job: inspection.job,
         runs: inspection.runs,
         outputs: inspection.outputs
+      });
+    }
+  );
+
+  // v1.2.0-alpha.1 (issue #49): the session evidence
+  // resource. The payload mirrors the `sessions show`
+  // CLI output: the session row + the per-event
+  // manifest (digest, redaction flags, metadata) + the
+  // ingestion plan. The event body is **not** in this
+  // payload — bodies live in `session_event_blobs`
+  // and are resolved on demand through a typed
+  // tool (added in Phase 2 with the candidate
+  // extractor).
+  server.registerResource(
+    "session_evidence",
+    new ResourceTemplate("agentrecall://sessions/{session_id}", { list: undefined }),
+    {
+      description:
+        "Durable session evidence: row + per-event manifest (sequence, type, content digest, redaction flags, metadata) + ingestion plan. Mirrors the agent-recall sessions show CLI output.",
+      mimeType: "application/json"
+    },
+    (uri: URL, variables: Variables) => {
+      const sessionId = pickVariable(variables, "session_id");
+      if (sessionId === undefined || sessionId.length === 0) {
+        return jsonResource(uri, { ok: false, error: "not_found", message: "missing session_id" });
+      }
+      const service = new SessionService(ctx.store, ctx.identityResolver);
+      const inspection = service.inspect(sessionId);
+      if (inspection === undefined) {
+        return jsonResource(uri, {
+          ok: false,
+          error: "not_found",
+          message: `unknown session_id ${sessionId}`
+        });
+      }
+      return jsonResource(uri, {
+        ok: true,
+        session: inspection.session,
+        events: inspection.events,
+        plan: inspection.plan
       });
     }
   );
