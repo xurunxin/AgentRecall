@@ -1,13 +1,5 @@
 import { forwardRef, type CSSProperties } from "react";
-import type { NodeProps } from "reactflow";
 import type { GraphNode } from "@agent-recall/contracts";
-
-export interface MemoryNodeData {
-  node: GraphNode;
-  // `onClick` is intentionally NOT on the per-node data payload: drawer-open
-  // is handled by xyflow's <ReactFlow onNodeClick={…}> on the parent, which
-  // gives correct click-vs-drag disambiguation for free.
-}
 
 // 12-color qualitative palette for the most common topics, chosen to be
 // distinguishable on both light and dark backgrounds. Topics that don't match
@@ -47,40 +39,23 @@ export function colorForTopic(topic: string): string {
 }
 
 // Uniform node circle diameter. Used for both the visible circle and the
-// dagre layout box (see GraphCanvas.tsx NODE_WIDTH). 3× the original 14px so
-// the topic color reads as a clear dot, not a pixel-sized speck.
+// dagre layout box (see GraphCanvas.tsx NODE_WIDTH).
 const CIRCLE_BASE = 42;
 
 /**
- * reactflow v11 passes a `ref` to the custom node component so it can attach
- * its own drag/selection handlers. Without `forwardRef`, that ref is dropped
- * and `nodesDraggable` silently does nothing — nodes are still clickable
- * (because onNodeClick uses a different code path) but cannot be dragged.
- *
- * The fix: wrap the component in `forwardRef<HTMLDivElement, NodeProps>` and
- * forward the ref to the outermost wrapper div. The wrapper is the single
- * element that owns the row layout, so attaching the ref there lets reactflow
- * capture pointer events from anywhere on the row.
- *
- * `NodeProps` is used with its default generic (the bare `Node<...>` type)
- * because `nodeTypes` in `reactflow` requires components assignable to
- * `ComponentType<NodeProps & { data: any; type: any }>`. The per-node
- * `data` is widened to `any` in that signature, so we keep the existing
- * `data as unknown as MemoryNodeData` cast inside the body.
+ * Plain DOM node visual. The parent <GraphCanvas> owns the absolute
+ * positioning and the mousedown handler that starts a drag. The ref is
+ * exposed for any consumer (e.g. unit tests) that wants to attach to the
+ * wrapper div; it is no longer required by a drag library.
  */
-const MemoryNode = forwardRef<HTMLDivElement, NodeProps>(
-  function MemoryNode({ data }, ref) {
-    const { node } = data as unknown as MemoryNodeData;
+const MemoryNode = forwardRef<HTMLDivElement, { node: GraphNode }>(
+  function MemoryNode({ node }, ref) {
     const color = colorForTopic(node.topic);
     const showGlow = node.importance >= 4;
 
     return (
       <div
         ref={ref}
-        // No `onClick` here on purpose: xyflow's own click-vs-drag detection
-        // (wired through `onNodeClick` on the <ReactFlow> parent) handles
-        // drawer-open, while the row remains freely draggable. Adding a
-        // manual onClick would steal pointer events and break drag.
         data-testid={`memory-node-${node.id}`}
         data-topic={node.topic}
         style={
@@ -88,20 +63,10 @@ const MemoryNode = forwardRef<HTMLDivElement, NodeProps>(
             display: "flex",
             alignItems: "center",
             gap: 8,
-            // `grab` cursor signals that the row is draggable. xyflow still
-            // owns the actual pointer handling (so the cursor flips to
-            // `grabbing` while dragging) — this is just visual feedback.
             cursor: "grab",
             userSelect: "none",
-            transition: "transform 120ms ease",
           } as CSSProperties
         }
-        onMouseEnter={(e) => {
-          (e.currentTarget as HTMLDivElement).style.transform = "scale(1.04)";
-        }}
-        onMouseLeave={(e) => {
-          (e.currentTarget as HTMLDivElement).style.transform = "scale(1)";
-        }}
       >
         {/* Solid topic-color circle. Uniform 42px regardless of importance. */}
         <div
@@ -141,4 +106,3 @@ const MemoryNode = forwardRef<HTMLDivElement, NodeProps>(
 );
 
 export default MemoryNode;
-

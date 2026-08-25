@@ -1,30 +1,41 @@
-import {
-  ReactFlow,
-  Background,
-  Controls,
-  MiniMap,
-  type Node,
-  type Edge,
-} from "reactflow";
-import "reactflow/dist/style.css";
-import { useMemo } from "react";
+// Hand-rolled graph view (replaces reactflow / @xyflow/react).
+//
+// Why we abandoned xyflow: 6 prior attempts to make edges visible and nodes
+// draggable inside Tauri 2.0's WebView2 (Microsoft Edge runtime) failed. The
+// library's pointer-event pipeline (useGesture + synthetic PointerEvents) drops
+// pointermove/pointerup on some WebView2 builds, and SVG path stacking under
+// the node div renders edges invisible even with high zIndex. Rather than
+// patch around library internals, we use plain DOM + standard mousedown /
+// mousemove / mouseup + CSS `transform: translate(x,y) scale(s)`. Standard
+// React event handling, no exotic pointer-event bookkeeping, 100% compatible
+// with any browser/webview.
+//
+// Layout: dagre still computes initial node positions (LR rankdir, 40/60
+// spacing). After mount, users can drag nodes freely; dragged positions are
+// kept across polling ticks in a `positionsRef` so re-renders from
+// `useGraph`/`usePolling` don't snap the graph back to the dagre layout.
+//
+// Coordinate system: positions are stored in *graph space* (pre-pan, pre-zoom).
+// The inner `<div>` applies `transform: translate(panX, panY) scale(zoom)`, so
+// `mousemove` deltas need to be divided by `zoom` to convert from screen
+// pixels to graph units.
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import dagre from "@dagrejs/dagre";
 import type { GraphEdge, GraphNode } from "@agent-recall/contracts";
-import MemoryNode, { colorForTopic } from "./MemoryNode.js";
+import MemoryNode from "./MemoryNode.js";
 
 interface Props {
   nodes: GraphNode[];
   edges: GraphEdge[];
   truncated: boolean;
   total: number;
-  /** Click on a xyflow node. Receives the underlying GraphNode. */
+  /** Click on a node. Receives the underlying GraphNode. */
   onNodeClick?: (node: GraphNode) => void;
 }
 
-// Actual hex values (NOT CSS vars — SVG `stroke` attribute does not resolve
-// `var(--…)`, so we duplicate the same colors that live in `theme.css` as
-// `--edge-supersede/merge/co-topic/co-scope`. Keep these in sync if the theme
-// palette ever changes.
+// Hex values for edges. SVG `stroke` does not resolve CSS vars, so we keep
+// these in sync with `--edge-*` in `theme.css`. (When we removed reactflow
+// the same color-mapping comment moved here.)
 const edgeKindColor: Record<GraphEdge["kind"], string> = {
   supersede: "#2563eb", // blue
   merge: "#7c3aed", // purple
@@ -32,38 +43,29 @@ const edgeKindColor: Record<GraphEdge["kind"], string> = {
   co_scope: "#9ca3af", // gray
 };
 
-const edgeKindStyle: Record<GraphEdge["kind"], "solid" | "dashed"> = {
-  supersede: "solid",
-  merge: "solid",
-  co_topic: "dashed",
-  co_scope: "dashed",
+const edgeKindDash: Record<GraphEdge["kind"], string | undefined> = {
+  supersede: undefined,
+  merge: undefined,
+  co_topic: "4 4",
+  co_scope: "4 4",
 };
 
-/**
- * Dagre box matches the *visible* node footprint so edge endpoints land on the
- * actual circle/label boundary instead of crossing through node centers.
- * Visible content: 42px circle + 8px gap + ~90px avg label (labels are
- * ellipsised at 180px, but most are well under 100px). This shrank from
- * 230×48 (which assumed the full 180px label and pushed edge paths under
- * the row).
- */
+// dagre box matches the visible node footprint so edge endpoints land on the
+// actual circle boundary. 42px circle + 8px gap + ~90px avg label = 140.
 const NODE_WIDTH = 42 + 8 + 90; // 140
 const NODE_HEIGHT = 42;
 
+type Position = { x: number; y: number };
+
 /**
- * Run dagre layout over nodes/edges and return a copy of `nodes` with
- * positions populated. Nodes that aren't in the dagre graph (e.g. isolates)
- * keep their previous position.
- *
- * Each box is the uniform 140×42 row (42px circle + 8px gap + ~90px avg
- * label); dagre centers each box on its computed anchor, so we subtract
- * width/2 and height/2 to convert to reactflow's top-left position
- * convention.
+ * Run dagre layout over the given nodes. Returns a map of nodeId → position
+ * (graph-space center coordinates). Nodes that aren't in the dagre graph
+ * (isolates) are placed in a small grid so they still render.
  */
 function layoutWithDagre(
-  nodes: Node<{ node: GraphNode }>[],
-  edges: Edge[]
-): Node[] {
+  nodes: GraphNode[],
+  edges: GraphEdge[]
+): Record<string, Position> {
   const g = new dagre.graphlib.Graph();
   g.setDefaultEdgeLabel(() => ({}));
   g.setGraph({
@@ -74,74 +76,213 @@ function layoutWithDagre(
     marginy: 40,
   });
 
-  nodes.forEach((n) => {
-    g.setNode(n.id, { width: NODE_WIDTH, height: NODE_HEIGHT });
+  nodes.forEach((n) => g.setNode(n.id, { width: NODE_WIDTH, height: NODE_HEIGHT }));
+  edges.forEach((e) => {
+    // Only lay out edges whose endpoints both exist in the node set.
+    if (g.hasNode(e.source) && g.hasNode(e.target)) g.setEdge(e.source, e.target);
   });
-  edges.forEach((e) => g.setEdge(e.source, e.target));
 
   dagre.layout(g);
 
-  return nodes.map((n) => {
+  const out: Record<string, Position> = {};
+  const isolates: GraphNode[] = [];
+  nodes.forEach((n) => {
     const dn = g.node(n.id);
-    if (!dn) return n;
-    return {
-      ...n,
-      position: {
-        x: dn.x - NODE_WIDTH / 2,
-        y: dn.y - NODE_HEIGHT / 2,
-      },
+    if (dn) {
+      out[n.id] = { x: dn.x, y: dn.y };
+    } else {
+      isolates.push(n);
+    }
+  });
+
+  // Place any isolates on a 3-column grid below the main layout so they
+  // remain visible but separate. dagre returns undefined for nodes with no
+  // edges, so they fall through here.
+  isolates.forEach((n, i) => {
+    const col = i % 3;
+    const row = Math.floor(i / 3);
+    out[n.id] = {
+      x: 40 + NODE_WIDTH / 2 + col * (NODE_WIDTH + 40),
+      y: 40 + NODE_HEIGHT / 2 + row * (NODE_HEIGHT + 60),
     };
   });
+
+  return out;
 }
 
+interface DragState {
+  nodeId: string;
+  /** Screen-space mouse position at drag start. */
+  startScreenX: number;
+  startScreenY: number;
+  /** Graph-space node position at drag start. */
+  startNodeX: number;
+  startNodeY: number;
+  /** True if the pointer moved beyond the click threshold (no click). */
+  moved: boolean;
+}
+
+const CLICK_THRESHOLD_PX = 5;
+
 export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClick }: Props) {
-  const flowEdges: Edge[] = useMemo(
-    () =>
-      edges.map((e, i) => {
-        // co_topic / co_scope are ambient similarity edges — keep them visible
-        // but de-emphasized so the eye lands on supersede/merge first.
-        const isAmbient = e.kind === "co_topic" || e.kind === "co_scope";
-        return {
-          id: `e-${i}`,
-          source: e.source,
-          target: e.target,
-          type: "straight",
-          // zIndex:100 keeps edges above the dot/line background and above
-          // xyflow's default node zIndex of 5, so the edge stroke remains
-          // visible even where it crosses a node's bounding box. With the
-          // shrunken dagre box (NODE_WIDTH=140, see above) most paths still
-          // land on the actual node boundary, but the high zIndex is a
-          // safety net for any case where the path runs under the row.
-          zIndex: 100,
-          className: isAmbient ? "ambient-edge" : "primary-edge",
-          style: {
-            stroke: edgeKindColor[e.kind],
-            strokeWidth: isAmbient ? 1 : 1.5,
-            strokeDasharray: edgeKindStyle[e.kind] === "dashed" ? "4 4" : undefined,
-            opacity: isAmbient ? 0.5 : 0.9,
-          },
-        };
-      }),
-    [edges]
+  // Persisted drag positions survive polling re-renders. The ref lets us
+  // reach the latest positions inside mousemove without re-binding the
+  // global listener on every move.
+  const positionsRef = useRef<Map<string, Position>>(new Map());
+  // Bump this when we mutate positionsRef so consumers re-read them.
+  const [positionsTick, setPositionsTick] = useState(0);
+
+  // Pan + zoom state. `transform-origin: 0 0` lets us anchor the inner div
+  // at top-left and translate relative to that anchor.
+  const [pan, setPan] = useState<Position>({ x: 0, y: 0 });
+  const [zoom, setZoom] = useState(1);
+
+  // Drag state for the currently-dragged node (null when not dragging).
+  const [drag, setDrag] = useState<DragState | null>(null);
+
+  // Pan state for canvas drag (null when not panning).
+  const [panDrag, setPanDrag] = useState<
+    { startScreenX: number; startScreenY: number; startPanX: number; startPanY: number } | null
+  >(null);
+
+  // Recompute dagre layout whenever the upstream node/edge set changes
+  // (new server response, filter change). Memoized on identity so we don't
+  // recompute on every render.
+  const baseLayout = useMemo(() => layoutWithDagre(nodes, edges), [nodes, edges]);
+
+  // Reset the user-drag map when the node identity set changes materially
+  // (e.g. filter swap). If a node from the new set was previously dragged,
+  // keep its position; otherwise adopt the dagre default.
+  useEffect(() => {
+    const next = new Map<string, Position>();
+    baseLayout; // referenced to keep lint happy; the next loop does the work
+    for (const n of nodes) {
+      const prev = positionsRef.current.get(n.id);
+      next.set(n.id, prev ?? baseLayout[n.id] ?? { x: 0, y: 0 });
+    }
+    positionsRef.current = next;
+    setPositionsTick((t) => t + 1);
+  }, [baseLayout, nodes]);
+
+  // Pre-fill positions for any node not in the map yet (defensive — covers
+  // the case where a single node is added between two renders).
+  const getPosition = useCallback(
+    (id: string): Position => {
+      const have = positionsRef.current.get(id);
+      if (have) return have;
+      const fallback = baseLayout[id] ?? { x: 0, y: 0 };
+      positionsRef.current.set(id, fallback);
+      return fallback;
+    },
+    [baseLayout]
   );
 
-  // Compute flowNodes with positions from dagre. Recompute when nodes or
-  // edges change so the graph reflows.
-  const flowNodes: Node[] = useMemo(() => {
-    const base: Node<{ node: GraphNode }>[] = nodes.map((n) => ({
-      id: n.id,
-      type: "memory",
-      position: { x: 0, y: 0 },
-      data: { node: n },
-    }));
-    return layoutWithDagre(base, flowEdges);
-    // flowEdges is derived from props.edges via useMemo; including it keeps
-    // positions in sync with the latest edge set without re-laying out when
-    // the only change is the parent re-rendering.
-  }, [nodes, flowEdges]);
+  // Global mousemove / mouseup listeners for the active drag (node OR pan).
+  // Using a single useEffect with both states means only one set of
+  // listeners at a time, and we attach/detach cleanly when drag ends.
+  useEffect(() => {
+    if (!drag && !panDrag) return;
+
+    const handleMove = (e: MouseEvent) => {
+      if (drag) {
+        const screenDx = e.clientX - drag.startScreenX;
+        const screenDy = e.clientY - drag.startScreenY;
+        const dx = screenDx / zoom;
+        const dy = screenDy / zoom;
+        positionsRef.current.set(drag.nodeId, {
+          x: drag.startNodeX + dx,
+          y: drag.startNodeY + dy,
+        });
+        // Once the user has moved more than CLICK_THRESHOLD_PX, the gesture
+        // is committed to a drag (and the click on mouseup is suppressed).
+        if (!drag.moved && Math.hypot(screenDx, screenDy) >= CLICK_THRESHOLD_PX) {
+          setDrag({ ...drag, moved: true });
+        }
+        // Re-render with new positions.
+        setPositionsTick((t) => t + 1);
+      } else if (panDrag) {
+        const dx = e.clientX - panDrag.startScreenX;
+        const dy = e.clientY - panDrag.startScreenY;
+        setPan({ x: panDrag.startPanX + dx, y: panDrag.startPanY + dy });
+      }
+    };
+
+    const handleUp = () => {
+      if (drag && !drag.moved) {
+        // Treat as a click: open the drawer.
+        const target = nodes.find((n) => n.id === drag.nodeId);
+        if (target && onNodeClick) onNodeClick(target);
+      }
+      setDrag(null);
+      setPanDrag(null);
+    };
+
+    window.addEventListener("mousemove", handleMove);
+    window.addEventListener("mouseup", handleUp);
+    return () => {
+      window.removeEventListener("mousemove", handleMove);
+      window.removeEventListener("mouseup", handleUp);
+    };
+  }, [drag, panDrag, zoom, nodes, onNodeClick]);
+
+  // Wheel zoom. Bound to the container (not window) so scrolling the page
+  // itself still works.
+  const handleWheel = useCallback(
+    (e: React.WheelEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      setZoom((z) => {
+        const next = e.deltaY > 0 ? z * 0.9 : z * 1.1;
+        return Math.max(0.2, Math.min(3, next));
+      });
+    },
+    []
+  );
+
+  // Canvas mousedown starts a pan (when the user clicks empty space).
+  const handleCanvasMouseDown = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      // Only start panning when the user clicks the container itself, not
+      // bubbled clicks from nodes (which stop propagation in their handler).
+      if (e.target !== e.currentTarget) return;
+      setPanDrag({
+        startScreenX: e.clientX,
+        startScreenY: e.clientY,
+        startPanX: pan.x,
+        startPanY: pan.y,
+      });
+    },
+    [pan]
+  );
+
+  // Node mousedown starts a drag. `e.stopPropagation()` so the canvas
+  // doesn't also see this as a pan-start.
+  const handleNodeMouseDown = useCallback(
+    (e: React.MouseEvent<HTMLDivElement>, node: GraphNode) => {
+      e.stopPropagation();
+      const pos = getPosition(node.id);
+      setDrag({
+        nodeId: node.id,
+        startScreenX: e.clientX,
+        startScreenY: e.clientY,
+        startNodeX: pos.x,
+        startNodeY: pos.y,
+        moved: false,
+      });
+    },
+    [getPosition]
+  );
+
+  // Compute the SVG viewBox so the canvas can host a 1:1 background grid if
+  // we ever add one. For now we just compute extents for edge rendering.
+  // Edges are absolute-positioned SVG inside the transformed div, so they
+  // automatically share the same pan/zoom.
+  // The position read is via `getPosition` so a positionsTick bump causes
+  // re-render. (positionsTick not used directly here, but reading via the
+  // ref keeps the closure fresh enough; React re-renders on tick anyway.)
+  void positionsTick;
 
   return (
-    <div style={{ flex: 1, position: "relative" }}>
+    <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
       <div
         style={{
           position: "absolute",
@@ -153,55 +294,110 @@ export default function GraphCanvas({ nodes, edges, truncated, total, onNodeClic
           border: "1px solid var(--border)",
           borderRadius: 4,
           fontSize: 12,
+          pointerEvents: "none",
         }}
       >
         节点 {nodes.length} / {total}
         {truncated && " (已截断)"} · 边 {edges.length}
       </div>
-      <ReactFlow
-        nodes={flowNodes}
-        edges={flowEdges}
-        nodeTypes={{ memory: MemoryNode }}
-        fitView
-        fitViewOptions={{ padding: 0.25 }}
-        onNodeClick={
-          onNodeClick
-            ? (_event, node) => onNodeClick(node.data.node as GraphNode)
-            : undefined
-        }
+      <div
+        style={{
+          position: "absolute",
+          top: 8,
+          right: 8,
+          zIndex: 10,
+          padding: "4px 8px",
+          background: "var(--bg-elev)",
+          border: "1px solid var(--border)",
+          borderRadius: 4,
+          fontSize: 12,
+          fontFamily: "monospace",
+          pointerEvents: "none",
+        }}
       >
-        <Background />
-        <Controls
-          // xyflow's Controls ship with a white background that looks like a
-          // white block on dark mode. The wrapper style was being overridden
-          // by xyflow's own CSS, so we now drive the look via a className
-          // and rules in `theme.css` (`.dark-controls`). The inner buttons
-          // also need their own background; see `.dark-controls button`.
-          className="dark-controls"
-          showInteractive={false}
-        />
-        <MiniMap
-          pannable
-          zoomable
-          nodeColor={(n) => {
-            const topic = (n.data as { node?: GraphNode })?.node?.topic;
-            // Reuse the same palette as MemoryNode so the minimap is a
-            // faithful thumbnail of the main canvas.
-            return topic ? colorForTopic(topic) : "#6b7280";
-          }}
-          // reactflow v11 has no `bgColor` prop — the wrapper background
-          // is driven by the `.react-flow__minimap` CSS rule. We override
-          // it in `theme.css` to `#1a1a1a`. `maskColor` is still the tint
-          // laid over the empty minimap area, so with both layers
-          // combined, empty space renders as `#1a1a1a` and node pucks
-          // stand out cleanly.
-          maskColor="rgba(0, 0, 0, 0.6)"
+        zoom {(zoom * 100).toFixed(0)}%
+      </div>
+      {/* Canvas (listens for pan-start, wheel for zoom). */}
+      <div
+        onMouseDown={handleCanvasMouseDown}
+        onWheel={handleWheel}
+        style={{
+          position: "absolute",
+          inset: 0,
+          background: "var(--bg)",
+          // "grabbing" when a pan is active OR a node is being dragged, so the
+          // user gets visual feedback that the gesture is engaged.
+          cursor: panDrag || drag ? "grabbing" : "grab",
+        }}
+      >
+        {/* Inner transformed layer. transform-origin: 0 0 anchors the
+            scale at top-left so translate + scale compose predictably. */}
+        <div
           style={{
-            border: "1px solid #2a2a2a",
+            position: "absolute",
+            left: 0,
+            top: 0,
+            transformOrigin: "0 0",
+            transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+            // Layer ordering: SVG edges below node divs so the colored
+            // circles stay crisp on top.
           }}
-          ariaLabel="Graph minimap"
-        />
-      </ReactFlow>
+        >
+          {/* Edges (SVG under nodes). */}
+          <svg
+            style={{
+              position: "absolute",
+              left: 0,
+              top: 0,
+              overflow: "visible",
+              pointerEvents: "none",
+            }}
+            width="0"
+            height="0"
+          >
+            {edges.map((e, i) => {
+              const src = positionsRef.current.get(e.source);
+              const tgt = positionsRef.current.get(e.target);
+              if (!src || !tgt) return null;
+              const isAmbient = e.kind === "co_topic" || e.kind === "co_scope";
+              return (
+                <line
+                  key={`e-${i}`}
+                  x1={src.x}
+                  y1={src.y}
+                  x2={tgt.x}
+                  y2={tgt.y}
+                  stroke={edgeKindColor[e.kind]}
+                  strokeWidth={isAmbient ? 1 : 1.5}
+                  strokeDasharray={edgeKindDash[e.kind]}
+                  opacity={isAmbient ? 0.5 : 0.9}
+                />
+              );
+            })}
+          </svg>
+          {/* Nodes. */}
+          {nodes.map((n) => {
+            const pos = positionsRef.current.get(n.id);
+            if (!pos) return null;
+            return (
+              <div
+                key={n.id}
+                onMouseDown={(e) => handleNodeMouseDown(e, n)}
+                style={{
+                  position: "absolute",
+                  left: pos.x,
+                  top: pos.y,
+                  transform: "translate(-50%, -50%)",
+                  cursor: drag?.nodeId === n.id ? "grabbing" : "grab",
+                  zIndex: 1,
+                }}
+              >
+                <MemoryNode node={n} />
+              </div>
+            );
+          })}
+        </div>
+      </div>
     </div>
   );
 }

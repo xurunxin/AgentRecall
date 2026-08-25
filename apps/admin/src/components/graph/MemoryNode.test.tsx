@@ -1,7 +1,5 @@
 import { describe, it, expect } from "vitest";
-import type { ReactElement } from "react";
-import { render, screen, fireEvent } from "@testing-library/react";
-import { ReactFlowProvider, type NodeProps } from "reactflow";
+import { render, screen } from "@testing-library/react";
 import MemoryNode, { colorForTopic } from "./MemoryNode.js";
 import type { GraphNode } from "@agent-recall/contracts";
 
@@ -17,21 +15,9 @@ const sampleNode: GraphNode = {
   created_at: "2026-08-24T10:00:00.000Z",
 };
 
-function renderInFlow(ui: ReactElement): ReturnType<typeof render> {
-  return render(<ReactFlowProvider>{ui}</ReactFlowProvider>);
-}
-
-// NodeProps<default Node> has many required fields (type, dragging, zIndex,
-// selectable, deletable, selected, draggable) that are populated by the
-// surrounding <ReactFlow> at runtime. Unit tests only check the
-// component's own rendering, so cast the minimal { id, data } shape.
-function nodePropsFor(node: GraphNode): NodeProps {
-  return { id: "n1", data: { node } } as unknown as NodeProps;
-}
-
 describe("MemoryNode", () => {
   it("renders the label as visible text and exposes the full label via the title tooltip", () => {
-    renderInFlow(<MemoryNode {...nodePropsFor(sampleNode)} />);
+    render(<MemoryNode node={sampleNode} />);
     // The label is the visible text next to the node.
     expect(screen.getByText("Use JWT for auth")).toBeDefined();
     // And also reachable via the native title attribute (hover tooltip).
@@ -39,13 +25,13 @@ describe("MemoryNode", () => {
   });
 
   it("exposes the topic as a data attribute for styling and tests", () => {
-    renderInFlow(<MemoryNode {...nodePropsFor(sampleNode)} />);
+    render(<MemoryNode node={sampleNode} />);
     const root = screen.getByTestId(`memory-node-${sampleNode.id}`);
     expect(root.getAttribute("data-topic")).toBe("auth");
   });
 
   it("renders a 42px topic-color circle (UX hotfix #4: 3× the original 14px)", () => {
-    renderInFlow(<MemoryNode {...nodePropsFor(sampleNode)} />);
+    render(<MemoryNode node={sampleNode} />);
     const circle = screen.getByTestId("memory-node-circle");
     // Width/height are set via inline style; assert both the literal px
     // values and the topic background color.
@@ -58,7 +44,7 @@ describe("MemoryNode", () => {
 
   it("adds a glow box-shadow on the circle when importance >= 4", () => {
     const high: GraphNode = { ...sampleNode, importance: 5 };
-    renderInFlow(<MemoryNode {...nodePropsFor(high)} />);
+    render(<MemoryNode node={high} />);
     const circle = screen.getByTestId("memory-node-circle");
     // Browser keeps our `0 0 0 3px ${color}55` template-literal value
     // verbatim (it does NOT normalize hex→rgb for box-shadow like it does
@@ -69,20 +55,9 @@ describe("MemoryNode", () => {
 
   it("omits the glow box-shadow on the circle when importance < 4", () => {
     const low: GraphNode = { ...sampleNode, importance: 2 };
-    renderInFlow(<MemoryNode {...nodePropsFor(low)} />);
+    render(<MemoryNode node={low} />);
     const circle = screen.getByTestId("memory-node-circle");
     expect(circle.style.boxShadow).toBe("");
-  });
-
-  it("does NOT attach an onClick to the wrapper (xyflow onNodeClick handles clicks)", () => {
-    // UX hotfix #4: removed the manual onClick from the MemoryNode wrapper
-    // so xyflow's own click-vs-drag detection works and drag isn't blocked.
-    // Asserting the inline onClick handler is gone (clicking the row is a
-    // no-op from the node's perspective).
-    renderInFlow(<MemoryNode {...nodePropsFor(sampleNode)} />);
-    const root = screen.getByTestId(`memory-node-${sampleNode.id}`);
-    // No onClick wired in props; clicking the row shouldn't throw.
-    expect(() => fireEvent.click(root)).not.toThrow();
   });
 
   it("renders long labels and relies on CSS ellipsis (no crash on overflow)", () => {
@@ -90,7 +65,7 @@ describe("MemoryNode", () => {
       ...sampleNode,
       label: "A very long memory label that would exceed 180px if not for CSS truncation handling",
     };
-    renderInFlow(<MemoryNode {...nodePropsFor(long)} />);
+    render(<MemoryNode node={long} />);
     // The full text is still in the DOM; the visual crop is done by CSS.
     expect(screen.getByText(long.label)).toBeDefined();
   });
