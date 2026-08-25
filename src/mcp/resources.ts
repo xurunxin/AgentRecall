@@ -34,6 +34,7 @@ import { listBackups } from "../backup.js";
 import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ProjectIdentityResolver } from "../scope-resolver.js";
 import { ImportBatchStore } from "../portability/import-batch-store.js";
+import { DerivationJobStore } from "../jobs/service.js";
 import type { ToolProfile } from "../tools/profile.js";
 import type { CapabilityStore } from "../admin/capability.js";
 import type { AuthorizationDecision } from "../services/auth-context.js";
@@ -507,6 +508,44 @@ export function registerMemoryResources(server: MemoryResourceServer, ctx: Memor
         });
       }
       return jsonResource(uri, batch);
+    }
+  );
+
+  // v1.2.0-alpha.0 (issue #48): the derivation job
+  // resource. The payload mirrors the `jobs show` CLI
+  // output and is the canonical read surface for an MCP
+  // client that wants to inspect a job's state, its
+  // per-stage runs, and the outputs the stages produced.
+  // The resource is read-only; mutations go through the
+  // `jobs_cancel` / `jobs_retry` tools.
+  server.registerResource(
+    "derivation_job",
+    new ResourceTemplate("agentrecall://jobs/{job_id}", { list: undefined }),
+    {
+      description:
+        "Durable derivation job inspection: state, lease, runs (one per stage), and the outputs the job has produced. Mirrors the agent-recall jobs show CLI output.",
+      mimeType: "application/json"
+    },
+    (uri: URL, variables: Variables) => {
+      const jobId = pickVariable(variables, "job_id");
+      if (jobId === undefined || jobId.length === 0) {
+        return jsonResource(uri, { ok: false, error: "not_found", message: "missing job_id" });
+      }
+      const store = new DerivationJobStore(ctx.store);
+      const inspection = store.inspect(jobId);
+      if (inspection === undefined) {
+        return jsonResource(uri, {
+          ok: false,
+          error: "not_found",
+          message: `unknown job_id ${jobId}`
+        });
+      }
+      return jsonResource(uri, {
+        ok: true,
+        job: inspection.job,
+        runs: inspection.runs,
+        outputs: inspection.outputs
+      });
     }
   );
 }

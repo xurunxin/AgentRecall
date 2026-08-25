@@ -13,6 +13,7 @@ import { backupCommand, restoreCommand } from "./commands/backup.js";
 import { doctorCommand } from "./commands/doctor.js";
 import { exportCommand } from "./commands/export.js";
 import { importCommand } from "./commands/import.js";
+import { jobsCommand } from "./commands/jobs.js";
 import { listCommand } from "./commands/list.js";
 import { migrateCommand } from "./commands/migrate.js";
 import { searchCommand } from "./commands/search.js";
@@ -96,6 +97,7 @@ Commands:
   restore    Restore from a verified backup
   migrate    Run schema migrations
   admin      Manage the operator capability (grant / status / revoke)
+  jobs       Inspect, cancel, or run derivation jobs
   version    Print the server version (also: --version / -v)
   help       Show this help
 
@@ -129,7 +131,11 @@ const dispatch: Record<string, CommandHandler> = {
   backup: backupCommand,
   restore: restoreCommand,
   migrate: migrateCommand,
-  admin: adminCommand
+  admin: adminCommand,
+  // v1.2.0-alpha.0 (issue #48): the derivation job
+  // subcommand. Provides the durable inspect / cancel /
+  // run surface for the v1.2 derivation job substrate.
+  jobs: jobsCommand
 };
 
 export async function runCli(

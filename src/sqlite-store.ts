@@ -137,8 +137,19 @@ export type SearchFilters = EntryFilters & {
  * `completed`) or (`failed`) state; the `ImportBatchStore`
  * is the public API for the row's lifecycle and the
  * redacted `inspect(...)` read.
+ * v14 (v1.2.0-alpha.0, issue #48): the durable derivation
+ * job substrate. Three additive tables — `derivation_jobs`,
+ * `derivation_runs`, `derivation_outputs` — back the
+ * session distillation / skill extraction / cold-start
+ * bootstrap / external-reference refresh pipelines. The
+ * `DerivationJobStore` (src/jobs/service.ts) wraps the
+ * tables with the `enqueue` / `claim` / `checkpoint` /
+ * `complete` / `fail` / `cancel` / `reap` lifecycle, a
+ * short lease (default TTL 30s), and a passive reap-on-
+ * claim policy so no daemon is required. Existing v13
+ * tables and contracts are untouched.
  */
-export const CURRENT_SCHEMA_VERSION = 13;
+export const CURRENT_SCHEMA_VERSION = 14;
 
 /**
  * Stage 12 PR9: thrown by `updateEntryWithRevision` when
@@ -311,6 +322,109 @@ export type MaintenancePlanRow = {
   items: MaintenancePlanItemRow[];
 };
 
+/**
+ * v1.2.0-alpha.0 (issue #48): the row shape for
+ * `derivation_jobs`. The store is the durable
+ * substrate backing the session distillation / skill
+ * extraction / cold-start bootstrap / external-refresh
+ * pipelines. All timestamps are Unix milliseconds in
+ * the v1.2 surface so the lease logic stays in pure
+ * integer math.
+ */
+export type DerivationJobState =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
+export type DerivationJobScope = "global" | "project";
+
+export type DerivationJobRow = {
+  job_id: string;
+  kind: string;
+  state: DerivationJobState;
+  scope: DerivationJobScope;
+  project_id?: string | null;
+  creator_actor_id: string;
+  idempotency_key: string;
+  input_digest: string;
+  config_digest: string;
+  cursor_json: string;
+  attempt_count: number;
+  lease_owner?: string | null;
+  lease_expires_at?: number | null;
+  cancel_requested_at?: number | null;
+  next_retry_at?: number | null;
+  error_code?: string | null;
+  redacted_error?: string | null;
+  created_at: number;
+  started_at?: number | null;
+  updated_at: number;
+  finished_at?: number | null;
+};
+
+/**
+ * v1.2.0-alpha.0 (issue #48): the per-stage audit row
+ * for a derivation job. The `started` -> terminal
+ * transition is the only state change `checkpoint`
+ * commits; a `started` row is the durable proof a
+ * worker is mid-flight.
+ */
+export type DerivationRunStatus =
+  | "started"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
+export type DerivationRunRow = {
+  run_id: string;
+  job_id: string;
+  stage: string;
+  status: DerivationRunStatus;
+  input_refs_json: string;
+  output_refs_json: string;
+  provider_id?: string | null;
+  model_id?: string | null;
+  prompt_template_version?: string | null;
+  prompt_hash?: string | null;
+  policy_version: string;
+  result_digest?: string | null;
+  started_at: number;
+  finished_at?: number | null;
+};
+
+/**
+ * v1.2.0-alpha.0 (issue #48): the lineage row that
+ * connects a job to the memory / asset / plan rows it
+ * produced. The composite primary key on
+ * `(job_id, output_kind, output_id)` is the contract
+ * that prevents a reap takeover from writing the same
+ * `applied` row twice.
+ */
+export type DerivationOutputKind =
+  | "candidate"
+  | "skill_draft"
+  | "bootstrap_plan"
+  | "external_ref"
+  | "applied_memory"
+  | "applied_asset";
+
+export type DerivationOutputDisposition =
+  | "proposed"
+  | "applied"
+  | "rejected"
+  | "superseded";
+
+export type DerivationOutputRow = {
+  job_id: string;
+  run_id: string;
+  output_kind: DerivationOutputKind;
+  output_id: string;
+  disposition: DerivationOutputDisposition;
+  created_at: number;
+};
+
 type Row = Record<string, SQLOutputValue>;
 
 function encodeJson(value: unknown): string {
@@ -334,6 +448,104 @@ function optionalStringCell(row: Row, column: string): string | undefined {
 function numberCell(row: Row, column: string): number {
   const value = row[column];
   return typeof value === "number" || typeof value === "bigint" ? Number(value) : Number(String(value));
+}
+
+function optionalNumberCell(row: Row, column: string): number | undefined {
+  const value = row[column];
+  if (value === undefined || value === null) return undefined;
+  return typeof value === "number" || typeof value === "bigint"
+    ? Number(value)
+    : Number(String(value));
+}
+
+/**
+ * v1.2.0-alpha.0 (issue #48): identify the
+ * SQLITE_CONSTRAINT_UNIQUE / SQLITE_CONSTRAINT_PRIMARYKEY
+ * errors raised by `node:sqlite` so the derivation job
+ * insert path can return `false` (idempotent) instead of
+ * throwing. The `node:sqlite` error shape varies by
+ * version: recent builds surface a `code` string
+ * (`"SQLITE_CONSTRAINT_UNIQUE"`) plus the numeric
+ * `errcode` (19 for `SQLITE_CONSTRAINT`, extended code
+ * 2067 for the UNIQUE sub-code) and the `errno`. Older
+ * builds (and some `bun:sqlite` configurations) only
+ * expose the human-readable message. We accept any of
+ * the four signals so the helper is robust to a runtime
+ * change in the error shape.
+ */
+function isSqliteUniqueConstraintError(error: unknown): boolean {
+  if (error === null || typeof error !== "object") return false;
+  const err = error as {
+    code?: unknown;
+    errcode?: unknown;
+    errno?: unknown;
+    message?: unknown;
+  };
+  if (err.code === "SQLITE_CONSTRAINT_UNIQUE") return true;
+  if (err.code === "SQLITE_CONSTRAINT_PRIMARYKEY") return true;
+  if (err.code === "SQLITE_CONSTRAINT") return true;
+  if (err.errcode === 19 || err.errno === 19) return true;
+  if (typeof err.message === "string") {
+    if (err.message.includes("UNIQUE constraint failed")) return true;
+    if (err.message.includes("PRIMARY KEY constraint failed")) return true;
+  }
+  return false;
+}
+
+function derivationJobFromRow(row: Row): DerivationJobRow {
+  return {
+    job_id: stringCell(row, "job_id"),
+    kind: stringCell(row, "kind"),
+    state: stringCell(row, "state") as DerivationJobState,
+    scope: stringCell(row, "scope") as DerivationJobScope,
+    project_id: optionalStringCell(row, "project_id") ?? null,
+    creator_actor_id: stringCell(row, "creator_actor_id"),
+    idempotency_key: stringCell(row, "idempotency_key"),
+    input_digest: stringCell(row, "input_digest"),
+    config_digest: stringCell(row, "config_digest"),
+    cursor_json: stringCell(row, "cursor_json"),
+    attempt_count: numberCell(row, "attempt_count"),
+    lease_owner: optionalStringCell(row, "lease_owner") ?? null,
+    lease_expires_at: optionalNumberCell(row, "lease_expires_at") ?? null,
+    cancel_requested_at: optionalNumberCell(row, "cancel_requested_at") ?? null,
+    next_retry_at: optionalNumberCell(row, "next_retry_at") ?? null,
+    error_code: optionalStringCell(row, "error_code") ?? null,
+    redacted_error: optionalStringCell(row, "redacted_error") ?? null,
+    created_at: numberCell(row, "created_at"),
+    started_at: optionalNumberCell(row, "started_at") ?? null,
+    updated_at: numberCell(row, "updated_at"),
+    finished_at: optionalNumberCell(row, "finished_at") ?? null
+  };
+}
+
+function derivationRunFromRow(row: Row): DerivationRunRow {
+  return {
+    run_id: stringCell(row, "run_id"),
+    job_id: stringCell(row, "job_id"),
+    stage: stringCell(row, "stage"),
+    status: stringCell(row, "status") as DerivationRunStatus,
+    input_refs_json: stringCell(row, "input_refs_json"),
+    output_refs_json: stringCell(row, "output_refs_json"),
+    provider_id: optionalStringCell(row, "provider_id") ?? null,
+    model_id: optionalStringCell(row, "model_id") ?? null,
+    prompt_template_version: optionalStringCell(row, "prompt_template_version") ?? null,
+    prompt_hash: optionalStringCell(row, "prompt_hash") ?? null,
+    policy_version: stringCell(row, "policy_version"),
+    result_digest: optionalStringCell(row, "result_digest") ?? null,
+    started_at: numberCell(row, "started_at"),
+    finished_at: optionalNumberCell(row, "finished_at") ?? null
+  };
+}
+
+function derivationOutputFromRow(row: Row): DerivationOutputRow {
+  return {
+    job_id: stringCell(row, "job_id"),
+    run_id: stringCell(row, "run_id"),
+    output_kind: stringCell(row, "output_kind") as DerivationOutputKind,
+    output_id: stringCell(row, "output_id"),
+    disposition: stringCell(row, "disposition") as DerivationOutputDisposition,
+    created_at: numberCell(row, "created_at")
+  };
 }
 
 function decodeEntry(row: Row): MemoryEntry {
@@ -745,6 +957,542 @@ export class SQLiteMemoryStore {
     return this.openMode;
   }
 
+  // ─────────────────────────────────────────────────────────────────────
+  // v1.2.0-alpha.0 (issue #48): derivation job substrate.
+  //
+  // The three tables — `derivation_jobs` / `derivation_runs` /
+  // `derivation_outputs` — are the durable backing for every
+  // provider-backed / multi-stage / cancellable pipeline
+  // introduced in v1.2 (session distillation, skill extraction,
+  // cold-start bootstrap, external-reference refresh). The
+  // public API for these rows lives in `src/jobs/service.ts`;
+  // the methods below are the lowest-level row readers and
+  // writers. Callers (the DerivationJobStore) compose them
+  // inside a single `BEGIN IMMEDIATE` transaction so the
+  // claim / checkpoint / apply semantics match the contract
+  // in `docs/adr/0009-derivation-job-lifecycle.md`.
+  // ─────────────────────────────────────────────────────────────────────
+
+  /**
+   * Find a derivation job by its primary key. Returns the
+   * row verbatim, or `undefined` if the job does not exist.
+   * The cursor JSON column is **not** parsed — callers that
+   * need the typed cursor should call
+   * `DerivationJobStore.get(jobId)` instead.
+   */
+  getDerivationJob(jobId: string): DerivationJobRow | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM derivation_jobs WHERE job_id = ?")
+      .get(jobId) as Row | undefined;
+    if (row === undefined) return undefined;
+    return derivationJobFromRow(row);
+  }
+
+  /**
+   * Find a derivation job by its
+   * `(creator_actor_id, kind, idempotency_key)` triple.
+   * Returns `undefined` if no job exists. This is the
+   * read side of the replay contract: an `enqueue` call
+   * with the same triple returns the same `job_id`.
+   */
+  getDerivationJobByIdempotency(
+    creator_actor_id: string,
+    kind: string,
+    idempotency_key: string
+  ): DerivationJobRow | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT * FROM derivation_jobs WHERE creator_actor_id = ? AND kind = ? AND idempotency_key = ?"
+      )
+      .get(creator_actor_id, kind, idempotency_key) as Row | undefined;
+    if (row === undefined) return undefined;
+    return derivationJobFromRow(row);
+  }
+
+  /**
+   * Insert a new derivation job. The caller is responsible
+   * for pre-computing the `job_id`, `input_digest`,
+   * `config_digest` and the `cursor_json` string. The
+   * row is inserted with `state='queued'`, `attempt_count=0`,
+   * no lease. Throws on the UNIQUE
+   * `(creator_actor_id, kind, idempotency_key)` violation
+   * when a replay uses a different digest — the higher-level
+   * `DerivationJobStore.enqueue` translates that to
+   * `idempotency_digest_mismatch`.
+   */
+  insertDerivationJob(row: DerivationJobRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO derivation_jobs (
+          job_id, kind, state, scope, project_id, creator_actor_id,
+          idempotency_key, input_digest, config_digest, cursor_json,
+          attempt_count, lease_owner, lease_expires_at, cancel_requested_at,
+          next_retry_at, error_code, redacted_error,
+          created_at, started_at, updated_at, finished_at
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?,
+          ?, ?, ?, ?,
+          ?, ?, ?,
+          ?, ?, ?, ?
+        )`
+      )
+      .run(
+        row.job_id,
+        row.kind,
+        row.state,
+        row.scope,
+        row.project_id ?? null,
+        row.creator_actor_id,
+        row.idempotency_key,
+        row.input_digest,
+        row.config_digest,
+        row.cursor_json,
+        row.attempt_count,
+        row.lease_owner ?? null,
+        row.lease_expires_at ?? null,
+        row.cancel_requested_at ?? null,
+        row.next_retry_at ?? null,
+        row.error_code ?? null,
+        row.redacted_error ?? null,
+        row.created_at,
+        row.started_at ?? null,
+        row.updated_at,
+        row.finished_at ?? null
+      );
+  }
+
+  /**
+   * Atomically transition a job from
+   * `queued` (or `failed` with a non-null past
+   * `next_retry_at`) into `running`, stamping the lease
+   * owner + expiry and incrementing `attempt_count`.
+   * Returns the updated row, or `undefined` if the
+   * predicate did not match (the caller is racing
+   * another worker or the lease is still live). This
+   * is the only place a job's `lease_owner` /
+   * `lease_expires_at` / `attempt_count` are written.
+   */
+  claimDerivationJob(args: {
+    job_id: string;
+    lease_owner: string;
+    lease_expires_at: number;
+    started_at: number;
+    now: number;
+  }): DerivationJobRow | undefined {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const updated = this.db
+        .prepare(
+          `UPDATE derivation_jobs
+              SET lease_owner = ?,
+                  lease_expires_at = ?,
+                  attempt_count = attempt_count + 1,
+                  state = 'running',
+                  started_at = COALESCE(started_at, ?),
+                  updated_at = ?
+            WHERE job_id = ?
+              AND (
+                state = 'queued'
+                OR (
+                  state = 'failed'
+                  AND next_retry_at IS NOT NULL
+                  AND next_retry_at <= ?
+                )
+              )
+              AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
+            RETURNING *`
+        )
+        .get(
+          args.lease_owner,
+          args.lease_expires_at,
+          args.started_at,
+          args.now,
+          args.job_id,
+          args.now,
+          args.now
+        ) as Row | undefined;
+      this.db.exec("COMMIT");
+      if (updated === undefined) return undefined;
+      return derivationJobFromRow(updated);
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * Find the next claimable job for the given kind (or any
+   * kind when `kind` is `undefined`). The predicate mirrors
+   * `claimDerivationJob`: `state = 'queued'`, OR
+   * `state = 'failed' AND next_retry_at IS NOT NULL AND
+   * next_retry_at <= now()` (a `failed` job without a
+   * retry window is terminal and is NOT re-claimed). The
+   * lease predicate matches the `claim` path. The list is
+   * ordered by `created_at ASC` so the oldest queued
+   * request is processed first.
+   */
+  listClaimableDerivationJobs(
+    kind: string | undefined,
+    now: number,
+    limit: number
+  ): DerivationJobRow[] {
+    const params: SQLInputValue[] = [];
+    let sql = `SELECT * FROM derivation_jobs
+                WHERE (
+                    state = 'queued'
+                    OR (
+                      state = 'failed'
+                      AND next_retry_at IS NOT NULL
+                      AND next_retry_at <= ?
+                    )
+                  )
+                  AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)`;
+    params.push(now, now);
+    if (kind !== undefined) {
+      sql += " AND kind = ?";
+      params.push(kind);
+    }
+    sql += " ORDER BY created_at ASC LIMIT ?";
+    params.push(limit);
+    const rows = this.db.prepare(sql).all(...params) as Row[];
+    return rows.map((r) => derivationJobFromRow(r));
+  }
+
+  /**
+   * Mark a job's `cancel_requested_at`. The job still
+   * transitions through its current stage boundary; the
+   * runner consults the timestamp before starting the next
+   * stage and routes to a terminal `cancelled` state.
+   */
+  requestDerivationJobCancel(jobId: string, now: number): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE derivation_jobs
+            SET cancel_requested_at = ?,
+                updated_at = ?
+          WHERE job_id = ?
+            AND state NOT IN ('succeeded', 'failed', 'cancelled')`
+      )
+      .run(now, now, jobId);
+    return result.changes > 0;
+  }
+
+  /**
+   * Transition a running job to a terminal state. The
+   * caller is the runner finishing its current stage; the
+   * `cursor_json` and `redacted_error` / `error_code` are
+   * the final values written on disk. Returns the updated
+   * row, or `undefined` if the job was not in `running`
+   * state (e.g. it was already cancelled or completed by
+   * a reap takeover).
+   */
+  finalizeDerivationJob(args: {
+    job_id: string;
+    terminal_state: Extract<DerivationJobState, "succeeded" | "failed" | "cancelled">;
+    cursor_json?: string;
+    error_code?: string | null;
+    redacted_error?: string | null;
+    next_retry_at?: number | null;
+    now: number;
+  }): DerivationJobRow | undefined {
+    const result = this.db
+      .prepare(
+        `UPDATE derivation_jobs
+            SET state = ?,
+                cursor_json = COALESCE(?, cursor_json),
+                error_code = ?,
+                redacted_error = ?,
+                next_retry_at = ?,
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                finished_at = COALESCE(finished_at, ?),
+                updated_at = ?
+          WHERE job_id = ?
+            AND state = 'running'
+          RETURNING *`
+      )
+      .get(
+        args.terminal_state,
+        args.cursor_json ?? null,
+        args.error_code ?? null,
+        args.redacted_error ?? null,
+        args.next_retry_at ?? null,
+        args.now,
+        args.now,
+        args.job_id
+      ) as Row | undefined;
+    if (result === undefined) return undefined;
+    return derivationJobFromRow(result);
+  }
+
+  /**
+   * Update the per-stage `cursor_json` while the job stays
+   * in `running`. Used by the runner between stages to
+   * checkpoint progress without committing a terminal
+   * state. The lease is renewed implicitly because
+   * `updated_at` advances — callers that need a hard
+   * lease refresh should call `renewDerivationJobLease`.
+   */
+  checkpointDerivationJob(
+    jobId: string,
+    cursorJson: string,
+    now: number
+  ): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE derivation_jobs
+            SET cursor_json = ?,
+                updated_at = ?
+          WHERE job_id = ? AND state = 'running'`
+      )
+      .run(cursorJson, now, jobId);
+    return result.changes > 0;
+  }
+
+  /**
+   * Renew a running job's lease. The TTL is the new
+   * `lease_expires_at`; if the caller has crossed the
+   * cancel boundary (e.g. user pressed Ctrl-C between
+   * stages) the row is left untouched so the runner can
+   * route to a terminal `cancelled` state on the next
+   * poll. Returns `true` on a successful renewal.
+   */
+  renewDerivationJobLease(
+    jobId: string,
+    leaseOwner: string,
+    leaseExpiresAt: number,
+    now: number
+  ): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE derivation_jobs
+            SET lease_owner = ?,
+                lease_expires_at = ?,
+                updated_at = ?
+          WHERE job_id = ?
+            AND state = 'running'
+            AND lease_owner = ?
+            AND (cancel_requested_at IS NULL OR cancel_requested_at > ?)`
+      )
+      .run(
+        leaseOwner,
+        leaseExpiresAt,
+        now,
+        jobId,
+        leaseOwner,
+        now
+      );
+    return result.changes > 0;
+  }
+
+  /**
+   * Passive reap: re-queue any job whose lease has
+   * expired. The runner calls this at the start of every
+   * `listClaimable` / `claim` cycle so a crashed worker
+   * does not strand a `running` job forever (issue #48
+   * AC #2). Returns the number of rows reset.
+   */
+  reapExpiredDerivationJobLeases(now: number): number {
+    const result = this.db
+      .prepare(
+        `UPDATE derivation_jobs
+            SET state = 'queued',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                updated_at = ?
+          WHERE state = 'running'
+            AND lease_expires_at IS NOT NULL
+            AND lease_expires_at <= ?`
+      )
+      .run(now, now);
+    return result.changes;
+  }
+
+  /**
+   * Insert a derivation run row (one per stage attempt).
+   * The runner writes the row in `started` state before
+   * the work; the same `run_id` is later updated to a
+   * terminal status by `completeDerivationRun` /
+   * `failDerivationRun`.
+   */
+  insertDerivationRun(row: DerivationRunRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO derivation_runs (
+          run_id, job_id, stage, status,
+          input_refs_json, output_refs_json,
+          provider_id, model_id,
+          prompt_template_version, prompt_hash,
+          policy_version, result_digest,
+          started_at, finished_at
+        ) VALUES (
+          ?, ?, ?, ?,
+          ?, ?,
+          ?, ?,
+          ?, ?,
+          ?, ?,
+          ?, ?
+        )`
+      )
+      .run(
+        row.run_id,
+        row.job_id,
+        row.stage,
+        row.status,
+        row.input_refs_json,
+        row.output_refs_json,
+        row.provider_id ?? null,
+        row.model_id ?? null,
+        row.prompt_template_version ?? null,
+        row.prompt_hash ?? null,
+        row.policy_version,
+        row.result_digest ?? null,
+        row.started_at,
+        row.finished_at ?? null
+      );
+  }
+
+  /**
+   * Finalise a derivation run row. The `output_refs_json`
+   * is the list of `output_id`s the stage produced; the
+   * caller is responsible for inserting the matching
+   * `derivation_outputs` rows in the same transaction.
+   */
+  completeDerivationRun(args: {
+    run_id: string;
+    status: Extract<DerivationRunStatus, "succeeded" | "failed" | "cancelled">;
+    output_refs_json: string;
+    result_digest?: string | null;
+    finished_at: number;
+  }): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE derivation_runs
+            SET status = ?,
+                output_refs_json = ?,
+                result_digest = ?,
+                finished_at = ?
+          WHERE run_id = ? AND status = 'started'`
+      )
+      .run(
+        args.status,
+        args.output_refs_json,
+        args.result_digest ?? null,
+        args.finished_at,
+        args.run_id
+      );
+    return result.changes > 0;
+  }
+
+  /**
+   * Read all run rows for a given job, ordered by
+   * `started_at ASC` so the audit trail reads in stage
+   * order. Used by the inspector (`jobs show <id>`).
+   */
+  listDerivationRunsForJob(jobId: string): DerivationRunRow[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM derivation_runs WHERE job_id = ? ORDER BY started_at ASC, run_id ASC"
+      )
+      .all(jobId) as Row[];
+    return rows.map((r) => derivationRunFromRow(r));
+  }
+
+  /**
+   * Read a single run row by its primary key. Returns
+   * `undefined` if the run does not exist. Used by
+   * `DerivationJobStore.finishStage` to resolve the
+   * `job_id` of a run without a full table scan.
+   */
+  getDerivationRun(runId: string): DerivationRunRow | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM derivation_runs WHERE run_id = ?")
+      .get(runId) as Row | undefined;
+    if (row === undefined) return undefined;
+    return derivationRunFromRow(row);
+  }
+
+  /**
+   * Insert a derivation output row. Used both for
+   * `proposed` (stage result) and `applied` (downstream
+   * service call) outputs. The composite primary key
+   * guarantees no duplicate `(job_id, output_kind,
+   * output_id)` — a reap takeover that tries to write
+   * the same applied row gets an SQLITE_CONSTRAINT
+   * error which the runner translates to a no-op (the
+   * row already exists from the first worker).
+   */
+  insertDerivationOutput(row: DerivationOutputRow): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO derivation_outputs (
+            job_id, run_id, output_kind, output_id, disposition, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          row.job_id,
+          row.run_id,
+          row.output_kind,
+          row.output_id,
+          row.disposition,
+          row.created_at
+        );
+      return true;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Read all output rows for a given job, ordered by
+   * `(output_kind ASC, output_id ASC)` for stable
+   * inspection. Used by `jobs show <id>` to render the
+   * `outputs:` block.
+   */
+  listDerivationOutputsForJob(jobId: string): DerivationOutputRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM derivation_outputs
+           WHERE job_id = ?
+           ORDER BY output_kind ASC, output_id ASC`
+      )
+      .all(jobId) as Row[];
+    return rows.map((r) => derivationOutputFromRow(r));
+  }
+
+  /**
+   * Filter derivation jobs by the inspector query. The
+   * `state` and `kind` arguments are optional; `limit`
+   * caps the row count. Ordered newest-first.
+   */
+  listDerivationJobs(filter: {
+    state?: DerivationJobState;
+    kind?: string;
+    limit: number;
+  }): DerivationJobRow[] {
+    const clauses: string[] = [];
+    const params: SQLInputValue[] = [];
+    if (filter.state !== undefined) {
+      clauses.push("state = ?");
+      params.push(filter.state);
+    }
+    if (filter.kind !== undefined) {
+      clauses.push("kind = ?");
+      params.push(filter.kind);
+    }
+    const where = clauses.length === 0 ? "" : " WHERE " + clauses.join(" AND ");
+    const sql = `SELECT * FROM derivation_jobs${where}
+                  ORDER BY created_at DESC LIMIT ?`;
+    params.push(filter.limit);
+    const rows = this.db.prepare(sql).all(...params) as Row[];
+    return rows.map((r) => derivationJobFromRow(r));
+  }
+
   close(): void {
     this.db.close();
   }
@@ -962,6 +1710,10 @@ export class SQLiteMemoryStore {
     }
     if (version === 13) {
       this.migrate_v12_to_v13();
+      return;
+    }
+    if (version === 14) {
+      this.migrate_v13_to_v14();
       return;
     }
     throw new Error(`No migration registered for schema version ${version}`);
@@ -1789,6 +2541,138 @@ export class SQLiteMemoryStore {
         "TEXT NOT NULL DEFAULT '{}'"
       );
       this.db.exec("PRAGMA user_version = 13");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * v1.2.0-alpha.0 (issue #48): v13 -> v14 schema
+   * migration. Introduces the durable derivation job
+   * substrate (`derivation_jobs` / `derivation_runs` /
+   * `derivation_outputs`) that backs every
+   * provider-backed / multi-stage / cancellable
+   * pipeline introduced in v1.2 (session distillation,
+   * skill extraction, cold-start bootstrap,
+   * external-reference refresh). The tables are
+   * strictly additive — no existing column or index is
+   * altered, no v13 table is renamed. The migration is
+   * fully transactional; on any throw the user_version
+   * stays at 13 and the database is untouched.
+   *
+   * Schema invariants (mirrored in `docs/adr/0009-`):
+   *  - `derivation_jobs` is the single source of truth
+   *    for a derivation request; the UNIQUE constraint
+   *    on `(creator_actor_id, kind, idempotency_key)` is
+   *    the contract that makes `enqueue` a replayable
+   *    operation (issue #48 AC #3).
+   *  - `derivation_runs` is the per-stage audit row. A
+   *    row in `started` state is the durable proof that
+   *    a worker is mid-flight; the `started` -> terminal
+   *    transition is the only state change that
+   *    `checkpoint` commits.
+   *  - `derivation_outputs` is the lineage surface that
+   *    connects a job to the memory / asset / plan rows
+   *    it produced. The composite primary key on
+   *    `(job_id, output_kind, output_id)` ensures
+   *    `disposition='applied'` is unique per job so a
+   *    reap takeover cannot write the same applied row
+   *    twice (issue #48 AC #2 + #5).
+   *  - All three tables use `INTEGER` for timestamps in
+   *    Unix milliseconds (matching the rest of the v1.2
+   *    surface; differs from v13's `TEXT` ISO 8601 on
+   *    `import_batches` because the derivation pipeline
+   *    drives numeric TTL math in the lease logic).
+   */
+  private migrate_v13_to_v14(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS derivation_jobs (
+          job_id              TEXT PRIMARY KEY,
+          kind                TEXT NOT NULL,
+          state               TEXT NOT NULL
+                                 CHECK (state IN ('queued','running','succeeded','failed','cancelled')),
+          scope               TEXT NOT NULL
+                                 CHECK (scope IN ('global','project')),
+          project_id          TEXT,
+          creator_actor_id    TEXT NOT NULL,
+          idempotency_key     TEXT NOT NULL,
+          input_digest        TEXT NOT NULL,
+          config_digest       TEXT NOT NULL,
+          cursor_json         TEXT NOT NULL DEFAULT '{}',
+          attempt_count       INTEGER NOT NULL DEFAULT 0,
+          lease_owner         TEXT,
+          lease_expires_at    INTEGER,
+          cancel_requested_at INTEGER,
+          next_retry_at       INTEGER,
+          error_code          TEXT,
+          redacted_error      TEXT,
+          created_at          INTEGER NOT NULL,
+          started_at          INTEGER,
+          updated_at          INTEGER NOT NULL,
+          finished_at         INTEGER,
+          UNIQUE (creator_actor_id, kind, idempotency_key)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_derivation_jobs_state_next_retry
+          ON derivation_jobs(state, next_retry_at);
+        CREATE INDEX IF NOT EXISTS idx_derivation_jobs_lease
+          ON derivation_jobs(lease_expires_at)
+          WHERE state = 'running';
+        CREATE INDEX IF NOT EXISTS idx_derivation_jobs_creator_state
+          ON derivation_jobs(creator_actor_id, state);
+        CREATE INDEX IF NOT EXISTS idx_derivation_jobs_kind
+          ON derivation_jobs(kind, state);
+
+        CREATE TABLE IF NOT EXISTS derivation_runs (
+          run_id                 TEXT PRIMARY KEY,
+          job_id                 TEXT NOT NULL
+                                   REFERENCES derivation_jobs(job_id) ON DELETE CASCADE,
+          stage                  TEXT NOT NULL,
+          status                 TEXT NOT NULL
+                                   CHECK (status IN ('started','succeeded','failed','cancelled')),
+          input_refs_json        TEXT NOT NULL DEFAULT '[]',
+          output_refs_json       TEXT NOT NULL DEFAULT '[]',
+          provider_id            TEXT,
+          model_id               TEXT,
+          prompt_template_version TEXT,
+          prompt_hash            TEXT,
+          policy_version         TEXT NOT NULL,
+          result_digest          TEXT,
+          started_at             INTEGER NOT NULL,
+          finished_at            INTEGER
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_derivation_runs_job_stage
+          ON derivation_runs(job_id, stage);
+        CREATE INDEX IF NOT EXISTS idx_derivation_runs_job_status
+          ON derivation_runs(job_id, status);
+
+        CREATE TABLE IF NOT EXISTS derivation_outputs (
+          job_id        TEXT NOT NULL
+                          REFERENCES derivation_jobs(job_id) ON DELETE CASCADE,
+          run_id        TEXT NOT NULL
+                          REFERENCES derivation_runs(run_id) ON DELETE CASCADE,
+          output_kind   TEXT NOT NULL
+                          CHECK (output_kind IN
+                            ('candidate','skill_draft','bootstrap_plan',
+                             'external_ref','applied_memory','applied_asset')),
+          output_id     TEXT NOT NULL,
+          disposition   TEXT NOT NULL
+                          CHECK (disposition IN ('proposed','applied','rejected','superseded')),
+          created_at    INTEGER NOT NULL,
+          PRIMARY KEY (job_id, output_kind, output_id)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_derivation_outputs_job_disposition
+          ON derivation_outputs(job_id, disposition);
+        CREATE INDEX IF NOT EXISTS idx_derivation_outputs_run
+          ON derivation_outputs(run_id);
+      `);
+      this.db.exec("PRAGMA user_version = 14");
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");

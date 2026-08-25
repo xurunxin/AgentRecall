@@ -90,3 +90,11 @@ export function flagString(args: ParsedArgs, name: string, fallback?: string): s
 export function flagBool(args: ParsedArgs, name: string): boolean {
   return args.flags[name] === true;
 }
+
+export function flagNumber(args: ParsedArgs, name: string): number | undefined {
+  const value = args.flags[name];
+  if (value === undefined) return undefined;
+  if (typeof value === "boolean") return undefined;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}

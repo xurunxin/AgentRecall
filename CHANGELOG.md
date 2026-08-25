@@ -36,6 +36,45 @@
 - "在图中定位" 实现 canvas pan + 2s 高亮
 - 整理动画缓动(FLIP / spring)
 
+## [1.2.0-alpha.0] — Derivation Job 子系统(issue #48,Phase 0)
+
+> v1.2 系列开篇:本条目只引入 derivation job 子系统,具体 kind 的执行器(session_distill / skill_extract / bootstrap_scan / external_ref_refresh)在后续 Phase 1 / 2 落地(#50、#53、#54)。本期所有现有 API 保持兼容,没有破坏性改动。
+
+### 新增
+
+- **Schema v14** — 三张 additive 表 `derivation_jobs` / `derivation_runs` / `derivation_outputs`,带复合主键与索引(`idx_derivation_jobs_state_next_retry`、`idx_derivation_jobs_lease WHERE state='running'`、`idx_derivation_jobs_creator_state`、`idx_derivation_jobs_kind`、`idx_derivation_runs_job_stage`、`idx_derivation_runs_job_status`、`idx_derivation_outputs_job_disposition`、`idx_derivation_outputs_run`)。所有 v13 表保持原样,迁移走 `migrate_v13_to_v14()`,失败可回滚,事务化(`BEGIN IMMEDIATE` + `COMMIT` / `ROLLBACK`)。
+- **`src/jobs/service.ts` — `DerivationJobStore`** — 提供 `enqueue` / `claim` / `listClaimable` / `reap` / `startStage` / `finishStage` / `complete` / `fail` / `requestCancel` / `markCancelled` / `inspect` / `list` 等公开 API;严格遵循 Epic #47 的"plan → review → apply"语义,claim 走单笔 `BEGIN IMMEDIATE` 事务保证多进程互斥,`listClaimable` 被动 reap 过期 lease。`enqueue` 通过 `UNIQUE (creator_actor_id, kind, idempotency_key)` 约束实现重放;若 `(input_digest, config_digest)` 与已存在行不一致则抛出 `idempotency_digest_mismatch`(issue #48 AC #3)。
+- **`src/jobs/runner.ts` — `runOnce` / `makeLeaseOwner`** — 事务外执行器,每个 `kind` 注册一个 `DerivationJobExecutor`;`runOnce` 单次扫描、claim 一次、处理一次,自动 catch 执行器抛错并把 job 标 `failed`(`internal_error`)。默认 lease TTL 30s,可在 `runOnce({lease_ttl_ms})` 覆盖。
+- **`src/jobs/redactor.ts` — `redactError` / `truncateRationale`** — secret-like pattern 替换为 `[redacted:<category>]`,限长 2000 字符,使用项目既有的 `secret-detector.ts` 词表。原始 prompt / response body 永远不进库,只持久化 `output_digest` + 200 字符 rationale(issue #48 AC #6)。
+- **`src/cli/commands/jobs.ts` — `agent-recall jobs ...`** — 4 个子命令:`list`(`--state` / `--kind` / `--limit` / `--json`)、`show <job_id>`(人类可读 + `--json` 两种格式)、`cancel <job_id>`(写 `cancel_requested_at`,runner 在下个 stage 边界处理)、`run`(`--kind` / `--max-jobs` / `--json`,单次扫描)。`--watch` 显式未实现,留待 Phase 2 #54 bootstrap planner 的 worker loop 一并落地。
+- **MCP resource `agentrecall://jobs/{job_id}`** — 只读,直接返回 `DerivationJobStore.inspect(jobId)` 的结果(job + runs + outputs 三块 JSON),对齐 CLI `jobs show` 的 JSON 输出。
+- **`packages/contracts/src/jobs.ts` — `DerivationJobSchema` / `DerivationRunSchema` / `DerivationOutputSchema` / `DerivationJobInspectionSchema`** — typed zod schema 公开 wire 形状,带 `schema_version: "1"` 字段供未来 v2 演进。Admin app 后续将消费这套 schema;`src/sqlite-store.ts` 仍持有 snake_case 行形状(数据源真相),中间通过 `DerivationJobStore` 的 row→wire 映射(留待 #55 收口时统一封装)。
+- **`docs/adr/0009-derivation-job-lifecycle.md`** — 完整记录 data model、9 步执行契约、lease 规则、被动 reap 策略、"为何不在中途续约"决策(简化实现,避免续约 race)、cancel 边界、`derivation_outputs` 的 reap-safe 重复写入语义。
+- **`docs/guides/jobs.md`** — 中文使用指南,含 CLI / MCP 三入口的等价示例、状态机、常见诊断步骤。
+
+### 改动
+
+- `src/sqlite-store.ts`:新增 `DerivationJobRow` / `DerivationRunRow` / `DerivationOutputRow` 类型 + 9 个 store 方法(`getDerivationJob` / `getDerivationJobByIdempotency` / `insertDerivationJob` / `claimDerivationJob` / `listClaimableDerivationJobs` / `requestDerivationJobCancel` / `finalizeDerivationJob` / `checkpointDerivationJob` / `renewDerivationJobLease` / `reapExpiredDerivationJobLeases` / `insertDerivationRun` / `completeDerivationRun` / `getDerivationRun` / `listDerivationRunsForJob` / `insertDerivationOutput` / `listDerivationOutputsForJob` / `listDerivationJobs`)+ 行解码器(`derivationJobFromRow` / `derivationRunFromRow` / `derivationOutputFromRow`)+ `isSqliteUniqueConstraintError`(同时识别 `code` / `errcode` / `errno` / message 多种形态,跨 node:sqlite / bun:sqlite 鲁棒)。`CURRENT_SCHEMA_VERSION` 由 13 升至 14,带 JSDoc 说明 Phase 0 的边界与对 v13 表的零侵入承诺。
+- `src/cli/arg-parser.ts`:新增 `flagNumber` 工具,`jobs` 子命令用其解析 `--limit` / `--max-jobs`。
+- `src/cli/index.ts`:dispatch 表新增 `jobs` 命令;`HELP_TEXT` 加一行说明。
+- `src/mcp/resources.ts`:新增 `derivation_job` resource 注册(MCP 同步回调直接调 `DerivationJobStore.inspect`);不动 v1.1.x 既有 resource 列表。
+- `test/mcp-v2-contract.test.ts`:"registers all 6 resources" → "registers all 7 resources",断言新增的 `derivation_job` 出现在列表里。
+
+### 测试
+
+- `test/unit/jobs-service.test.ts`(22 测试) — 覆盖:enqueue 四类路径(首次入队 / 同 idem 同 digest 重放 / 异 input_digest 拒绝 / 异 config_digest 拒绝);claim 三类路径(转 running + lease / 并发只一个赢 / 过期 lease 被 reap 后接管);`listClaimable` 按 kind 过滤;stage 写入 + finishStage 写出 `derivation_outputs`;`complete` / `fail`(redacted + 2000 截断)/ `requestCancel` + `markCancelled`;`outputs` 在 reap 重写下重复 `(job_id, output_kind, output_id)` 插入被静默吞掉。
+- `test/unit/jobs-runner.test.ts`(6 测试) — 覆盖:`runOnce` 空入队返回零计数;无 executor 的 kind 被自动标 `failed`(`internal_error` + "no executor" rationale);注册的 executor 收到 `startStage` 回调并写 `derivation_outputs`;执行器抛错被 catch 翻译为 `failed`;`max_jobs` 截断;cancel 路径走 `markCancelled` 终态。
+- `test/cli/jobs.test.ts`(9 测试) — 覆盖:`help` / `list` / `show` 正向 + 错误路径 / `cancel` / `run --json` / `run --watch` 拒绝 / 未知子命令;`enqueue` → `list --json` → `show --json` 端到端往返。
+- `test/unit/redactor` 嵌入在 `jobs-service.test.ts` 末尾(7 测试) — 覆盖:null / undefined / 空输入返空串、无 secret pattern 时原样透传、5 类 secret pattern 各自 mask、2000 截断。
+- `packages/contracts/tests/jobs.test.ts`(17 测试) — 覆盖 11 个 zod schema 的 happy path + rejection path,确认 `schema_version: "1"` 是 literal。
+- `test/release-gate/jobs-multi-process.test.ts`(1 测试,默认 config 已 exclude;release-candidate 跑) — 4 worker × 6 job = 24 job,共享一个 data home,验证多进程 lease 互斥 + reap takeover;依赖 `dist/`(`npm run build` 之后运行)。
+
+### 不在本版本范围(留待后续 Phase)
+
+- `session_distill` / `skill_extract` / `bootstrap_scan` / `external_ref_refresh` 这 4 个具体 kind 的执行器都属于 Phase 2(#50、#53、#54),本期 `runOnce` 在没有 executor 时会全部标 `failed`。
+- `--watch` 循环(让 CLI 持续轮询)、HTTP bridge 的 `jobs` 端点、Admin app 的候选 / Job 浏览器属于 Phase 1 / 2 的相邻工作。
+- 任何 `network` 端到端测试(provider 调用)按"零新依赖 + 零新网络"原则不在本期。本期所有新测试均纯本地 SQLite。
+
 ## [1.1.6] — 发布门强化:清理 CHANGELOG
 
 ### 新增
