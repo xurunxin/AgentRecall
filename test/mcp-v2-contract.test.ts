@@ -382,7 +382,7 @@ describe("MCP resources (spec § 6.3)", () => {
     return new MemoryService(store, undefined, "agent:test", dataHome);
   }
 
-  it("registers all 11 resources (5 stable + import lineage + v1.2 derivation job + v1.2 session evidence + v1.2 asset envelope + v1.2 distillation candidate + v1.2 distillation candidate list)", () => {
+  it("registers all 12 resources (5 stable + import lineage + v1.2 derivation job + v1.2 session evidence + v1.2 asset envelope + v1.2 distillation candidates + v1.2.0-alpha.2 loadout context)", () => {
     const { server, calls } = captureServer();
     const service = makeService();
     registerMemoryResources(server as unknown as Parameters<typeof registerMemoryResources>[0], {
@@ -402,7 +402,8 @@ describe("MCP resources (spec § 6.3)", () => {
       "session_evidence",
       "asset_envelope",
       "distillation_candidate",
-      "distillation_candidate_list"
+      "distillation_candidate_list",
+      "agent_loadout_context"
     ]);
     expect(calls[0]?.uriOrTemplate).toBe("memory://projects");
     expect(calls[1]?.uriOrTemplate).toBeInstanceOf(ResourceTemplate);
@@ -413,6 +414,10 @@ describe("MCP resources (spec § 6.3)", () => {
     // durable import batch lineage resource is
     // a templated URI keyed on `{batch_id}`.
     expect(calls[5]?.uriOrTemplate).toBeInstanceOf(ResourceTemplate);
+    // v1.2.0-alpha.2 (issue #52): the loadout
+    // context-assembly resource is a static URI
+    // (`agentrecall://context/loadout`).
+    expect(calls[9]?.uriOrTemplate).toBe("agentrecall://context/loadout");
   });
 
   it("memory://health returns a JSON payload with server_version + schema_version", async () => {

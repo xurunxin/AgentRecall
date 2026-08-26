@@ -33,6 +33,7 @@ import type { CallToolResult, ServerNotification } from "@modelcontextprotocol/s
 import { z, type ZodType } from "zod";
 import type { MemoryService } from "../memory-service.js";
 import { CURRENT_SCHEMA_VERSION } from "../sqlite-store.js";
+import { ContextAssembler } from "../context-assembly/assembler.js";
 import { serverVersion } from "../server-version.js";
 import { errorCategory, isStableErrorCode, type StableErrorCode } from "./error-codes.js";
 import { memoryToolDescriptions } from "./descriptions.js";
@@ -128,6 +129,108 @@ function textResult(text: string): CallToolResult {
 
 function jsonResult(value: unknown): CallToolResult {
   return textResult(JSON.stringify(value ?? null, null, 2));
+}
+
+/**
+ * v1.2.0-alpha.2 (issue #52): the
+ * `recall_context` tool is the only tool whose
+ * result is BOTH a markdown text payload
+ * (preserved for backward compat) AND a typed
+ * structured payload. The legacy
+ * `textEnvelopeHandler` returns
+ * `{ data: { markdown: text } }`; the new
+ * handler returns the assembled context object
+ * (with `text` as a top-level field) so v2
+ * clients can read the new
+ * `channels.{bootstrap,query}.hash` and
+ * `bootstrap_hash` keys without losing the
+ * legacy markdown body.
+ *
+ * The wire is additive: the legacy
+ * `text` / `items` fields are preserved.
+ */
+function textWithAssembledHandler<T>(
+  toolName: MemoryToolName,
+  schema: ZodType<T>,
+  run: (input: T, extra: HandlerExtra | undefined, ctx: RequestContext) => Promise<{
+    text: string;
+    data: Record<string, unknown>;
+  }>,
+  actorResolver?: ToolActorResolver
+): (input: unknown, extra?: HandlerExtra) => Promise<CallToolResult> {
+  return async (input: unknown, extra?: HandlerExtra) => {
+    const started = Date.now();
+    if (Boolean(extra?.signal?.aborted)) {
+      return buildEnvelopeResult({
+        legacyContent: jsonResult({
+          ok: false,
+          error: "cancelled",
+          message: `Request for ${toolName} was cancelled before it started.`
+        }).content,
+        failure: {
+          code: "cancelled",
+          message: `Request for ${toolName} was cancelled before it started.`
+        },
+        durationMs: Date.now() - started
+      });
+    }
+    const parsed = schema.safeParse(input);
+    if (!parsed.success) {
+      const legacy: CallToolResult = jsonResult({
+        ok: false,
+        error: "invalid_schema",
+        message: `Input does not match the ${toolName} tool schema.`,
+        details: {
+          issues: parsed.error.issues.map((issue) => ({
+            path: issue.path.map(String).join("."),
+            message: issue.message
+          }))
+        }
+      });
+      return buildEnvelopeResult({
+        legacyContent: legacy.content,
+        failure: {
+          code: "invalid_schema",
+          message: `Input does not match the ${toolName} tool schema.`,
+          details: {
+            issues: parsed.error.issues.map((issue) => ({
+              path: issue.path.map(String).join("."),
+              message: issue.message
+            }))
+          }
+        },
+        durationMs: Date.now() - started
+      });
+    }
+    const sessionActor = actorResolver?.();
+    const actorOverride =
+      sessionActor !== undefined
+        ? `${sessionActor.kind}:${sessionActor.id}`
+        : undefined;
+    const ctx = buildToolRequestContext(extra, {
+      ...(actorOverride !== undefined ? { actor: actorOverride } : {})
+    });
+    try {
+      const { text, data } = await run(parsed.data, extra, ctx);
+      const legacy: CallToolResult = textResult(text);
+      return buildEnvelopeResult({
+        legacyContent: legacy.content,
+        data,
+        durationMs: Date.now() - started
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const wasAborted =
+        (error instanceof Error && error.name === "AbortError") ||
+        Boolean(extra?.signal?.aborted);
+      const code = wasAborted ? "cancelled" : "tool_error";
+      return buildEnvelopeResult({
+        legacyContent: jsonResult({ ok: false, error: code, message }).content,
+        failure: { code, message },
+        durationMs: Date.now() - started
+      });
+    }
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -586,12 +689,83 @@ export function createMemoryToolHandlers(
   // omits the resolver and falls through to the
   // env-default. See the `ToolActorResolver`
   // JSDoc above for the canonical contract.
-  actorResolver?: ToolActorResolver
+  actorResolver?: ToolActorResolver,
+  // v1.2.0-alpha.2 (issue #52): optional
+  // loadout / context-assembly context. When
+  // present, the `recall_context` tool emits the
+  // new `channels.{bootstrap,query}.hash` and
+  // `bootstrap_hash` fields in addition to the
+  // legacy markdown `text` field. When absent,
+  // the tool falls back to the original
+  // `textEnvelopeHandler` behaviour so existing
+  // callers (the test harness, the legacy
+  // fixture suite) keep working unchanged.
+  loadoutContext?: {
+    loadoutService: import("../loadouts/service.js").LoadoutService;
+    readService: import("../services/memory-read-service.js").MemoryReadService;
+    actorId: string;
+    maxSensitivity: "normal" | "private" | "restricted";
+  }
 ): MemoryToolHandlers {
+  const recallContextHandler = (() => {
+    if (loadoutContext === undefined) {
+      return textEnvelopeHandler(
+        "recall_context",
+        memoryToolSchemas.recall_context,
+        (input, _extra, ctx) =>
+          service.exportMemoryContext(
+            serviceInput<Parameters<MemoryService["exportMemoryContext"]>[0]>(input),
+            ctx
+          ),
+        actorResolver
+      );
+    }
+    return textWithAssembledHandler(
+      "recall_context",
+      memoryToolSchemas.recall_context,
+      async (input, _extra, ctx) => {
+        const text = service.exportMemoryContext(
+          serviceInput<Parameters<MemoryService["exportMemoryContext"]>[0]>(input),
+          ctx
+        );
+        const loadout = loadoutContext.loadoutService.resolve({
+          actor_id: loadoutContext.actorId
+        });
+        const assembler = new ContextAssembler({ read_service: loadoutContext.readService });
+        const assembled = assembler.assembleAll({
+          loadout: loadout.loadout,
+          rules: loadout.rules,
+          authz: {
+            actor_id: loadoutContext.actorId,
+            max_sensitivity: loadoutContext.maxSensitivity
+          },
+          ...(typeof (input as { query?: unknown }).query === "string"
+            ? { query: (input as { query: string }).query }
+            : {})
+        });
+        return {
+          text,
+          data: {
+            text,
+            // v1.2.0-alpha.2 (issue #52): the new
+            // shape is additive on top of the legacy
+            // markdown text. v1 clients keep reading
+            // `text`; v2 clients can read `channels`
+            // and `bootstrap_hash`.
+            loadout_id: assembled.loadout_id,
+            loadout_version: assembled.loadout_version,
+            policy_version: assembled.policy_version,
+            channels: assembled.channels,
+            bootstrap_hash: assembled.bootstrap_hash,
+            explanation: assembled.explanation
+          }
+        };
+      },
+      actorResolver
+    );
+  })();
   return {
-    recall_context: textEnvelopeHandler("recall_context", memoryToolSchemas.recall_context, (input, _extra, ctx) =>
-      service.exportMemoryContext(serviceInput<Parameters<MemoryService["exportMemoryContext"]>[0]>(input), ctx)
-    , actorResolver),
+    recall_context: recallContextHandler,
     remember: envelopeHandler("remember", memoryToolSchemas.remember, (input, _extra, ctx) => {
       // Stage 18 v1.1.2 follow-up (review by ora-9):
       // forward `capability` and `user_confirmed`
@@ -1030,8 +1204,22 @@ type MemoryToolServer = {
   ): unknown;
 };
 
-export function registerMemoryTools(server: MemoryToolServer, service: MemoryService): void {
-  const handlers = createMemoryToolHandlers(service);
+export function registerMemoryTools(
+  server: MemoryToolServer,
+  service: MemoryService,
+  // v1.2.0-alpha.2 (issue #52): optional loadout
+  // context. When supplied, the `recall_context`
+  // tool emits the new `channels.{bootstrap,query}.hash`
+  // and `bootstrap_hash` fields in addition to the
+  // legacy markdown `text` field. When absent,
+  // `recall_context` falls back to the original
+  // `textEnvelopeHandler` behaviour. The 3rd
+  // positional arg is optional for backward
+  // compatibility with the test harness and any
+  // external caller.
+  loadoutContext?: Parameters<typeof createMemoryToolHandlers>[2]
+): void {
+  const handlers = createMemoryToolHandlers(service, undefined, loadoutContext);
 
   for (const name of memoryToolNames) {
     server.registerTool(
@@ -1129,9 +1317,14 @@ export function registerCoreTools(
   // time. The 4th positional arg is optional
   // for backwards compatibility with the test
   // helper and any external caller.
-  actorResolver?: ToolActorResolver
+  actorResolver?: ToolActorResolver,
+  // v1.2.0-alpha.2 (issue #52): optional loadout
+  // context. When supplied, the `recall_context`
+  // tool emits the new `channels` +
+  // `bootstrap_hash` fields.
+  loadoutContext?: Parameters<typeof createMemoryToolHandlers>[2]
 ): void {
-  const handlers = createMemoryToolHandlers(service, actorResolver);
+  const handlers = createMemoryToolHandlers(service, actorResolver, loadoutContext);
   for (const name of CORE_TOOL_NAMES) {
     server.registerTool(
       name,
@@ -1173,7 +1366,12 @@ export function registerExtendedTools(
   // `registerCoreTools` for the rationale. Same
   // optional per-session actor source; same
   // future-proof per-call hook.
-  actorResolver?: ToolActorResolver
+  actorResolver?: ToolActorResolver,
+  // v1.2.0-alpha.2 (issue #52): optional loadout
+  // context. When supplied, the `recall_context`
+  // tool emits the new `channels` +
+  // `bootstrap_hash` fields.
+  loadoutContext?: Parameters<typeof createMemoryToolHandlers>[2]
 ): void {
   // v1.1.2 (issue #22): Extended = Core + the
   // additional memory-semantics + administrative
@@ -1186,7 +1384,7 @@ export function registerExtendedTools(
   // v1.1.2 contract: "explicit Extended exposes
   // the documented additional set" *on top of*
   // the Core surface.
-  const handlers = createMemoryToolHandlers(service, actorResolver);
+  const handlers = createMemoryToolHandlers(service, actorResolver, loadoutContext);
   for (const name of [...CORE_TOOL_NAMES, ...EXTENDED_TOOL_NAMES]) {
     server.registerTool(
       name,

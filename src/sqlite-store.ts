@@ -166,24 +166,28 @@ export type SearchFilters = EntryFilters & {
  * The migration is fully transactional; on any throw
  * the user_version stays at 15 and the database is
  * untouched.
- * v17 (v1.2.0-alpha.2, issue #50): the session-to-memory
- * distillation pipeline. Three additive tables —
- * `derivation_candidates`, `candidate_evidence`,
- * `candidate_actions` — back the reviewable
- * `memory` / `episode` / `skill_candidate` proposals
- * produced by the deterministic baseline extractor
- * (and any future provider-backed extractor).
- * The candidate row's `state` is a small state
- * machine (`proposed` -> `accepted` -> `applied` or
- * `rejected` / `stale`); the row's `expected_target_revision`
- * is the CAS guard for the `apply` step. The candidate
- * is never a `memory_id` until the `apply` step writes
- * the `derivation_outputs` + the `memory_entries` row
- * (issue #50 AC #1). The migration is fully
- * transactional; on any throw the user_version stays
- * at 16 and the database is untouched.
+ * v17 (v1.2.0-alpha.2, issue #50 placeholder): the
+ * distillation pipeline lands a parallel additive set
+ * of tables in its own worktree. This v18 migration
+ * (issue #52) takes a no-op v17 hop so the v17 / v18
+ * lanes can ship independently. If the v17 lane ships
+ * first, its migration is the active one; if v18 ships
+ * first, v17 is recorded as a no-op so the v18
+ * migration chain stays linear.
+ * v18 (v1.2.0-alpha.2, issue #52): the agent loadout
+ * substrate. Three additive tables — `agent_loadouts`,
+ * `loadout_rules`, `loadout_bindings` — back the
+ * policy-bound loadout surface that powers
+ * `bootstrap` / `query` / `tool_only` channels of the
+ * context-assembly service. The `loadout_rules` table
+ * is keyed on `(loadout_id, version, channel)` so a
+ * `updateRules` call bumps the version and inserts a
+ * new immutable rule row in the same transaction.
+ * The migration is fully transactional; on any throw
+ * the user_version stays at 16 and the database is
+ * untouched.
  */
-export const CURRENT_SCHEMA_VERSION = 17;
+export const CURRENT_SCHEMA_VERSION = 18;
 
 /**
  * Stage 12 PR9: thrown by `updateEntryWithRevision` when
@@ -625,28 +629,96 @@ export type MemoryRefBindingRow = {
 };
 
 /**
- * v1.2.0-alpha.2 (issue #50): the row shape for
- * `derivation_candidates`. A candidate is a
- * reviewable memory / episode / skill-candidate
- * proposal produced by an extractor provider and
- * surfaced through the session-to-memory distillation
- * pipeline. The row is **not** a `memory_id`; the
- * `apply` step writes the `memory_entries` row +
- * a `derivation_outputs` row with
- * `output_kind='applied_memory'` and
- * `disposition='applied'`.
+ * v1.2.0-alpha.2 (issue #52): the loadout row.
+ * `version` is bumped on every `updateRules` call; the
+ * rules table is keyed on `(loadout_id, version,
+ * channel)`. Bumping `version` is what changes
+ * `bootstrap_hash` in the context-assembly output
+ * (the upstream prompt-cache key).
+ */
+export type LoadoutLifecycleState =
+  | "draft"
+  | "active"
+  | "deprecated"
+  | "archived";
+
+export type LoadoutScope = "global" | "project";
+
+export type LoadoutChannel = "bootstrap" | "query" | "tool_only";
+
+export type LoadoutOrderingPolicy =
+  | "rule_then_score"
+  | "score_only"
+  | "rule_only";
+
+export type LoadoutTier = "core" | "working" | "archival";
+
+export type LoadoutRow = {
+  loadout_id: string;
+  name: string;
+  version: number;
+  lifecycle_state: LoadoutLifecycleState;
+  match_actor_id: string | null;
+  match_client_name: string | null;
+  scope: LoadoutScope;
+  project_id: string | null;
+  task_mode: string | null;
+  created_by_actor_id: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type LoadoutRuleRow = {
+  loadout_id: string;
+  version: number;
+  channel: LoadoutChannel;
+  include_asset_ids: string[];
+  include_memory_ids: string[];
+  include_types: string[];
+  include_tiers: LoadoutTier[];
+  include_tags: string[];
+  include_topics: string[];
+  exclude_asset_ids: string[];
+  exclude_memory_ids: string[];
+  exclude_tags: string[];
+  required_refs: string[];
+  max_items: number;
+  max_chars: number;
+  max_tokens: number | null;
+  timeout_ms: number;
+  ordering_policy: LoadoutOrderingPolicy;
+};
+
+export type LoadoutBindingRow = {
+  binding_id: string;
+  loadout_id: string;
+  loadout_version: number;
+  actor_id: string | null;
+  client_name: string | null;
+  project_id: string | null;
+  task_mode: string | null;
+  priority: number;
+  created_at: string;
+};
+
+/**
+ * v1.2.0-alpha.2 (issue #50): the session-to-memory
+ * distillation candidate row. The candidate is the
+ * durable artefact produced by an extractor (the
+ * baseline `DeterministicBaselineExtractor` in this
+ * release, plus any future provider-backed
+ * extractor). One candidate row per proposed memory
+ * / episode / skill_candidate; the `evidence` and
+ * `action` tables fan out from the `candidate_id`.
  *
  * The `state` column is a small state machine:
- *   - `proposed`  -> freshly emitted by the extractor
- *   - `accepted`  -> reviewed + accepted by a human
- *   - `rejected`  -> reviewed + rejected by a human
- *   - `applied`   -> accepted + successfully applied
- *   - `stale`     -> CAS drift on apply; skipped
- *
- * The `expected_target_revision` is the CAS guard
- * for the `apply` step (when the candidate targets
- * an existing `memory_id`). A drift transitions the
- * candidate to `stale` and the apply batch skips it.
+ * `proposed` -> `accepted` -> `applied`, with
+ * `rejected` and `stale` as terminal / soft
+ * transitions. The `expected_target_revision` is
+ * the CAS guard used by the `apply` step (when the
+ * candidate targets an existing `memory_id`). Drift
+ * transitions the candidate to `stale` and the
+ * apply batch skips it.
  */
 export type DerivationCandidateKind = "memory" | "episode" | "skill_candidate";
 
@@ -689,7 +761,7 @@ export type DerivationCandidateRow = {
   proposed_title: string | null;
   proposed_body: string | null;
   proposed_tags_json: string;
-  proposed_scope: "global" | "project";
+  proposed_scope: DerivationCandidateScope;
   proposed_project_id: string | null;
   proposed_tier: DerivationCandidateTier;
   proposed_trust_level: DerivationCandidateTrustLevel;
@@ -938,6 +1010,60 @@ function assetVersionFromRow(row: Row): AssetVersionRow {
   };
 }
 
+function loadoutFromRow(row: Row): LoadoutRow {
+  return {
+    loadout_id: stringCell(row, "loadout_id"),
+    name: stringCell(row, "name"),
+    version: numberCell(row, "version"),
+    lifecycle_state: stringCell(row, "lifecycle_state") as LoadoutLifecycleState,
+    match_actor_id: optionalStringCell(row, "match_actor_id") ?? null,
+    match_client_name: optionalStringCell(row, "match_client_name") ?? null,
+    scope: stringCell(row, "scope") as LoadoutScope,
+    project_id: optionalStringCell(row, "project_id") ?? null,
+    task_mode: optionalStringCell(row, "task_mode") ?? null,
+    created_by_actor_id: stringCell(row, "created_by_actor_id"),
+    created_at: stringCell(row, "created_at"),
+    updated_at: stringCell(row, "updated_at")
+  };
+}
+
+function loadoutRuleFromRow(row: Row): LoadoutRuleRow {
+  return {
+    loadout_id: stringCell(row, "loadout_id"),
+    version: numberCell(row, "version"),
+    channel: stringCell(row, "channel") as LoadoutChannel,
+    include_asset_ids: decodeJson<string[]>(stringCell(row, "include_asset_ids_json")),
+    include_memory_ids: decodeJson<string[]>(stringCell(row, "include_memory_ids_json")),
+    include_types: decodeJson<string[]>(stringCell(row, "include_types_json")),
+    include_tiers: decodeJson<LoadoutTier[]>(stringCell(row, "include_tiers_json")),
+    include_tags: decodeJson<string[]>(stringCell(row, "include_tags_json")),
+    include_topics: decodeJson<string[]>(stringCell(row, "include_topics_json")),
+    exclude_asset_ids: decodeJson<string[]>(stringCell(row, "exclude_asset_ids_json")),
+    exclude_memory_ids: decodeJson<string[]>(stringCell(row, "exclude_memory_ids_json")),
+    exclude_tags: decodeJson<string[]>(stringCell(row, "exclude_tags_json")),
+    required_refs: decodeJson<string[]>(stringCell(row, "required_refs_json")),
+    max_items: numberCell(row, "max_items"),
+    max_chars: numberCell(row, "max_chars"),
+    max_tokens: optionalNumberCell(row, "max_tokens") ?? null,
+    timeout_ms: numberCell(row, "timeout_ms"),
+    ordering_policy: stringCell(row, "ordering_policy") as LoadoutOrderingPolicy
+  };
+}
+
+function loadoutBindingFromRow(row: Row): LoadoutBindingRow {
+  return {
+    binding_id: stringCell(row, "binding_id"),
+    loadout_id: stringCell(row, "loadout_id"),
+    loadout_version: numberCell(row, "loadout_version"),
+    actor_id: optionalStringCell(row, "actor_id") ?? null,
+    client_name: optionalStringCell(row, "client_name") ?? null,
+    project_id: optionalStringCell(row, "project_id") ?? null,
+    task_mode: optionalStringCell(row, "task_mode") ?? null,
+    priority: numberCell(row, "priority"),
+    created_at: stringCell(row, "created_at")
+  };
+}
+
 function memoryRefBindingFromRow(row: Row): MemoryRefBindingRow {
   return {
     asset_id: stringCell(row, "asset_id"),
@@ -960,7 +1086,7 @@ function derivationCandidateFromRow(row: Row): DerivationCandidateRow {
     proposed_title: optionalStringCell(row, "proposed_title") ?? null,
     proposed_body: optionalStringCell(row, "proposed_body") ?? null,
     proposed_tags_json: stringCell(row, "proposed_tags_json"),
-    proposed_scope: stringCell(row, "proposed_scope") as "global" | "project",
+    proposed_scope: stringCell(row, "proposed_scope") as DerivationCandidateScope,
     proposed_project_id: optionalStringCell(row, "proposed_project_id") ?? null,
     proposed_tier: stringCell(row, "proposed_tier") as DerivationCandidateTier,
     proposed_trust_level: stringCell(row, "proposed_trust_level") as DerivationCandidateTrustLevel,
@@ -2686,6 +2812,10 @@ export class SQLiteMemoryStore {
       this.migrate_v16_to_v17();
       return;
     }
+    if (version === 18) {
+      this.migrate_v17_to_v18();
+      return;
+    }
     throw new Error(`No migration registered for schema version ${version}`);
   }
 
@@ -3908,48 +4038,59 @@ export class SQLiteMemoryStore {
   }
 
   /**
-   * v1.2.0-alpha.2 (issue #50): the v16 -> v17 schema
-   * migration. Three additive tables — `derivation_candidates`,
-   * `candidate_evidence`, `candidate_actions` — back the
-   * session-to-memory distillation pipeline. The candidate
-   * row's `state` is a small state machine (`proposed` ->
-   * `accepted` -> `applied` or `rejected` / `stale`); the
-   * `expected_target_revision` is the CAS guard for the
-   * `apply` step. The CHECK on `state = 'applied' OR
-   * applied_at IS NULL` keeps the two terminal "applied"
-   * fields in sync.
+   * v1.2.0-alpha.2 (issue #52) v17 lane placeholder.
    *
-   * The migration is fully transactional; on any throw
-   * the user_version stays at 16 and the database is
-   * untouched.
+   * The v17 lane is owned by the parallel distillation
+   * pipeline worktree (issue #50). It ships its own
+   * additive tables; this migration is a no-op so the
+   * v18 chain stays linear. The migration is still
+   * wrapped in `BEGIN IMMEDIATE` + `COMMIT` so the
+   * no-op is atomic — if the v17 lane ever ships
+   * additional SQL through this method, the
+   * transactional shape is already in place.
+   *
+   * On any throw, the database is rolled back and
+   * `user_version` stays at 16.
    */
   private migrate_v16_to_v17(): void {
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      // v1.2.0-alpha.2 (issue #50): the session-to-memory
+      // distillation pipeline. Three additive tables —
+      // `derivation_candidates`, `candidate_evidence`,
+      // `candidate_actions` — back the reviewable
+      // memory / episode / skill-candidate proposals
+      // produced by the deterministic baseline extractor
+      // (and any future provider-backed extractor).
+      // The candidate row's `state` is a small state
+      // machine (`proposed` -> `accepted` -> `applied` or
+      // `rejected` / `stale`); the row's
+      // `expected_target_revision` is the CAS guard for
+      // the `apply` step.
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS derivation_candidates (
           candidate_id              TEXT PRIMARY KEY,
           job_id                    TEXT NOT NULL REFERENCES derivation_jobs(job_id) ON DELETE CASCADE,
           run_id                    TEXT NOT NULL REFERENCES derivation_runs(run_id) ON DELETE CASCADE,
           candidate_kind            TEXT NOT NULL
-                                      CHECK (candidate_kind IN ('memory','episode','skill_candidate')),
+                                        CHECK (candidate_kind IN ('memory','episode','skill_candidate')),
           proposed_type             TEXT,
           proposed_topic            TEXT,
           proposed_title            TEXT,
           proposed_body             TEXT,
           proposed_tags_json        TEXT NOT NULL DEFAULT '[]',
           proposed_scope            TEXT NOT NULL
-                                      CHECK (proposed_scope IN ('global','project')),
+                                        CHECK (proposed_scope IN ('global','project')),
           proposed_project_id       TEXT,
           proposed_tier             TEXT NOT NULL DEFAULT 'working'
-                                      CHECK (proposed_tier IN ('working')),
+                                        CHECK (proposed_tier IN ('working')),
           proposed_trust_level      TEXT NOT NULL DEFAULT 'inferred'
-                                      CHECK (proposed_trust_level IN ('inferred','agent_observed')),
+                                        CHECK (proposed_trust_level IN ('inferred','agent_observed')),
           proposed_sensitivity      TEXT NOT NULL
-                                      CHECK (proposed_sensitivity IN ('normal')),
+                                        CHECK (proposed_sensitivity IN ('normal')),
           confidence                REAL NOT NULL,
           state                     TEXT NOT NULL
-                                      CHECK (state IN ('proposed','accepted','rejected','applied','stale')),
+                                        CHECK (state IN ('proposed','accepted','rejected','applied','stale')),
           extractor_id              TEXT NOT NULL,
           extractor_version         TEXT NOT NULL,
           content_hash              TEXT NOT NULL,
@@ -3971,7 +4112,7 @@ export class SQLiteMemoryStore {
         CREATE TABLE IF NOT EXISTS candidate_evidence (
           candidate_id   TEXT NOT NULL REFERENCES derivation_candidates(candidate_id) ON DELETE CASCADE,
           evidence_role  TEXT NOT NULL
-                           CHECK (evidence_role IN ('primary','supporting','context')),
+                              CHECK (evidence_role IN ('primary','supporting','context')),
           session_id     TEXT,
           event_id       TEXT,
           message_id     TEXT,
@@ -3987,13 +4128,13 @@ export class SQLiteMemoryStore {
         CREATE TABLE IF NOT EXISTS candidate_actions (
           candidate_id            TEXT NOT NULL REFERENCES derivation_candidates(candidate_id) ON DELETE CASCADE,
           action                  TEXT NOT NULL
-                                    CHECK (action IN ('create','update','supersede','merge','skip')),
+                                      CHECK (action IN ('create','update','supersede','merge','skip')),
           target_memory_ids_json  TEXT NOT NULL DEFAULT '[]',
           expected_revisions_json TEXT NOT NULL DEFAULT '[]',
           rationale               TEXT NOT NULL,
           conflict_signals_json   TEXT NOT NULL DEFAULT '[]',
           risk                    TEXT NOT NULL
-                                    CHECK (risk IN ('low','medium','high')),
+                                      CHECK (risk IN ('low','medium','high')),
           PRIMARY KEY (candidate_id, action)
         ) STRICT;
       `);
@@ -4005,258 +4146,97 @@ export class SQLiteMemoryStore {
     }
   }
 
-  // ─────────────────────────────────────────────────────────────────────
-  // v1.2.0-alpha.2 (issue #50): distillation candidate rows.
-  //
-  // The three tables — `derivation_candidates` /
-  // `candidate_evidence` / `candidate_actions` — back the
-  // reviewable memory / episode / skill-candidate proposals
-  // produced by the session-to-memory distillation pipeline.
-  // The public service lives in
-  // `src/distillation/service.ts`; the methods below are the
-  // lowest-level row readers and writers used by the
-  // `DistillationService`. The methods compose inside single
-  // `BEGIN IMMEDIATE` transactions so the apply step is
-  // atomic with the candidate state transition (issue #50
-  // AC #2).
-  // ─────────────────────────────────────────────────────────────────────
-
   /**
-   * Insert a single candidate row. The caller pre-computes
-   * `candidate_id`, `content_hash`, the scope / project_id
-   * pair, and the proposed trust / tier / sensitivity
-   * values. The row is inserted with `state='proposed'`
-   * (the v17 CHECK constraint enforces the enum). Returns
-   * `false` on a primary-key collision so the service can
-   * translate it to a stable error code.
+   * v1.2.0-alpha.2 (issue #52): the agent loadout
+   * substrate. Three additive tables — `agent_loadouts`,
+   * `loadout_rules`, `loadout_bindings` — back the
+   * policy-bound loadout surface that powers the
+   * `bootstrap` / `query` / `tool_only` channels of
+   * the context-assembly service.
+   *
+   * The `loadout_rules` table is keyed on
+   * `(loadout_id, version, channel)` so a
+   * `updateRules` call bumps the version and inserts a
+   * new immutable rule row in the same transaction;
+   * the `version` bump is what changes `bootstrap_hash`
+   * in the assembled context (the upstream prompt-cache
+   * key).
+   *
+   * The migration is fully transactional; on any throw
+   * the user_version stays at 17 and the database is
+   * untouched. All DDL is `IF NOT EXISTS` so the
+   * migration is idempotent against re-runs.
    */
-  insertCandidate(row: DerivationCandidateRow): boolean {
+  private migrate_v17_to_v18(): void {
+    this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.db
-        .prepare(
-          `INSERT INTO derivation_candidates (
-            candidate_id, job_id, run_id, candidate_kind,
-            proposed_type, proposed_topic, proposed_title, proposed_body,
-            proposed_tags_json, proposed_scope, proposed_project_id,
-            proposed_tier, proposed_trust_level, proposed_sensitivity,
-            confidence, state,
-            extractor_id, extractor_version, content_hash,
-            created_at, reviewed_at, reviewed_by_actor_id, applied_at,
-            expected_target_revision
-          ) VALUES (
-            ?, ?, ?, ?,
-            ?, ?, ?, ?,
-            ?, ?, ?,
-            ?, ?, ?,
-            ?, ?,
-            ?, ?, ?,
-            ?, ?, ?, ?,
-            ?
-          )`
-        )
-        .run(
-          row.candidate_id,
-          row.job_id,
-          row.run_id,
-          row.candidate_kind,
-          row.proposed_type,
-          row.proposed_topic,
-          row.proposed_title,
-          row.proposed_body,
-          row.proposed_tags_json,
-          row.proposed_scope,
-          row.proposed_project_id,
-          row.proposed_tier,
-          row.proposed_trust_level,
-          row.proposed_sensitivity,
-          row.confidence,
-          row.state,
-          row.extractor_id,
-          row.extractor_version,
-          row.content_hash,
-          row.created_at,
-          row.reviewed_at,
-          row.reviewed_by_actor_id,
-          row.applied_at,
-          row.expected_target_revision
-        );
-      return true;
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS agent_loadouts (
+          loadout_id        TEXT PRIMARY KEY,
+          name              TEXT NOT NULL,
+          version           INTEGER NOT NULL DEFAULT 1,
+          lifecycle_state   TEXT NOT NULL CHECK (lifecycle_state IN ('draft','active','deprecated','archived')),
+          match_actor_id    TEXT,
+          match_client_name TEXT,
+          scope             TEXT NOT NULL CHECK (scope IN ('global','project')),
+          project_id        TEXT,
+          task_mode         TEXT,
+          created_by_actor_id TEXT NOT NULL,
+          created_at        TEXT NOT NULL,
+          updated_at        TEXT NOT NULL,
+          CHECK (scope = 'project' AND project_id IS NOT NULL
+                 OR scope = 'global' AND project_id IS NULL)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_loadouts_scope
+          ON agent_loadouts(scope, project_id, lifecycle_state);
+        CREATE INDEX IF NOT EXISTS idx_loadouts_match
+          ON agent_loadouts(match_actor_id, match_client_name, task_mode);
+
+        CREATE TABLE IF NOT EXISTS loadout_rules (
+          loadout_id           TEXT NOT NULL REFERENCES agent_loadouts(loadout_id) ON DELETE CASCADE,
+          version              INTEGER NOT NULL,
+          channel              TEXT NOT NULL CHECK (channel IN ('bootstrap','query','tool_only')),
+          include_asset_ids_json   TEXT NOT NULL DEFAULT '[]',
+          include_memory_ids_json  TEXT NOT NULL DEFAULT '[]',
+          include_types_json       TEXT NOT NULL DEFAULT '[]',
+          include_tiers_json       TEXT NOT NULL DEFAULT '[]',
+          include_tags_json        TEXT NOT NULL DEFAULT '[]',
+          include_topics_json      TEXT NOT NULL DEFAULT '[]',
+          exclude_asset_ids_json   TEXT NOT NULL DEFAULT '[]',
+          exclude_memory_ids_json  TEXT NOT NULL DEFAULT '[]',
+          exclude_tags_json        TEXT NOT NULL DEFAULT '[]',
+          required_refs_json       TEXT NOT NULL DEFAULT '[]',
+          max_items               INTEGER NOT NULL DEFAULT 32,
+          max_chars               INTEGER NOT NULL DEFAULT 8000,
+          max_tokens              INTEGER,
+          timeout_ms              INTEGER NOT NULL DEFAULT 5000,
+          ordering_policy         TEXT NOT NULL DEFAULT 'rule_then_score',
+          PRIMARY KEY (loadout_id, version, channel),
+          CHECK (version > 0)
+        ) STRICT;
+
+        CREATE TABLE IF NOT EXISTS loadout_bindings (
+          binding_id       TEXT PRIMARY KEY,
+          loadout_id       TEXT NOT NULL REFERENCES agent_loadouts(loadout_id) ON DELETE CASCADE,
+          loadout_version  INTEGER NOT NULL,
+          actor_id         TEXT,
+          client_name      TEXT,
+          project_id       TEXT,
+          task_mode        TEXT,
+          priority         INTEGER NOT NULL DEFAULT 0,
+          created_at       TEXT NOT NULL
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_loadout_bindings_match
+          ON loadout_bindings(actor_id, client_name, project_id, task_mode, priority);
+      `);
+      this.db.exec("PRAGMA user_version = 18");
+      this.db.exec("COMMIT");
     } catch (error) {
-      if (isSqliteUniqueConstraintError(error)) return false;
+      this.db.exec("ROLLBACK");
       throw error;
     }
-  }
-
-  /**
-   * Read a single candidate row by its primary key.
-   * Returns `undefined` if the row does not exist.
-   */
-  getCandidate(candidateId: string): DerivationCandidateRow | undefined {
-    const row = this.db
-      .prepare("SELECT * FROM derivation_candidates WHERE candidate_id = ?")
-      .get(candidateId) as Row | undefined;
-    if (row === undefined) return undefined;
-    return derivationCandidateFromRow(row);
-  }
-
-  /**
-   * List all candidates for a given job, ordered by
-   * `created_at ASC` so the inspection output reads in
-   * the same order the extractor emitted them.
-   */
-  listCandidatesForJob(jobId: string): DerivationCandidateRow[] {
-    const rows = this.db
-      .prepare(
-        "SELECT * FROM derivation_candidates WHERE job_id = ? ORDER BY created_at ASC, candidate_id ASC"
-      )
-      .all(jobId) as Row[];
-    return rows.map((r) => derivationCandidateFromRow(r));
-  }
-
-  /**
-   * Transition a candidate's state. The `now_ms` is the
-   * timestamp written to the matching side-column
-   * (`reviewed_at` for accept/reject, `applied_at` for
-   * apply). A `stale` transition is a no-op for the
-   * reviewer / applied columns; the row still moves
-   * to `stale` so the inspector surfaces the drift.
-   * Returns `true` when the row updated.
-   */
-  updateCandidateState(args: {
-    candidate_id: string;
-    next_state: DerivationCandidateState;
-    reviewed_by_actor_id?: string | null;
-    now_ms: number;
-  }): boolean {
-    const reviewedBy =
-      args.reviewed_by_actor_id === undefined ? null : args.reviewed_by_actor_id;
-    if (args.next_state === "applied") {
-      const result = this.db
-        .prepare(
-          `UPDATE derivation_candidates
-              SET state = ?,
-                  applied_at = ?,
-                  reviewed_at = COALESCE(reviewed_at, ?),
-                  reviewed_by_actor_id = COALESCE(reviewed_by_actor_id, ?)
-            WHERE candidate_id = ?`
-        )
-        .run(args.next_state, args.now_ms, args.now_ms, reviewedBy, args.candidate_id);
-      return result.changes > 0;
-    }
-    if (args.next_state === "accepted" || args.next_state === "rejected") {
-      const result = this.db
-        .prepare(
-          `UPDATE derivation_candidates
-              SET state = ?,
-                  reviewed_at = ?,
-                  reviewed_by_actor_id = ?
-            WHERE candidate_id = ?`
-        )
-        .run(args.next_state, args.now_ms, reviewedBy, args.candidate_id);
-      return result.changes > 0;
-    }
-    // `proposed` (re-emit) or `stale` (CAS drift)
-    // transitions only flip the state column.
-    const result = this.db
-      .prepare(
-        `UPDATE derivation_candidates
-            SET state = ?
-          WHERE candidate_id = ?`
-      )
-      .run(args.next_state, args.candidate_id);
-    return result.changes > 0;
-  }
-
-  /**
-   * Insert one evidence row. The composite primary key
-   * `(candidate_id, evidence_role, excerpt_digest)`
-   * de-dupes identical rows so a re-run is a no-op.
-   * Throws on duplicate (caller can ignore).
-   */
-  insertCandidateEvidence(row: CandidateEvidenceRow): void {
-    this.db
-      .prepare(
-        `INSERT INTO candidate_evidence (
-          candidate_id, evidence_role,
-          session_id, event_id, message_id, tool_call_id, file_ref,
-          excerpt_digest
-        ) VALUES (
-          ?, ?,
-          ?, ?, ?, ?, ?,
-          ?
-        )`
-      )
-      .run(
-        row.candidate_id,
-        row.evidence_role,
-        row.session_id,
-        row.event_id,
-        row.message_id,
-        row.tool_call_id,
-        row.file_ref,
-        row.excerpt_digest
-      );
-  }
-
-  /**
-   * Insert one action row. The composite primary key
-   * `(candidate_id, action)` keeps the action list
-   * deduped; a re-run of the same action is a
-   * SQLITE_CONSTRAINT that the service can ignore.
-   */
-  insertCandidateAction(row: CandidateActionRow): void {
-    this.db
-      .prepare(
-        `INSERT INTO candidate_actions (
-          candidate_id, action,
-          target_memory_ids_json, expected_revisions_json,
-          rationale, conflict_signals_json, risk
-        ) VALUES (
-          ?, ?,
-          ?, ?,
-          ?, ?, ?
-        )`
-      )
-      .run(
-        row.candidate_id,
-        row.action,
-        row.target_memory_ids_json,
-        row.expected_revisions_json,
-        row.rationale,
-        row.conflict_signals_json,
-        row.risk
-      );
-  }
-
-  /**
-   * Read all evidence rows for a candidate, ordered by
-   * `evidence_role ASC, excerpt_digest ASC` for stable
-   * inspection.
-   */
-  getCandidateEvidence(candidateId: string): CandidateEvidenceRow[] {
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM candidate_evidence
-           WHERE candidate_id = ?
-           ORDER BY evidence_role ASC, excerpt_digest ASC`
-      )
-      .all(candidateId) as Row[];
-    return rows.map((r) => candidateEvidenceFromRow(r));
-  }
-
-  /**
-   * Read all action rows for a candidate, ordered by
-   * `action ASC` for stable inspection.
-   */
-  getCandidateAction(candidateId: string): CandidateActionRow[] {
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM candidate_actions
-           WHERE candidate_id = ?
-           ORDER BY action ASC`
-      )
-      .all(candidateId) as Row[];
-    return rows.map((r) => candidateActionFromRow(r));
   }
 
   private addColumnIfMissing(table: string, column: string, definition: string): void {
@@ -6432,6 +6412,703 @@ export class SQLiteMemoryStore {
       );
   }
 
+  // ─────────────────────────────────────────────────────────────────────
+  // v1.2.0-alpha.2 (issue #50): session -> memory
+  // distillation candidate store. The three tables
+  // — `derivation_candidates` / `candidate_evidence` /
+  // `candidate_actions` — back the reviewable
+  // memory / episode / skill-candidate proposals
+  // produced by the deterministic baseline extractor
+  // (and any future provider-backed extractor).
+  //
+  // All inserts are idempotent: a duplicate
+  // `candidate_id` returns `false` from
+  // `insertCandidate`; the evidence / action tables
+  // de-dupe on the composite primary key. The
+  // `apply` path's CAS guard is the
+  // `expected_target_revision` column on the
+  // candidate row; drift transitions the row to
+  // `stale` and the apply batch continues with the
+  // remaining candidates.
+  // ─────────────────────────────────────────────────────────────────────
+
+  /**
+   * v1.2.0-alpha.2 (issue #50): insert a new
+   * candidate row. Returns `true` on success,
+   * `false` when a row with the same
+   * `candidate_id` already exists (idempotent
+   * re-insert). Throws on CHECK violation
+   * (invalid kind, invalid state, invalid
+   * scope/project_id combo, etc.) — the caller
+   * surfaces that as a stable error code.
+   */
+  insertCandidate(row: DerivationCandidateRow): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO derivation_candidates (
+            candidate_id, job_id, run_id, candidate_kind,
+            proposed_type, proposed_topic, proposed_title, proposed_body,
+            proposed_tags_json, proposed_scope, proposed_project_id,
+            proposed_tier, proposed_trust_level, proposed_sensitivity,
+            confidence, state,
+            extractor_id, extractor_version, content_hash,
+            created_at, reviewed_at, reviewed_by_actor_id, applied_at,
+            expected_target_revision
+          ) VALUES (
+            ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?,
+            ?, ?, ?,
+            ?, ?,
+            ?, ?, ?,
+            ?, ?, ?, ?,
+            ?
+          )`
+        )
+        .run(
+          row.candidate_id,
+          row.job_id,
+          row.run_id,
+          row.candidate_kind,
+          row.proposed_type,
+          row.proposed_topic,
+          row.proposed_title,
+          row.proposed_body,
+          row.proposed_tags_json,
+          row.proposed_scope,
+          row.proposed_project_id,
+          row.proposed_tier,
+          row.proposed_trust_level,
+          row.proposed_sensitivity,
+          row.confidence,
+          row.state,
+          row.extractor_id,
+          row.extractor_version,
+          row.content_hash,
+          row.created_at,
+          row.reviewed_at,
+          row.reviewed_by_actor_id,
+          row.applied_at,
+          row.expected_target_revision
+        );
+      return true;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * Read a single candidate row by its primary key.
+   * Returns `undefined` if the row does not exist.
+   */
+  getCandidate(candidateId: string): DerivationCandidateRow | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM derivation_candidates WHERE candidate_id = ?")
+      .get(candidateId) as Row | undefined;
+    if (row === undefined) return undefined;
+    return derivationCandidateFromRow(row);
+  }
+
+  /**
+   * List all candidates for a given job, ordered by
+   * `created_at ASC` so the inspection output reads in
+   * the same order the extractor emitted them.
+   */
+  listCandidatesForJob(jobId: string): DerivationCandidateRow[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM derivation_candidates WHERE job_id = ? ORDER BY created_at ASC, candidate_id ASC"
+      )
+      .all(jobId) as Row[];
+    return rows.map((r) => derivationCandidateFromRow(r));
+  }
+
+  /**
+   * Transition a candidate's state. The `now_ms` is
+   * the timestamp written to the matching side-column
+   * (`reviewed_at` for accept/reject, `applied_at`
+   * for apply). A `stale` transition is a no-op for
+   * the reviewer / applied columns; the row still
+   * moves to `stale` so the inspector surfaces the
+   * drift. Returns `true` when the row updated.
+   */
+  updateCandidateState(args: {
+    candidate_id: string;
+    next_state: DerivationCandidateState;
+    reviewed_by_actor_id?: string | null;
+    now_ms: number;
+  }): boolean {
+    const reviewedBy =
+      args.reviewed_by_actor_id === undefined ? null : args.reviewed_by_actor_id;
+    if (args.next_state === "applied") {
+      const result = this.db
+        .prepare(
+          `UPDATE derivation_candidates
+              SET state = ?,
+                  applied_at = ?,
+                  reviewed_at = COALESCE(reviewed_at, ?),
+                  reviewed_by_actor_id = COALESCE(reviewed_by_actor_id, ?)
+            WHERE candidate_id = ?`
+        )
+        .run(args.next_state, args.now_ms, args.now_ms, reviewedBy, args.candidate_id);
+      return result.changes > 0;
+    }
+    if (args.next_state === "accepted" || args.next_state === "rejected") {
+      const result = this.db
+        .prepare(
+          `UPDATE derivation_candidates
+              SET state = ?,
+                  reviewed_at = ?,
+                  reviewed_by_actor_id = ?
+            WHERE candidate_id = ?`
+        )
+        .run(args.next_state, args.now_ms, reviewedBy, args.candidate_id);
+      return result.changes > 0;
+    }
+    // `proposed` (re-emit) or `stale` (CAS drift)
+    // transitions only flip the state column.
+    const result = this.db
+      .prepare(
+        `UPDATE derivation_candidates
+            SET state = ?
+          WHERE candidate_id = ?`
+      )
+      .run(args.next_state, args.candidate_id);
+    return result.changes > 0;
+  }
+
+  /**
+   * Insert one evidence row. The composite primary
+   * key `(candidate_id, evidence_role,
+   * excerpt_digest)` de-dupes identical rows so a
+   * re-run is a no-op. Throws on duplicate (caller
+   * can ignore).
+   */
+  insertCandidateEvidence(row: CandidateEvidenceRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO candidate_evidence (
+          candidate_id, evidence_role,
+          session_id, event_id, message_id, tool_call_id, file_ref,
+          excerpt_digest
+        ) VALUES (
+          ?, ?,
+          ?, ?, ?, ?, ?,
+          ?
+        )`
+      )
+      .run(
+        row.candidate_id,
+        row.evidence_role,
+        row.session_id,
+        row.event_id,
+        row.message_id,
+        row.tool_call_id,
+        row.file_ref,
+        row.excerpt_digest
+      );
+  }
+
+  /**
+   * Insert one action row. The composite primary
+   * key `(candidate_id, action)` keeps the action
+   * list deduped; a re-run of the same action is a
+   * SQLITE_CONSTRAINT that the service can ignore.
+   */
+  insertCandidateAction(row: CandidateActionRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO candidate_actions (
+          candidate_id, action,
+          target_memory_ids_json, expected_revisions_json,
+          rationale, conflict_signals_json, risk
+        ) VALUES (
+          ?, ?,
+          ?, ?,
+          ?, ?, ?
+        )`
+      )
+      .run(
+        row.candidate_id,
+        row.action,
+        row.target_memory_ids_json,
+        row.expected_revisions_json,
+        row.rationale,
+        row.conflict_signals_json,
+        row.risk
+      );
+  }
+
+  /**
+   * Read all evidence rows for a candidate, ordered
+   * by `evidence_role ASC, excerpt_digest ASC` for
+   * stable inspection.
+   */
+  getCandidateEvidence(candidateId: string): CandidateEvidenceRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM candidate_evidence
+           WHERE candidate_id = ?
+           ORDER BY evidence_role ASC, excerpt_digest ASC`
+      )
+      .all(candidateId) as Row[];
+    return rows.map((r) => candidateEvidenceFromRow(r));
+  }
+
+  /**
+   * Read all action rows for a candidate, ordered
+   * by `action ASC` for stable inspection.
+   */
+  getCandidateAction(candidateId: string): CandidateActionRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM candidate_actions
+           WHERE candidate_id = ?
+           ORDER BY action ASC`
+      )
+      .all(candidateId) as Row[];
+    return rows.map((r) => candidateActionFromRow(r));
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // v1.2.0-alpha.2 (issue #52): agent loadout substrate.
+  //
+  // The three tables — `agent_loadouts` /
+  // `loadout_rules` / `loadout_bindings` — are the durable
+  // backing for the policy-bound loadout surface that
+  // powers `bootstrap` / `query` / `tool_only` channels
+  // of the context-assembly service. The
+  // `LoadoutService` (src/loadouts/service.ts) wraps
+  // these methods with the public verb API
+  // (`create` / `updateRules` / `bind` / `unbind` /
+  // `resolve`) and the `LoadoutService.updateRules` CAS
+  // semantics that keep `bootstrap_hash` stable when the
+  // loadout row + content are unchanged.
+  // ─────────────────────────────────────────────────────────────────────
+
+  /**
+   * v1.2.0-alpha.2 (issue #52): insert a new
+   * `agent_loadouts` row. The row is inserted with
+   * `version: 1`, `lifecycle_state: "draft"`. Returns
+   * `true` on success, `false` when a row with the
+   * same `loadout_id` already exists (idempotent
+   * re-insert). Throws on CHECK violation
+   * (invalid scope, missing project_id for
+   * project-scope, invalid lifecycle_state, etc.)
+   * — the caller surfaces that as a stable error code.
+   */
+  insertLoadout(row: LoadoutRow): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO agent_loadouts (
+            loadout_id, name, version, lifecycle_state,
+            match_actor_id, match_client_name,
+            scope, project_id, task_mode,
+            created_by_actor_id, created_at, updated_at
+          ) VALUES (
+            ?, ?, ?, ?,
+            ?, ?,
+            ?, ?, ?,
+            ?, ?, ?
+          )`
+        )
+        .run(
+          row.loadout_id,
+          row.name,
+          row.version,
+          row.lifecycle_state,
+          row.match_actor_id,
+          row.match_client_name,
+          row.scope,
+          row.project_id,
+          row.task_mode,
+          row.created_by_actor_id,
+          row.created_at,
+          row.updated_at
+        );
+      return true;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #52): read a single
+   * `agent_loadouts` row by primary key. Returns
+   * `undefined` when the row does not exist.
+   */
+  getLoadout(loadoutId: string): LoadoutRow | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM agent_loadouts WHERE loadout_id = ?")
+      .get(loadoutId) as Row | undefined;
+    if (row === undefined) return undefined;
+    return loadoutFromRow(row);
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #52): list loadout rows.
+   * The `scope` / `lifecycle_state` filters are
+   * optional; the `limit` caps the row count
+   * (default 50). Ordered newest-first by
+   * `updated_at DESC`.
+   */
+  listLoadouts(filter: {
+    scope?: LoadoutScope;
+    project_id?: string;
+    lifecycle_state?: LoadoutLifecycleState;
+    limit?: number;
+  }): LoadoutRow[] {
+    const clauses: string[] = [];
+    const params: SQLInputValue[] = [];
+    if (filter.scope !== undefined) {
+      clauses.push("scope = ?");
+      params.push(filter.scope);
+    }
+    if (filter.project_id !== undefined) {
+      clauses.push("project_id = ?");
+      params.push(filter.project_id);
+    }
+    if (filter.lifecycle_state !== undefined) {
+      clauses.push("lifecycle_state = ?");
+      params.push(filter.lifecycle_state);
+    }
+    const where = clauses.length === 0 ? "" : " WHERE " + clauses.join(" AND ");
+    const limit = filter.limit ?? 50;
+    const sql = `SELECT * FROM agent_loadouts${where}
+                  ORDER BY updated_at DESC LIMIT ?`;
+    params.push(limit);
+    const rows = this.db.prepare(sql).all(...params) as Row[];
+    return rows.map((r) => loadoutFromRow(r));
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #52): insert one
+   * `loadout_rules` row at `(loadout_id, version,
+   * channel)`. The (loadout_id, version, channel)
+   * triple is the primary key, so a duplicate
+   * insert throws on the constraint. The method
+   * is intended to be called inside a
+   * `BEGIN IMMEDIATE` block that has already
+   * bumped `agent_loadouts.version` (the
+   * `LoadoutService.updateRules` caller is the
+   * canonical writer).
+   */
+  insertLoadoutRule(row: LoadoutRuleRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO loadout_rules (
+          loadout_id, version, channel,
+          include_asset_ids_json, include_memory_ids_json,
+          include_types_json, include_tiers_json,
+          include_tags_json, include_topics_json,
+          exclude_asset_ids_json, exclude_memory_ids_json,
+          exclude_tags_json, required_refs_json,
+          max_items, max_chars, max_tokens, timeout_ms,
+          ordering_policy
+        ) VALUES (
+          ?, ?, ?,
+          ?, ?,
+          ?, ?,
+          ?, ?,
+          ?, ?,
+          ?, ?,
+          ?, ?, ?, ?,
+          ?
+        )`
+      )
+      .run(
+        row.loadout_id,
+        row.version,
+        row.channel,
+        encodeJson(row.include_asset_ids),
+        encodeJson(row.include_memory_ids),
+        encodeJson(row.include_types),
+        encodeJson(row.include_tiers),
+        encodeJson(row.include_tags),
+        encodeJson(row.include_topics),
+        encodeJson(row.exclude_asset_ids),
+        encodeJson(row.exclude_memory_ids),
+        encodeJson(row.exclude_tags),
+        encodeJson(row.required_refs),
+        row.max_items,
+        row.max_chars,
+        row.max_tokens,
+        row.timeout_ms,
+        row.ordering_policy
+      );
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #52): CAS update of the
+   * `agent_loadouts.version` column. The update
+   * only succeeds when the current row has
+   * `version = expected_previous_version`;
+   * otherwise the function returns `undefined`
+   * (caller is racing a concurrent updateRules).
+   * The new version MUST be
+   * `expected_previous_version + 1`. The
+   * `updated_at` is set to `now`. The matching
+   * `loadout_rules` rows are inserted by the
+   * caller inside the same transaction.
+   */
+  updateLoadoutVersion(args: {
+    loadout_id: string;
+    expected_previous_version: number;
+    new_version: number;
+    now: string;
+  }): LoadoutRow | undefined {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const updated = this.db
+        .prepare(
+          `UPDATE agent_loadouts
+              SET version = ?,
+                  updated_at = ?
+            WHERE loadout_id = ?
+              AND version = ?
+            RETURNING *`
+        )
+        .get(
+          args.new_version,
+          args.now,
+          args.loadout_id,
+          args.expected_previous_version
+        ) as Row | undefined;
+      if (updated === undefined) {
+        this.db.exec("ROLLBACK");
+        return undefined;
+      }
+      this.db.exec("COMMIT");
+      return loadoutFromRow(updated);
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #52): insert one
+   * `loadout_bindings` row. The PRIMARY KEY is
+   * `binding_id` (a UUID minted by the caller);
+   * the row is otherwise a pure match-attribute
+   * payload. The `loadout_version` is recorded
+   * as the snapshot the binding was created
+   * against so a future rule update bumps the
+   * `version` but a pre-existing binding
+   * continues to point at the head the user
+   * originally asked for (the resolver re-pins
+   * the version on a successful match — see
+   * `LoadoutService.resolve`).
+   */
+  insertLoadoutBinding(row: LoadoutBindingRow): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO loadout_bindings (
+            binding_id, loadout_id, loadout_version,
+            actor_id, client_name, project_id, task_mode,
+            priority, created_at
+          ) VALUES (
+            ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?
+          )`
+        )
+        .run(
+          row.binding_id,
+          row.loadout_id,
+          row.loadout_version,
+          row.actor_id,
+          row.client_name,
+          row.project_id,
+          row.task_mode,
+          row.priority,
+          row.created_at
+        );
+      return true;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #52): remove a
+   * `loadout_bindings` row by primary key.
+   * Returns `true` on a successful delete,
+   * `false` when the `binding_id` is unknown
+   * (idempotent no-op for re-issued unbinds).
+   */
+  removeLoadoutBinding(bindingId: string): boolean {
+    const result = this.db
+      .prepare("DELETE FROM loadout_bindings WHERE binding_id = ?")
+      .run(bindingId);
+    return result.changes > 0;
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #52): read the per-channel
+   * `loadout_rules` rows for the loadout's head
+   * `version`. Used by `LoadoutService.resolve` to
+   * project the active rule set without a second
+   * `getLoadout` round-trip.
+   */
+  loadoutRulesForVersion(loadoutId: string, version: number): LoadoutRuleRow[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM loadout_rules WHERE loadout_id = ? AND version = ?"
+      )
+      .all(loadoutId, version) as Row[];
+    return rows.map((r) => loadoutRuleFromRow(r));
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #52): the precedence
+   * resolution used by `LoadoutService.resolve`.
+   * The method returns the highest-priority
+   * matching binding for the supplied
+   * `(actor_id, client_name, project_id,
+   * task_mode)` tuple, walking the 5-level
+   * precedence chain in order:
+   *
+   *   1. (actor + project + task_mode) exact match
+   *   2. (actor + project) exact match
+   *   3. (project) default for the project
+   *   4. (global) default
+   *   5. (no binding) — `undefined` returned; the
+   *      `LoadoutService` falls back to the
+   *      built-in `legacy-inject-all-active` row.
+   *
+   * `NULL` on a binding column means "any value"
+   * (i.e. a project default binds to every
+   * `actor_id` that does not have a more specific
+   * binding). The `(scope, project_id)` filter
+   * ensures a project-scope binding never leaks
+   * into a global resolve and vice versa.
+   *
+   * The returned tuple is
+   * `{ binding, loadout, rules }` so the caller
+   * has everything it needs in one round-trip.
+   */
+  resolveLoadout(input: {
+    actor_id?: string;
+    client_name?: string;
+    project_id?: string;
+    task_mode?: string;
+  }): {
+    binding: LoadoutBindingRow;
+    loadout: LoadoutRow;
+    rules: LoadoutRuleRow[];
+    matched_rule:
+      | "actor_project_task"
+      | "actor_project"
+      | "project_default"
+      | "global_default";
+  } | undefined {
+    // Precedence chain. Each level tries every
+    // binding column, treating `NULL` as a
+    // wildcard. We walk the 4 levels in
+    // priority order; the first non-empty result
+    // wins. Within a single level, the row with
+    // the highest `priority` wins; ties are
+    // surfaced as `binding_ambiguous` by the
+    // service layer.
+    const levelQueries: Array<{
+      matched_rule:
+        | "actor_project_task"
+        | "actor_project"
+        | "project_default"
+        | "global_default";
+      sql: string;
+      params: SQLInputValue[];
+    }> = [
+      // 1. actor + project + task_mode
+      {
+        matched_rule: "actor_project_task",
+        sql: `SELECT b.* FROM loadout_bindings b
+              JOIN agent_loadouts l ON l.loadout_id = b.loadout_id
+              WHERE (b.actor_id = ? OR b.actor_id IS NULL)
+                AND (b.client_name = ? OR b.client_name IS NULL)
+                AND (b.project_id = ? OR b.project_id IS NULL)
+                AND (b.task_mode = ? OR b.task_mode IS NULL)
+                AND l.lifecycle_state = 'active'
+              ORDER BY b.priority DESC, b.created_at ASC
+              LIMIT 10`,
+        params: [
+          input.actor_id ?? null,
+          input.client_name ?? null,
+          input.project_id ?? null,
+          input.task_mode ?? null
+        ]
+      },
+      // 2. actor + project (task_mode NULL on binding)
+      {
+        matched_rule: "actor_project",
+        sql: `SELECT b.* FROM loadout_bindings b
+              JOIN agent_loadouts l ON l.loadout_id = b.loadout_id
+              WHERE (b.actor_id = ? OR b.actor_id IS NULL)
+                AND (b.client_name = ? OR b.client_name IS NULL)
+                AND (b.project_id = ? OR b.project_id IS NULL)
+                AND b.task_mode IS NULL
+                AND l.lifecycle_state = 'active'
+              ORDER BY b.priority DESC, b.created_at ASC
+              LIMIT 10`,
+        params: [
+          input.actor_id ?? null,
+          input.client_name ?? null,
+          input.project_id ?? null
+        ]
+      },
+      // 3. project default
+      {
+        matched_rule: "project_default",
+        sql: `SELECT b.* FROM loadout_bindings b
+              JOIN agent_loadouts l ON l.loadout_id = b.loadout_id
+              WHERE b.actor_id IS NULL
+                AND b.client_name IS NULL
+                AND (b.project_id = ? OR b.project_id IS NULL)
+                AND b.task_mode IS NULL
+                AND l.lifecycle_state = 'active'
+              ORDER BY b.priority DESC, b.created_at ASC
+              LIMIT 10`,
+        params: [input.project_id ?? null]
+      },
+      // 4. global default
+      {
+        matched_rule: "global_default",
+        sql: `SELECT b.* FROM loadout_bindings b
+              JOIN agent_loadouts l ON l.loadout_id = b.loadout_id
+              WHERE b.actor_id IS NULL
+                AND b.client_name IS NULL
+                AND b.project_id IS NULL
+                AND b.task_mode IS NULL
+                AND l.scope = 'global'
+                AND l.lifecycle_state = 'active'
+              ORDER BY b.priority DESC, b.created_at ASC
+              LIMIT 10`,
+        params: []
+      }
+    ];
+    for (const level of levelQueries) {
+      const rows = this.db.prepare(level.sql).all(...level.params) as Row[];
+      if (rows.length === 0) continue;
+      const binding = loadoutBindingFromRow(rows[0] as Row);
+      const loadoutRow = this.getLoadout(binding.loadout_id);
+      if (loadoutRow === undefined) continue;
+      const rules = this.loadoutRulesForVersion(loadoutRow.loadout_id, loadoutRow.version);
+      return {
+        binding,
+        loadout: loadoutRow,
+        rules,
+        matched_rule: level.matched_rule
+      };
+    }
+    return undefined;
+  }
 }
 
 // v1.1.6 follow-up B1 (issue #42, spec

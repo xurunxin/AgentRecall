@@ -16,6 +16,7 @@ import { doctorCommand } from "./commands/doctor.js";
 import { exportCommand } from "./commands/export.js";
 import { importCommand } from "./commands/import.js";
 import { jobsCommand } from "./commands/jobs.js";
+import { loadoutsCommand } from "./commands/loadouts.js";
 import { listCommand } from "./commands/list.js";
 import { migrateCommand } from "./commands/migrate.js";
 import { searchCommand } from "./commands/search.js";
@@ -104,6 +105,7 @@ Commands:
   candidates List, show, accept, reject, or apply distillation candidates (issue #50)
   sessions   Inspect / ingest / list / show / forget / distill captured session traces
   assets     Manage the typed asset registry (memory_ref / skill / context_pack / external_reference)
+  loadouts   Manage the agent loadout substrate (issue #52; create / update / bind / resolve)
   version    Print the server version (also: --version / -v)
   help       Show this help
 
@@ -167,7 +169,12 @@ const dispatch: Record<string, CommandHandler> = {
   // context_pack / external_reference creation
   // land with their owning Phase 2 issues
   // (#53 / #54).
-  assets: assetsCommand
+  assets: assetsCommand,
+  // v1.2.0-alpha.2 (issue #52): the agent
+  // loadout subcommand. Provides list / show /
+  // create / update / bind / unbind / resolve
+  // for the policy-bound loadout substrate.
+  loadouts: loadoutsCommand
 };
 
 export async function runCli(

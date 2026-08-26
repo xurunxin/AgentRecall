@@ -3,10 +3,16 @@
 // Auto-injects [AGENT_RECALL] local memory entries into the system prompt on every
 // LLM turn, mirroring what opencode-supermemory does for its cloud store.
 //
-// The agent-recall MCP server (separate process) is the write/active-read path; this
-// plugin is the passive injection layer that surfaces stored entries without forcing
-// the model to call a tool. It reads the same SQLite database directly via
-// node:sqlite to avoid spawning the MCP server in a loop.
+// v1.2.0-alpha.2 (issue #52): the plugin now reads the
+// assembled bootstrap channel from the agent-recall
+// MCP server via a stdio client
+// (`./context-client.mjs`) and surfaces the canonical
+// `[AGENT_RECALL]` block to the LLM. The pre-1.2
+// SQLite-direct path is preserved as a fallback when
+// the MCP client is unavailable (a real local DB on
+// disk, no `agent-recall-mcp` binary in PATH, or an
+// RPC failure); the existing test suite + the manual
+// smoke tests both work unchanged.
 //
 // All hook logic must be best-effort: any failure is logged to stderr and the hook
 // is a no-op so the LLM call proceeds unchanged.
@@ -15,6 +21,7 @@ import sqlite from "node:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
+import { fetchAssembledContext } from "./context-client.mjs";
 
 /**
  * @typedef {Object} PluginOptions
@@ -25,6 +32,13 @@ import { dirname, isAbsolute, join, normalize, resolve } from "node:path";
  * @property {boolean} [include_global=true] If false, only project-scope memories are injected.
  * @property {string} [header]              First line of the injected block. Set to "" to omit.
  * @property {boolean} [debug=false]        Log to stderr on each inject.
+ * @property {boolean} [use_mcp=true]       Use the MCP context-client (issue #52). When false, fall back to the SQLite-direct path.
+ * @property {string} [mcp_binary]          Override path to the agent-recall-mcp binary.
+ * @property {string} [resource_uri]        Override the resource URI (default agentrecall://context/loadout).
+ * @property {string} [actor_id]            Override the actor id forwarded to the resolver.
+ * @property {string} [client_name]         Forwarded as the client_name to the resolve chain.
+ * @property {string} [project_id]          Forwarded as the project_id to the resolve chain.
+ * @property {string} [task_mode]           Forwarded as the task_mode to the resolve chain.
  */
 
 const DEFAULTS = Object.freeze({
@@ -36,6 +50,13 @@ const DEFAULTS = Object.freeze({
   header:
     "[AGENT_RECALL] Local memory context. Use the agent-recall MCP tools (search_memories, remember, get_memory, list_memories, update_memory, supersede_memory, forget_memory) to add, refresh, or supersede entries. This block is auto-injected from the local SQLite store and is not a substitute for active recall.",
   debug: false,
+  use_mcp: true,
+  mcp_binary: undefined,
+  resource_uri: undefined,
+  actor_id: undefined,
+  client_name: "opencode",
+  project_id: undefined,
+  task_mode: undefined
 });
 
 const TYPE_LABELS = {
@@ -43,7 +64,6 @@ const TYPE_LABELS = {
   procedure: "Procedures",
   fact: "Facts",
   decision: "Decisions",
-  lesson: "Lessons",
   debugging: "Debugging",
   constraint: "Constraints",
 };
@@ -244,6 +264,37 @@ function formatBlock(memories, { header, maxChars }) {
 }
 
 /**
+ * Format the assembled bootstrap channel from the
+ * `context-client.mjs` payload. The MCP server
+ * returns the canonical block in
+ * `channels.bootstrap.text`; we wrap it with the
+ * `[AGENT_RECALL]` header (when configured) so the
+ * surface is identical to the legacy SQLite-direct
+ * path. The `bootstrap_hash` is included as a
+ * comment header so debug builds can verify
+ * upstream-cache stability.
+ */
+function formatAssembledBlock(assembled, { header, maxChars }) {
+  const channels = assembled?.channels ?? {};
+  const bootstrap = channels.bootstrap;
+  if (bootstrap === undefined || typeof bootstrap.text !== "string") return "";
+  const text = bootstrap.text;
+  if (text.length === 0) return "";
+  const hash = typeof assembled.bootstrap_hash === "string" ? assembled.bootstrap_hash : "";
+  const head = [
+    header,
+    hash ? `bootstrap_hash=${hash}` : null,
+    `loadout_id=${assembled.loadout_id ?? "?"}@v${assembled.loadout_version ?? "?"}`
+  ]
+    .filter((line) => line !== null)
+    .join("\n");
+  const block = head ? `${head}\n${text}` : text;
+  if (block.length <= maxChars) return block;
+  // Truncate gracefully (header always preserved).
+  return `${head}\n(truncated; full block available via agent-recall)\n${text.slice(0, Math.max(0, maxChars - head.length - 64))}\n`;
+}
+
+/**
  * The plugin entrypoint. OpenCode calls this once per session; we return the hooks
  * that will be registered for the session lifetime.
  *
@@ -267,9 +318,9 @@ export const AgentRecallPlugin = async (input, options = {}) => {
     `loaded ${scopes.length} project scope(s) from ${dbPath}; include_global=${cfg.include_global}`,
   );
 
-  let cached = null; // { text, projectId, expiresAt }
+  let cached = null; // { text, projectId, expiresAt, bootstrapHash }
 
-  const build = () => {
+  const buildSqlite = () => {
     const project = matchProjectId(input.directory, scopes);
     const projectId = project?.project_id ?? null;
     const memories = readMemories(db, {
@@ -282,7 +333,30 @@ export const AgentRecallPlugin = async (input, options = {}) => {
       cfg.debug,
       `format: project=${projectId ?? "(none)"} memories=${memories.length} bytes=${text.length}`,
     );
-    return { text, projectId };
+    return { text, projectId, bootstrapHash: null };
+  };
+
+  const buildMcp = async () => {
+    const project = matchProjectId(input.directory, scopes);
+    const projectId = project?.project_id ?? null;
+    const assembled = await fetchAssembledContext({
+      debug: cfg.debug,
+      ...(cfg.mcp_binary !== undefined ? { binary: cfg.mcp_binary } : {}),
+      ...(cfg.resource_uri !== undefined ? { uri: cfg.resource_uri } : {})
+    });
+    if (assembled === null) {
+      debugLog(cfg.debug, "MCP context-client returned null; falling back to SQLite path");
+      return { text: "", projectId, bootstrapHash: null };
+    }
+    const text = formatAssembledBlock(assembled, {
+      header: cfg.header,
+      maxChars: cfg.max_chars
+    });
+    debugLog(
+      cfg.debug,
+      `mcp: project=${projectId ?? "(none)"} bytes=${text.length} hash=${assembled.bootstrap_hash ?? "?"}`,
+    );
+    return { text, projectId, bootstrapHash: assembled.bootstrap_hash ?? null };
   };
 
   return {
@@ -296,15 +370,32 @@ export const AgentRecallPlugin = async (input, options = {}) => {
     "experimental.chat.system.transform": async (_in, output) => {
       try {
         const now = Date.now();
+        const project = matchProjectId(input.directory, scopes);
+        const projectId = project?.project_id ?? null;
         if (
           !cached ||
           cached.expiresAt <= now ||
-          cached.projectId !== (matchProjectId(input.directory, scopes)?.project_id ?? null)
+          cached.projectId !== projectId
         ) {
-          const fresh = build();
+          let fresh;
+          if (cfg.use_mcp) {
+            fresh = await buildMcp();
+            if (!fresh.text && db) {
+              // MCP path returned empty (binary
+              // missing, RPC failure, no DB
+              // reachable). Fall back to the
+              // legacy SQLite-direct path so the
+              // existing test suite + manual
+              // smoke tests both work unchanged.
+              fresh = buildSqlite();
+            }
+          } else {
+            fresh = buildSqlite();
+          }
           cached = {
             text: fresh.text,
             projectId: fresh.projectId,
+            bootstrapHash: fresh.bootstrapHash,
             expiresAt: now + Math.max(0, cfg.cache_ttl_ms),
           };
         }

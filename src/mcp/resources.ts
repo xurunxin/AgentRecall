@@ -38,9 +38,12 @@ import { DerivationJobStore } from "../jobs/service.js";
 import { SessionService } from "../sessions/service.js";
 import { AssetService } from "../assets/service.js";
 import { DistillationService } from "../distillation/service.js";
+import { LoadoutService } from "../loadouts/service.js";
+import { ContextAssembler, type CallerAuthz } from "../context-assembly/assembler.js";
 import type { ToolProfile } from "../tools/profile.js";
 import type { CapabilityStore } from "../admin/capability.js";
 import type { AuthorizationDecision } from "../services/auth-context.js";
+import type { MemoryReadService } from "../services/memory-read-service.js";
 
 export interface MemoryServerContext {
   readonly store: SQLiteMemoryStore;
@@ -113,6 +116,28 @@ export interface MemoryServerContext {
    * the field is absent.
    */
   readonly authorization?: AuthorizationDecision;
+  /**
+   * v1.2.0-alpha.2 (issue #52): the read service
+   * the context-assembly surface uses to source
+   * `active` / search-candidate memory rows. The
+   * `agentrecall://context/loadout` resource is
+   * wired through this instance so every read is
+   * gated on the SQL-boundary sensitivity filter.
+   * Optional for backward compatibility with test
+   * fixtures that pre-date the loadout surface;
+   * the resource returns a structured
+   * `not_available` envelope when the field is
+   * absent.
+   */
+  readonly readService?: MemoryReadService;
+  /**
+   * v1.2.0-alpha.2 (issue #52): the caller's
+   * actor id (forwarded to the loadout resolver so
+   * the binding precedence chain can match the
+   * right loadout). Defaults to
+   * `defaultActor` when absent.
+   */
+  readonly callerActorId?: string;
 }
 
 type Variables = Record<string, string | string[] | undefined>;
@@ -630,18 +655,77 @@ export function registerMemoryResources(server: MemoryResourceServer, ctx: Memor
     }
   );
 
-  // v1.2.0-alpha.2 (issue #50): the distillation
-  // candidate resource. The payload mirrors the
-  // `candidates show <id>` CLI output: the candidate
-  // row + its evidence + its actions. Read-only;
-  // mutations go through the `candidates_accept` /
-  // `candidates_reject` / `candidates_apply` tools
-  // (added in a later Phase 2 issue). The
-  // `DistillationService` is constructed with the
-  // same `MemoryService` / `MemoryWriteService`
-  // the MCP server already owns; the apply path's
-  // trust / sensitivity gates are the same ones
-  // used by the `remember` tool.
+  // v1.2.0-alpha.2 (issue #52): the agent loadout
+  // context-assembly resource. The payload is the
+  // assembled `Assembled` (bootstrap + query +
+  // tool_only channels) for the calling actor. The
+  // resource is the canonical MCP surface for the
+  // v1.2-alpha.2 loadout service: the OpenCode
+  // plugin (and any other MCP client) calls this
+  // resource to surface the assembled bootstrap
+  // channel into the system prompt without
+  // duplicating the assembler in JS. The
+  // `bootstrap_hash` field is the upstream
+  // prompt-cache key.
+  //
+  // The resource is read-only; mutations go
+  // through the `loadouts_create` /
+  // `loadouts_update_rules` / `loadouts_bind` /
+  // `loadouts_unbind` CLI verbs (the MCP tool
+  // surface for loadouts lands in Phase 2.3).
+  server.registerResource(
+    "agent_loadout_context",
+    "agentrecall://context/loadout",
+    {
+      description:
+        "Assembled context for the calling actor: bootstrap / query / tool_only channels + bootstrap_hash upstream-cache key. Mirrors the agent-recall loadouts resolve + context-assembly surface.",
+      mimeType: "application/json"
+    },
+    (uri: URL) => {
+      if (ctx.readService === undefined) {
+        return jsonResource(uri, {
+          ok: false,
+          error: "not_available",
+          message: "readService not configured; the loadout context resource requires a MemoryReadService on the server context"
+        });
+      }
+      const loadoutService = new LoadoutService(ctx.store);
+      const resolved = loadoutService.resolve({
+        actor_id: ctx.callerActorId ?? ctx.defaultActor
+      });
+      const authz: CallerAuthz = {
+        actor_id: ctx.callerActorId ?? ctx.defaultActor,
+        max_sensitivity: ctx.actorMaxSensitivity ?? "normal"
+      };
+      const assembler = new ContextAssembler({ read_service: ctx.readService });
+      const assembled = assembler.assembleAll({
+        loadout: resolved.loadout,
+        rules: resolved.rules,
+        authz
+      });
+      return jsonResource(uri, {
+        ok: true,
+        loadout_id: assembled.loadout_id,
+        loadout_version: assembled.loadout_version,
+        policy_version: assembled.policy_version,
+        channels: assembled.channels,
+        bootstrap_hash: assembled.bootstrap_hash,
+        explanation: assembled.explanation
+      });
+    }
+  );
+
+  // v1.2.0-alpha.2 (issue #50): the single
+  // distillation-candidate inspection resource.
+  // The payload is the full candidate row + the
+  // candidate's evidence rows + action rows,
+  // mirroring the `agent-recall candidates show`
+  // CLI verb. The `DistillationService` is
+  // constructed with the same `MemoryService` /
+  // `MemoryWriteService` the MCP server already
+  // owns; the apply path's trust / sensitivity
+  // gates are the same ones used by the `remember`
+  // tool.
   server.registerResource(
     "distillation_candidate",
     new ResourceTemplate("agentrecall://candidates/{candidate_id}", { list: undefined }),
@@ -677,9 +761,10 @@ export function registerMemoryResources(server: MemoryResourceServer, ctx: Memor
 
   // v1.2.0-alpha.2 (issue #50): the by-job
   // candidate list. The payload is the full
-  // candidate + evidence + action triple for every
-  // row attached to a derivation job. An unknown
-  // `job_id` surfaces a `not_found` envelope.
+  // candidate + evidence + action triple for
+  // every row attached to a derivation job. An
+  // unknown `job_id` surfaces a `not_found`
+  // envelope.
   server.registerResource(
     "distillation_candidate_list",
     new ResourceTemplate("agentrecall://candidates/by-job/{job_id}", { list: undefined }),
