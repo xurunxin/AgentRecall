@@ -53,6 +53,10 @@
 
 export type DispatchMode = "cli" | "mcp" | "http";
 
+import { existsSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+
 export interface DispatchRequest {
   /** The invoked executable path, i.e.
    * `process.argv[0]` of the launching
@@ -139,6 +143,21 @@ export function decideMode(
   // the HTTP path itself is a stub until
   // Stage 4 wires in the real
   // `runHttpServer` (Task 9).
+  if (args[0] === "--http") return "http";
+  // v1.2.0 release: a wrapper command (e.g. a
+  // PowerShell `.cmd` shim on Windows that
+  // launches `node <install>/dist/src/launcher.js`)
+  // cannot use the compat-name dispatch because
+  // the basename is `node.exe` rather than
+  // `agent-recall-mcp`. The explicit `--mcp`
+  // flag opts in to the MCP stdio transport for
+  // any basename. The flag is checked after
+  // `--http` so an explicit HTTP override still
+  // wins; the flag is checked before the
+  // `agent-recall` basename check so the
+  // wrapper path is independent of argv[0]
+  // basename.
+  if (args[0] === "--mcp") return "mcp";
   if (args[0] === "--http") return "http";
   // The canonical name dispatches on
   // argument presence. A single leading
@@ -505,23 +524,132 @@ export async function dispatch(req: DispatchRequest): Promise<DispatchMode> {
 // The production entry point. Read
 // `process.argv` once and dispatch.
 async function main(): Promise<void> {
+  chdirToInstallRoot();
   const argv0 = process.argv[0] ?? "";
   const args = process.argv.slice(2);
   await dispatch({ argv0, args });
 }
 
-main().catch((error: unknown) => {
-  // The CLI prints structured errors; the
-  // MCP server never reaches this branch
-  // because `main()` owns its own
-  // diagnostics + exit path. Anything that
-  // lands here is an unhandled launch
-  // failure (import error, runtime crash,
-  // etc.). Surface on stderr with a
-  // non-zero exit code so callers (npm
-  // postinstall, MCP supervisors) can
-  // detect the failure.
-  const message = error instanceof Error ? error.stack ?? error.message : String(error);
-  process.stderr.write(`agent-recall: launcher failed: ${message}\n`);
-  process.exit(1);
-});
+/**
+ * v1.2.0 release: chdir to the install root so
+ * the Bun single-file binary can resolve
+ * `@agent-recall/contracts` from
+ * `<install>/node_modules/`. The Bun
+ * `--compile` mode uses a virtual
+ * `B:/~BUN/root/` cwd that does not consult
+ * the user's actual cwd, so any `import
+ * "@agent-recall/..."` fails with
+ * `Cannot find module` until the cwd is the
+ * install root. The detection logic:
+ *
+ *   1. If a `node_modules/@agent-recall/contracts/`
+ *      directory is reachable from the
+ *      current cwd, the cwd is already the
+ *      install root — leave it alone.
+ *   2. Otherwise walk up from the binary's own
+ *      location via `import.meta.url` and
+ *      `process.argv[1]` until we find a
+ *      directory whose `node_modules/` contains
+ *      the contracts package; chdir there.
+ *   3. Fall back: keep the cwd; the binary
+ *      will surface a stable error code on
+ *      the first import that needs the
+ *      workspace package.
+ *
+ * The non-binary source-mode launcher
+ * (`node dist/src/launcher.js` from the
+ * repo root) hits branch 1 and the chdir is
+ * a no-op.
+ */
+function chdirToInstallRoot(): void {
+  try {
+    const cwd = process.cwd();
+    if (existsSync(resolve(cwd, "node_modules", "@agent-recall", "contracts"))) {
+      return;
+    }
+    const candidates: string[] = [];
+    // Bun `--compile` exposes the original
+    // file location via `process.execPath` /
+    // `process.argv[0]`. The binary's own
+    // `argv[1]` is empty in our case, so we
+    // walk from `process.execPath` instead.
+    const execPath = process.execPath ?? "";
+    if (execPath.length > 0) {
+      let dir = dirname(execPath);
+      for (let i = 0; i < 6; i += 1) {
+        candidates.push(dir);
+        const parent = dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+      }
+    }
+    // Source-mode fallback: walk from
+    // `import.meta.url` of this file. The
+    // compiled JS lives at `dist/src/launcher.js`
+    // so 3 `..` steps land on the repo root.
+    const here = import.meta.url;
+    if (here.startsWith("file://")) {
+      // We have to inline the URL-to-path
+      // conversion because `node:url` is
+      // imported lazily elsewhere; the
+      // `file://` prefix is consistent
+      // across Node and Bun, so a substring
+      // strip is enough for the path-walk.
+      const path = here.slice("file://".length);
+      let dir = path;
+      for (let i = 0; i < 6; i += 1) {
+        candidates.push(dirname(dir));
+        const parent = dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+      }
+    }
+    for (const candidate of candidates) {
+      if (existsSync(resolve(candidate, "node_modules", "@agent-recall", "contracts"))) {
+        process.chdir(candidate);
+        return;
+      }
+    }
+  } catch {
+    // The chdir is best-effort. The binary
+    // surfaces the original error to the
+    // caller; the chdir failing should not
+    // mask the real failure.
+  }
+}
+
+// v1.2.0 release: the launcher's `main()` was
+// historically invoked unconditionally at
+// module load. That was a foot-gun: a wrapper
+// that imported the launcher (a unit test, the
+// eval CLI's `runEvalInline` dynamic import,
+// any future re-export) would silently launch
+// the CLI / MCP server with the importing
+// caller's `process.argv`, surfacing the help
+// text or a spurious MCP stdio loop. The entry
+// guard compares `import.meta.url` to
+// `pathToFileURL(process.argv[1])` so only a
+// direct `node <launcher>` invocation drives
+// `main()`. A programmatic import returns the
+// exports untouched (the unit-test path).
+const __entry = import.meta.url;
+if (
+  process.argv[1] !== undefined &&
+  pathToFileURL(process.argv[1]).href === __entry
+) {
+  main().catch((error: unknown) => {
+    // The CLI prints structured errors; the
+    // MCP server never reaches this branch
+    // because `main()` owns its own
+    // diagnostics + exit path. Anything that
+    // lands here is an unhandled launch
+    // failure (import error, runtime crash,
+    // etc.). Surface on stderr with a
+    // non-zero exit code so callers (npm
+    // postinstall, MCP supervisors) can
+    // detect the failure.
+    const message = error instanceof Error ? error.stack ?? error.message : String(error);
+    process.stderr.write(`agent-recall: launcher failed: ${message}\n`);
+    process.exit(1);
+  });
+}

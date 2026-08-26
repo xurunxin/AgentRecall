@@ -2,7 +2,21 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "rootDir": "./src",
-    "outDir": "./dist",
+    // v1.2.0 release: contracts now compiles
+    // directly under `dist/packages/contracts/`
+    // so the published tarball (which carries
+    // `dist/` but not `packages/`) still has the
+    // compiled contracts at a stable relative
+    // path. The `package.json` `main` / `exports`
+    // still point at `./dist/index.js`; the build
+    // output is now at `<repo>/dist/packages/contracts/dist/index.js`
+    // for the source-mode consumer and at
+    // `<repo>/packages/contracts/dist/index.js`
+    // for the workspace-mode consumer
+    // (`pnpm exec ...`). Both paths resolve to
+    // the same compiled file via the symlink-free
+    // double-build the `build:bun` script runs.
+    "outDir": "../../dist/packages/contracts/dist",
     "declaration": true,
     "composite": true
   },
