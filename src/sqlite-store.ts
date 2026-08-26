@@ -137,8 +137,66 @@ export type SearchFilters = EntryFilters & {
  * `completed`) or (`failed`) state; the `ImportBatchStore`
  * is the public API for the row's lifecycle and the
  * redacted `inspect(...)` read.
+ * v14 (v1.2.0-alpha.0, issue #48): the durable derivation
+ * job substrate. Three additive tables — `derivation_jobs`,
+ * `derivation_runs`, `derivation_outputs` — back the
+ * session distillation / skill extraction / cold-start
+ * bootstrap / external-reference refresh pipelines. The
+ * `DerivationJobStore` (src/jobs/service.ts) wraps the
+ * tables with the `enqueue` / `claim` / `checkpoint` /
+ * `complete` / `fail` / `cancel` / `reap` lifecycle, a
+ * short lease (default TTL 30s), and a passive reap-on-
+ * claim policy so no daemon is required. Existing v13
+ * tables and contracts are untouched.
+ * v15 (v1.2.0-alpha.1, issue #49): the session evidence
+ * substrate. Three additive tables — `sessions`,
+ * `session_events`, `session_event_blobs` — capture
+ * stable, replayable session traces from any
+ * SessionTraceBundle v1 adapter. The migration is fully
+ * transactional; on any throw the user_version stays at
+ * 14 and the database is untouched. Existing v14
+ * derivation tables are not affected.
+ * v16 (v1.2.0-alpha.1, issue #51): the additive asset
+ * registry. Three envelope tables — `assets`,
+ * `asset_versions`, `asset_relations` — sit alongside
+ * the type-specific `memory_ref_bindings` table (the
+ * only type-specific table that v1.2-alpha.1 ships
+ * with; `skills` / `context_packs` / `external_references`
+ * land with their owning Phase 2 issues #53 / #54).
+ * The migration is fully transactional; on any throw
+ * the user_version stays at 15 and the database is
+ * untouched.
+ * v17 (v1.2.0-alpha.2, issue #50): the distillation
+ * pipeline's additive set of tables —
+ * `derivation_candidates`, `candidate_evidence`,
+ * `candidate_actions` — back the reviewable
+ * memory / episode / skill-candidate proposals
+ * produced by the deterministic baseline extractor.
+ * v18 (v1.2.0-alpha.2, issue #52): the agent loadout
+ * substrate. Three additive tables — `agent_loadouts`,
+ * `loadout_rules`, `loadout_bindings` — back the
+ * policy-bound loadout surface that powers
+ * `bootstrap` / `query` / `tool_only` channels of the
+ * context-assembly service. The `loadout_rules` table
+ * is keyed on `(loadout_id, version, channel)` so a
+ * `updateRules` call bumps the version and inserts a
+ * new immutable rule row in the same transaction.
+ * v19 (v1.2.0-alpha.2, issue #53): the additive
+ * `skills` type-specific table for the asset
+ * registry. The `skill` envelope is a thin pointer
+ * to the `skills` row, which holds the canonical
+ * `SKILL.md` bytes plus the parsed frontmatter
+ * (name / description / triggers / etc.) and the
+ * content-addressed `resources` list. The
+ * `body_hash` column is `sha256:hex64` over
+ * `skill_md_canonical` and matches the
+ * `asset_versions.content_hash` for the same
+ * version. The migrations are fully transactional;
+ * on any throw the user_version stays at the
+ * last successful version and the database is
+ * untouched.
  */
-export const CURRENT_SCHEMA_VERSION = 13;
+export const CURRENT_SCHEMA_VERSION = 20;
 
 /**
  * Stage 12 PR9: thrown by `updateEntryWithRevision` when
@@ -311,6 +369,585 @@ export type MaintenancePlanRow = {
   items: MaintenancePlanItemRow[];
 };
 
+/**
+ * v1.2.0-alpha.0 (issue #48): the row shape for
+ * `derivation_jobs`. The store is the durable
+ * substrate backing the session distillation / skill
+ * extraction / cold-start bootstrap / external-refresh
+ * pipelines. All timestamps are Unix milliseconds in
+ * the v1.2 surface so the lease logic stays in pure
+ * integer math.
+ */
+export type DerivationJobState =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
+export type DerivationJobScope = "global" | "project";
+
+export type DerivationJobRow = {
+  job_id: string;
+  kind: string;
+  state: DerivationJobState;
+  scope: DerivationJobScope;
+  project_id?: string | null;
+  creator_actor_id: string;
+  idempotency_key: string;
+  input_digest: string;
+  config_digest: string;
+  cursor_json: string;
+  attempt_count: number;
+  lease_owner?: string | null;
+  lease_expires_at?: number | null;
+  cancel_requested_at?: number | null;
+  next_retry_at?: number | null;
+  error_code?: string | null;
+  redacted_error?: string | null;
+  created_at: number;
+  started_at?: number | null;
+  updated_at: number;
+  finished_at?: number | null;
+};
+
+/**
+ * v1.2.0-alpha.0 (issue #48): the per-stage audit row
+ * for a derivation job. The `started` -> terminal
+ * transition is the only state change `checkpoint`
+ * commits; a `started` row is the durable proof a
+ * worker is mid-flight.
+ */
+export type DerivationRunStatus =
+  | "started"
+  | "succeeded"
+  | "failed"
+  | "cancelled";
+
+export type DerivationRunRow = {
+  run_id: string;
+  job_id: string;
+  stage: string;
+  status: DerivationRunStatus;
+  input_refs_json: string;
+  output_refs_json: string;
+  provider_id?: string | null;
+  model_id?: string | null;
+  prompt_template_version?: string | null;
+  prompt_hash?: string | null;
+  policy_version: string;
+  result_digest?: string | null;
+  started_at: number;
+  finished_at?: number | null;
+};
+
+/**
+ * v1.2.0-alpha.0 (issue #48): the lineage row that
+ * connects a job to the memory / asset / plan rows it
+ * produced. The composite primary key on
+ * `(job_id, output_kind, output_id)` is the contract
+ * that prevents a reap takeover from writing the same
+ * `applied` row twice.
+ */
+export type DerivationOutputKind =
+  | "candidate"
+  | "skill_draft"
+  | "bootstrap_plan"
+  | "external_ref"
+  | "applied_memory"
+  | "applied_asset";
+
+export type DerivationOutputDisposition =
+  | "proposed"
+  | "applied"
+  | "rejected"
+  | "superseded";
+
+export type DerivationOutputRow = {
+  job_id: string;
+  run_id: string;
+  output_kind: DerivationOutputKind;
+  output_id: string;
+  disposition: DerivationOutputDisposition;
+  created_at: number;
+};
+
+/**
+ * v1.2.0-alpha.1 (issue #49): the row shape for
+ * `sessions`. All timestamps are ISO 8601 (matching
+ * the recall layer and the v13 portability surface).
+ */
+export type SessionScope = "global" | "project";
+export type SessionSensitivity = "normal" | "private" | "restricted";
+
+export type SessionRow = {
+  session_id: string;
+  source_kind: string;
+  source_version: string;
+  source_instance_id: string;
+  source_session_id: string;
+  scope: SessionScope;
+  project_id: string | null;
+  actor_id: string;
+  client_name: string;
+  client_version: string;
+  started_at: string;
+  ended_at: string | null;
+  sensitivity: SessionSensitivity;
+  bundle_hash: string;
+  adapter_id: string;
+  adapter_version: string;
+  ingestion_plan_json: string;
+  redaction_summary_json: string;
+  ingested_at: string;
+  retention_until: string | null;
+};
+
+/**
+ * v1.2.0-alpha.1 (issue #49): the row shape for
+ * `session_events`. The body itself lives in
+ * `session_event_blobs` keyed by `content_digest`;
+ * SQLite holds the manifest / index / metadata only.
+ */
+export type SessionEventType =
+  | "session_started"
+  | "user_message"
+  | "assistant_message"
+  | "tool_call"
+  | "tool_result"
+  | "decision_confirmed"
+  | "task_completed"
+  | "session_ended";
+
+export type SessionEventRole = "user" | "assistant" | "system" | "tool";
+
+export type SessionRedactionFlag =
+  | "contains_secret"
+  | "risk_injection"
+  | "truncated"
+  | "high_entropy_token"
+  | "policy_redacted";
+
+export type SessionEventRow = {
+  event_id: string;
+  session_id: string;
+  sequence: number;
+  turn_id: string;
+  event_type: SessionEventType;
+  role: SessionEventRole | null;
+  content_digest: string;
+  content_blob_ref: string | null;
+  tool_name: string | null;
+  tool_call_id: string | null;
+  tool_status: string | null;
+  timestamp: string;
+  sensitivity: SessionSensitivity;
+  redaction_flags_json: string;
+  metadata_json: string;
+};
+
+/**
+ * v1.2.0-alpha.1 (issue #49): the content-
+ * addressed body cache. The full body lives in
+ * the local file system under the data home;
+ * SQLite holds head / tail 1KB slices for
+ * inspection without a full file read. The
+ * `head_tail_window_json` records the policy
+ * (default 1024 / 1024) so a later version can
+ * change it without rewriting the blob table.
+ */
+export type SessionEventBlobRow = {
+  digest: string;
+  size_bytes: number;
+  media_type: string;
+  head_bytes: Buffer;
+  tail_bytes: Buffer;
+  head_tail_window_json: string;
+  stored_at: string;
+};
+
+/**
+ * v1.2.0-alpha.1 (issue #51): the row shape for
+ * `assets`. The `manifest_json` column is the
+ * type-specific payload (or, for `memory_ref` /
+ * `external_reference`, the payload is split
+ * between the envelope and a type-specific child
+ * row).
+ */
+export type AssetType =
+  | "memory_ref"
+  | "skill"
+  | "context_pack"
+  | "external_reference";
+
+export type AssetLifecycleState =
+  | "draft"
+  | "active"
+  | "deprecated"
+  | "archived";
+
+export type AssetTrustLevel =
+  | "user_confirmed"
+  | "agent_observed"
+  | "inferred";
+
+export type AssetRow = {
+  asset_id: string;
+  asset_type: AssetType;
+  scope: "global" | "project";
+  project_id: string | null;
+  owner_actor_id: string;
+  lifecycle_state: AssetLifecycleState;
+  current_version: number;
+  trust_level: AssetTrustLevel;
+  sensitivity: "normal" | "private" | "restricted";
+  metadata_json: string;
+  created_at: string;
+  updated_at: string;
+  archived_at: string | null;
+};
+
+export type AssetVersionRow = {
+  asset_id: string;
+  version: number;
+  schema_version: string;
+  content_hash: string;
+  manifest_json: string;
+  created_by_actor_id: string;
+  provenance_kind: "derivation_run" | "import_batch" | "manual" | "external" | null;
+  provenance_ref: string | null;
+  created_at: string;
+};
+
+export type AssetRelationRow = {
+  from_asset_id: string;
+  relation_type: string;
+  to_asset_id: string | null;
+  external_target_ref: string | null;
+  metadata_json: string;
+  created_at: string;
+};
+
+export type MemoryRefBindingRow = {
+  asset_id: string;
+  version: number;
+  memory_id: string;
+  memory_revision: number;
+  binding_rule: string | null;
+  note: string | null;
+};
+
+/**
+ * v1.2.0-alpha.2 (issue #52): the loadout row.
+ * `version` is bumped on every `updateRules` call; the
+ * rules table is keyed on `(loadout_id, version,
+ * channel)`. Bumping `version` is what changes
+ * `bootstrap_hash` in the context-assembly output
+ * (the upstream prompt-cache key).
+ */
+export type LoadoutLifecycleState =
+  | "draft"
+  | "active"
+  | "deprecated"
+  | "archived";
+
+export type LoadoutScope = "global" | "project";
+
+export type LoadoutChannel = "bootstrap" | "query" | "tool_only";
+
+export type LoadoutOrderingPolicy =
+  | "rule_then_score"
+  | "score_only"
+  | "rule_only";
+
+export type LoadoutTier = "core" | "working" | "archival";
+
+export type LoadoutRow = {
+  loadout_id: string;
+  name: string;
+  version: number;
+  lifecycle_state: LoadoutLifecycleState;
+  match_actor_id: string | null;
+  match_client_name: string | null;
+  scope: LoadoutScope;
+  project_id: string | null;
+  task_mode: string | null;
+  created_by_actor_id: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type LoadoutRuleRow = {
+  loadout_id: string;
+  version: number;
+  channel: LoadoutChannel;
+  include_asset_ids: string[];
+  include_memory_ids: string[];
+  include_types: string[];
+  include_tiers: LoadoutTier[];
+  include_tags: string[];
+  include_topics: string[];
+  exclude_asset_ids: string[];
+  exclude_memory_ids: string[];
+  exclude_tags: string[];
+  required_refs: string[];
+  max_items: number;
+  max_chars: number;
+  max_tokens: number | null;
+  timeout_ms: number;
+  ordering_policy: LoadoutOrderingPolicy;
+};
+
+export type LoadoutBindingRow = {
+  binding_id: string;
+  loadout_id: string;
+  loadout_version: number;
+  actor_id: string | null;
+  client_name: string | null;
+  project_id: string | null;
+  task_mode: string | null;
+  priority: number;
+  created_at: string;
+};
+
+/**
+ * v1.2.0-alpha.2 (issue #50): the session-to-memory
+ * distillation candidate row. The candidate is the
+ * durable artefact produced by an extractor (the
+ * baseline `DeterministicBaselineExtractor` in this
+ * release, plus any future provider-backed
+ * extractor). One candidate row per proposed memory
+ * / episode / skill_candidate; the `evidence` and
+ * `action` tables fan out from the `candidate_id`.
+ *
+ * The `state` column is a small state machine:
+ * `proposed` -> `accepted` -> `applied`, with
+ * `rejected` and `stale` as terminal / soft
+ * transitions. The `expected_target_revision` is
+ * the CAS guard used by the `apply` step (when the
+ * candidate targets an existing `memory_id`). Drift
+ * transitions the candidate to `stale` and the
+ * apply batch skips it.
+ */
+export type DerivationCandidateKind = "memory" | "episode" | "skill_candidate";
+
+export type DerivationCandidateState =
+  | "proposed"
+  | "accepted"
+  | "rejected"
+  | "applied"
+  | "stale";
+
+export type DerivationCandidateTier = "working";
+
+export type DerivationCandidateTrustLevel = "inferred" | "agent_observed";
+
+export type DerivationCandidateSensitivity = "normal";
+
+export type DerivationCandidateRisk = "low" | "medium" | "high";
+
+export type DerivationCandidateAction =
+  | "create"
+  | "update"
+  | "supersede"
+  | "merge"
+  | "skip";
+
+export type DerivationCandidateScope = "global" | "project";
+
+export type DerivationCandidateEvidenceRole =
+  | "primary"
+  | "supporting"
+  | "context";
+
+export type DerivationCandidateRow = {
+  candidate_id: string;
+  job_id: string;
+  run_id: string;
+  candidate_kind: DerivationCandidateKind;
+  proposed_type: string | null;
+  proposed_topic: string | null;
+  proposed_title: string | null;
+  proposed_body: string | null;
+  proposed_tags_json: string;
+  proposed_scope: DerivationCandidateScope;
+  proposed_project_id: string | null;
+  proposed_tier: DerivationCandidateTier;
+  proposed_trust_level: DerivationCandidateTrustLevel;
+  proposed_sensitivity: DerivationCandidateSensitivity;
+  confidence: number;
+  state: DerivationCandidateState;
+  extractor_id: string;
+  extractor_version: string;
+  content_hash: string;
+  created_at: number;
+  reviewed_at: number | null;
+  reviewed_by_actor_id: string | null;
+  applied_at: number | null;
+  expected_target_revision: number | null;
+};
+
+export type CandidateEvidenceRow = {
+  candidate_id: string;
+  evidence_role: DerivationCandidateEvidenceRole;
+  session_id: string | null;
+  event_id: string | null;
+  message_id: string | null;
+  tool_call_id: string | null;
+  file_ref: string | null;
+  excerpt_digest: string;
+};
+
+export type CandidateActionRow = {
+  candidate_id: string;
+  action: DerivationCandidateAction;
+  target_memory_ids_json: string;
+  expected_revisions_json: string;
+  rationale: string;
+  conflict_signals_json: string;
+  risk: DerivationCandidateRisk;
+};
+
+/**
+ * v1.2.0-alpha.2 (issue #53): the row shape for
+ * the type-specific `skills` table. The Skill
+ * envelope lives in `assets`; this row carries
+ * the canonical SKILL.md bytes plus the parsed
+ * frontmatter. `body_hash` is `sha256:hex64`
+ * over `skill_md_canonical`. The `resources_json`
+ * column is a JSON-encoded array of
+ * `{ path, type, media_type, sha256 }` (the
+ * shape is validated upstream by the Zod
+ * contract before insert).
+ */
+export type SkillResourceRow = {
+  path: string;
+  type: "text" | "reference";
+  media_type: string;
+  sha256: string;
+};
+
+export type SkillRow = {
+  asset_id: string;
+  version: number;
+  name: string;
+  description: string;
+  schema_version: string;
+  category: string | null;
+  triggers_json: string;
+  when_to_use: string | null;
+  when_not_to_use: string | null;
+  compatibility_json: string;
+  source: "manual" | "derived" | "imported";
+  skill_md_canonical: string;
+  body_hash: string;
+  resources_json: string;
+};
+
+/**
+ * v1.2.0-alpha.2 (issue #54): the row shapes for the
+ * cold-start bootstrap surface. The four tables
+ * (`bootstrap_sources`, `bootstrap_plans`,
+ * `bootstrap_plan_items`, `external_references`) are
+ * the persistence layer for the v20 migration; the
+ * service layer is `src/bootstrap/service.ts` and
+ * `src/external-refs/service.ts`. The wire / MCP /
+ * admin shape is `packages/contracts/src/bootstrap.ts`.
+ */
+export type BootstrapSourceKind =
+  | "file"
+  | "directory"
+  | "git_metadata"
+  | "session_bundle"
+  | "memory_bundle"
+  | "external_provider";
+
+export type BootstrapSourceRow = {
+  source_id: string;
+  source_kind: BootstrapSourceKind;
+  scope: "global" | "project";
+  project_id: string | null;
+  canonical_ref: string;
+  source_version: string | null;
+  content_digest: string;
+  sensitivity: "normal" | "private" | "restricted";
+  configured_by_actor_id: string;
+  created_at: string;
+  last_scanned_at: string | null;
+  size_bytes: number | null;
+};
+
+export type BootstrapPlanState =
+  | "draft"
+  | "scanning"
+  | "plan_ready"
+  | "applying"
+  | "applied"
+  | "expired"
+  | "failed"
+  | "cancelled";
+
+export type BootstrapPlanRow = {
+  plan_id: string;
+  project_id: string;
+  creator_actor_id: string;
+  state: BootstrapPlanState;
+  config_digest: string;
+  source_set_digest: string;
+  created_at: string;
+  expires_at: string;
+  completed_at: string | null;
+  job_id: string | null;
+};
+
+export type BootstrapPlanItemAction =
+  | "propose_memory"
+  | "propose_context_pack"
+  | "propose_skill_ref"
+  | "register_external_ref"
+  | "bind_loadout"
+  | "skip";
+
+export type BootstrapPlanItemRow = {
+  plan_id: string;
+  source_id: string;
+  item_seq: number;
+  action: BootstrapPlanItemAction;
+  target_ref: string | null;
+  proposed_payload_json: string;
+  evidence_digest: string;
+  expected_revision_or_version: number | null;
+  risk: "low" | "medium" | "high";
+  rationale: string;
+};
+
+export type ExternalReferenceResourceKind =
+  | "wiki"
+  | "code_index"
+  | "repository_context"
+  | "document_set"
+  | "custom";
+
+export type ExternalReferenceRow = {
+  asset_id: string;
+  version: number;
+  provider_kind: string;
+  provider_instance_id: string;
+  resource_kind: ExternalReferenceResourceKind;
+  resource_ref: string;
+  uri: string;
+  source_version: string | null;
+  source_digest: string | null;
+  retrieval_contract_version: string;
+  capabilities_json: string;
+  allowed_scope: "global" | "project";
+  project_id: string | null;
+  sensitivity: "normal" | "private" | "restricted";
+  refresh_policy_json: string;
+  last_verified_at: string | null;
+  metadata_json: string;
+};
+
 type Row = Record<string, SQLOutputValue>;
 
 function encodeJson(value: unknown): string {
@@ -334,6 +971,406 @@ function optionalStringCell(row: Row, column: string): string | undefined {
 function numberCell(row: Row, column: string): number {
   const value = row[column];
   return typeof value === "number" || typeof value === "bigint" ? Number(value) : Number(String(value));
+}
+
+function optionalNumberCell(row: Row, column: string): number | undefined {
+  const value = row[column];
+  if (value === undefined || value === null) return undefined;
+  return typeof value === "number" || typeof value === "bigint"
+    ? Number(value)
+    : Number(String(value));
+}
+
+/**
+ * v1.2.0-alpha.0 (issue #48): identify the
+ * SQLITE_CONSTRAINT_UNIQUE / SQLITE_CONSTRAINT_PRIMARYKEY
+ * errors raised by `node:sqlite` so the derivation job
+ * insert path can return `false` (idempotent) instead of
+ * throwing. The `node:sqlite` error shape varies by
+ * version: recent builds surface a `code` string
+ * (`"SQLITE_CONSTRAINT_UNIQUE"`) plus the numeric
+ * `errcode` (19 for `SQLITE_CONSTRAINT`, extended code
+ * 2067 for the UNIQUE sub-code) and the `errno`. Older
+ * builds (and some `bun:sqlite` configurations) only
+ * expose the human-readable message. We accept any of
+ * the four signals so the helper is robust to a runtime
+ * change in the error shape.
+ */
+function isSqliteUniqueConstraintError(error: unknown): boolean {
+  if (error === null || typeof error !== "object") return false;
+  const err = error as {
+    code?: unknown;
+    errcode?: unknown;
+    errno?: unknown;
+    message?: unknown;
+  };
+  if (err.code === "SQLITE_CONSTRAINT_UNIQUE") return true;
+  if (err.code === "SQLITE_CONSTRAINT_PRIMARYKEY") return true;
+  if (err.code === "SQLITE_CONSTRAINT") return true;
+  if (err.errcode === 19 || err.errno === 19) return true;
+  if (typeof err.message === "string") {
+    if (err.message.includes("UNIQUE constraint failed")) return true;
+    if (err.message.includes("PRIMARY KEY constraint failed")) return true;
+  }
+  return false;
+}
+
+function derivationJobFromRow(row: Row): DerivationJobRow {
+  return {
+    job_id: stringCell(row, "job_id"),
+    kind: stringCell(row, "kind"),
+    state: stringCell(row, "state") as DerivationJobState,
+    scope: stringCell(row, "scope") as DerivationJobScope,
+    project_id: optionalStringCell(row, "project_id") ?? null,
+    creator_actor_id: stringCell(row, "creator_actor_id"),
+    idempotency_key: stringCell(row, "idempotency_key"),
+    input_digest: stringCell(row, "input_digest"),
+    config_digest: stringCell(row, "config_digest"),
+    cursor_json: stringCell(row, "cursor_json"),
+    attempt_count: numberCell(row, "attempt_count"),
+    lease_owner: optionalStringCell(row, "lease_owner") ?? null,
+    lease_expires_at: optionalNumberCell(row, "lease_expires_at") ?? null,
+    cancel_requested_at: optionalNumberCell(row, "cancel_requested_at") ?? null,
+    next_retry_at: optionalNumberCell(row, "next_retry_at") ?? null,
+    error_code: optionalStringCell(row, "error_code") ?? null,
+    redacted_error: optionalStringCell(row, "redacted_error") ?? null,
+    created_at: numberCell(row, "created_at"),
+    started_at: optionalNumberCell(row, "started_at") ?? null,
+    updated_at: numberCell(row, "updated_at"),
+    finished_at: optionalNumberCell(row, "finished_at") ?? null
+  };
+}
+
+function derivationRunFromRow(row: Row): DerivationRunRow {
+  return {
+    run_id: stringCell(row, "run_id"),
+    job_id: stringCell(row, "job_id"),
+    stage: stringCell(row, "stage"),
+    status: stringCell(row, "status") as DerivationRunStatus,
+    input_refs_json: stringCell(row, "input_refs_json"),
+    output_refs_json: stringCell(row, "output_refs_json"),
+    provider_id: optionalStringCell(row, "provider_id") ?? null,
+    model_id: optionalStringCell(row, "model_id") ?? null,
+    prompt_template_version: optionalStringCell(row, "prompt_template_version") ?? null,
+    prompt_hash: optionalStringCell(row, "prompt_hash") ?? null,
+    policy_version: stringCell(row, "policy_version"),
+    result_digest: optionalStringCell(row, "result_digest") ?? null,
+    started_at: numberCell(row, "started_at"),
+    finished_at: optionalNumberCell(row, "finished_at") ?? null
+  };
+}
+
+function derivationOutputFromRow(row: Row): DerivationOutputRow {
+  return {
+    job_id: stringCell(row, "job_id"),
+    run_id: stringCell(row, "run_id"),
+    output_kind: stringCell(row, "output_kind") as DerivationOutputKind,
+    output_id: stringCell(row, "output_id"),
+    disposition: stringCell(row, "disposition") as DerivationOutputDisposition,
+    created_at: numberCell(row, "created_at")
+  };
+}
+
+function sessionFromRow(row: Row): SessionRow {
+  return {
+    session_id: stringCell(row, "session_id"),
+    source_kind: stringCell(row, "source_kind"),
+    source_version: stringCell(row, "source_version"),
+    source_instance_id: stringCell(row, "source_instance_id"),
+    source_session_id: stringCell(row, "source_session_id"),
+    scope: stringCell(row, "scope") as SessionScope,
+    project_id: optionalStringCell(row, "project_id") ?? null,
+    actor_id: stringCell(row, "actor_id"),
+    client_name: stringCell(row, "client_name"),
+    client_version: stringCell(row, "client_version"),
+    started_at: stringCell(row, "started_at"),
+    ended_at: optionalStringCell(row, "ended_at") ?? null,
+    sensitivity: stringCell(row, "sensitivity") as SessionSensitivity,
+    bundle_hash: stringCell(row, "bundle_hash"),
+    adapter_id: stringCell(row, "adapter_id"),
+    adapter_version: stringCell(row, "adapter_version"),
+    ingestion_plan_json: stringCell(row, "ingestion_plan_json"),
+    redaction_summary_json: stringCell(row, "redaction_summary_json"),
+    ingested_at: stringCell(row, "ingested_at"),
+    retention_until: optionalStringCell(row, "retention_until") ?? null
+  };
+}
+
+function sessionEventFromRow(row: Row): SessionEventRow {
+  const headBytesRaw = row["head_bytes"];
+  const tailBytesRaw = row["tail_bytes"];
+  return {
+    event_id: stringCell(row, "event_id"),
+    session_id: stringCell(row, "session_id"),
+    sequence: numberCell(row, "sequence"),
+    turn_id: stringCell(row, "turn_id"),
+    event_type: stringCell(row, "event_type") as SessionEventType,
+    role: optionalStringCell(row, "role") as SessionEventRole | null ?? null,
+    content_digest: stringCell(row, "content_digest"),
+    content_blob_ref: optionalStringCell(row, "content_blob_ref") ?? null,
+    tool_name: optionalStringCell(row, "tool_name") ?? null,
+    tool_call_id: optionalStringCell(row, "tool_call_id") ?? null,
+    tool_status: optionalStringCell(row, "tool_status") ?? null,
+    timestamp: stringCell(row, "timestamp"),
+    sensitivity: stringCell(row, "sensitivity") as SessionSensitivity,
+    redaction_flags_json: stringCell(row, "redaction_flags_json"),
+    metadata_json: stringCell(row, "metadata_json")
+  };
+}
+
+function assetFromRow(row: Row): AssetRow {
+  return {
+    asset_id: stringCell(row, "asset_id"),
+    asset_type: stringCell(row, "asset_type") as AssetType,
+    scope: stringCell(row, "scope") as "global" | "project",
+    project_id: optionalStringCell(row, "project_id") ?? null,
+    owner_actor_id: stringCell(row, "owner_actor_id"),
+    lifecycle_state: stringCell(row, "lifecycle_state") as AssetLifecycleState,
+    current_version: numberCell(row, "current_version"),
+    trust_level: stringCell(row, "trust_level") as AssetTrustLevel,
+    sensitivity: stringCell(row, "sensitivity") as
+      | "normal"
+      | "private"
+      | "restricted",
+    metadata_json: stringCell(row, "metadata_json"),
+    created_at: stringCell(row, "created_at"),
+    updated_at: stringCell(row, "updated_at"),
+    archived_at: optionalStringCell(row, "archived_at") ?? null
+  };
+}
+
+function assetVersionFromRow(row: Row): AssetVersionRow {
+  return {
+    asset_id: stringCell(row, "asset_id"),
+    version: numberCell(row, "version"),
+    schema_version: stringCell(row, "schema_version"),
+    content_hash: stringCell(row, "content_hash"),
+    manifest_json: stringCell(row, "manifest_json"),
+    created_by_actor_id: stringCell(row, "created_by_actor_id"),
+    provenance_kind:
+      (optionalStringCell(row, "provenance_kind") as
+        | "derivation_run"
+        | "import_batch"
+        | "manual"
+        | "external"
+        | null) ?? null,
+    provenance_ref: optionalStringCell(row, "provenance_ref") ?? null,
+    created_at: stringCell(row, "created_at")
+  };
+}
+
+function loadoutFromRow(row: Row): LoadoutRow {
+  return {
+    loadout_id: stringCell(row, "loadout_id"),
+    name: stringCell(row, "name"),
+    version: numberCell(row, "version"),
+    lifecycle_state: stringCell(row, "lifecycle_state") as LoadoutLifecycleState,
+    match_actor_id: optionalStringCell(row, "match_actor_id") ?? null,
+    match_client_name: optionalStringCell(row, "match_client_name") ?? null,
+    scope: stringCell(row, "scope") as LoadoutScope,
+    project_id: optionalStringCell(row, "project_id") ?? null,
+    task_mode: optionalStringCell(row, "task_mode") ?? null,
+    created_by_actor_id: stringCell(row, "created_by_actor_id"),
+    created_at: stringCell(row, "created_at"),
+    updated_at: stringCell(row, "updated_at")
+  };
+}
+
+function loadoutRuleFromRow(row: Row): LoadoutRuleRow {
+  return {
+    loadout_id: stringCell(row, "loadout_id"),
+    version: numberCell(row, "version"),
+    channel: stringCell(row, "channel") as LoadoutChannel,
+    include_asset_ids: decodeJson<string[]>(stringCell(row, "include_asset_ids_json")),
+    include_memory_ids: decodeJson<string[]>(stringCell(row, "include_memory_ids_json")),
+    include_types: decodeJson<string[]>(stringCell(row, "include_types_json")),
+    include_tiers: decodeJson<LoadoutTier[]>(stringCell(row, "include_tiers_json")),
+    include_tags: decodeJson<string[]>(stringCell(row, "include_tags_json")),
+    include_topics: decodeJson<string[]>(stringCell(row, "include_topics_json")),
+    exclude_asset_ids: decodeJson<string[]>(stringCell(row, "exclude_asset_ids_json")),
+    exclude_memory_ids: decodeJson<string[]>(stringCell(row, "exclude_memory_ids_json")),
+    exclude_tags: decodeJson<string[]>(stringCell(row, "exclude_tags_json")),
+    required_refs: decodeJson<string[]>(stringCell(row, "required_refs_json")),
+    max_items: numberCell(row, "max_items"),
+    max_chars: numberCell(row, "max_chars"),
+    max_tokens: optionalNumberCell(row, "max_tokens") ?? null,
+    timeout_ms: numberCell(row, "timeout_ms"),
+    ordering_policy: stringCell(row, "ordering_policy") as LoadoutOrderingPolicy
+  };
+}
+
+function loadoutBindingFromRow(row: Row): LoadoutBindingRow {
+  return {
+    binding_id: stringCell(row, "binding_id"),
+    loadout_id: stringCell(row, "loadout_id"),
+    loadout_version: numberCell(row, "loadout_version"),
+    actor_id: optionalStringCell(row, "actor_id") ?? null,
+    client_name: optionalStringCell(row, "client_name") ?? null,
+    project_id: optionalStringCell(row, "project_id") ?? null,
+    task_mode: optionalStringCell(row, "task_mode") ?? null,
+    priority: numberCell(row, "priority"),
+    created_at: stringCell(row, "created_at")
+  };
+}
+
+function memoryRefBindingFromRow(row: Row): MemoryRefBindingRow {
+  return {
+    asset_id: stringCell(row, "asset_id"),
+    version: numberCell(row, "version"),
+    memory_id: stringCell(row, "memory_id"),
+    memory_revision: numberCell(row, "memory_revision"),
+    binding_rule: optionalStringCell(row, "binding_rule") ?? null,
+    note: optionalStringCell(row, "note") ?? null
+  };
+}
+
+function derivationCandidateFromRow(row: Row): DerivationCandidateRow {
+  return {
+    candidate_id: stringCell(row, "candidate_id"),
+    job_id: stringCell(row, "job_id"),
+    run_id: stringCell(row, "run_id"),
+    candidate_kind: stringCell(row, "candidate_kind") as DerivationCandidateKind,
+    proposed_type: optionalStringCell(row, "proposed_type") ?? null,
+    proposed_topic: optionalStringCell(row, "proposed_topic") ?? null,
+    proposed_title: optionalStringCell(row, "proposed_title") ?? null,
+    proposed_body: optionalStringCell(row, "proposed_body") ?? null,
+    proposed_tags_json: stringCell(row, "proposed_tags_json"),
+    proposed_scope: stringCell(row, "proposed_scope") as DerivationCandidateScope,
+    proposed_project_id: optionalStringCell(row, "proposed_project_id") ?? null,
+    proposed_tier: stringCell(row, "proposed_tier") as DerivationCandidateTier,
+    proposed_trust_level: stringCell(row, "proposed_trust_level") as DerivationCandidateTrustLevel,
+    proposed_sensitivity: stringCell(row, "proposed_sensitivity") as DerivationCandidateSensitivity,
+    confidence: numberCell(row, "confidence"),
+    state: stringCell(row, "state") as DerivationCandidateState,
+    extractor_id: stringCell(row, "extractor_id"),
+    extractor_version: stringCell(row, "extractor_version"),
+    content_hash: stringCell(row, "content_hash"),
+    created_at: numberCell(row, "created_at"),
+    reviewed_at: optionalNumberCell(row, "reviewed_at") ?? null,
+    reviewed_by_actor_id: optionalStringCell(row, "reviewed_by_actor_id") ?? null,
+    applied_at: optionalNumberCell(row, "applied_at") ?? null,
+    expected_target_revision: optionalNumberCell(row, "expected_target_revision") ?? null
+  };
+}
+
+function candidateEvidenceFromRow(row: Row): CandidateEvidenceRow {
+  return {
+    candidate_id: stringCell(row, "candidate_id"),
+    evidence_role: stringCell(row, "evidence_role") as DerivationCandidateEvidenceRole,
+    session_id: optionalStringCell(row, "session_id") ?? null,
+    event_id: optionalStringCell(row, "event_id") ?? null,
+    message_id: optionalStringCell(row, "message_id") ?? null,
+    tool_call_id: optionalStringCell(row, "tool_call_id") ?? null,
+    file_ref: optionalStringCell(row, "file_ref") ?? null,
+    excerpt_digest: stringCell(row, "excerpt_digest")
+  };
+}
+
+function candidateActionFromRow(row: Row): CandidateActionRow {
+  return {
+    candidate_id: stringCell(row, "candidate_id"),
+    action: stringCell(row, "action") as DerivationCandidateAction,
+    target_memory_ids_json: stringCell(row, "target_memory_ids_json"),
+    expected_revisions_json: stringCell(row, "expected_revisions_json"),
+    rationale: stringCell(row, "rationale"),
+    conflict_signals_json: stringCell(row, "conflict_signals_json"),
+    risk: stringCell(row, "risk") as DerivationCandidateRisk
+  };
+}
+
+function skillFromRow(row: Row): SkillRow {
+  return {
+    asset_id: stringCell(row, "asset_id"),
+    version: numberCell(row, "version"),
+    name: stringCell(row, "name"),
+    description: stringCell(row, "description"),
+    schema_version: stringCell(row, "schema_version"),
+    category: optionalStringCell(row, "category") ?? null,
+    triggers_json: stringCell(row, "triggers_json"),
+    when_to_use: optionalStringCell(row, "when_to_use") ?? null,
+    when_not_to_use: optionalStringCell(row, "when_not_to_use") ?? null,
+    compatibility_json: stringCell(row, "compatibility_json"),
+    source: stringCell(row, "source") as "manual" | "derived" | "imported",
+    skill_md_canonical: stringCell(row, "skill_md_canonical"),
+    body_hash: stringCell(row, "body_hash"),
+    resources_json: stringCell(row, "resources_json")
+  };
+}
+
+function bootstrapSourceFromRow(row: Row): BootstrapSourceRow {
+  return {
+    source_id: stringCell(row, "source_id"),
+    source_kind: stringCell(row, "source_kind") as BootstrapSourceKind,
+    scope: stringCell(row, "scope") as "global" | "project",
+    project_id: optionalStringCell(row, "project_id") ?? null,
+    canonical_ref: stringCell(row, "canonical_ref"),
+    source_version: optionalStringCell(row, "source_version") ?? null,
+    content_digest: stringCell(row, "content_digest"),
+    sensitivity: stringCell(row, "sensitivity") as
+      | "normal"
+      | "private"
+      | "restricted",
+    configured_by_actor_id: stringCell(row, "configured_by_actor_id"),
+    created_at: stringCell(row, "created_at"),
+    last_scanned_at: optionalStringCell(row, "last_scanned_at") ?? null,
+    size_bytes: optionalNumberCell(row, "size_bytes") ?? null
+  };
+}
+
+function bootstrapPlanFromRow(row: Row): BootstrapPlanRow {
+  return {
+    plan_id: stringCell(row, "plan_id"),
+    project_id: stringCell(row, "project_id"),
+    creator_actor_id: stringCell(row, "creator_actor_id"),
+    state: stringCell(row, "state") as BootstrapPlanState,
+    config_digest: stringCell(row, "config_digest"),
+    source_set_digest: stringCell(row, "source_set_digest"),
+    created_at: stringCell(row, "created_at"),
+    expires_at: stringCell(row, "expires_at"),
+    completed_at: optionalStringCell(row, "completed_at") ?? null,
+    job_id: optionalStringCell(row, "job_id") ?? null
+  };
+}
+
+function bootstrapPlanItemFromRow(row: Row): BootstrapPlanItemRow {
+  return {
+    plan_id: stringCell(row, "plan_id"),
+    source_id: stringCell(row, "source_id"),
+    item_seq: numberCell(row, "item_seq"),
+    action: stringCell(row, "action") as BootstrapPlanItemAction,
+    target_ref: optionalStringCell(row, "target_ref") ?? null,
+    proposed_payload_json: stringCell(row, "proposed_payload_json"),
+    evidence_digest: stringCell(row, "evidence_digest"),
+    expected_revision_or_version:
+      optionalNumberCell(row, "expected_revision_or_version") ?? null,
+    risk: stringCell(row, "risk") as "low" | "medium" | "high",
+    rationale: stringCell(row, "rationale")
+  };
+}
+
+function externalReferenceFromRow(row: Row): ExternalReferenceRow {
+  return {
+    asset_id: stringCell(row, "asset_id"),
+    version: numberCell(row, "version"),
+    provider_kind: stringCell(row, "provider_kind"),
+    provider_instance_id: stringCell(row, "provider_instance_id"),
+    resource_kind: stringCell(row, "resource_kind") as ExternalReferenceResourceKind,
+    resource_ref: stringCell(row, "resource_ref"),
+    uri: stringCell(row, "uri"),
+    source_version: optionalStringCell(row, "source_version") ?? null,
+    source_digest: optionalStringCell(row, "source_digest") ?? null,
+    retrieval_contract_version: stringCell(row, "retrieval_contract_version"),
+    capabilities_json: stringCell(row, "capabilities_json"),
+    allowed_scope: stringCell(row, "allowed_scope") as "global" | "project",
+    project_id: optionalStringCell(row, "project_id") ?? null,
+    sensitivity: stringCell(row, "sensitivity") as
+      | "normal"
+      | "private"
+      | "restricted",
+    refresh_policy_json: stringCell(row, "refresh_policy_json"),
+    last_verified_at: optionalStringCell(row, "last_verified_at") ?? null,
+    metadata_json: stringCell(row, "metadata_json")
+  };
 }
 
 function decodeEntry(row: Row): MemoryEntry {
@@ -745,6 +1782,1602 @@ export class SQLiteMemoryStore {
     return this.openMode;
   }
 
+  // ─────────────────────────────────────────────────────────────────────
+  // v1.2.0-alpha.0 (issue #48): derivation job substrate.
+  //
+  // The three tables — `derivation_jobs` / `derivation_runs` /
+  // `derivation_outputs` — are the durable backing for every
+  // provider-backed / multi-stage / cancellable pipeline
+  // introduced in v1.2 (session distillation, skill extraction,
+  // cold-start bootstrap, external-reference refresh). The
+  // public API for these rows lives in `src/jobs/service.ts`;
+  // the methods below are the lowest-level row readers and
+  // writers. Callers (the DerivationJobStore) compose them
+  // inside a single `BEGIN IMMEDIATE` transaction so the
+  // claim / checkpoint / apply semantics match the contract
+  // in `docs/adr/0009-derivation-job-lifecycle.md`.
+  // ─────────────────────────────────────────────────────────────────────
+
+  /**
+   * Find a derivation job by its primary key. Returns the
+   * row verbatim, or `undefined` if the job does not exist.
+   * The cursor JSON column is **not** parsed — callers that
+   * need the typed cursor should call
+   * `DerivationJobStore.get(jobId)` instead.
+   */
+  getDerivationJob(jobId: string): DerivationJobRow | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM derivation_jobs WHERE job_id = ?")
+      .get(jobId) as Row | undefined;
+    if (row === undefined) return undefined;
+    return derivationJobFromRow(row);
+  }
+
+  /**
+   * Find a derivation job by its
+   * `(creator_actor_id, kind, idempotency_key)` triple.
+   * Returns `undefined` if no job exists. This is the
+   * read side of the replay contract: an `enqueue` call
+   * with the same triple returns the same `job_id`.
+   */
+  getDerivationJobByIdempotency(
+    creator_actor_id: string,
+    kind: string,
+    idempotency_key: string
+  ): DerivationJobRow | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT * FROM derivation_jobs WHERE creator_actor_id = ? AND kind = ? AND idempotency_key = ?"
+      )
+      .get(creator_actor_id, kind, idempotency_key) as Row | undefined;
+    if (row === undefined) return undefined;
+    return derivationJobFromRow(row);
+  }
+
+  /**
+   * Insert a new derivation job. The caller is responsible
+   * for pre-computing the `job_id`, `input_digest`,
+   * `config_digest` and the `cursor_json` string. The
+   * row is inserted with `state='queued'`, `attempt_count=0`,
+   * no lease. Throws on the UNIQUE
+   * `(creator_actor_id, kind, idempotency_key)` violation
+   * when a replay uses a different digest — the higher-level
+   * `DerivationJobStore.enqueue` translates that to
+   * `idempotency_digest_mismatch`.
+   */
+  insertDerivationJob(row: DerivationJobRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO derivation_jobs (
+          job_id, kind, state, scope, project_id, creator_actor_id,
+          idempotency_key, input_digest, config_digest, cursor_json,
+          attempt_count, lease_owner, lease_expires_at, cancel_requested_at,
+          next_retry_at, error_code, redacted_error,
+          created_at, started_at, updated_at, finished_at
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?,
+          ?, ?, ?, ?,
+          ?, ?, ?,
+          ?, ?, ?, ?
+        )`
+      )
+      .run(
+        row.job_id,
+        row.kind,
+        row.state,
+        row.scope,
+        row.project_id ?? null,
+        row.creator_actor_id,
+        row.idempotency_key,
+        row.input_digest,
+        row.config_digest,
+        row.cursor_json,
+        row.attempt_count,
+        row.lease_owner ?? null,
+        row.lease_expires_at ?? null,
+        row.cancel_requested_at ?? null,
+        row.next_retry_at ?? null,
+        row.error_code ?? null,
+        row.redacted_error ?? null,
+        row.created_at,
+        row.started_at ?? null,
+        row.updated_at,
+        row.finished_at ?? null
+      );
+  }
+
+  /**
+   * Atomically transition a job from
+   * `queued` (or `failed` with a non-null past
+   * `next_retry_at`) into `running`, stamping the lease
+   * owner + expiry and incrementing `attempt_count`.
+   * Returns the updated row, or `undefined` if the
+   * predicate did not match (the caller is racing
+   * another worker or the lease is still live). This
+   * is the only place a job's `lease_owner` /
+   * `lease_expires_at` / `attempt_count` are written.
+   */
+  claimDerivationJob(args: {
+    job_id: string;
+    lease_owner: string;
+    lease_expires_at: number;
+    started_at: number;
+    now: number;
+  }): DerivationJobRow | undefined {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const updated = this.db
+        .prepare(
+          `UPDATE derivation_jobs
+              SET lease_owner = ?,
+                  lease_expires_at = ?,
+                  attempt_count = attempt_count + 1,
+                  state = 'running',
+                  started_at = COALESCE(started_at, ?),
+                  updated_at = ?
+            WHERE job_id = ?
+              AND (
+                state = 'queued'
+                OR (
+                  state = 'failed'
+                  AND next_retry_at IS NOT NULL
+                  AND next_retry_at <= ?
+                )
+              )
+              AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)
+            RETURNING *`
+        )
+        .get(
+          args.lease_owner,
+          args.lease_expires_at,
+          args.started_at,
+          args.now,
+          args.job_id,
+          args.now,
+          args.now
+        ) as Row | undefined;
+      this.db.exec("COMMIT");
+      if (updated === undefined) return undefined;
+      return derivationJobFromRow(updated);
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * Find the next claimable job for the given kind (or any
+   * kind when `kind` is `undefined`). The predicate mirrors
+   * `claimDerivationJob`: `state = 'queued'`, OR
+   * `state = 'failed' AND next_retry_at IS NOT NULL AND
+   * next_retry_at <= now()` (a `failed` job without a
+   * retry window is terminal and is NOT re-claimed). The
+   * lease predicate matches the `claim` path. The list is
+   * ordered by `created_at ASC` so the oldest queued
+   * request is processed first.
+   */
+  listClaimableDerivationJobs(
+    kind: string | undefined,
+    now: number,
+    limit: number
+  ): DerivationJobRow[] {
+    const params: SQLInputValue[] = [];
+    let sql = `SELECT * FROM derivation_jobs
+                WHERE (
+                    state = 'queued'
+                    OR (
+                      state = 'failed'
+                      AND next_retry_at IS NOT NULL
+                      AND next_retry_at <= ?
+                    )
+                  )
+                  AND (lease_owner IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?)`;
+    params.push(now, now);
+    if (kind !== undefined) {
+      sql += " AND kind = ?";
+      params.push(kind);
+    }
+    sql += " ORDER BY created_at ASC LIMIT ?";
+    params.push(limit);
+    const rows = this.db.prepare(sql).all(...params) as Row[];
+    return rows.map((r) => derivationJobFromRow(r));
+  }
+
+  /**
+   * Mark a job's `cancel_requested_at`. The job still
+   * transitions through its current stage boundary; the
+   * runner consults the timestamp before starting the next
+   * stage and routes to a terminal `cancelled` state.
+   */
+  requestDerivationJobCancel(jobId: string, now: number): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE derivation_jobs
+            SET cancel_requested_at = ?,
+                updated_at = ?
+          WHERE job_id = ?
+            AND state NOT IN ('succeeded', 'failed', 'cancelled')`
+      )
+      .run(now, now, jobId);
+    return result.changes > 0;
+  }
+
+  /**
+   * Transition a running job to a terminal state. The
+   * caller is the runner finishing its current stage; the
+   * `cursor_json` and `redacted_error` / `error_code` are
+   * the final values written on disk. Returns the updated
+   * row, or `undefined` if the job was not in `running`
+   * state (e.g. it was already cancelled or completed by
+   * a reap takeover).
+   */
+  finalizeDerivationJob(args: {
+    job_id: string;
+    terminal_state: Extract<DerivationJobState, "succeeded" | "failed" | "cancelled">;
+    cursor_json?: string;
+    error_code?: string | null;
+    redacted_error?: string | null;
+    next_retry_at?: number | null;
+    now: number;
+  }): DerivationJobRow | undefined {
+    const result = this.db
+      .prepare(
+        `UPDATE derivation_jobs
+            SET state = ?,
+                cursor_json = COALESCE(?, cursor_json),
+                error_code = ?,
+                redacted_error = ?,
+                next_retry_at = ?,
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                finished_at = COALESCE(finished_at, ?),
+                updated_at = ?
+          WHERE job_id = ?
+            AND state = 'running'
+          RETURNING *`
+      )
+      .get(
+        args.terminal_state,
+        args.cursor_json ?? null,
+        args.error_code ?? null,
+        args.redacted_error ?? null,
+        args.next_retry_at ?? null,
+        args.now,
+        args.now,
+        args.job_id
+      ) as Row | undefined;
+    if (result === undefined) return undefined;
+    return derivationJobFromRow(result);
+  }
+
+  /**
+   * Update the per-stage `cursor_json` while the job stays
+   * in `running`. Used by the runner between stages to
+   * checkpoint progress without committing a terminal
+   * state. The lease is renewed implicitly because
+   * `updated_at` advances — callers that need a hard
+   * lease refresh should call `renewDerivationJobLease`.
+   */
+  checkpointDerivationJob(
+    jobId: string,
+    cursorJson: string,
+    now: number
+  ): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE derivation_jobs
+            SET cursor_json = ?,
+                updated_at = ?
+          WHERE job_id = ? AND state = 'running'`
+      )
+      .run(cursorJson, now, jobId);
+    return result.changes > 0;
+  }
+
+  /**
+   * Renew a running job's lease. The TTL is the new
+   * `lease_expires_at`; if the caller has crossed the
+   * cancel boundary (e.g. user pressed Ctrl-C between
+   * stages) the row is left untouched so the runner can
+   * route to a terminal `cancelled` state on the next
+   * poll. Returns `true` on a successful renewal.
+   */
+  renewDerivationJobLease(
+    jobId: string,
+    leaseOwner: string,
+    leaseExpiresAt: number,
+    now: number
+  ): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE derivation_jobs
+            SET lease_owner = ?,
+                lease_expires_at = ?,
+                updated_at = ?
+          WHERE job_id = ?
+            AND state = 'running'
+            AND lease_owner = ?
+            AND (cancel_requested_at IS NULL OR cancel_requested_at > ?)`
+      )
+      .run(
+        leaseOwner,
+        leaseExpiresAt,
+        now,
+        jobId,
+        leaseOwner,
+        now
+      );
+    return result.changes > 0;
+  }
+
+  /**
+   * Passive reap: re-queue any job whose lease has
+   * expired. The runner calls this at the start of every
+   * `listClaimable` / `claim` cycle so a crashed worker
+   * does not strand a `running` job forever (issue #48
+   * AC #2). Returns the number of rows reset.
+   */
+  reapExpiredDerivationJobLeases(now: number): number {
+    const result = this.db
+      .prepare(
+        `UPDATE derivation_jobs
+            SET state = 'queued',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                updated_at = ?
+          WHERE state = 'running'
+            AND lease_expires_at IS NOT NULL
+            AND lease_expires_at <= ?`
+      )
+      .run(now, now);
+    return result.changes;
+  }
+
+  /**
+   * Insert a derivation run row (one per stage attempt).
+   * The runner writes the row in `started` state before
+   * the work; the same `run_id` is later updated to a
+   * terminal status by `completeDerivationRun` /
+   * `failDerivationRun`.
+   */
+  insertDerivationRun(row: DerivationRunRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO derivation_runs (
+          run_id, job_id, stage, status,
+          input_refs_json, output_refs_json,
+          provider_id, model_id,
+          prompt_template_version, prompt_hash,
+          policy_version, result_digest,
+          started_at, finished_at
+        ) VALUES (
+          ?, ?, ?, ?,
+          ?, ?,
+          ?, ?,
+          ?, ?,
+          ?, ?,
+          ?, ?
+        )`
+      )
+      .run(
+        row.run_id,
+        row.job_id,
+        row.stage,
+        row.status,
+        row.input_refs_json,
+        row.output_refs_json,
+        row.provider_id ?? null,
+        row.model_id ?? null,
+        row.prompt_template_version ?? null,
+        row.prompt_hash ?? null,
+        row.policy_version,
+        row.result_digest ?? null,
+        row.started_at,
+        row.finished_at ?? null
+      );
+  }
+
+  /**
+   * Finalise a derivation run row. The `output_refs_json`
+   * is the list of `output_id`s the stage produced; the
+   * caller is responsible for inserting the matching
+   * `derivation_outputs` rows in the same transaction.
+   */
+  completeDerivationRun(args: {
+    run_id: string;
+    status: Extract<DerivationRunStatus, "succeeded" | "failed" | "cancelled">;
+    output_refs_json: string;
+    result_digest?: string | null;
+    finished_at: number;
+  }): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE derivation_runs
+            SET status = ?,
+                output_refs_json = ?,
+                result_digest = ?,
+                finished_at = ?
+          WHERE run_id = ? AND status = 'started'`
+      )
+      .run(
+        args.status,
+        args.output_refs_json,
+        args.result_digest ?? null,
+        args.finished_at,
+        args.run_id
+      );
+    return result.changes > 0;
+  }
+
+  /**
+   * Read all run rows for a given job, ordered by
+   * `started_at ASC` so the audit trail reads in stage
+   * order. Used by the inspector (`jobs show <id>`).
+   */
+  listDerivationRunsForJob(jobId: string): DerivationRunRow[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM derivation_runs WHERE job_id = ? ORDER BY started_at ASC, run_id ASC"
+      )
+      .all(jobId) as Row[];
+    return rows.map((r) => derivationRunFromRow(r));
+  }
+
+  /**
+   * Read a single run row by its primary key. Returns
+   * `undefined` if the run does not exist. Used by
+   * `DerivationJobStore.finishStage` to resolve the
+   * `job_id` of a run without a full table scan.
+   */
+  getDerivationRun(runId: string): DerivationRunRow | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM derivation_runs WHERE run_id = ?")
+      .get(runId) as Row | undefined;
+    if (row === undefined) return undefined;
+    return derivationRunFromRow(row);
+  }
+
+  /**
+   * Insert a derivation output row. Used both for
+   * `proposed` (stage result) and `applied` (downstream
+   * service call) outputs. The composite primary key
+   * guarantees no duplicate `(job_id, output_kind,
+   * output_id)` — a reap takeover that tries to write
+   * the same applied row gets an SQLITE_CONSTRAINT
+   * error which the runner translates to a no-op (the
+   * row already exists from the first worker).
+   */
+  insertDerivationOutput(row: DerivationOutputRow): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO derivation_outputs (
+            job_id, run_id, output_kind, output_id, disposition, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          row.job_id,
+          row.run_id,
+          row.output_kind,
+          row.output_id,
+          row.disposition,
+          row.created_at
+        );
+      return true;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Read all output rows for a given job, ordered by
+   * `(output_kind ASC, output_id ASC)` for stable
+   * inspection. Used by `jobs show <id>` to render the
+   * `outputs:` block.
+   */
+  listDerivationOutputsForJob(jobId: string): DerivationOutputRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM derivation_outputs
+           WHERE job_id = ?
+           ORDER BY output_kind ASC, output_id ASC`
+      )
+      .all(jobId) as Row[];
+    return rows.map((r) => derivationOutputFromRow(r));
+  }
+
+  /**
+   * Filter derivation jobs by the inspector query. The
+   * `state` and `kind` arguments are optional; `limit`
+   * caps the row count. Ordered newest-first.
+   */
+  listDerivationJobs(filter: {
+    state?: DerivationJobState;
+    kind?: string;
+    limit: number;
+  }): DerivationJobRow[] {
+    const clauses: string[] = [];
+    const params: SQLInputValue[] = [];
+    if (filter.state !== undefined) {
+      clauses.push("state = ?");
+      params.push(filter.state);
+    }
+    if (filter.kind !== undefined) {
+      clauses.push("kind = ?");
+      params.push(filter.kind);
+    }
+    const where = clauses.length === 0 ? "" : " WHERE " + clauses.join(" AND ");
+    const sql = `SELECT * FROM derivation_jobs${where}
+                  ORDER BY created_at DESC LIMIT ?`;
+    params.push(filter.limit);
+    const rows = this.db.prepare(sql).all(...params) as Row[];
+    return rows.map((r) => derivationJobFromRow(r));
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // v1.2.0-alpha.1 (issue #49): session evidence substrate.
+  //
+  // The three tables — `sessions` / `session_events` /
+  // `session_event_blobs` — back the SessionTraceBundle
+  // v1 capture surface. The public API for the rows
+  // lives in `src/sessions/service.ts`; the methods
+  // below are the lowest-level row readers and
+  // writers used by the SessionService. The methods
+  // compose inside single `BEGIN IMMEDIATE`
+  // transactions so the ingest path is atomic with
+  // the per-event plan (issue #49 AC #1).
+  // ─────────────────────────────────────────────────────────────────────
+
+  /**
+   * Find a session by the source-identity tuple.
+   * Returns `undefined` if no row exists. The
+   * read side of the replay contract: an `ingest`
+   * call with the same tuple + same `bundle_hash`
+   * returns the original `session_id`.
+   */
+  getSessionBySourceIdentity(args: {
+    source_kind: string;
+    source_version: string;
+    source_instance_id: string;
+    source_session_id: string;
+  }): SessionRow | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM sessions
+           WHERE source_kind = ?
+             AND source_version = ?
+             AND source_instance_id = ?
+             AND source_session_id = ?`
+      )
+      .get(
+        args.source_kind,
+        args.source_version,
+        args.source_instance_id,
+        args.source_session_id
+      ) as Row | undefined;
+    if (row === undefined) return undefined;
+    return sessionFromRow(row);
+  }
+
+  /**
+   * Read a session by its primary key.
+   */
+  getSession(sessionId: string): SessionRow | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM sessions WHERE session_id = ?")
+      .get(sessionId) as Row | undefined;
+    if (row === undefined) return undefined;
+    return sessionFromRow(row);
+  }
+
+  /**
+   * Insert one session row. Called from
+   * `SessionService.ingest` inside a single
+   * transaction that also inserts the per-event
+   * rows and the blob rows.
+   */
+  insertSession(row: SessionRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO sessions (
+          session_id, source_kind, source_version, source_instance_id, source_session_id,
+          scope, project_id, actor_id, client_name, client_version,
+          started_at, ended_at, sensitivity, bundle_hash,
+          adapter_id, adapter_version, ingestion_plan_json, redaction_summary_json,
+          ingested_at, retention_until
+        ) VALUES (
+          ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?,
+          ?, ?, ?, ?,
+          ?, ?, ?, ?,
+          ?, ?
+        )`
+      )
+      .run(
+        row.session_id,
+        row.source_kind,
+        row.source_version,
+        row.source_instance_id,
+        row.source_session_id,
+        row.scope,
+        row.project_id,
+        row.actor_id,
+        row.client_name,
+        row.client_version,
+        row.started_at,
+        row.ended_at,
+        row.sensitivity,
+        row.bundle_hash,
+        row.adapter_id,
+        row.adapter_version,
+        row.ingestion_plan_json,
+        row.redaction_summary_json,
+        row.ingested_at,
+        row.retention_until
+      );
+  }
+
+  /**
+   * List sessions for the CLI / MCP inspector. The
+   * `state` and `kind` arguments are optional;
+   * `limit` caps the row count. Ordered
+   * newest-first.
+   */
+  listSessions(filter: {
+    scope?: SessionScope;
+    project_id?: string;
+    limit: number;
+  }): SessionRow[] {
+    const clauses: string[] = [];
+    const params: SQLInputValue[] = [];
+    if (filter.scope !== undefined) {
+      clauses.push("scope = ?");
+      params.push(filter.scope);
+    }
+    if (filter.project_id !== undefined) {
+      clauses.push("project_id = ?");
+      params.push(filter.project_id);
+    }
+    const where = clauses.length === 0 ? "" : " WHERE " + clauses.join(" AND ");
+    const sql = `SELECT * FROM sessions${where}
+                  ORDER BY ingested_at DESC LIMIT ?`;
+    params.push(filter.limit);
+    const rows = this.db.prepare(sql).all(...params) as Row[];
+    return rows.map((r) => sessionFromRow(r));
+  }
+
+  /**
+   * Read the events for a single session, ordered
+   * by `sequence ASC` so the audit trail reads in
+   * capture order.
+   */
+  listSessionEvents(sessionId: string): SessionEventRow[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM session_events WHERE session_id = ? ORDER BY sequence ASC, event_id ASC"
+      )
+      .all(sessionId) as Row[];
+    return rows.map((r) => sessionEventFromRow(r));
+  }
+
+  /**
+   * Insert one session event row. The body itself
+   * is in `session_event_blobs` keyed by
+   * `content_digest`; the row holds the manifest
+   * + metadata only.
+   */
+  insertSessionEvent(row: SessionEventRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO session_events (
+          event_id, session_id, sequence, turn_id, event_type, role,
+          content_digest, content_blob_ref, tool_name, tool_call_id, tool_status,
+          timestamp, sensitivity, redaction_flags_json, metadata_json
+        ) VALUES (
+          ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?,
+          ?, ?, ?, ?
+        )`
+      )
+      .run(
+        row.event_id,
+        row.session_id,
+        row.sequence,
+        row.turn_id,
+        row.event_type,
+        row.role,
+        row.content_digest,
+        row.content_blob_ref,
+        row.tool_name,
+        row.tool_call_id,
+        row.tool_status,
+        row.timestamp,
+        row.sensitivity,
+        row.redaction_flags_json,
+        row.metadata_json
+      );
+  }
+
+  /**
+   * Insert (or replace) a session event blob.
+   * The blob row is keyed by digest; the same
+   * digest from two events reuses the same body
+   * (issue #49 storage model: content-addressed).
+   */
+  /**
+   * v1.2.0-alpha.2 (issue #50): read a single
+   * `session_event_blobs` row by digest. Returns
+   * `undefined` when the digest is unknown. Used
+   * by the distillation extractor (and the admin
+   * inspector) to reconstruct the event body
+   * from the head + tail slices.
+   */
+  getSessionEventBlob(digest: string): SessionEventBlobRow | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT * FROM session_event_blobs WHERE digest = ?"
+      )
+      .get(digest) as Row | undefined;
+    if (row === undefined) return undefined;
+    // The BLOB column may come back as a Buffer
+    // (preferred) or as a string (older node:sqlite
+    // builds or string-typed returns). Normalize
+    // both to a Buffer without re-encoding a
+    // string (which would corrupt binary payloads
+    // containing non-UTF-8 bytes).
+    const headRaw = row["head_bytes"];
+    const tailRaw = row["tail_bytes"];
+    const toBuffer = (v: unknown): Buffer => {
+      if (v instanceof Buffer) return v;
+      if (v instanceof Uint8Array) return Buffer.from(v);
+      if (typeof v === "string") return Buffer.from(v, "binary");
+      return Buffer.alloc(0);
+    };
+    return {
+      digest: stringCell(row, "digest"),
+      size_bytes: numberCell(row, "size_bytes"),
+      media_type: stringCell(row, "media_type"),
+      head_bytes: toBuffer(headRaw),
+      tail_bytes: toBuffer(tailRaw),
+      head_tail_window_json: stringCell(row, "head_tail_window_json"),
+      stored_at: stringCell(row, "stored_at")
+    };
+  }
+
+  upsertSessionEventBlob(row: SessionEventBlobRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO session_event_blobs (
+          digest, size_bytes, media_type, head_bytes, tail_bytes,
+          head_tail_window_json, stored_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(digest) DO NOTHING`
+      )
+      .run(
+        row.digest,
+        row.size_bytes,
+        row.media_type,
+        row.head_bytes,
+        row.tail_bytes,
+        row.head_tail_window_json,
+        row.stored_at
+      );
+  }
+
+  /**
+   * Forget a session. The ON DELETE CASCADE on
+   * `session_events` removes all event rows in
+   * the same transaction. The blob rows are
+   * intentionally NOT cascaded: a digest is
+   * content-addressed and may be referenced by
+   * another (unrelated) session, so a session
+   * forget only removes the manifest / index
+   * rows. Blob rows that lose all referrers
+   * become eligible for the GC sweep added in
+   * #55.
+   */
+  forgetSession(sessionId: string): boolean {
+    const result = this.db
+      .prepare("DELETE FROM sessions WHERE session_id = ?")
+      .run(sessionId);
+    return result.changes > 0;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // v1.2.0-alpha.1 (issue #51): asset registry.
+  //
+  // The envelope tables — `assets` / `asset_versions` /
+  // `asset_relations` — and the only v16-shipped
+  // type-specific table — `memory_ref_bindings` —
+  // back the additive typed asset registry. The
+  // public service lives in `src/assets/service.ts`.
+  // ─────────────────────────────────────────────────────────────────────
+
+  /**
+   * Insert the envelope row for a new asset. The
+   * caller pre-computes `asset_id`,
+   * `current_version` (always 0 on the first
+   * insert), and the type-specific payload
+   * (manifest + bindings). Returns `false` when
+   * the unique key (`asset_id`) collides so the
+   * service can translate the violation into a
+   * stable error code.
+   */
+  insertAsset(row: AssetRow): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO assets (
+            asset_id, asset_type, scope, project_id, owner_actor_id,
+            lifecycle_state, current_version, trust_level, sensitivity,
+            metadata_json, created_at, updated_at, archived_at
+          ) VALUES (
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?
+          )`
+        )
+        .run(
+          row.asset_id,
+          row.asset_type,
+          row.scope,
+          row.project_id,
+          row.owner_actor_id,
+          row.lifecycle_state,
+          row.current_version,
+          row.trust_level,
+          row.sensitivity,
+          row.metadata_json,
+          row.created_at,
+          row.updated_at,
+          row.archived_at
+        );
+      return true;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * Read the envelope row by `asset_id`.
+   */
+  getAsset(assetId: string): AssetRow | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM assets WHERE asset_id = ?")
+      .get(assetId) as Row | undefined;
+    if (row === undefined) return undefined;
+    return assetFromRow(row);
+  }
+
+  /**
+   * List envelope rows. The `asset_type` /
+   * `lifecycle_state` / `scope` / `project_id`
+   * filters are optional; the `limit` caps the
+   * row count. Ordered newest-first by
+   * `updated_at DESC`.
+   */
+  listAssets(filter: {
+    asset_type?: AssetType;
+    lifecycle_state?: AssetLifecycleState;
+    scope?: "global" | "project";
+    project_id?: string;
+    limit: number;
+  }): AssetRow[] {
+    const clauses: string[] = [];
+    const params: SQLInputValue[] = [];
+    if (filter.asset_type !== undefined) {
+      clauses.push("asset_type = ?");
+      params.push(filter.asset_type);
+    }
+    if (filter.lifecycle_state !== undefined) {
+      clauses.push("lifecycle_state = ?");
+      params.push(filter.lifecycle_state);
+    }
+    if (filter.scope !== undefined) {
+      clauses.push("scope = ?");
+      params.push(filter.scope);
+    }
+    if (filter.project_id !== undefined) {
+      clauses.push("project_id = ?");
+      params.push(filter.project_id);
+    }
+    const where = clauses.length === 0 ? "" : " WHERE " + clauses.join(" AND ");
+    const sql = `SELECT * FROM assets${where}
+                  ORDER BY updated_at DESC LIMIT ?`;
+    params.push(filter.limit);
+    const rows = this.db.prepare(sql).all(...params) as Row[];
+    return rows.map((r) => assetFromRow(r));
+  }
+
+  /**
+   * Atomically append a new version + advance the
+   * envelope's `current_version` in a single
+   * transaction. The `version` argument is the
+   * expected new version (1-based, monotonically
+   * increasing); the update only succeeds when
+   * the row's current_version is exactly
+   * `version - 1`. Returns the updated envelope
+   * row, or `undefined` on CAS failure (caller is
+   * racing a concurrent append).
+   */
+  appendAssetVersion(args: {
+    asset_id: string;
+    expected_previous_version: number;
+    new_version: number;
+    schema_version: string;
+    content_hash: string;
+    manifest_json: string;
+    created_by_actor_id: string;
+    provenance_kind: AssetVersionRow["provenance_kind"];
+    provenance_ref: string | null;
+    now: string;
+  }): AssetRow | undefined {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO asset_versions (
+            asset_id, version, schema_version, content_hash, manifest_json,
+            created_by_actor_id, provenance_kind, provenance_ref, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          args.asset_id,
+          args.new_version,
+          args.schema_version,
+          args.content_hash,
+          args.manifest_json,
+          args.created_by_actor_id,
+          args.provenance_kind,
+          args.provenance_ref,
+          args.now
+        );
+      const updated = this.db
+        .prepare(
+          `UPDATE assets
+              SET current_version = ?, updated_at = ?
+            WHERE asset_id = ? AND current_version = ?
+            RETURNING *`
+        )
+        .get(
+          args.new_version,
+          args.now,
+          args.asset_id,
+          args.expected_previous_version
+        ) as Row | undefined;
+      this.db.exec("COMMIT");
+      if (updated === undefined) return undefined;
+      return assetFromRow(updated);
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * Read all version rows for one asset, ordered
+   * by `version ASC` so the audit trail reads in
+   * append order.
+   */
+  listAssetVersions(assetId: string): AssetVersionRow[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM asset_versions WHERE asset_id = ? ORDER BY version ASC"
+      )
+      .all(assetId) as Row[];
+    return rows.map((r) => assetVersionFromRow(r));
+  }
+
+  /**
+   * Read the type-specific binding for a single
+   * (asset_id, version). Returns `undefined` for
+   * `memory_ref` assets that have no row (the
+   * asset is the envelope only — no body is
+   * duplicated). The service uses this to surface
+   * the binding on inspection.
+   */
+  getMemoryRefBinding(
+    assetId: string,
+    version: number
+  ): MemoryRefBindingRow | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT * FROM memory_ref_bindings WHERE asset_id = ? AND version = ?"
+      )
+      .get(assetId, version) as Row | undefined;
+    if (row === undefined) return undefined;
+    return memoryRefBindingFromRow(row);
+  }
+
+  /**
+   * Insert one memory_ref binding row. The
+   * composite primary key on (asset_id, version)
+   * guarantees no duplicate binding per version;
+   * a v2 of the same asset reuses the same
+   * `asset_id` but bumps `version`, and the new
+   * row is a fresh binding.
+   */
+  insertMemoryRefBinding(row: MemoryRefBindingRow): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO memory_ref_bindings (
+            asset_id, version, memory_id, memory_revision, binding_rule, note
+          ) VALUES (?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          row.asset_id,
+          row.version,
+          row.memory_id,
+          row.memory_revision,
+          row.binding_rule,
+          row.note
+        );
+      return true;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * Flip the envelope's `lifecycle_state`. The
+   * `archived_at` column is set when the new
+   * state is `archived`, cleared when it is
+   * anything else. The operation only succeeds
+   * when the current state matches
+   * `expected_state` (CAS); concurrent lifecycle
+   * mutations are detected as `undefined`.
+   */
+  setAssetLifecycle(args: {
+    asset_id: string;
+    expected_state: AssetLifecycleState;
+    new_state: AssetLifecycleState;
+    now: string;
+  }): AssetRow | undefined {
+    const archivedAt = args.new_state === "archived" ? args.now : null;
+    const updated = this.db
+      .prepare(
+        `UPDATE assets
+            SET lifecycle_state = ?,
+                archived_at = ?,
+                updated_at = ?
+          WHERE asset_id = ? AND lifecycle_state = ?
+          RETURNING *`
+      )
+      .get(
+        args.new_state,
+        archivedAt,
+        args.now,
+        args.asset_id,
+        args.expected_state
+      ) as Row | undefined;
+    if (updated === undefined) return undefined;
+    return assetFromRow(updated);
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #53): insert one
+   * `skills` row. The composite primary key on
+   * `(asset_id, version)` guarantees no duplicate
+   * row per version; a v2 of the same asset reuses
+   * the same `asset_id` but bumps `version`, and
+   * the new row is a fresh body. Returns `false`
+   * on a UNIQUE collision (caller is racing an
+   * append or has a stale `version`). All other
+   * errors propagate.
+   */
+  insertSkillRow(row: SkillRow): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO skills (
+            asset_id, version, name, description, schema_version,
+            category, triggers_json, when_to_use, when_not_to_use,
+            compatibility_json, source, skill_md_canonical, body_hash,
+            resources_json
+          ) VALUES (
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?
+          )`
+        )
+        .run(
+          row.asset_id,
+          row.version,
+          row.name,
+          row.description,
+          row.schema_version,
+          row.category,
+          row.triggers_json,
+          row.when_to_use,
+          row.when_not_to_use,
+          row.compatibility_json,
+          row.source,
+          row.skill_md_canonical,
+          row.body_hash,
+          row.resources_json
+        );
+      return true;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #53): read one
+   * `skills` row by `(asset_id, version)`.
+   * Returns `undefined` for `skill` assets that
+   * have no row (the asset envelope exists but
+   * the type-specific body has not been
+   * materialised yet — should not happen in
+   * practice; the `SkillService` always writes
+   * the row inside the same transaction as the
+   * `asset_versions` append).
+   */
+  getSkillRow(assetId: string, version: number): SkillRow | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT * FROM skills WHERE asset_id = ? AND version = ?"
+      )
+      .get(assetId, version) as Row | undefined;
+    if (row === undefined) return undefined;
+    return skillFromRow(row);
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #53): list skill rows
+   * whose `name` matches the SQL LIKE `pattern`.
+   * The pattern is passed through verbatim (callers
+   * are responsible for any escaping they need; the
+   * underlying column is the kebab-case name). The
+   * list is ordered by `name ASC, asset_id ASC,
+   * version ASC` so the iteration is stable and the
+   * head (largest version) is the LAST row per
+   * `asset_id`. The result is NOT asset-id-
+   * deduplicated; callers that want a flat summary
+   * can pick the head in the service layer.
+   */
+  listSkillRows(pattern: string, limit: number): SkillRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM skills
+          WHERE name LIKE ?
+          ORDER BY name ASC, asset_id ASC, version ASC
+          LIMIT ?`
+      )
+      .all(pattern, limit) as Row[];
+    return rows.map((r) => skillFromRow(r));
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #53): list skill rows
+   * whose `body_hash` matches the supplied
+   * `sha256:hex64` value. Used to look up "do we
+   * already have this exact skill body?" before
+   * inserting. Ordered newest-first by `(asset_id,
+   * version)`. Limit defaults to 50 to keep the
+   * call bounded; callers should pass an explicit
+   * limit if they need a different cap.
+   */
+  listSkillRowsByHash(bodyHash: string, limit: number): SkillRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM skills
+          WHERE body_hash = ?
+          ORDER BY asset_id ASC, version ASC
+          LIMIT ?`
+      )
+      .all(bodyHash, limit) as Row[];
+    return rows.map((r) => skillFromRow(r));
+  }
+
+  // ============================================================
+  // v1.2.0-alpha.2 (issue #54): bootstrap + external_references
+  // ============================================================
+
+  /**
+   * Upsert a bootstrap source row. The
+   * `(scope, project_id, canonical_ref)` triple is
+   * the natural key — re-configuring an existing
+   * source is idempotent. Returns the persisted row
+   * (either the inserted one or the pre-existing one).
+   * A unique-key collision that does not match the
+   * natural key is treated as `undefined` so the
+   * caller can surface a stable error.
+   */
+  upsertBootstrapSource(row: BootstrapSourceRow): BootstrapSourceRow | undefined {
+    const existing = this.db
+      .prepare(
+        `SELECT * FROM bootstrap_sources
+           WHERE scope = ? AND project_id IS ? AND canonical_ref = ?`
+      )
+      .get(row.scope, row.project_id, row.canonical_ref) as Row | undefined;
+    if (existing !== undefined) {
+      return bootstrapSourceFromRow(existing);
+    }
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO bootstrap_sources (
+            source_id, source_kind, scope, project_id, canonical_ref,
+            source_version, content_digest, sensitivity,
+            configured_by_actor_id, created_at, last_scanned_at, size_bytes
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          row.source_id,
+          row.source_kind,
+          row.scope,
+          row.project_id,
+          row.canonical_ref,
+          row.source_version,
+          row.content_digest,
+          row.sensitivity,
+          row.configured_by_actor_id,
+          row.created_at,
+          row.last_scanned_at,
+          row.size_bytes
+        );
+      return row;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) return undefined;
+      throw error;
+    }
+  }
+
+  /**
+   * Read all configured sources for a project (or
+   * the global scope when `project_id === null`).
+   * The order is `created_at ASC` so a re-scan
+   * produces a stable source_set_digest.
+   */
+  listBootstrapSources(filter: {
+    scope: "global" | "project";
+    project_id: string | null;
+  }): BootstrapSourceRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM bootstrap_sources
+           WHERE scope = ? AND project_id IS ?
+           ORDER BY created_at ASC, source_id ASC`
+      )
+      .all(filter.scope, filter.project_id) as Row[];
+    return rows.map(bootstrapSourceFromRow);
+  }
+
+  /**
+   * Read one source by id.
+   */
+  getBootstrapSource(sourceId: string): BootstrapSourceRow | undefined {
+    const row = this.db
+      .prepare(`SELECT * FROM bootstrap_sources WHERE source_id = ?`)
+      .get(sourceId) as Row | undefined;
+    if (row === undefined) return undefined;
+    return bootstrapSourceFromRow(row);
+  }
+
+  /**
+   * Update the `content_digest`, `last_scanned_at`
+   * and `size_bytes` of an existing source.
+   * Returns the updated row or `undefined` when the
+   * source has been removed concurrently.
+   */
+  updateBootstrapSourceScan(args: {
+    source_id: string;
+    content_digest: string;
+    last_scanned_at: string;
+    size_bytes: number | null;
+  }): BootstrapSourceRow | undefined {
+    const updated = this.db
+      .prepare(
+        `UPDATE bootstrap_sources
+            SET content_digest = ?,
+                last_scanned_at = ?,
+                size_bytes = ?
+          WHERE source_id = ?
+          RETURNING *`
+      )
+      .get(
+        args.content_digest,
+        args.last_scanned_at,
+        args.size_bytes,
+        args.source_id
+      ) as Row | undefined;
+    if (updated === undefined) return undefined;
+    return bootstrapSourceFromRow(updated);
+  }
+
+  /**
+   * Insert a fresh plan row. The plan_id is the
+   * primary key; a collision returns `false` so the
+   * caller can retry. The plan starts in `draft`
+   * state; the scan/apply verbs transition it.
+   */
+  insertBootstrapPlan(row: BootstrapPlanRow): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO bootstrap_plans (
+            plan_id, project_id, creator_actor_id, state,
+            config_digest, source_set_digest,
+            created_at, expires_at, completed_at, job_id
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          row.plan_id,
+          row.project_id,
+          row.creator_actor_id,
+          row.state,
+          row.config_digest,
+          row.source_set_digest,
+          row.created_at,
+          row.expires_at,
+          row.completed_at,
+          row.job_id
+        );
+      return true;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * CAS-update a plan's state. The `expected_state`
+   * guard makes concurrent transitions detectable.
+   * When the plan is not in `expected_state`, returns
+   * `undefined` and the caller surfaces a stable
+   * `cas_mismatch` error.
+   */
+  setBootstrapPlanState(args: {
+    plan_id: string;
+    expected_state: BootstrapPlanState;
+    new_state: BootstrapPlanState;
+    completed_at?: string | null;
+    job_id?: string | null;
+  }): BootstrapPlanRow | undefined {
+    const sets: string[] = ["state = ?"];
+    const params: Array<string | number | null> = [args.new_state];
+    if (args.completed_at !== undefined) {
+      sets.push("completed_at = ?");
+      params.push(args.completed_at);
+    }
+    if (args.job_id !== undefined) {
+      sets.push("job_id = ?");
+      params.push(args.job_id);
+    }
+    params.push(args.plan_id, args.expected_state);
+    const updated = this.db
+      .prepare(
+        `UPDATE bootstrap_plans
+            SET ${sets.join(", ")}
+          WHERE plan_id = ? AND state = ?
+          RETURNING *`
+      )
+      .get(...params) as Row | undefined;
+    if (updated === undefined) return undefined;
+    return bootstrapPlanFromRow(updated);
+  }
+
+  /**
+   * Read a plan by id.
+   */
+  getBootstrapPlan(planId: string): BootstrapPlanRow | undefined {
+    const row = this.db
+      .prepare(`SELECT * FROM bootstrap_plans WHERE plan_id = ?`)
+      .get(planId) as Row | undefined;
+    if (row === undefined) return undefined;
+    return bootstrapPlanFromRow(row);
+  }
+
+  /**
+   * List plans for a project (or global scope when
+   * `project_id === null`). Newest-first.
+   */
+  listBootstrapPlans(filter: {
+    project_id: string;
+    state?: BootstrapPlanState;
+    limit?: number;
+  }): BootstrapPlanRow[] {
+    const clauses: string[] = ["project_id = ?"];
+    const params: Array<string | number> = [filter.project_id];
+    if (filter.state !== undefined) {
+      clauses.push("state = ?");
+      params.push(filter.state);
+    }
+    const limit = filter.limit ?? 50;
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM bootstrap_plans
+           WHERE ${clauses.join(" AND ")}
+           ORDER BY created_at DESC LIMIT ?`
+      )
+      .all(...params, limit) as Row[];
+    return rows.map(bootstrapPlanFromRow);
+  }
+
+  /**
+   * Bulk-insert plan items. The order of the
+   * input array becomes the `item_seq` (1-based).
+   * The whole insert is wrapped in a single
+   * `BEGIN IMMEDIATE` so an item-rejected insert
+   * rolls back the entire batch.
+   */
+  insertBootstrapPlanItems(
+    items: ReadonlyArray<BootstrapPlanItemRow>
+  ): void {
+    if (items.length === 0) return;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const stmt = this.db.prepare(
+        `INSERT INTO bootstrap_plan_items (
+          plan_id, source_id, item_seq, action, target_ref,
+          proposed_payload_json, evidence_digest,
+          expected_revision_or_version, risk, rationale
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+      for (const it of items) {
+        stmt.run(
+          it.plan_id,
+          it.source_id,
+          it.item_seq,
+          it.action,
+          it.target_ref,
+          it.proposed_payload_json,
+          it.evidence_digest,
+          it.expected_revision_or_version,
+          it.risk,
+          it.rationale
+        );
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * List the items of a plan, ordered by `item_seq ASC`.
+   */
+  listBootstrapPlanItems(planId: string): BootstrapPlanItemRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM bootstrap_plan_items
+           WHERE plan_id = ?
+           ORDER BY item_seq ASC`
+      )
+      .all(planId) as Row[];
+    return rows.map(bootstrapPlanItemFromRow);
+  }
+
+  /**
+   * Insert an `external_reference` row. The
+   * `(asset_id, version)` pair is the primary key
+   * (composite with `assets`).
+   */
+  insertExternalReference(row: ExternalReferenceRow): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO external_references (
+            asset_id, version, provider_kind, provider_instance_id,
+            resource_kind, resource_ref, uri,
+            source_version, source_digest, retrieval_contract_version,
+            capabilities_json, allowed_scope, project_id, sensitivity,
+            refresh_policy_json, last_verified_at, metadata_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          row.asset_id,
+          row.version,
+          row.provider_kind,
+          row.provider_instance_id,
+          row.resource_kind,
+          row.resource_ref,
+          row.uri,
+          row.source_version,
+          row.source_digest,
+          row.retrieval_contract_version,
+          row.capabilities_json,
+          row.allowed_scope,
+          row.project_id,
+          row.sensitivity,
+          row.refresh_policy_json,
+          row.last_verified_at,
+          row.metadata_json
+        );
+      return true;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * Read the latest `external_references` row for an
+   * asset (the row whose `version` is the head).
+   */
+  getLatestExternalReference(assetId: string): ExternalReferenceRow | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM external_references
+           WHERE asset_id = ?
+           ORDER BY version DESC LIMIT 1`
+      )
+      .get(assetId) as Row | undefined;
+    if (row === undefined) return undefined;
+    return externalReferenceFromRow(row);
+  }
+
+  /**
+   * List `external_references` rows, optionally
+   * filtered by `provider_kind` / `allowed_scope` /
+   * `project_id`. Newest-first by `version DESC`.
+   */
+  listExternalReferences(filter: {
+    provider_kind?: string;
+    allowed_scope?: "global" | "project";
+    project_id?: string;
+    limit?: number;
+  }): ExternalReferenceRow[] {
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (filter.provider_kind !== undefined) {
+      clauses.push("provider_kind = ?");
+      params.push(filter.provider_kind);
+    }
+    if (filter.allowed_scope !== undefined) {
+      clauses.push("allowed_scope = ?");
+      params.push(filter.allowed_scope);
+    }
+    if (filter.project_id !== undefined) {
+      clauses.push("project_id = ?");
+      params.push(filter.project_id);
+    }
+    const where = clauses.length === 0 ? "" : " WHERE " + clauses.join(" AND ");
+    const limit = filter.limit ?? 50;
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM external_references${where}
+           ORDER BY version DESC LIMIT ?`
+      )
+      .all(...params, limit) as Row[];
+    return rows.map(externalReferenceFromRow);
+  }
+
+  /**
+   * Refresh `last_verified_at` on the head
+   * `external_references` row for an asset. The
+   * `expected_version` guard makes concurrent
+   * version appends detectable; returns `undefined`
+   * on CAS failure.
+   */
+  refreshExternalReferenceLastVerified(args: {
+    asset_id: string;
+    expected_version: number;
+    now: string;
+  }): ExternalReferenceRow | undefined {
+    const updated = this.db
+      .prepare(
+        `UPDATE external_references
+            SET last_verified_at = ?
+          WHERE asset_id = ? AND version = ?
+          RETURNING *`
+      )
+      .get(args.now, args.asset_id, args.expected_version) as Row | undefined;
+    if (updated === undefined) return undefined;
+    return externalReferenceFromRow(updated);
+  }
+
   close(): void {
     this.db.close();
   }
@@ -962,6 +3595,46 @@ export class SQLiteMemoryStore {
     }
     if (version === 13) {
       this.migrate_v12_to_v13();
+      return;
+    }
+    if (version === 14) {
+      this.migrate_v13_to_v14();
+      return;
+    }
+    if (version === 15) {
+      this.migrate_v14_to_v15();
+      return;
+    }
+    if (version === 16) {
+      this.migrate_v15_to_v16();
+      return;
+    }
+    if (version === 17) {
+      // v17 (v1.2.0-alpha.2, issue #50): the session
+      // distillation candidate tables. Additive; does
+      // not touch any prior table.
+      this.migrate_v16_to_v17();
+      return;
+    }
+    if (version === 18) {
+      // v18 (v1.2.0-alpha.2, issue #52): the agent
+      // loadout tables. Additive; does not touch any
+      // prior table.
+      this.migrate_v17_to_v18();
+      return;
+    }
+    if (version === 19) {
+      // v19 (v1.2.0-alpha.2, issue #53) is the additive
+      // `skills` type-specific table.
+      this.migrate_v18_to_v19();
+      return;
+    }
+    if (version === 20) {
+      // v20 (v1.2.0-alpha.2, issue #54): the cold-start
+      // bootstrap surface. Four additive tables —
+      // `bootstrap_sources`, `bootstrap_plans`,
+      // `bootstrap_plan_items`, `external_references`.
+      this.migrate_v19_to_v20();
       return;
     }
     throw new Error(`No migration registered for schema version ${version}`);
@@ -1789,6 +4462,775 @@ export class SQLiteMemoryStore {
         "TEXT NOT NULL DEFAULT '{}'"
       );
       this.db.exec("PRAGMA user_version = 13");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * v1.2.0-alpha.0 (issue #48): v13 -> v14 schema
+   * migration. Introduces the durable derivation job
+   * substrate (`derivation_jobs` / `derivation_runs` /
+   * `derivation_outputs`) that backs every
+   * provider-backed / multi-stage / cancellable
+   * pipeline introduced in v1.2 (session distillation,
+   * skill extraction, cold-start bootstrap,
+   * external-reference refresh). The tables are
+   * strictly additive — no existing column or index is
+   * altered, no v13 table is renamed. The migration is
+   * fully transactional; on any throw the user_version
+   * stays at 13 and the database is untouched.
+   *
+   * Schema invariants (mirrored in `docs/adr/0009-`):
+   *  - `derivation_jobs` is the single source of truth
+   *    for a derivation request; the UNIQUE constraint
+   *    on `(creator_actor_id, kind, idempotency_key)` is
+   *    the contract that makes `enqueue` a replayable
+   *    operation (issue #48 AC #3).
+   *  - `derivation_runs` is the per-stage audit row. A
+   *    row in `started` state is the durable proof that
+   *    a worker is mid-flight; the `started` -> terminal
+   *    transition is the only state change that
+   *    `checkpoint` commits.
+   *  - `derivation_outputs` is the lineage surface that
+   *    connects a job to the memory / asset / plan rows
+   *    it produced. The composite primary key on
+   *    `(job_id, output_kind, output_id)` ensures
+   *    `disposition='applied'` is unique per job so a
+   *    reap takeover cannot write the same applied row
+   *    twice (issue #48 AC #2 + #5).
+   *  - All three tables use `INTEGER` for timestamps in
+   *    Unix milliseconds (matching the rest of the v1.2
+   *    surface; differs from v13's `TEXT` ISO 8601 on
+   *    `import_batches` because the derivation pipeline
+   *    drives numeric TTL math in the lease logic).
+   */
+  private migrate_v13_to_v14(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS derivation_jobs (
+          job_id              TEXT PRIMARY KEY,
+          kind                TEXT NOT NULL,
+          state               TEXT NOT NULL
+                                 CHECK (state IN ('queued','running','succeeded','failed','cancelled')),
+          scope               TEXT NOT NULL
+                                 CHECK (scope IN ('global','project')),
+          project_id          TEXT,
+          creator_actor_id    TEXT NOT NULL,
+          idempotency_key     TEXT NOT NULL,
+          input_digest        TEXT NOT NULL,
+          config_digest       TEXT NOT NULL,
+          cursor_json         TEXT NOT NULL DEFAULT '{}',
+          attempt_count       INTEGER NOT NULL DEFAULT 0,
+          lease_owner         TEXT,
+          lease_expires_at    INTEGER,
+          cancel_requested_at INTEGER,
+          next_retry_at       INTEGER,
+          error_code          TEXT,
+          redacted_error      TEXT,
+          created_at          INTEGER NOT NULL,
+          started_at          INTEGER,
+          updated_at          INTEGER NOT NULL,
+          finished_at         INTEGER,
+          UNIQUE (creator_actor_id, kind, idempotency_key)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_derivation_jobs_state_next_retry
+          ON derivation_jobs(state, next_retry_at);
+        CREATE INDEX IF NOT EXISTS idx_derivation_jobs_lease
+          ON derivation_jobs(lease_expires_at)
+          WHERE state = 'running';
+        CREATE INDEX IF NOT EXISTS idx_derivation_jobs_creator_state
+          ON derivation_jobs(creator_actor_id, state);
+        CREATE INDEX IF NOT EXISTS idx_derivation_jobs_kind
+          ON derivation_jobs(kind, state);
+
+        CREATE TABLE IF NOT EXISTS derivation_runs (
+          run_id                 TEXT PRIMARY KEY,
+          job_id                 TEXT NOT NULL
+                                   REFERENCES derivation_jobs(job_id) ON DELETE CASCADE,
+          stage                  TEXT NOT NULL,
+          status                 TEXT NOT NULL
+                                   CHECK (status IN ('started','succeeded','failed','cancelled')),
+          input_refs_json        TEXT NOT NULL DEFAULT '[]',
+          output_refs_json       TEXT NOT NULL DEFAULT '[]',
+          provider_id            TEXT,
+          model_id               TEXT,
+          prompt_template_version TEXT,
+          prompt_hash            TEXT,
+          policy_version         TEXT NOT NULL,
+          result_digest          TEXT,
+          started_at             INTEGER NOT NULL,
+          finished_at            INTEGER
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_derivation_runs_job_stage
+          ON derivation_runs(job_id, stage);
+        CREATE INDEX IF NOT EXISTS idx_derivation_runs_job_status
+          ON derivation_runs(job_id, status);
+
+        CREATE TABLE IF NOT EXISTS derivation_outputs (
+          job_id        TEXT NOT NULL
+                          REFERENCES derivation_jobs(job_id) ON DELETE CASCADE,
+          run_id        TEXT NOT NULL
+                          REFERENCES derivation_runs(run_id) ON DELETE CASCADE,
+          output_kind   TEXT NOT NULL
+                          CHECK (output_kind IN
+                            ('candidate','skill_draft','bootstrap_plan',
+                             'external_ref','applied_memory','applied_asset')),
+          output_id     TEXT NOT NULL,
+          disposition   TEXT NOT NULL
+                          CHECK (disposition IN ('proposed','applied','rejected','superseded')),
+          created_at    INTEGER NOT NULL,
+          PRIMARY KEY (job_id, output_kind, output_id)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_derivation_outputs_job_disposition
+          ON derivation_outputs(job_id, disposition);
+        CREATE INDEX IF NOT EXISTS idx_derivation_outputs_run
+          ON derivation_outputs(run_id);
+      `);
+      this.db.exec("PRAGMA user_version = 14");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * v1.2.0-alpha.1 (issue #49): v14 -> v15 schema
+   * migration. Introduces the session evidence
+   * substrate (`sessions` / `session_events` /
+   * `session_event_blobs`). The tables are
+   * strictly additive — no v14 column or index
+   * is altered, no derivation job row is renamed.
+   * The migration is fully transactional; on any
+   * throw the user_version stays at 14 and the
+   * database is untouched.
+   *
+   * Schema invariants (mirrored in
+   * `docs/adr/0011-session-evidence-lifecycle.md`):
+   *  - `sessions` is the canonical identity for a
+   *    captured trace. The UNIQUE constraint on
+   *    `(source_kind, source_version,
+   *    source_instance_id, source_session_id)` is
+   *    the contract that makes `ingest` a
+   *    replayable operation (issue #49 AC #1).
+   *  - `session_events.event_id` is the
+   *    adapter-stable identity supplied by the
+   *    source (OpenCode lifecycle hook, JSONL
+   *    fixture, ...); the row is the canonical
+   *    durable record.
+   *  - `session_event_blobs` is the
+   *    content-addressed body cache. SQLite is
+   *    still the authoritative manifest / index;
+   *    large bodies live in a content-addressed
+   *    local file (head + tail 1KB slices are
+   *    kept in-row for inspection; the full body
+   *    is resolved on demand).
+   *  - All three tables use `TEXT` ISO 8601 for
+   *    timestamps (matching the v13 portability
+   *    surface and the rest of the recall layer).
+   */
+  private migrate_v14_to_v15(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS sessions (
+          session_id              TEXT PRIMARY KEY,
+          source_kind             TEXT NOT NULL,
+          source_version          TEXT NOT NULL,
+          source_instance_id      TEXT NOT NULL,
+          source_session_id       TEXT NOT NULL,
+          scope                   TEXT NOT NULL
+                                     CHECK (scope IN ('global', 'project')),
+          project_id              TEXT,
+          actor_id                TEXT NOT NULL,
+          client_name             TEXT NOT NULL,
+          client_version          TEXT NOT NULL,
+          started_at              TEXT NOT NULL,
+          ended_at                TEXT,
+          sensitivity             TEXT NOT NULL
+                                     CHECK (sensitivity IN ('normal', 'private', 'restricted')),
+          bundle_hash             TEXT NOT NULL,
+          adapter_id              TEXT NOT NULL,
+          adapter_version         TEXT NOT NULL,
+          ingestion_plan_json     TEXT NOT NULL,
+          redaction_summary_json  TEXT NOT NULL,
+          ingested_at             TEXT NOT NULL,
+          retention_until         TEXT,
+          UNIQUE (source_kind, source_version, source_instance_id, source_session_id)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_project
+          ON sessions(scope, project_id);
+        CREATE INDEX IF NOT EXISTS idx_sessions_source_session
+          ON sessions(source_session_id);
+        CREATE INDEX IF NOT EXISTS idx_sessions_ingested_at
+          ON sessions(ingested_at);
+
+        CREATE TABLE IF NOT EXISTS session_events (
+          event_id                TEXT PRIMARY KEY,
+          session_id              TEXT NOT NULL
+                                     REFERENCES sessions(session_id) ON DELETE CASCADE,
+          sequence                INTEGER NOT NULL,
+          turn_id                 TEXT NOT NULL,
+          event_type              TEXT NOT NULL,
+          role                    TEXT,
+          content_digest          TEXT NOT NULL,
+          content_blob_ref        TEXT,
+          tool_name               TEXT,
+          tool_call_id            TEXT,
+          tool_status             TEXT,
+          timestamp               TEXT NOT NULL,
+          sensitivity             TEXT NOT NULL
+                                     CHECK (sensitivity IN ('normal', 'private', 'restricted')),
+          redaction_flags_json    TEXT NOT NULL DEFAULT '[]',
+          metadata_json           TEXT NOT NULL DEFAULT '{}',
+          UNIQUE (session_id, sequence)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_session_events_session_seq
+          ON session_events(session_id, sequence);
+        CREATE INDEX IF NOT EXISTS idx_session_events_ts
+          ON session_events(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_session_events_event_type
+          ON session_events(event_type);
+
+        CREATE TABLE IF NOT EXISTS session_event_blobs (
+          digest                  TEXT PRIMARY KEY,
+          size_bytes              INTEGER NOT NULL,
+          media_type              TEXT NOT NULL,
+          head_bytes              BLOB NOT NULL,
+          tail_bytes              BLOB NOT NULL,
+          head_tail_window_json   TEXT NOT NULL,
+          stored_at               TEXT NOT NULL
+        ) STRICT;
+      `);
+      this.db.exec("PRAGMA user_version = 15");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * v1.2.0-alpha.1 (issue #51): v15 -> v16 schema
+   * migration. Introduces the additive asset
+   * registry. The envelope tables (`assets` /
+   * `asset_versions` / `asset_relations`) cover
+   * all four type variants; the only v16-shipped
+   * type-specific table is `memory_ref_bindings`
+   * (the `memory_ref` asset is the only type that
+   * already has a Phase 1 use case — the
+   * `memory_entries` row is the authoritative
+   * body, the binding is a typed pointer). The
+   * `skills` / `context_packs` / `external_references`
+   * type-specific tables land with their owning
+   * Phase 2 issues (#53 / #54) in subsequent
+   * migrations; the envelope schema is forward-
+   * compatible.
+   *
+   * Schema invariants (mirrored in
+   * `docs/adr/0010-asset-registry.md`):
+   *  - `assets.current_version` is the head;
+   *    new versions append monotonically and
+   *    `asset_versions.content_hash` is the
+   *    SHA-256 over the canonicalised type-
+   *    specific payload.
+   *  - `asset_relations` is directional; the
+   *    CHECK constraint ensures the relation
+   *    has exactly one of `to_asset_id` or
+   *    `external_target_ref`.
+   *  - `memory_ref_bindings` is the only v16
+   *    type-specific table. The binding is
+   *    immutable: a new version appends a row,
+   *    the previous version stays.
+   */
+  private migrate_v15_to_v16(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS assets (
+          asset_id        TEXT PRIMARY KEY,
+          asset_type      TEXT NOT NULL
+                            CHECK (asset_type IN
+                              ('memory_ref','skill','context_pack','external_reference')),
+          scope           TEXT NOT NULL
+                            CHECK (scope IN ('global','project')),
+          project_id      TEXT,
+          owner_actor_id  TEXT NOT NULL,
+          lifecycle_state TEXT NOT NULL
+                            CHECK (lifecycle_state IN
+                              ('draft','active','deprecated','archived')),
+          current_version INTEGER NOT NULL DEFAULT 0,
+          trust_level     TEXT NOT NULL
+                            CHECK (trust_level IN
+                              ('user_confirmed','agent_observed','inferred')),
+          sensitivity     TEXT NOT NULL
+                            CHECK (sensitivity IN ('normal','private','restricted')),
+          metadata_json   TEXT NOT NULL DEFAULT '{}',
+          created_at      TEXT NOT NULL,
+          updated_at      TEXT NOT NULL,
+          archived_at     TEXT,
+          CHECK (scope = 'project' AND project_id IS NOT NULL
+                 OR scope = 'global' AND project_id IS NULL),
+          CHECK (lifecycle_state != 'archived' OR archived_at IS NOT NULL)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_assets_type_state
+          ON assets(asset_type, lifecycle_state);
+        CREATE INDEX IF NOT EXISTS idx_assets_scope_project
+          ON assets(scope, project_id);
+        CREATE INDEX IF NOT EXISTS idx_assets_owner
+          ON assets(owner_actor_id, updated_at);
+
+        CREATE TABLE IF NOT EXISTS asset_versions (
+          asset_id            TEXT NOT NULL
+                                REFERENCES assets(asset_id) ON DELETE CASCADE,
+          version             INTEGER NOT NULL,
+          schema_version      TEXT NOT NULL,
+          content_hash        TEXT NOT NULL,
+          manifest_json       TEXT NOT NULL,
+          created_by_actor_id TEXT NOT NULL,
+          provenance_kind     TEXT
+                                CHECK (provenance_kind IN
+                                  ('derivation_run','import_batch','manual','external')
+                                  OR provenance_kind IS NULL),
+          provenance_ref      TEXT,
+          created_at          TEXT NOT NULL,
+          PRIMARY KEY (asset_id, version),
+          CHECK (version > 0)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_asset_versions_hash
+          ON asset_versions(content_hash);
+        CREATE INDEX IF NOT EXISTS idx_asset_versions_provenance
+          ON asset_versions(provenance_kind, provenance_ref);
+
+        CREATE TABLE IF NOT EXISTS asset_relations (
+          from_asset_id        TEXT NOT NULL
+                                 REFERENCES assets(asset_id) ON DELETE CASCADE,
+          relation_type        TEXT NOT NULL,
+          to_asset_id          TEXT
+                                 REFERENCES assets(asset_id) ON DELETE CASCADE,
+          external_target_ref  TEXT,
+          metadata_json        TEXT NOT NULL DEFAULT '{}',
+          created_at           TEXT NOT NULL,
+          CHECK ((to_asset_id IS NOT NULL) <> (external_target_ref IS NOT NULL))
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_asset_relations_from
+          ON asset_relations(from_asset_id, relation_type);
+        CREATE INDEX IF NOT EXISTS idx_asset_relations_to
+          ON asset_relations(to_asset_id);
+        CREATE INDEX IF NOT EXISTS idx_asset_relations_external
+          ON asset_relations(external_target_ref)
+          WHERE external_target_ref IS NOT NULL;
+
+        CREATE TABLE IF NOT EXISTS memory_ref_bindings (
+          asset_id        TEXT NOT NULL
+                            REFERENCES assets(asset_id) ON DELETE CASCADE,
+          version         INTEGER NOT NULL,
+          memory_id       TEXT NOT NULL
+                            REFERENCES memory_entries(id) ON DELETE RESTRICT,
+          memory_revision INTEGER NOT NULL,
+          binding_rule    TEXT,
+          note            TEXT,
+          PRIMARY KEY (asset_id, version),
+          CHECK (version > 0),
+          CHECK (memory_revision > 0)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_memory_ref_bindings_memory
+          ON memory_ref_bindings(memory_id, memory_revision);
+      `);
+      this.db.exec("PRAGMA user_version = 16");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #50): the session-to-memory
+   * distillation pipeline. Three additive tables —
+   * `derivation_candidates`, `candidate_evidence`,
+   * `candidate_actions` — back the reviewable
+   * memory / episode / skill-candidate proposals
+   * produced by the deterministic baseline extractor
+   * (and any future provider-backed extractor).
+   * The candidate row's `state` is a small state
+   * machine (`proposed` -> `accepted` -> `applied` or
+   * `rejected` / `stale`); the row's
+   * `expected_target_revision` is the CAS guard for
+   * the `apply` step. The migration is fully
+   * transactional; on any throw the user_version
+   * stays at 16 and the database is untouched. All
+   * DDL is `IF NOT EXISTS` so the migration is
+   * idempotent against re-runs.
+   */
+  private migrate_v16_to_v17(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS derivation_candidates (
+          candidate_id              TEXT PRIMARY KEY,
+          job_id                    TEXT NOT NULL REFERENCES derivation_jobs(job_id) ON DELETE CASCADE,
+          run_id                    TEXT NOT NULL REFERENCES derivation_runs(run_id) ON DELETE CASCADE,
+          candidate_kind            TEXT NOT NULL
+                                        CHECK (candidate_kind IN ('memory','episode','skill_candidate')),
+          proposed_type             TEXT,
+          proposed_topic            TEXT,
+          proposed_title            TEXT,
+          proposed_body             TEXT,
+          proposed_tags_json        TEXT NOT NULL DEFAULT '[]',
+          proposed_scope            TEXT NOT NULL
+                                        CHECK (proposed_scope IN ('global','project')),
+          proposed_project_id       TEXT,
+          proposed_tier             TEXT NOT NULL DEFAULT 'working'
+                                        CHECK (proposed_tier IN ('working')),
+          proposed_trust_level      TEXT NOT NULL DEFAULT 'inferred'
+                                        CHECK (proposed_trust_level IN ('inferred','agent_observed')),
+          proposed_sensitivity      TEXT NOT NULL
+                                        CHECK (proposed_sensitivity IN ('normal')),
+          confidence                REAL NOT NULL,
+          state                     TEXT NOT NULL
+                                        CHECK (state IN ('proposed','accepted','rejected','applied','stale')),
+          extractor_id              TEXT NOT NULL,
+          extractor_version         TEXT NOT NULL,
+          content_hash              TEXT NOT NULL,
+          created_at                INTEGER NOT NULL,
+          reviewed_at               INTEGER,
+          reviewed_by_actor_id      TEXT,
+          applied_at                INTEGER,
+          expected_target_revision  INTEGER,
+          CHECK (state = 'applied' OR applied_at IS NULL),
+          CHECK (proposed_scope = 'project' AND proposed_project_id IS NOT NULL
+                 OR proposed_scope = 'global' AND proposed_project_id IS NULL)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_candidates_job
+          ON derivation_candidates(job_id);
+        CREATE INDEX IF NOT EXISTS idx_candidates_state
+          ON derivation_candidates(state);
+
+        CREATE TABLE IF NOT EXISTS candidate_evidence (
+          candidate_id   TEXT NOT NULL REFERENCES derivation_candidates(candidate_id) ON DELETE CASCADE,
+          evidence_role  TEXT NOT NULL
+                              CHECK (evidence_role IN ('primary','supporting','context')),
+          session_id     TEXT,
+          event_id       TEXT,
+          message_id     TEXT,
+          tool_call_id   TEXT,
+          file_ref       TEXT,
+          excerpt_digest TEXT NOT NULL,
+          PRIMARY KEY (candidate_id, evidence_role, excerpt_digest)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_candidate_evidence_session
+          ON candidate_evidence(session_id);
+
+        CREATE TABLE IF NOT EXISTS candidate_actions (
+          candidate_id            TEXT NOT NULL REFERENCES derivation_candidates(candidate_id) ON DELETE CASCADE,
+          action                  TEXT NOT NULL
+                                      CHECK (action IN ('create','update','supersede','merge','skip')),
+          target_memory_ids_json  TEXT NOT NULL DEFAULT '[]',
+          expected_revisions_json TEXT NOT NULL DEFAULT '[]',
+          rationale               TEXT NOT NULL,
+          conflict_signals_json   TEXT NOT NULL DEFAULT '[]',
+          risk                    TEXT NOT NULL
+                                      CHECK (risk IN ('low','medium','high')),
+          PRIMARY KEY (candidate_id, action)
+        ) STRICT;
+      `);
+      this.db.exec("PRAGMA user_version = 17");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #52): the agent loadout
+   * substrate. Three additive tables — `agent_loadouts`,
+   * `loadout_rules`, `loadout_bindings` — back the
+   * policy-bound loadout surface that powers the
+   * `bootstrap` / `query` / `tool_only` channels of
+   * the context-assembly service.
+   *
+   * The `loadout_rules` table is keyed on
+   * `(loadout_id, version, channel)` so a
+   * `updateRules` call bumps the version and inserts a
+   * new immutable rule row in the same transaction;
+   * the `version` bump is what changes `bootstrap_hash`
+   * in the assembled context (the upstream prompt-cache
+   * key).
+   *
+   * The migration is fully transactional; on any throw
+   * the user_version stays at 17 and the database is
+   * untouched. All DDL is `IF NOT EXISTS` so the
+   * migration is idempotent against re-runs.
+   */
+  private migrate_v17_to_v18(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS agent_loadouts (
+          loadout_id        TEXT PRIMARY KEY,
+          name              TEXT NOT NULL,
+          version           INTEGER NOT NULL DEFAULT 1,
+          lifecycle_state   TEXT NOT NULL CHECK (lifecycle_state IN ('draft','active','deprecated','archived')),
+          match_actor_id    TEXT,
+          match_client_name TEXT,
+          scope             TEXT NOT NULL CHECK (scope IN ('global','project')),
+          project_id        TEXT,
+          task_mode         TEXT,
+          created_by_actor_id TEXT NOT NULL,
+          created_at        TEXT NOT NULL,
+          updated_at        TEXT NOT NULL,
+          CHECK (scope = 'project' AND project_id IS NOT NULL
+                 OR scope = 'global' AND project_id IS NULL)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_loadouts_scope
+          ON agent_loadouts(scope, project_id, lifecycle_state);
+        CREATE INDEX IF NOT EXISTS idx_loadouts_match
+          ON agent_loadouts(match_actor_id, match_client_name, task_mode);
+
+        CREATE TABLE IF NOT EXISTS loadout_rules (
+          loadout_id           TEXT NOT NULL REFERENCES agent_loadouts(loadout_id) ON DELETE CASCADE,
+          version              INTEGER NOT NULL,
+          channel              TEXT NOT NULL CHECK (channel IN ('bootstrap','query','tool_only')),
+          include_asset_ids_json   TEXT NOT NULL DEFAULT '[]',
+          include_memory_ids_json  TEXT NOT NULL DEFAULT '[]',
+          include_types_json       TEXT NOT NULL DEFAULT '[]',
+          include_tiers_json       TEXT NOT NULL DEFAULT '[]',
+          include_tags_json        TEXT NOT NULL DEFAULT '[]',
+          include_topics_json      TEXT NOT NULL DEFAULT '[]',
+          exclude_asset_ids_json   TEXT NOT NULL DEFAULT '[]',
+          exclude_memory_ids_json  TEXT NOT NULL DEFAULT '[]',
+          exclude_tags_json        TEXT NOT NULL DEFAULT '[]',
+          required_refs_json       TEXT NOT NULL DEFAULT '[]',
+          max_items               INTEGER NOT NULL DEFAULT 32,
+          max_chars               INTEGER NOT NULL DEFAULT 8000,
+          max_tokens              INTEGER,
+          timeout_ms              INTEGER NOT NULL DEFAULT 5000,
+          ordering_policy         TEXT NOT NULL DEFAULT 'rule_then_score',
+          PRIMARY KEY (loadout_id, version, channel),
+          CHECK (version > 0)
+        ) STRICT;
+
+        CREATE TABLE IF NOT EXISTS loadout_bindings (
+          binding_id       TEXT PRIMARY KEY,
+          loadout_id       TEXT NOT NULL REFERENCES agent_loadouts(loadout_id) ON DELETE CASCADE,
+          loadout_version  INTEGER NOT NULL,
+          actor_id         TEXT,
+          client_name      TEXT,
+          project_id       TEXT,
+          task_mode        TEXT,
+          priority         INTEGER NOT NULL DEFAULT 0,
+          created_at       TEXT NOT NULL
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_loadout_bindings_match
+          ON loadout_bindings(actor_id, client_name, project_id, task_mode, priority);
+      `);
+      this.db.exec("PRAGMA user_version = 18");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #53): v18 -> v19 schema
+   * migration. Introduces the additive `skills`
+   * type-specific table. The `skill` envelope
+   * row lives in `assets` (asset_type='skill'); the
+   * type-specific body, frontmatter, and content-
+   * addressed resources live here, keyed by
+   * `(asset_id, version)`. The asset envelope's
+   * `current_version` stays the source of truth
+   * for "which version is the head".
+   *
+   * Schema invariants (mirrored in
+   * `docs/adr/0010-asset-registry.md` and the v19
+   * section of the contracts):
+   *  - `skills.body_hash` is `sha256:hex64` over
+   *    `skill_md_canonical` (the canonicalised
+   *    SKILL.md bytes). It MUST equal the
+   *    `asset_versions.content_hash` of the same
+   *    `(asset_id, version)`. The schema does not
+   *    enforce the equality (SQLite cannot compare
+   *    across tables inside a CHECK); the
+   *    `SkillService` write path enforces it.
+   *  - `skills.source` is the strict 3-value enum
+   *    that matches `SkillAssetV1Schema.source`.
+   *  - `skills.name` is a kebab-case identifier
+   *    (the canonical contract is enforced by the
+   *    Zod schema in `packages/contracts`; the
+   *    CHECK is a last-line safety net).
+   *  - `skills.resources_json` is JSON; the shape
+   *    is validated by the Zod contract before
+   *    the row is inserted.
+   */
+  private migrate_v18_to_v19(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS skills (
+          asset_id           TEXT NOT NULL
+                               REFERENCES assets(asset_id) ON DELETE CASCADE,
+          version            INTEGER NOT NULL,
+          name               TEXT NOT NULL,
+          description        TEXT NOT NULL,
+          schema_version     TEXT NOT NULL,
+          category           TEXT,
+          triggers_json      TEXT NOT NULL DEFAULT '[]',
+          when_to_use        TEXT,
+          when_not_to_use    TEXT,
+          compatibility_json TEXT NOT NULL DEFAULT '{}',
+          source             TEXT NOT NULL
+                               CHECK (source IN ('manual','derived','imported')),
+          skill_md_canonical TEXT NOT NULL,
+          body_hash          TEXT NOT NULL,
+          resources_json     TEXT NOT NULL DEFAULT '[]',
+          PRIMARY KEY (asset_id, version),
+          CHECK (version > 0)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_skills_name
+          ON skills(name);
+        CREATE INDEX IF NOT EXISTS idx_skills_body_hash
+          ON skills(body_hash);
+      `);
+      this.db.exec("PRAGMA user_version = 19");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #54): v19 -> v20 schema
+   * migration. Four additive tables for the
+   * cold-start bootstrap surface —
+   * `bootstrap_sources`, `bootstrap_plans`,
+   * `bootstrap_plan_items`, `external_references`.
+   * The migration is fully transactional; on any
+   * throw the user_version stays at 19 and the
+   * database is untouched. All DDL is
+   * `IF NOT EXISTS` so the migration is idempotent
+   * against re-runs.
+   */
+  private migrate_v19_to_v20(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS bootstrap_sources (
+          source_id              TEXT PRIMARY KEY,
+          source_kind            TEXT NOT NULL
+                                  CHECK (source_kind IN
+                                    ('file','directory','git_metadata','session_bundle',
+                                     'memory_bundle','external_provider')),
+          scope                  TEXT NOT NULL
+                                  CHECK (scope IN ('global','project')),
+          project_id             TEXT,
+          canonical_ref          TEXT NOT NULL,
+          source_version         TEXT,
+          content_digest         TEXT NOT NULL,
+          sensitivity            TEXT NOT NULL
+                                  CHECK (sensitivity IN ('normal','private','restricted')),
+          configured_by_actor_id TEXT NOT NULL,
+          created_at             TEXT NOT NULL,
+          last_scanned_at        TEXT,
+          size_bytes             INTEGER
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_bootstrap_sources_project
+          ON bootstrap_sources(scope, project_id);
+
+        CREATE TABLE IF NOT EXISTS bootstrap_plans (
+          plan_id            TEXT PRIMARY KEY,
+          project_id         TEXT NOT NULL,
+          creator_actor_id   TEXT NOT NULL,
+          state              TEXT NOT NULL
+                                CHECK (state IN ('draft','scanning','plan_ready','applying',
+                                                 'applied','expired','failed','cancelled')),
+          config_digest      TEXT NOT NULL,
+          source_set_digest  TEXT NOT NULL,
+          created_at         TEXT NOT NULL,
+          expires_at         TEXT NOT NULL,
+          completed_at       TEXT,
+          job_id             TEXT
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_bootstrap_plans_project
+          ON bootstrap_plans(project_id, state);
+
+        CREATE TABLE IF NOT EXISTS bootstrap_plan_items (
+          plan_id                     TEXT NOT NULL
+                                        REFERENCES bootstrap_plans(plan_id) ON DELETE CASCADE,
+          source_id                   TEXT NOT NULL
+                                        REFERENCES bootstrap_sources(source_id) ON DELETE RESTRICT,
+          item_seq                    INTEGER NOT NULL,
+          action                      TEXT NOT NULL
+                                        CHECK (action IN ('propose_memory','propose_context_pack',
+                                                          'propose_skill_ref','register_external_ref',
+                                                          'bind_loadout','skip')),
+          target_ref                  TEXT,
+          proposed_payload_json       TEXT NOT NULL,
+          evidence_digest             TEXT NOT NULL,
+          expected_revision_or_version INTEGER,
+          risk                        TEXT NOT NULL
+                                        CHECK (risk IN ('low','medium','high')),
+          rationale                   TEXT NOT NULL,
+          PRIMARY KEY (plan_id, item_seq)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_bootstrap_plan_items_source
+          ON bootstrap_plan_items(source_id);
+
+        CREATE TABLE IF NOT EXISTS external_references (
+          asset_id                   TEXT NOT NULL
+                                       REFERENCES assets(asset_id) ON DELETE CASCADE,
+          version                    INTEGER NOT NULL,
+          provider_kind              TEXT NOT NULL,
+          provider_instance_id       TEXT NOT NULL,
+          resource_kind              TEXT NOT NULL
+                                       CHECK (resource_kind IN
+                                         ('wiki','code_index','repository_context','document_set','custom')),
+          resource_ref               TEXT NOT NULL,
+          uri                        TEXT NOT NULL,
+          source_version             TEXT,
+          source_digest              TEXT,
+          retrieval_contract_version TEXT NOT NULL,
+          capabilities_json          TEXT NOT NULL DEFAULT '[]',
+          allowed_scope              TEXT NOT NULL
+                                       CHECK (allowed_scope IN ('global','project')),
+          project_id                 TEXT,
+          sensitivity                TEXT NOT NULL
+                                       CHECK (sensitivity IN ('normal','private','restricted')),
+          refresh_policy_json        TEXT NOT NULL DEFAULT '{"kind":"manual"}',
+          last_verified_at           TEXT,
+          metadata_json              TEXT NOT NULL DEFAULT '{}',
+          PRIMARY KEY (asset_id, version)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_external_references_provider
+          ON external_references(provider_kind, resource_ref);
+      `);
+      this.db.exec("PRAGMA user_version = 20");
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -3969,6 +7411,720 @@ export class SQLiteMemoryStore {
       );
   }
 
+  // ─────────────────────────────────────────────────────────────────────
+  // v1.2.0-alpha.2 (issue #50): session -> memory
+  // distillation candidate store. The three tables
+  // — `derivation_candidates` / `candidate_evidence` /
+  // `candidate_actions` — back the reviewable
+  // memory / episode / skill-candidate proposals
+  // produced by the deterministic baseline extractor
+  // (and any future provider-backed extractor).
+  //
+  // All inserts are idempotent: a duplicate
+  // `candidate_id` returns `false` from
+  // `insertCandidate`; the evidence / action tables
+  // de-dupe on the composite primary key. The
+  // `apply` path's CAS guard is the
+  // `expected_target_revision` column on the
+  // candidate row; drift transitions the row to
+  // `stale` and the apply batch continues with the
+  // remaining candidates.
+  // ─────────────────────────────────────────────────────────────────────
+
+  /**
+   * v1.2.0-alpha.2 (issue #50): insert a new
+   * candidate row. Returns `true` on success,
+   * `false` when a row with the same
+   * `candidate_id` already exists (idempotent
+   * re-insert). Throws on CHECK violation
+   * (invalid kind, invalid state, invalid
+   * scope/project_id combo, etc.) — the caller
+   * surfaces that as a stable error code.
+   */
+  insertCandidate(row: DerivationCandidateRow): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO derivation_candidates (
+            candidate_id, job_id, run_id, candidate_kind,
+            proposed_type, proposed_topic, proposed_title, proposed_body,
+            proposed_tags_json, proposed_scope, proposed_project_id,
+            proposed_tier, proposed_trust_level, proposed_sensitivity,
+            confidence, state,
+            extractor_id, extractor_version, content_hash,
+            created_at, reviewed_at, reviewed_by_actor_id, applied_at,
+            expected_target_revision
+          ) VALUES (
+            ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?,
+            ?, ?, ?,
+            ?, ?,
+            ?, ?, ?,
+            ?, ?, ?, ?,
+            ?
+          )`
+        )
+        .run(
+          row.candidate_id,
+          row.job_id,
+          row.run_id,
+          row.candidate_kind,
+          row.proposed_type,
+          row.proposed_topic,
+          row.proposed_title,
+          row.proposed_body,
+          row.proposed_tags_json,
+          row.proposed_scope,
+          row.proposed_project_id,
+          row.proposed_tier,
+          row.proposed_trust_level,
+          row.proposed_sensitivity,
+          row.confidence,
+          row.state,
+          row.extractor_id,
+          row.extractor_version,
+          row.content_hash,
+          row.created_at,
+          row.reviewed_at,
+          row.reviewed_by_actor_id,
+          row.applied_at,
+          row.expected_target_revision
+        );
+      return true;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * Read a single candidate row by its primary key.
+   * Returns `undefined` if the row does not exist.
+   */
+  getCandidate(candidateId: string): DerivationCandidateRow | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM derivation_candidates WHERE candidate_id = ?")
+      .get(candidateId) as Row | undefined;
+    if (row === undefined) return undefined;
+    return derivationCandidateFromRow(row);
+  }
+
+  /**
+   * List all candidates for a given job, ordered by
+   * `created_at ASC` so the inspection output reads in
+   * the same order the extractor emitted them.
+   */
+  listCandidatesForJob(jobId: string): DerivationCandidateRow[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM derivation_candidates WHERE job_id = ? ORDER BY created_at ASC, candidate_id ASC"
+      )
+      .all(jobId) as Row[];
+    return rows.map((r) => derivationCandidateFromRow(r));
+  }
+
+  /**
+   * Transition a candidate's state. The `now_ms` is
+   * the timestamp written to the matching side-column
+   * (`reviewed_at` for accept/reject, `applied_at`
+   * for apply). A `stale` transition is a no-op for
+   * the reviewer / applied columns; the row still
+   * moves to `stale` so the inspector surfaces the
+   * drift. Returns `true` when the row updated.
+   */
+  updateCandidateState(args: {
+    candidate_id: string;
+    next_state: DerivationCandidateState;
+    reviewed_by_actor_id?: string | null;
+    now_ms: number;
+  }): boolean {
+    const reviewedBy =
+      args.reviewed_by_actor_id === undefined ? null : args.reviewed_by_actor_id;
+    if (args.next_state === "applied") {
+      const result = this.db
+        .prepare(
+          `UPDATE derivation_candidates
+              SET state = ?,
+                  applied_at = ?,
+                  reviewed_at = COALESCE(reviewed_at, ?),
+                  reviewed_by_actor_id = COALESCE(reviewed_by_actor_id, ?)
+            WHERE candidate_id = ?`
+        )
+        .run(args.next_state, args.now_ms, args.now_ms, reviewedBy, args.candidate_id);
+      return result.changes > 0;
+    }
+    if (args.next_state === "accepted" || args.next_state === "rejected") {
+      const result = this.db
+        .prepare(
+          `UPDATE derivation_candidates
+              SET state = ?,
+                  reviewed_at = ?,
+                  reviewed_by_actor_id = ?
+            WHERE candidate_id = ?`
+        )
+        .run(args.next_state, args.now_ms, reviewedBy, args.candidate_id);
+      return result.changes > 0;
+    }
+    // `proposed` (re-emit) or `stale` (CAS drift)
+    // transitions only flip the state column.
+    const result = this.db
+      .prepare(
+        `UPDATE derivation_candidates
+            SET state = ?
+          WHERE candidate_id = ?`
+      )
+      .run(args.next_state, args.candidate_id);
+    return result.changes > 0;
+  }
+
+  /**
+   * Insert one evidence row. The composite primary
+   * key `(candidate_id, evidence_role,
+   * excerpt_digest)` de-dupes identical rows so a
+   * re-run is a no-op. Throws on duplicate (caller
+   * can ignore).
+   */
+  insertCandidateEvidence(row: CandidateEvidenceRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO candidate_evidence (
+          candidate_id, evidence_role,
+          session_id, event_id, message_id, tool_call_id, file_ref,
+          excerpt_digest
+        ) VALUES (
+          ?, ?,
+          ?, ?, ?, ?, ?,
+          ?
+        )`
+      )
+      .run(
+        row.candidate_id,
+        row.evidence_role,
+        row.session_id,
+        row.event_id,
+        row.message_id,
+        row.tool_call_id,
+        row.file_ref,
+        row.excerpt_digest
+      );
+  }
+
+  /**
+   * Insert one action row. The composite primary
+   * key `(candidate_id, action)` keeps the action
+   * list deduped; a re-run of the same action is a
+   * SQLITE_CONSTRAINT that the service can ignore.
+   */
+  insertCandidateAction(row: CandidateActionRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO candidate_actions (
+          candidate_id, action,
+          target_memory_ids_json, expected_revisions_json,
+          rationale, conflict_signals_json, risk
+        ) VALUES (
+          ?, ?,
+          ?, ?,
+          ?, ?, ?
+        )`
+      )
+      .run(
+        row.candidate_id,
+        row.action,
+        row.target_memory_ids_json,
+        row.expected_revisions_json,
+        row.rationale,
+        row.conflict_signals_json,
+        row.risk
+      );
+  }
+
+  /**
+   * Read all evidence rows for a candidate, ordered
+   * by `evidence_role ASC, excerpt_digest ASC` for
+   * stable inspection.
+   */
+  getCandidateEvidence(candidateId: string): CandidateEvidenceRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM candidate_evidence
+           WHERE candidate_id = ?
+           ORDER BY evidence_role ASC, excerpt_digest ASC`
+      )
+      .all(candidateId) as Row[];
+    return rows.map((r) => candidateEvidenceFromRow(r));
+  }
+
+  /**
+   * Read all action rows for a candidate, ordered
+   * by `action ASC` for stable inspection.
+   */
+  getCandidateAction(candidateId: string): CandidateActionRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM candidate_actions
+           WHERE candidate_id = ?
+           ORDER BY action ASC`
+      )
+      .all(candidateId) as Row[];
+    return rows.map((r) => candidateActionFromRow(r));
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // v1.2.0-alpha.2 (issue #52): agent loadout substrate.
+  //
+  // The three tables — `agent_loadouts` /
+  // `loadout_rules` / `loadout_bindings` — are the durable
+  // backing for the policy-bound loadout surface that
+  // powers `bootstrap` / `query` / `tool_only` channels
+  // of the context-assembly service. The
+  // `LoadoutService` (src/loadouts/service.ts) wraps
+  // these methods with the public verb API
+  // (`create` / `updateRules` / `bind` / `unbind` /
+  // `resolve`) and the `LoadoutService.updateRules` CAS
+  // semantics that keep `bootstrap_hash` stable when the
+  // loadout row + content are unchanged.
+  // ─────────────────────────────────────────────────────────────────────
+
+  /**
+   * v1.2.0-alpha.2 (issue #52): insert a new
+   * `agent_loadouts` row. The row is inserted with
+   * `version: 1`, `lifecycle_state: "draft"`. Returns
+   * `true` on success, `false` when a row with the
+   * same `loadout_id` already exists (idempotent
+   * re-insert). Throws on CHECK violation
+   * (invalid scope, missing project_id for
+   * project-scope, invalid lifecycle_state, etc.)
+   * — the caller surfaces that as a stable error code.
+   */
+  insertLoadout(row: LoadoutRow): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO agent_loadouts (
+            loadout_id, name, version, lifecycle_state,
+            match_actor_id, match_client_name,
+            scope, project_id, task_mode,
+            created_by_actor_id, created_at, updated_at
+          ) VALUES (
+            ?, ?, ?, ?,
+            ?, ?,
+            ?, ?, ?,
+            ?, ?, ?
+          )`
+        )
+        .run(
+          row.loadout_id,
+          row.name,
+          row.version,
+          row.lifecycle_state,
+          row.match_actor_id,
+          row.match_client_name,
+          row.scope,
+          row.project_id,
+          row.task_mode,
+          row.created_by_actor_id,
+          row.created_at,
+          row.updated_at
+        );
+      return true;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #52): read a single
+   * `agent_loadouts` row by primary key. Returns
+   * `undefined` when the row does not exist.
+   */
+  getLoadout(loadoutId: string): LoadoutRow | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM agent_loadouts WHERE loadout_id = ?")
+      .get(loadoutId) as Row | undefined;
+    if (row === undefined) return undefined;
+    return loadoutFromRow(row);
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #52): list loadout rows.
+   * The `scope` / `lifecycle_state` filters are
+   * optional; the `limit` caps the row count
+   * (default 50). Ordered newest-first by
+   * `updated_at DESC`.
+   */
+  listLoadouts(filter: {
+    scope?: LoadoutScope;
+    project_id?: string;
+    lifecycle_state?: LoadoutLifecycleState;
+    limit?: number;
+  }): LoadoutRow[] {
+    const clauses: string[] = [];
+    const params: SQLInputValue[] = [];
+    if (filter.scope !== undefined) {
+      clauses.push("scope = ?");
+      params.push(filter.scope);
+    }
+    if (filter.project_id !== undefined) {
+      clauses.push("project_id = ?");
+      params.push(filter.project_id);
+    }
+    if (filter.lifecycle_state !== undefined) {
+      clauses.push("lifecycle_state = ?");
+      params.push(filter.lifecycle_state);
+    }
+    const where = clauses.length === 0 ? "" : " WHERE " + clauses.join(" AND ");
+    const limit = filter.limit ?? 50;
+    const sql = `SELECT * FROM agent_loadouts${where}
+                  ORDER BY updated_at DESC LIMIT ?`;
+    params.push(limit);
+    const rows = this.db.prepare(sql).all(...params) as Row[];
+    return rows.map((r) => loadoutFromRow(r));
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #52): insert one
+   * `loadout_rules` row at `(loadout_id, version,
+   * channel)`. The (loadout_id, version, channel)
+   * triple is the primary key, so a duplicate
+   * insert throws on the constraint. The method
+   * is intended to be called inside a
+   * `BEGIN IMMEDIATE` block that has already
+   * bumped `agent_loadouts.version` (the
+   * `LoadoutService.updateRules` caller is the
+   * canonical writer).
+   */
+  insertLoadoutRule(row: LoadoutRuleRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO loadout_rules (
+          loadout_id, version, channel,
+          include_asset_ids_json, include_memory_ids_json,
+          include_types_json, include_tiers_json,
+          include_tags_json, include_topics_json,
+          exclude_asset_ids_json, exclude_memory_ids_json,
+          exclude_tags_json, required_refs_json,
+          max_items, max_chars, max_tokens, timeout_ms,
+          ordering_policy
+        ) VALUES (
+          ?, ?, ?,
+          ?, ?,
+          ?, ?,
+          ?, ?,
+          ?, ?,
+          ?, ?,
+          ?, ?, ?, ?,
+          ?
+        )`
+      )
+      .run(
+        row.loadout_id,
+        row.version,
+        row.channel,
+        encodeJson(row.include_asset_ids),
+        encodeJson(row.include_memory_ids),
+        encodeJson(row.include_types),
+        encodeJson(row.include_tiers),
+        encodeJson(row.include_tags),
+        encodeJson(row.include_topics),
+        encodeJson(row.exclude_asset_ids),
+        encodeJson(row.exclude_memory_ids),
+        encodeJson(row.exclude_tags),
+        encodeJson(row.required_refs),
+        row.max_items,
+        row.max_chars,
+        row.max_tokens,
+        row.timeout_ms,
+        row.ordering_policy
+      );
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #52): CAS update of the
+   * `agent_loadouts.version` column. The update
+   * only succeeds when the current row has
+   * `version = expected_previous_version`;
+   * otherwise the function returns `undefined`
+   * (caller is racing a concurrent updateRules).
+   * The new version MUST be
+   * `expected_previous_version + 1`. The
+   * `updated_at` is set to `now`. The matching
+   * `loadout_rules` rows are inserted by the
+   * caller inside the same transaction.
+   */
+  updateLoadoutVersion(args: {
+    loadout_id: string;
+    expected_previous_version: number;
+    new_version: number;
+    now: string;
+  }): LoadoutRow | undefined {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const updated = this.db
+        .prepare(
+          `UPDATE agent_loadouts
+              SET version = ?,
+                  updated_at = ?
+            WHERE loadout_id = ?
+              AND version = ?
+            RETURNING *`
+        )
+        .get(
+          args.new_version,
+          args.now,
+          args.loadout_id,
+          args.expected_previous_version
+        ) as Row | undefined;
+      if (updated === undefined) {
+        this.db.exec("ROLLBACK");
+        return undefined;
+      }
+      this.db.exec("COMMIT");
+      return loadoutFromRow(updated);
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #52): insert one
+   * `loadout_bindings` row. The PRIMARY KEY is
+   * `binding_id` (a UUID minted by the caller);
+   * the row is otherwise a pure match-attribute
+   * payload. The `loadout_version` is recorded
+   * as the snapshot the binding was created
+   * against so a future rule update bumps the
+   * `version` but a pre-existing binding
+   * continues to point at the head the user
+   * originally asked for (the resolver re-pins
+   * the version on a successful match — see
+   * `LoadoutService.resolve`).
+   */
+  insertLoadoutBinding(row: LoadoutBindingRow): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO loadout_bindings (
+            binding_id, loadout_id, loadout_version,
+            actor_id, client_name, project_id, task_mode,
+            priority, created_at
+          ) VALUES (
+            ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?
+          )`
+        )
+        .run(
+          row.binding_id,
+          row.loadout_id,
+          row.loadout_version,
+          row.actor_id,
+          row.client_name,
+          row.project_id,
+          row.task_mode,
+          row.priority,
+          row.created_at
+        );
+      return true;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #52): remove a
+   * `loadout_bindings` row by primary key.
+   * Returns `true` on a successful delete,
+   * `false` when the `binding_id` is unknown
+   * (idempotent no-op for re-issued unbinds).
+   */
+  removeLoadoutBinding(bindingId: string): boolean {
+    const result = this.db
+      .prepare("DELETE FROM loadout_bindings WHERE binding_id = ?")
+      .run(bindingId);
+    return result.changes > 0;
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #52): read the per-channel
+   * `loadout_rules` rows for the loadout's head
+   * `version`. Used by `LoadoutService.resolve` to
+   * project the active rule set without a second
+   * `getLoadout` round-trip.
+   */
+  loadoutRulesForVersion(loadoutId: string, version: number): LoadoutRuleRow[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM loadout_rules WHERE loadout_id = ? AND version = ?"
+      )
+      .all(loadoutId, version) as Row[];
+    return rows.map((r) => loadoutRuleFromRow(r));
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #52): the precedence
+   * resolution used by `LoadoutService.resolve`.
+   * The method returns the highest-priority
+   * matching binding for the supplied
+   * `(actor_id, client_name, project_id,
+   * task_mode)` tuple, walking the 5-level
+   * precedence chain in order:
+   *
+   *   1. (actor + project + task_mode) exact match
+   *   2. (actor + project) exact match
+   *   3. (project) default for the project
+   *   4. (global) default
+   *   5. (no binding) — `undefined` returned; the
+   *      `LoadoutService` falls back to the
+   *      built-in `legacy-inject-all-active` row.
+   *
+   * `NULL` on a binding column means "any value"
+   * (i.e. a project default binds to every
+   * `actor_id` that does not have a more specific
+   * binding). The `(scope, project_id)` filter
+   * ensures a project-scope binding never leaks
+   * into a global resolve and vice versa.
+   *
+   * The returned tuple is
+   * `{ binding, loadout, rules }` so the caller
+   * has everything it needs in one round-trip.
+   */
+  resolveLoadout(input: {
+    actor_id?: string;
+    client_name?: string;
+    project_id?: string;
+    task_mode?: string;
+  }): {
+    binding: LoadoutBindingRow;
+    loadout: LoadoutRow;
+    rules: LoadoutRuleRow[];
+    matched_rule:
+      | "actor_project_task"
+      | "actor_project"
+      | "project_default"
+      | "global_default";
+  } | undefined {
+    // Precedence chain. Each level tries every
+    // binding column, treating `NULL` on a
+    // binding column as "any value". We walk the
+    // 4 levels in priority order; the first
+    // non-empty result wins. Level 1
+    // (actor_project_task) is only queried when
+    // the resolve supplies a `task_mode` — when
+    // the resolve omits task_mode, the resolution
+    // falls through to level 2 (actor + project
+    // default). Within a single level, the row
+    // with the highest `priority` wins; ties are
+    // surfaced as `binding_ambiguous` by the
+    // service layer.
+    const levelQueries: Array<{
+      matched_rule:
+        | "actor_project_task"
+        | "actor_project"
+        | "project_default"
+        | "global_default";
+      sql: string;
+      params: SQLInputValue[];
+    }> = [
+      // 1. actor + project + task_mode (exact match)
+      {
+        matched_rule: "actor_project_task",
+        sql: `SELECT b.* FROM loadout_bindings b
+              JOIN agent_loadouts l ON l.loadout_id = b.loadout_id
+              WHERE (b.actor_id = ? OR b.actor_id IS NULL)
+                AND (b.client_name = ? OR b.client_name IS NULL)
+                AND (b.project_id = ? OR b.project_id IS NULL)
+                AND b.task_mode = ?
+                AND l.lifecycle_state IN ('draft', 'active')
+              ORDER BY b.priority DESC, b.created_at ASC
+              LIMIT 10`,
+        params: [
+          input.actor_id ?? null,
+          input.client_name ?? null,
+          input.project_id ?? null,
+          input.task_mode ?? ""
+        ]
+      },
+      // 2. actor + project (task_mode NULL on binding)
+      {
+        matched_rule: "actor_project",
+        sql: `SELECT b.* FROM loadout_bindings b
+              JOIN agent_loadouts l ON l.loadout_id = b.loadout_id
+              WHERE (b.actor_id = ? OR b.actor_id IS NULL)
+                AND (b.client_name = ? OR b.client_name IS NULL)
+                AND (b.project_id = ? OR b.project_id IS NULL)
+                AND b.task_mode IS NULL
+                AND l.lifecycle_state IN ('draft', 'active')
+              ORDER BY b.priority DESC, b.created_at ASC
+              LIMIT 10`,
+        params: [
+          input.actor_id ?? null,
+          input.client_name ?? null,
+          input.project_id ?? null
+        ]
+      },
+      // 3. project default
+      {
+        matched_rule: "project_default",
+        sql: `SELECT b.* FROM loadout_bindings b
+              JOIN agent_loadouts l ON l.loadout_id = b.loadout_id
+              WHERE b.actor_id IS NULL
+                AND b.client_name IS NULL
+                AND (b.project_id = ? OR b.project_id IS NULL)
+                AND b.task_mode IS NULL
+                AND l.lifecycle_state IN ('draft', 'active')
+              ORDER BY b.priority DESC, b.created_at ASC
+              LIMIT 10`,
+        params: [input.project_id ?? null]
+      },
+      // 4. global default
+      {
+        matched_rule: "global_default",
+        sql: `SELECT b.* FROM loadout_bindings b
+              JOIN agent_loadouts l ON l.loadout_id = b.loadout_id
+              WHERE b.actor_id IS NULL
+                AND b.client_name IS NULL
+                AND b.project_id IS NULL
+                AND b.task_mode IS NULL
+                AND l.scope = 'global'
+                AND l.lifecycle_state IN ('draft', 'active')
+              ORDER BY b.priority DESC, b.created_at ASC
+              LIMIT 10`,
+        params: []
+      }
+    ];
+    for (const level of levelQueries) {
+      // Level 1 (actor_project_task) is an exact
+      // match — only query it when the resolve
+      // supplies a task_mode. When the resolve
+      // omits task_mode we fall through to level 2
+      // (actor + project default) which expects
+      // b.task_mode IS NULL.
+      if (
+        level.matched_rule === "actor_project_task" &&
+        input.task_mode === undefined
+      ) {
+        continue;
+      }
+      const rows = this.db.prepare(level.sql).all(...level.params) as Row[];
+      if (rows.length === 0) continue;
+      const binding = loadoutBindingFromRow(rows[0] as Row);
+      const loadoutRow = this.getLoadout(binding.loadout_id);
+      if (loadoutRow === undefined) continue;
+      const rules = this.loadoutRulesForVersion(loadoutRow.loadout_id, loadoutRow.version);
+      return {
+        binding,
+        loadout: loadoutRow,
+        rules,
+        matched_rule: level.matched_rule
+      };
+    }
+    return undefined;
+  }
 }
 
 // v1.1.6 follow-up B1 (issue #42, spec

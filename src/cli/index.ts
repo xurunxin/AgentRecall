@@ -8,15 +8,23 @@ import { resolveDataHome } from "../index.js";
 import { SQLiteMemoryStore } from "../sqlite-store.js";
 import { ProjectIdentityResolver } from "../scope-resolver.js";
 import { adminCommand } from "./commands/admin.js";
+import { assetsCommand } from "./commands/assets.js";
 import { auditCommand } from "./commands/audit.js";
 import { backupCommand, restoreCommand } from "./commands/backup.js";
+import { bootstrapCommand } from "./commands/bootstrap.js";
+import { candidatesCommand } from "./commands/candidates.js";
 import { doctorCommand } from "./commands/doctor.js";
 import { exportCommand } from "./commands/export.js";
+import { externalRefsCommand } from "./commands/external-refs.js";
 import { importCommand } from "./commands/import.js";
+import { jobsCommand } from "./commands/jobs.js";
+import { loadoutsCommand } from "./commands/loadouts.js";
 import { listCommand } from "./commands/list.js";
 import { migrateCommand } from "./commands/migrate.js";
 import { searchCommand } from "./commands/search.js";
+import { sessionsCommand } from "./commands/sessions.js";
 import { showCommand } from "./commands/show.js";
+import { skillsCommand } from "./commands/skills.js";
 import { parseArgs, type ParsedArgs } from "./arg-parser.js";
 import { buildRequestContext, type RequestContext } from "../request-context.js";
 import { randomUUID } from "node:crypto";
@@ -96,6 +104,14 @@ Commands:
   restore    Restore from a verified backup
   migrate    Run schema migrations
   admin      Manage the operator capability (grant / status / revoke)
+  jobs       Inspect, cancel, or run derivation jobs
+  candidates List, show, accept, reject, or apply distillation candidates (issue #50)
+  sessions   Inspect / ingest / list / show / forget / distill captured session traces
+  assets     Manage the typed asset registry (memory_ref / skill / context_pack / external_reference)
+  loadouts   Manage the agent loadout substrate (issue #52; create / update / bind / resolve)
+  skills     Manage Skill assets (canonical SKILL.md import / export / search)
+  bootstrap  Cold-start bootstrap pipeline (configure / scan / plan)
+  external-refs  Manage typed external_reference assets (list / create / verify)
   version    Print the server version (also: --version / -v)
   help       Show this help
 
@@ -129,7 +145,51 @@ const dispatch: Record<string, CommandHandler> = {
   backup: backupCommand,
   restore: restoreCommand,
   migrate: migrateCommand,
-  admin: adminCommand
+  admin: adminCommand,
+  // v1.2.0-alpha.0 (issue #48): the derivation job
+  // subcommand. Provides the durable inspect / cancel /
+  // run surface for the v1.2 derivation job substrate.
+  jobs: jobsCommand,
+  // v1.2.0-alpha.1 (issue #49): the session trace
+  // subcommand. Provides the inspect / ingest / list /
+  // show / forget surface for the v1.2 session
+  // evidence substrate.
+  sessions: sessionsCommand,
+  // v1.2.0-alpha.1 (issue #51): the typed asset
+  // registry subcommand. Provides list / show /
+  // history / lifecycle / create-memory-ref for
+  // the additive asset envelope. Skill /
+  // context_pack / external_reference creation
+  // land with their owning Phase 2 issues
+  // (#53 / #54).
+  assets: assetsCommand,
+  // v1.2.0-alpha.2 (issue #50): the candidate
+  // review / apply surface. Backed by the
+  // `DistillationService` (src/distillation/service.ts)
+  // and the `derivation_candidates` /
+  // `candidate_evidence` / `candidate_actions` tables.
+  candidates: candidatesCommand,
+  // v1.2.0-alpha.2 (issue #52): the agent
+  // loadout subcommand. Provides list / show /
+  // create / update / bind / unbind / resolve
+  // for the policy-bound loadout substrate.
+  loadouts: loadoutsCommand,
+  // v1.2.0-alpha.2 (issue #53): the skill
+  // subcommand. Provides list / search / show /
+  // import / export for the type-specific
+  // `skills` table. Lifecycle is delegated to
+  // the envelope's `assets lifecycle` verb.
+  skills: skillsCommand,
+  // v1.2.0-alpha.2 (issue #54): the cold-start
+  // bootstrap pipeline. Provides configure / scan /
+  // plan show / plan apply / plan cancel for the
+  // v20 surface.
+  bootstrap: bootstrapCommand,
+  // v1.2.0-alpha.2 (issue #54): the typed
+  // external_reference asset subcommand. Provides
+  // list / create / verify for the
+  // `external_references` table.
+  "external-refs": externalRefsCommand
 };
 
 export async function runCli(
@@ -256,4 +316,41 @@ export async function runCli(
 
 export function registerCommand(name: string, handler: CommandHandler): void {
   dispatch[name] = handler;
+}
+
+/**
+ * v1.2.0-alpha.2 (issue #50): build a minimal
+ * `WriteContext` for the CLI's `MemoryWriteService`.
+ * The CLI does not own a `MemoryService` instance
+ * directly (the MCP server does); the write
+ * services are only constructed when a CLI verb
+ * needs to mutate memory rows. The write context
+ * uses the CLI's `identityResolver` for project
+ * scope checks and the `ctx.defaultActor` for the
+ * `actor` field. A `configureProjectBudget` stub
+ * is supplied so the `remember` path can lazily
+ * bootstrap a project on a `project_path`-only
+ * input — the candidate apply path passes an
+ * explicit `project_id`, so the stub is only
+ * consulted for `project_path` flows.
+ */
+export function buildCliWriteContext(
+  cliCtx: CliContext
+): import("../services/memory-write-service.js").WriteContext {
+  return {
+    store: cliCtx.store,
+    defaultActor: cliCtx.ctx.actor_id,
+    identityResolver: cliCtx.identityResolver,
+    configureProjectBudget: (
+      _project_id: string,
+      _budget: import("../domain.js").MemoryBudget,
+      _canonical_path: string,
+      _display_name: string
+    ) => {
+      throw new Error(
+        "[internal_error] configureProjectBudget is not wired into the CLI; " +
+          "candidate apply must pass an explicit project_id"
+      );
+    }
+  };
 }

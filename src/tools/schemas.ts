@@ -469,7 +469,19 @@ export const recallContextToolSchema = z
     include_global: z.boolean().default(true),
     budget_chars: z.number().int().min(100).max(50_000).default(8000),
     types: z.array(typeSchema).default([]),
-    topics: stringListSchema
+    topics: stringListSchema,
+    // v1.2.0-alpha.2 (issue #52): the explicit
+    // loadout override. When supplied, the
+    // resolver short-circuits the precedence
+    // chain and uses this loadout_id directly.
+    // The field is additive (existing v1 callers
+    // that omit it keep the precedence-based
+    // resolve path).
+    loadout_id: nonEmptyString.optional(),
+    // v1.2.0-alpha.2 (issue #52): the optional
+    // task_mode attribute (forwarded to the
+    // binding matcher). Additive.
+    task_mode: nonEmptyString.optional()
   })
   .strict()
   .superRefine(requireProjectIdentity);

@@ -7,6 +7,158 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [1.2.0-alpha.2] — Session distillation (#50) + Agent loadouts (#52) + Skill assets (#53) + Cold-start bootstrap (#54, Phase 2 combined)
+
+> Phase 2 wires the v1.2.0-alpha.0/1 substrate into a set of end-to-end agent-facing flows: distill reviewable candidates from captured sessions, assemble context packs under a loadout policy, register SKILL.md as versioned assets, and derive an applicable bootstrap plan from a cold-start scan. The four issues shipped across four parallel worktrees and were sequentially rebased; the schema version slots (v17=#50, v18=#52, v19=#53, v20=#54) were pre-allocated to prevent concurrent migration conflicts. All existing APIs are preserved — no breaking changes. `migrate_v16_to_v17` adds the distillation pipeline tables, `migrate_v17_to_v18` adds the loadout substrate, `migrate_v18_to_v19` adds the skills table, and `migrate_v19_to_v20` adds the bootstrap surface. All four migrations are transactional + rollback-safe.
+
+### Added
+
+- **Schema v17** (issue #50) — `derivation_candidates` / `candidate_evidence` / `candidate_actions` three additive tables, backing the reviewable memory / episode / skill-candidate proposals. The `state` column is a small state machine (`proposed` → `accepted` → `applied`, with `rejected` / `stale`). `expected_target_revision` is the CAS guard for the `apply` step.
+- **Schema v18** (issue #52) — `agent_loadouts` / `loadout_rules` / `loadout_bindings` three additive tables, backing the policy-bound loadout surface that powers the `bootstrap` / `query` / `tool_only` channels of the context-assembly service. `loadout_rules` is keyed on `(loadout_id, version, channel)` so a `updateRules` call bumps the version and inserts a new immutable rule row in the same transaction; the version bump is what changes `bootstrap_hash` in the assembled context (the upstream prompt-cache key).
+- **Schema v19** (issue #53) — the additive `skills` type-specific table for the asset registry. The `skill` envelope is a thin pointer to the `skills` row, which holds the canonical SKILL.md bytes plus the parsed frontmatter (name / description / triggers / etc.) and the content-addressed `resources` list. `body_hash` is `sha256:hex64` over `skill_md_canonical` and matches the `asset_versions.content_hash` for the same version.
+- **Schema v20** (issue #54) — `bootstrap_sources` / `bootstrap_plans` / `bootstrap_plan_items` / `external_references` four additive tables, backing the cold-start plan and the external-resource pointer. `bootstrap_plans.state` is an 8-state machine (`draft` → `scanning` → `plan_ready` → `applying` → `applied` / `expired` / `failed` / `cancelled`). `applyPlan` is an atomic batch — any failure rolls back the entire batch.
+- **`DistillationService.runOnBundle`** (issue #50) — 6-stage pipeline (window select → extract → evidence validation → conflict / novelty analysis → review → apply). The `apply` batch is atomic; `expected_target_revision` drift transitions the candidate to `stale`.
+- **`DeterministicBaselineExtractor`** (issue #50) — pure function, emits one `memory` candidate per `decision_confirmed` event with non-empty content; skips events carrying `risk_injection` or `contains_secret` flags. Replay-safe (same input → same output).
+- **`LoadoutService`** (issue #52) — `create` / `updateRules` (CAS on `version`) / `bind` / `unbind` / `resolve`. The 6-step resolve precedence chain is: (1) explicit `loadout_id` short-circuit, (2) actor + project + task_mode exact, (3) actor + project (task_mode NULL on binding), (4) project default, (5) global default, (6) built-in `legacy-inject-all-active` fallback. `updateRules` supports `--expected-previous-version` as an explicit CAS guard.
+- **`ContextAssembler`** (issue #52) — `bootstrap` / `query` / `tool_only` three channels, filtered by `include_*` / `exclude_*` / `required_refs`. `bootstrap_hash` is the upstream prompt-cache key (stable when loadout + content are unchanged).
+- **`SkillService`** (issue #53) — `importSkillMd` (CRLF → LF, frontmatter keys dictionary-sorted, unknown keys routed through the `extension.*` namespace) / `appendSkillVersion` (CAS-bump) / `exportSkillMd` (byte-stable round-trip).
+- **`BootstrapService`** (issue #54) — `configure` (rejects path traversal / device paths / unsafe symlinks; `.gitignore` + `bootstrap.deny` integration) / `scan` (idempotent: same content digest + same config → same plan, zero new items) / `showPlan` / `applyPlan` (atomic batch) / `cancelPlan` / `expirePlan`.
+- **`ExternalReferenceService`** (issue #54) — `create` / `list` / `verify`. `last_verified_at` records freshness; `metadata` is always a pointer + retrieval contract — provider content is never stored in the row.
+- **`run --watch` extension** (issue #54) — `agent-recall jobs run --watch` used to reject `--watch`; it now defaults to `poll_ms=2000`, polls `listClaimable`, and exits on signal only.
+- **CLI** — `agent-recall sessions distill <id>` (issue #50) + `agent-recall candidates list | show | accept | reject | apply` (#50) + `agent-recall loadouts create | update | bind | unbind | resolve | list | show` (#52) + `agent-recall skills list | search | show | import | export` (#53) + `agent-recall bootstrap configure | scan | plan show | plan apply | plan cancel` (#54) + `agent-recall external-refs list | create | verify` (#54).
+- **MCP resources** — `agentrecall://candidates/{candidate_id}` + `agentrecall://candidates/by-job/{job_id}` (issue #50); `agentrecall://context/loadout` (issue #52, loadout-assembled `Assembled` for the calling actor).
+- **OpenCode plugin** — `opencode-plugin/context-client.mjs` pulls the loadout resolve result into the system prompt via MCP; `opencode-plugin/capture.mjs` upgrades the opt-in prompt.
+- **Contracts** — `packages/contracts/src/distillation.ts` (5 zod schemas, issue #50) + `packages/contracts/src/loadouts.ts` (5 zod schemas + typed rule union, issue #52) + `packages/contracts/src/skills.ts` (tightened `SkillAssetV1Schema`: kebab-case name / source enum / resource type union, issue #53) + `packages/contracts/src/bootstrap.ts` (5 zod schemas, issue #54). All carry `schema_version: "1"`.
+
+### Changed
+
+- `src/sqlite-store.ts` — `CURRENT_SCHEMA_VERSION` raised to 20. Four new migrations: `migrate_v16_to_v17` (distillation) + `migrate_v17_to_v18` (loadout) + `migrate_v18_to_v19` (skills) + `migrate_v19_to_v20` (bootstrap). All four are `BEGIN IMMEDIATE` + `COMMIT` / `ROLLBACK`, fail-closed. `resolveLoadout` is a 6-step cascade ((1) explicit `loadout_id` short-circuit → (2) actor + project + task_mode exact → (3) actor + project (task_mode NULL on binding) → (4) project default → (5) global default → (6) built-in `legacy-inject-all-active` fallback) with `lifecycle_state IN ('draft', 'active')`. `updateLoadoutVersion` exposes an `expected_previous_version` guard.
+- `src/cli/commands/loadouts.ts` — `--json` works across all subcommands (create / update / bind / unbind / resolve / list / show); `--expected-previous-version` is forwarded to `LoadoutService.updateRules`.
+- `src/distillation/service.ts` — `enqueueAndRunSessionDistill` re-reads the job after `runOnce` (post-execution `state`) rather than returning the pre-execution `queued` state; `DistillationService` accepts an optional `ExtractorProvider` injection.
+- `src/mcp/resources.ts` — `agent_loadout_context` (static URI) is registered after the `distillation_candidate` family (registration order matches the test contract). The 3 new v1.2-alpha.2 resources (`agent_loadout_context` / `distillation_candidate` / `distillation_candidate_list`) bring the total to 12.
+- `src/cli/commands/jobs.ts` — `--watch` is wired into the runner polling loop (issue #54); the previous "rejects --watch" test is rewritten to subscribe to the polling sentinel.
+- `test/mcp-v2-contract.test.ts` — "registers all 9 resources" → "registers all 12 resources"; the 3 new v1.2 resources are asserted to appear in the list.
+- `test/blackbox/mcp-all-tools-e2e-{core,extended}.test.ts` — resource list assertions updated to the v1.2 shape: 4 static + 8 templated (12 total).
+
+### Tests
+
+- `test/unit/distillation-service.test.ts` (26 tests) — extractor / validate / accept / reject / apply / state machine / CAS / state guard; the 6-stage pipeline end-to-end.
+- `test/unit/loadouts-service.test.ts` (12 tests) — create / `updateRules` CAS / bind / resolve 5-step cascade / lifecycle state / unbind.
+- `test/unit/context-assembly.test.ts` (7 pass + 4 known gaps) — `bootstrap` / `query` / `tool_only` channel filtering / `bootstrap_hash` stability / `policy_version` stamp.
+- `test/unit/skill-md.test.ts` — SKILL.md parse / CRLF → LF / frontmatter sort / `extension.*` namespace / round-trip.
+- `test/unit/skills-service.test.ts` — skills import / show / export / `appendSkillVersion` CAS / `cas_mismatch`.
+- `test/unit/bootstrap-service.test.ts` — `configure` path safety / `scan` idempotent / `showPlan` / `applyPlan` atomic / `cancelPlan` / `expirePlan`.
+- `test/unit/external-refs-service.test.ts` — `create` / `list` / `verify` freshness / metadata never holds provider content.
+- `test/unit/jobs-runner-watch.test.ts` — `--watch` polling / signal exit / `poll_ms`.
+- `test/cli/loadouts.test.ts` (3 tests) — create + update + bind + resolve round-trip / `cas_mismatch` / list + show.
+- `test/cli/skills.test.ts` — skill CLI end-to-end.
+- `test/cli/bootstrap.test.ts` — `configure` / `scan` / `plan show` / `plan apply` end-to-end.
+- `test/cli/external-refs.test.ts` — external-refs CLI end-to-end.
+- `packages/contracts/tests/distillation.test.ts` — 5 zod schemas happy + rejection.
+- `packages/contracts/tests/loadouts.test.ts` — 5 zod schemas + rule patch validation.
+- `packages/contracts/tests/skills.test.ts` — kebab-case / source enum / resource type union.
+- `packages/contracts/tests/bootstrap.test.ts` — 5 zod schemas happy + rejection.
+- `test/release-gate/loadout-resolution-multi-process.test.ts` — 8 concurrent workers, no `binding_ambiguous` false positives, `bootstrap_hash` stable across the run (upstream prompt-cache key is not churned by accident).
+- `test/release-gate/skills-multi-process.test.ts` — 8 concurrent workers import the same SKILL.md, byte-stable for a single import.
+- `test/release-gate/bootstrap-multi-process.test.ts` — 8 concurrent workers scan the same source, `source_set_digest` stable under concurrency.
+- `test/mcp-v2-contract.test.ts` — 1 test updated (9 → 12 resources, 3 new v1.2 entries).
+- `test/blackbox/mcp-all-tools-e2e-core.test.ts` (30 tests) / `test/blackbox/mcp-all-tools-e2e-extended.test.ts` (39 tests) — end-to-end MCP tools + resource list (updated to the v1.2 resource set).
+- **`test/eval-lifecycle/` (issue #55 skeleton)** — the lifecycle evaluation harness ships with the v0.1.0 corpus: 2 fixtures (1 happy path + 1 policy-fail). The runner is built around Zod-versioned schemas (`lifecycle.eval.v1` / `lifecycle.corpus.v1` / `lifecycle.result.v1` / `lifecycle.report.v1`) and walks the manifest against a fresh in-process memory store per fixture, calling the real service APIs (no CLI shim). `pnpm run eval:lifecycle:quick` exits 0 today; the 13-fixture coverage matrix per #55 AC lands in v0.2.0 over the next corpus releases. `pnpm test` still reports 836 passing tests. The harness is documented in `docs/adr/0012-lifecycle-eval-harness.md` and the rollout plan in `docs/plans/v1.2-lifecycle-eval-design.md`.
+
+### Known caveats (out of scope for this release)
+
+- `test/blackbox/mcp-stdio-idle.test.ts` occasionally fails on the Windows runner because of a temp-dir EPERM (unrelated to this release, pre-existing on Windows); stable on Linux/macOS runners.
+- Dimension C (recall + assembly) quality scorers (Recall@K, nDCG, byte-determinism counters) are wired as scaffolding in `ContextAssembler` but not yet exercised by the v0.1.0 corpus; the v0.2.0 corpus release lands the scorers.
+- The v0.1.0 lifecycle corpus has 2 fixtures (one happy path, one policy-fail); the full 15-fixture coverage matrix per #55 AC lands over the next 3 corpus releases.
+
+### Out of scope (deferred to subsequent phases)
+
+- Lifecycle evaluation / release gate (#55 wraps Phase 2 + the v1.2 release cadence).
+- HTTP bridge endpoints for distillation / loadouts / skills / bootstrap (Phase 3).
+- Admin app candidate browser / loadout editor / SKILL.md editor / bootstrap plan visualiser (Phase 3).
+- Provider-backed extractors (LLM-backed distillation to replace the `DeterministicBaselineExtractor` placeholder).
+
+## [1.2.0-alpha.1] — Session evidence layer (#49) + Asset registry (#51, Phase 1)
+
+> Phase 1 is the merged PR for two parallel workstreams. The session evidence layer stands up the "capture + evidence + persistence" chain. The asset registry delivers a typed envelope (issue #51 ships the `memory_ref` type only; the `skill` / `context_pack` / `external_reference` type-specific tables land with their owning Phase 2 issues #53 / #54). All existing APIs are preserved — no breaking changes.
+
+### Added
+
+- **Schema v15** — `sessions` / `session_events` / `session_event_blobs` three additive tables (issue #49). `UNIQUE (source_kind, source_version, source_instance_id, source_session_id)` is the replay contract. 3 indexes. Bodies are content-addressed (head/tail 1KB goes in the row; the full body is fetched via `content_digest`).
+- **Schema v16** — `assets` / `asset_versions` / `asset_relations` three envelope tables + the only v16-shipped type-specific table `memory_ref_bindings` (issue #51). CAS append on `current_version` keeps concurrent appends safe. `archived` is a one-way transition (`asset_already_terminal` rejects un-archive).
+- **`SessionService.ingest`** — replay-safe: same source-identity + same `bundle_hash` returns the original `session_id`; a different `bundle_hash` throws `bundle_hash_drift`. Plan counts (accepted / redacted / skipped / rejected) are decided by a pure walk before the row write. Secret scan + `risk_injection` tag + per-event (256KB) / per-session (8MB) size caps (oversize events are head/tail truncated; the original body digest is preserved).
+- **`JsonlSessionAdapter`** — v1 reference implementation: line 1 is the bundle header (events: `[]`); subsequent lines are `SessionTraceEventV1` events; zod validation reuses the shared `@agent-recall/contracts` schema.
+- **`AssetService`** — `createMemoryRef` (CAS-style version append + immutable binding) / `list` / `show` / `history` / `setLifecycle`. `archived` is a one-way transition.
+- **CLI** — `agent-recall sessions inspect | ingest | list | show | forget` (#49); `agent-recall assets list | show | history | lifecycle | create-memory-ref` (#51).
+- **MCP resources** — `agentrecall://sessions/{session_id}` (#49); `agentrecall://assets/{asset_id}` (#51).
+- **Contracts** — `packages/contracts/src/sessions.ts` 7 zod schemas; `packages/contracts/src/assets.ts` 11 zod schemas (4 type-specific discriminated unions); all `schema_version: "1"`.
+
+### Changed
+
+- `src/sqlite-store.ts` — `CURRENT_SCHEMA_VERSION` raised to 16. New migrations `migrate_v14_to_v15` + `migrate_v15_to_v16` (both `BEGIN IMMEDIATE` + `COMMIT` / `ROLLBACK`, rollback-safe). 16 new store methods + 7 row decoders + 3 row types (`SessionRow` / `SessionEventRow` / `SessionEventBlobRow` / `AssetRow` / `AssetVersionRow` / `AssetRelationRow` / `MemoryRefBindingRow`).
+- `src/cli/arg-parser.ts` — `flagNumber` utility was already present; Phase 1 uses it for `--limit` / `--max-jobs`.
+- `src/cli/index.ts` — dispatch table adds `sessions` + `assets` commands; `HELP_TEXT` gets two new lines.
+- `src/mcp/resources.ts` — new `session_evidence` + `asset_envelope` resource registrations.
+- `test/mcp-v2-contract.test.ts` — "registers all 6 resources" → "registers all 9 resources"; the new `session_evidence` + `asset_envelope` are asserted to appear in the list.
+
+### Tests
+
+- `test/unit/sessions-service.test.ts` (13 tests) — replay / digest-drift / size caps / secret / injection / forget / JSONL parse / file round-trip.
+- `test/unit/assets-service.test.ts` (8 tests) — create / list / show / history / lifecycle / archive terminal / binding validation.
+- `test/cli/sessions.test.ts` (7 tests) — help / list / show / cancel-style coverage + secret / injection / size end-to-end.
+- `test/cli/assets.test.ts` (5 tests) — help / list / show / history / lifecycle end-to-end round-trip.
+- `packages/contracts/tests/sessions.test.ts` (10 tests) — 7 zod schemas happy + rejection.
+- `packages/contracts/tests/assets.test.ts` (17 tests) — 11 zod schemas happy + rejection.
+- `test/mcp-v2-contract.test.ts` — 1 test updated (8 → 9 resources).
+
+### Out of scope (deferred to subsequent phases)
+
+- `skill` / `context_pack` / `external_reference` type-specific tables + executor (land with #53 / #54).
+- `bootstrap scan` / `external-ref refresh` executors (land with #54).
+- `run --watch` loop (deferred to #54 bootstrap planner).
+- Lifecycle evaluation / release gate (#55 wraps the v1.2 release).
+- HTTP bridge sessions / assets endpoints (Phase 2 ships them together).
+- Admin app session browser / asset browser (Phase 2 ships them together).
+
+## [1.2.0-alpha.0] — Derivation Job substrate (issue #48, Phase 0)
+
+> The opening entry of the v1.2 series: this entry introduces only the derivation job substrate. The kind-specific executors (`session_distill` / `skill_extract` / `bootstrap_scan` / `external_ref_refresh`) land in Phase 1 / 2 (#50, #53, #54). All existing APIs are preserved — no breaking changes.
+
+### Added
+
+- **Schema v14** — three additive tables `derivation_jobs` / `derivation_runs` / `derivation_outputs`, with composite primary keys and indexes (`idx_derivation_jobs_state_next_retry`, `idx_derivation_jobs_lease WHERE state='running'`, `idx_derivation_jobs_creator_state`, `idx_derivation_jobs_kind`, `idx_derivation_runs_job_stage`, `idx_derivation_runs_job_status`, `idx_derivation_outputs_job_disposition`, `idx_derivation_outputs_run`). All v13 tables are unchanged; the migration runs `migrate_v13_to_v14()` and is fail-closed + transactional (`BEGIN IMMEDIATE` + `COMMIT` / `ROLLBACK`).
+- **`src/jobs/service.ts` — `DerivationJobStore`** — public API: `enqueue` / `claim` / `listClaimable` / `reap` / `startStage` / `finishStage` / `complete` / `fail` / `requestCancel` / `markCancelled` / `inspect` / `list`. Strictly follows Epic #47's "plan → review → apply" semantics. `claim` runs in a single `BEGIN IMMEDIATE` transaction to guarantee multi-process mutual exclusion. `listClaimable` passively reaps expired leases. `enqueue` is replay-safe via the `UNIQUE (creator_actor_id, kind, idempotency_key)` constraint; if `(input_digest, config_digest)` does not match an existing row, the call throws `idempotency_digest_mismatch` (issue #48 AC #3).
+- **`src/jobs/runner.ts` — `runOnce` / `makeLeaseOwner`** — out-of-transaction executor. Every `kind` registers a `DerivationJobExecutor`. `runOnce` does a single scan, claims one job, processes one job, automatically catches executor errors and transitions the job to `failed` (`internal_error`). Default lease TTL is 30s; `runOnce({lease_ttl_ms})` overrides.
+- **`src/jobs/redactor.ts` — `redactError` / `truncateRationale`** — secret-like patterns are replaced with `[redacted:<category>]`, capped at 2000 characters, using the existing `secret-detector.ts` word list. The original prompt / response body never enters the database; only the `output_digest` + a 200-character rationale are persisted (issue #48 AC #6).
+- **`src/cli/commands/jobs.ts` — `agent-recall jobs ...`** — 4 subcommands: `list` (`--state` / `--kind` / `--limit` / `--json`), `show <job_id>` (human-readable + `--json` formats), `cancel <job_id>` (writes `cancel_requested_at`; the runner handles it at the next stage boundary), `run` (`--kind` / `--max-jobs` / `--json`, single-pass scan). `--watch` is explicitly unimplemented; it lands alongside the Phase 2 #54 bootstrap planner worker loop.
+- **MCP resource `agentrecall://jobs/{job_id}`** — read-only, returns the result of `DerivationJobStore.inspect(jobId)` (job + runs + outputs triple JSON), mirroring CLI `jobs show`'s JSON output.
+- **`packages/contracts/src/jobs.ts` — `DerivationJobSchema` / `DerivationRunSchema` / `DerivationOutputSchema` / `DerivationJobInspectionSchema`** — typed zod schemas for the public wire shape, with `schema_version: "1"` reserved for future v2 evolution. The admin app will consume these schemas; `src/sqlite-store.ts` continues to hold the snake_case row shape (the source of truth), with the row→wire mapping living in `DerivationJobStore` (the v1.2 release consolidates the mapping when #55 wraps up).
+- **`docs/adr/0009-derivation-job-lifecycle.md`** — full record of the data model, the 9-step execution contract, the lease rules, the passive-reap policy, the "why no mid-run lease renewal" decision (simplification — avoids the renewal race), the cancel boundary, and `derivation_outputs`'s reap-safe duplicate-write semantics.
+- **`docs/guides/jobs.md`** — Chinese user guide with CLI / MCP three-entry-point examples, the state machine, and common diagnostic steps.
+
+### Changed
+
+- `src/sqlite-store.ts` — added `DerivationJobRow` / `DerivationRunRow` / `DerivationOutputRow` types + 9 store methods (`getDerivationJob` / `getDerivationJobByIdempotency` / `insertDerivationJob` / `claimDerivationJob` / `listClaimableDerivationJobs` / `requestDerivationJobCancel` / `finalizeDerivationJob` / `checkpointDerivationJob` / `renewDerivationJobLease` / `reapExpiredDerivationJobLeases` / `insertDerivationRun` / `completeDerivationRun` / `getDerivationRun` / `listDerivationRunsForJob` / `insertDerivationOutput` / `listDerivationOutputsForJob` / `listDerivationJobs`) + row decoders (`derivationJobFromRow` / `derivationRunFromRow` / `derivationOutputFromRow`) + `isSqliteUniqueConstraintError` (recognises `code` / `errcode` / `errno` / message in multiple shapes — robust across `node:sqlite` and `bun:sqlite`). `CURRENT_SCHEMA_VERSION` raised from 13 to 14, with JSDoc explaining the Phase 0 boundary and the non-intrusive commitment to v13 tables.
+- `src/cli/arg-parser.ts` — added the `flagNumber` utility; `jobs` uses it for `--limit` / `--max-jobs`.
+- `src/cli/index.ts` — dispatch table adds the `jobs` command; `HELP_TEXT` gets a new line.
+- `src/mcp/resources.ts` — added `derivation_job` resource registration (the MCP sync callback calls `DerivationJobStore.inspect` directly); the v1.1.x resource list is unchanged.
+- `test/mcp-v2-contract.test.ts` — "registers all 6 resources" → "registers all 7 resources"; the new `derivation_job` is asserted to appear in the list.
+
+### Tests
+
+- `test/unit/jobs-service.test.ts` (22 tests) — covers: enqueue's four paths (first insert / same-idem-same-digest replay / different `input_digest` rejected / different `config_digest` rejected); claim's three paths (transition to running + lease / only-one-winner under concurrency / expired lease reaped then taken over); `listClaimable` filtered by `kind`; stage write + `finishStage` writing `derivation_outputs`; `complete` / `fail` (redacted + 2000 truncate) / `requestCancel` + `markCancelled`; `outputs` quietly absorbs duplicate `(job_id, output_kind, output_id)` inserts under reap-rewriting.
+- `test/unit/jobs-runner.test.ts` (6 tests) — covers: `runOnce` returns zero count on an empty queue; an unknown kind is auto-transitioned to `failed` (`internal_error` + "no executor" rationale); a registered executor receives the `startStage` callback and writes `derivation_outputs`; executor errors are caught and translated to `failed`; `max_jobs` truncation; the cancel path goes through `markCancelled`.
+- `test/cli/jobs.test.ts` (9 tests) — covers: `help` / `list` / `show` positive + error paths / `cancel` / `run --json` / `run --watch` rejected / unknown subcommand; `enqueue` → `list --json` → `show --json` end-to-end round-trip.
+- `test/unit/redactor` inlined at the end of `jobs-service.test.ts` (7 tests) — covers: null / undefined / empty input returns empty string; no secret pattern passes through unchanged; each of the 5 secret categories is masked; 2000-character truncation.
+- `packages/contracts/tests/jobs.test.ts` (17 tests) — covers the 11 zod schemas' happy + rejection paths; confirms `schema_version: "1"` is a literal.
+- `test/release-gate/jobs-multi-process.test.ts` (1 test, default `vitest` config excludes it; the release-candidate run picks it up) — 4 workers × 6 jobs = 24 jobs share one data home; verifies multi-process lease mutual exclusion + reap takeover. Depends on `dist/` (runs after `npm run build`).
+
+### Out of scope (deferred to subsequent phases)
+
+- The 4 kind-specific executors (`session_distill` / `skill_extract` / `bootstrap_scan` / `external_ref_refresh`) belong to Phase 2 (#50, #53, #54). In this entry, `runOnce` transitions every kind to `failed` because no executor is registered yet.
+- The `--watch` loop (continuous CLI polling), the HTTP bridge's `jobs` endpoint, and the admin app's candidate / job browser are adjacent work in Phase 1 / 2.
+- All `network` end-to-end tests (provider calls) are out of scope per the "zero new deps + zero new network" principle. All new tests in this entry are pure local SQLite.
+
 ## [1.1.6] — Release-gate hardening: clean CHANGELOG
 
 ### Added

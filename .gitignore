@@ -4,6 +4,9 @@ dist/
 dist-bin/
 coverage/
 
+# Lifecycle evaluation harness output (issue #55)
+artifacts/eval-lifecycle/
+
 # Local data homes (legacy + current naming)
 .local-memory-mcp/
 .agent-recall/

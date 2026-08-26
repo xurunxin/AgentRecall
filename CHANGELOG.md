@@ -36,6 +36,158 @@
 - "在图中定位" 实现 canvas pan + 2s 高亮
 - 整理动画缓动(FLIP / spring)
 
+## [1.2.0-alpha.1] — Session 证据层(#49)+ 资产注册表(#51,Phase 1)
+
+> Phase 1 并行两个工作流的合并 PR。Session 证据层把"捕获 + 证据 + 持久化"这条链路立起来,资产注册表给出 typed envelope(#51 暂只 ship `memory_ref` 类型;`skill` / `context_pack` / `external_reference` 类型特定表随 Phase 2 各自的 issue 落地 #53 / #54)。所有现有 API 保持兼容,没有破坏性改动。
+
+### 新增
+
+- **Schema v15** — `sessions` / `session_events` / `session_event_blobs` 三张 additive 表(issue #49);UNIQUE `(source_kind, source_version, source_instance_id, source_session_id)` 是 replay 契约;3 个索引;body 用内容地址化 (head/tail 1KB 入 row,full body 由 `content_digest` 寻址)。
+- **Schema v16** — `assets` / `asset_versions` / `asset_relations` 三张 envelope 表 + 唯一 v16-shipped 的 `memory_ref_bindings` 类型特定表(issue #51);CAS append on `current_version` 保证并发 append 安全;`archived` 是单向转换(`asset_already_terminal` 拒绝 un-archive)。
+- **`SessionService.ingest`** — replay-safe:同 source-identity + 同 `bundle_hash` 返回原 `session_id`;异 `bundle_hash` 抛 `bundle_hash_drift`。计划计数 (accepted / redacted / skipped / rejected) 在写 row 前由纯 walk 决定;secret scan + `risk_injection` tag + per-event (256KB) / per-session (8MB) 大小上限(超过则 head/tail 截断,原 body digest 保留)。
+- **`JsonlSessionAdapter`** — v1 参考实现:line 1 是 bundle header (events: []),后续每行一个 `SessionTraceEventV1`;zod 校验走共享 `@agent-recall/contracts` schema。
+- **`AssetService`** — `createMemoryRef` (CAS-style version append + immutable binding) / `list` / `show` / `history` / `setLifecycle`。archived 是单向转换。
+- **CLI** — `agent-recall sessions inspect | ingest | list | show | forget`(#49);`agent-recall assets list | show | history | lifecycle | create-memory-ref`(#51)。
+- **MCP resources** — `agentrecall://sessions/{session_id}`(#49);`agentrecall://assets/{asset_id}`(#51)。
+- **Contracts** — `packages/contracts/src/sessions.ts` 7 个 zod schema;`packages/contracts/src/assets.ts` 11 个 zod schema(包含 4 个类型特定 discriminated union);全部 `schema_version: "1"` literal。
+
+### 改动
+
+- `src/sqlite-store.ts`:`CURRENT_SCHEMA_VERSION` 升至 16,新增 `migrate_v14_to_v15` + `migrate_v15_to_v16`(都是 `BEGIN IMMEDIATE` + `COMMIT` / `ROLLBACK`,失败可回滚);新增 16 个 store 方法 + 7 个 row decoder + 3 个 row type (`SessionRow` / `SessionEventRow` / `SessionEventBlobRow` / `AssetRow` / `AssetVersionRow` / `AssetRelationRow` / `MemoryRefBindingRow`)。
+- `src/cli/arg-parser.ts`:`flagNumber` 工具已存在;本 Phase 1 用其解析 `--limit` / `--max-jobs`。
+- `src/cli/index.ts`:dispatch 表新增 `sessions` + `assets` 命令;`HELP_TEXT` 加两行。
+- `src/mcp/resources.ts`:新增 `session_evidence` + `asset_envelope` resource 注册。
+- `test/mcp-v2-contract.test.ts`:"registers all 6 resources" → "registers all 9 resources",断言新增的 `session_evidence` + `asset_envelope` 出现在列表里。
+
+### 测试
+
+- `test/unit/sessions-service.test.ts`(13 测试) — replay / digest-drift / 大小上限 / secret / injection / forget / JSONL 解析 / file round-trip。
+- `test/unit/assets-service.test.ts`(8 测试) — create / list / show / history / lifecycle / archive terminal / binding 校验。
+- `test/cli/sessions.test.ts`(7 测试) — help / list / show / cancel 风格覆盖 + secret / inject / 大小 端到端。
+- `test/cli/assets.test.ts`(5 测试) — help / list / show / history / lifecycle 端到端 round-trip。
+- `packages/contracts/tests/sessions.test.ts`(10 测试) — 7 个 zod schema 的 happy + rejection path。
+- `packages/contracts/tests/assets.test.ts`(17 测试) — 11 个 zod schema 的 happy + rejection path。
+- `test/mcp-v2-contract.test.ts`:1 测试更新(8 → 9 resources)。
+
+### 不在本版本范围(留待后续 Phase)
+
+- `skill` / `context_pack` / `external_reference` 的类型特定表 + executor(随 #53 / #54 落地)。
+- `bootstrap scan` / `external-ref refresh` 执行器(随 #54 落地)。
+- `run --watch` 循环(等 #54 bootstrap planner)。
+- Lifecycle evaluation / release gate(等 #55 收口)。
+- HTTP bridge 的 sessions / assets 端点(Phase 2 一并提供)。
+- Admin app 的 session 浏览器 / asset 浏览器(Phase 2 一并提供)。
+
+## [1.2.0-alpha.2] — Session 蒸馏(#50)+ Agent Loadout(#52)+ Skill 资产(#53)+ 冷启动 Bootstrap(#54,Phase 2 合并)
+
+> Phase 2 把 v1.2.0-alpha.0/1 的 substrate 接到一组面向 agent 的端到端链路上:从 captured session 蒸馏出 reviewable 候选、按 loadout 策略组装 context_pack、把 SKILL.md 注册为可版本化资产、从冷启动 scan 派生出可应用的 bootstrap plan。四个 issue 跨 4 个并行 worktree,通过 git rebase 顺序合成,schema version slot 预先分配 (v17=#50, v18=#52, v19=#53, v20=#54) 避免并发迁移冲突。所有现有 API 保持兼容,没有破坏性改动。`migrate_v16_to_v17` 是蒸馏 pipeline 的 additive 表,`migrate_v17_to_v18` 是 loadout substrate,`migrate_v18_to_v19` 是 skills 表,`migrate_v19_to_v20` 是 bootstrap 表面 — 4 个迁移依次 transactional + rollback-safe。
+
+### 新增
+
+- **Schema v17** (issue #50) — `derivation_candidates` / `candidate_evidence` / `candidate_actions` 三张 additive 表,backing 可 reviewable 的 memory / episode / skill_candidate 候选;`state` 字段是小型 state machine (`proposed` → `accepted` → `applied`,with `rejected` / `stale`);`expected_target_revision` 是 `apply` 步的 CAS guard。
+- **Schema v18** (issue #52) — `agent_loadouts` / `loadout_rules` / `loadout_bindings` 三张 additive 表,backing policy-bound loadout 表面;`loadout_rules` keyed on `(loadout_id, version, channel)`,让 `updateRules` 的 CAS-bump 保持 `bootstrap_hash` 稳定(上游 prompt-cache key)。
+- **Schema v19** (issue #53) — `skills` 类型特定表 for asset registry,`body_hash` 是 `sha256:hex64` over `skill_md_canonical` 与 `asset_versions.content_hash` 同步;`source` 严格 3-value enum,`name` 是 kebab-case 标识(由 Zod schema 强制,CHECK 兜底)。
+- **Schema v20** (issue #54) — `bootstrap_sources` / `bootstrap_plans` / `bootstrap_plan_items` / `external_references` 四张 additive 表,backing 冷启动 plan / 外部资源指针;`bootstrap_plans.state` 8-state machine (`draft` → `scanning` → `plan_ready` → `applying` → `applied` / `expired` / `failed` / `cancelled`),`applyPlan` 走原子 batch(任一失败整批回滚)。
+- **`DistillationService.runOnBundle`** (issue #50) — 6-stage pipeline (window select → extract → evidence validation → conflict / novelty analysis → review → apply);`apply` 批原子,`expected_target_revision` drift → `stale`。
+- **`DeterministicBaselineExtractor`** (issue #50) — 纯函数,emit 一个 `memory` candidate per `decision_confirmed` event with non-empty content;跳过 `risk_injection` / `contains_secret` flags;replay-safe (same input → same output)。
+- **`LoadoutService`** (issue #52) — `create` / `updateRules` (CAS on `version`) / `bind` / `unbind` / `resolve`;resolve 优先级 6 步:(1) 显式 `loadout_id` 短路,(2) actor + project + task_mode exact,(3) actor + project(task_mode NULL on binding),(4) project default,(5) global default,(6) built-in `legacy-inject-all-active` fallback;`updateRules` 支持 `--expected-previous-version` (CAS 显式 guard)。
+- **`ContextAssembler`** (issue #52) — `bootstrap` / `query` / `tool_only` 三 channel,filter by `include_*` / `exclude_*` / `required_refs`;`bootstrap_hash` 是上游 prompt-cache key(在 loadout + content 不变时稳定)。
+- **`SkillService`** (issue #53) — `importSkillMd` (CRLF → LF, frontmatter keys 字典序,unknown keys 走 `extension.*` namespace) / `appendSkillVersion` (CAS-bump) / `exportSkillMd` (byte-stable round-trip)。
+- **`BootstrapService`** (issue #54) — `configure` (rejects path traversal / device paths / unsafe symlinks;`.gitignore` + `bootstrap.deny` integration) / `scan` (idempotent: same content digest + same config → same plan, 0 new items) / `showPlan` / `applyPlan` (atomic batch) / `cancelPlan` / `expirePlan`。
+- **`ExternalReferenceService`** (issue #54) — `create` / `list` / `verify`;`last_verified_at` 记录新鲜度;`metadata` 始终是 pointer + retrieval contract,绝不存 provider 内容。
+- **`run --watch` extension** (issue #54) — `agent-recall jobs run --watch` 之前拒绝 `--watch`,现在默认 `poll_ms=2000` 轮询 `listClaimable`,signal-only exit。
+- **CLI** — `agent-recall sessions distill <id>` (issue #50) + `agent-recall candidates list | show | accept | reject | apply` (#50) + `agent-recall loadouts create | update | bind | unbind | resolve | list | show` (#52) + `agent-recall skills list | search | show | import | export` (#53) + `agent-recall bootstrap configure | scan | plan show | plan apply | plan cancel` (#54) + `agent-recall external-refs list | create | verify` (#54)。
+- **MCP resources** — `agentrecall://candidates/{candidate_id}` + `agentrecall://candidates/by-job/{job_id}` (issue #50);`agentrecall://context/loadout` (issue #52,loadout-assembled `Assembled` for the calling actor)。
+- **OpenCode plugin** — `opencode-plugin/context-client.mjs` 把 loadout resolve 结果通过 MCP 拉到 system prompt;`opencode-plugin/capture.mjs` 增强 opt-in 提示。
+- **Contracts** — `packages/contracts/src/distillation.ts` (5 zod schema, issue #50) + `packages/contracts/src/loadouts.ts` (5 zod schema + typed rule union, issue #52) + `packages/contracts/src/skills.ts` (tightened `SkillAssetV1Schema`: kebab-case name / source enum / resource type union, issue #53) + `packages/contracts/src/bootstrap.ts` (5 zod schema, issue #54);全部 `schema_version: "1"`。
+
+### 改动
+
+- `src/sqlite-store.ts`:`CURRENT_SCHEMA_VERSION` 升至 20,新增 `migrate_v16_to_v17` (蒸馏) + `migrate_v17_to_v18` (loadout) + `migrate_v18_to_v19` (skills) + `migrate_v19_to_v20` (bootstrap);4 个迁移都 `BEGIN IMMEDIATE` + `COMMIT` / `ROLLBACK`,失败可回滚;resolveLoadout 6 步级联 ((1) 显式 `loadout_id` 短路 → (2) actor + project + task_mode exact → (3) actor + project (task_mode NULL on binding) → (4) project default → (5) global default → (6) built-in `legacy-inject-all-active` fallback),`lifecycle_state IN ('draft', 'active')`;`updateLoadoutVersion` 暴露 expected_previous_version guard。
+- `src/cli/commands/loadouts.ts`:`--json` flag 在所有子命令 (create / update / bind / unbind / resolve / list / show) 上工作;`--expected-previous-version` flag 透传到 `LoadoutService.updateRules`。
+- `src/distillation/service.ts`:`enqueueAndRunSessionDistill` 在 runOnce 后重新读取 job (post-execution `state`),而不是返回 enqueue 时的 `queued` 状态;`DistillationService` 接收可选的 `ExtractorProvider` 注入。
+- `src/mcp/resources.ts`:`agent_loadout_context` (静态 URI) 移到 `distillation_candidate` 系列之后 (registration 顺序与测试 contract 一致);`agent_loadout_context` / `distillation_candidate` / `distillation_candidate_list` 是 v1.2-alpha.2 的 3 个新 resource,12 个 resource 总计。
+- `src/cli/commands/jobs.ts`:`--watch` flag 接入 runner 轮询循环 (issue #54);之前拒绝 `--watch` 的测试用例改写为订阅轮询 sentinel。
+- `test/mcp-v2-contract.test.ts`:"registers all 9 resources" → "registers all 12 resources",断言新增的 3 个 v1.2 resource 出现在列表里。
+- `test/blackbox/mcp-all-tools-e2e-{core,extended}.test.ts`:资源列表断言更新到 v1.2 的 4 静态 + 8 模板 (12 总) 形式。
+
+### 测试
+
+- `test/unit/distillation-service.test.ts` (26 测试) — extractor / validate / accept / reject / apply / 状态机 / CAS / 状态守护;6 阶段 pipeline 端到端。
+- `test/unit/loadouts-service.test.ts` (12 测试) — create / updateRules CAS / bind / resolve 5 步级联 / lifecycle 状态 / unbind。
+- `test/unit/context-assembly.test.ts` (7 测过 + 4 已知 gap) — `bootstrap` / `query` / `tool_only` channel 过滤 / `bootstrap_hash` 稳定性 / policy_version 戳。
+- `test/unit/skill-md.test.ts` (skill-md 解析 / CRLF → LF / frontmatter 排序 / extension.* 命名空间 / round-trip)。
+- `test/unit/skills-service.test.ts` (skills import / show / export / appendSkillVersion CAS / cas_mismatch)。
+- `test/unit/bootstrap-service.test.ts` (configure 路径安全 / scan idempotent / showPlan / applyPlan atomic / cancelPlan / expirePlan)。
+- `test/unit/external-refs-service.test.ts` (create / list / verify freshness / metadata 永远不存 provider 内容)。
+- `test/unit/jobs-runner-watch.test.ts` (--watch 轮询 / signal exit / poll_ms)。
+- `test/cli/loadouts.test.ts` (3 测试) — create + update + bind + resolve round-trip / cas_mismatch / list + show。
+- `test/cli/skills.test.ts` (skill CLI 端到端)。
+- `test/cli/bootstrap.test.ts` (configure / scan / plan show / plan apply 端到端)。
+- `test/cli/external-refs.test.ts` (external-refs CLI 端到端)。
+- `packages/contracts/tests/distillation.test.ts` (5 zod schema happy + rejection)。
+- `packages/contracts/tests/loadouts.test.ts` (5 zod schema + rule patch 校验)。
+- `packages/contracts/tests/skills.test.ts` (kebab-case / source enum / resource type union)。
+- `packages/contracts/tests/bootstrap.test.ts` (5 zod schema happy + rejection)。
+- `test/release-gate/loadout-resolution-multi-process.test.ts` — 8 worker 并发 resolve,no `binding_ambiguous` 误报,`bootstrap_hash` 在过程中稳定 (上游 prompt-cache key 不被意外 churn)。
+- `test/release-gate/skills-multi-process.test.ts` — 8 worker 并发 import 同一 SKILL.md,byte-stable 单次 import。
+- `test/release-gate/bootstrap-multi-process.test.ts` — 8 worker 并发 scan 同一 source,`source_set_digest` 在并发下稳定。
+- `test/mcp-v2-contract.test.ts`:1 测试更新 (9 → 12 resources,新增 3 个 v1.2)。
+- `test/blackbox/mcp-all-tools-e2e-core.test.ts` (30 测试) / `test/blackbox/mcp-all-tools-e2e-extended.test.ts` (39 测试) — 端到端 MCP 工具 + 资源 列表(已更新到 v1.2 资源集合)。
+- **`test/eval-lifecycle/` (issue #55 骨架)** — lifecycle evaluation harness 本期发 v0.1.0 corpus:2 个 fixture(1 happy + 1 policy_fail)。Runner 用 Zod-versioned schema 走 manifest(`lifecycle.eval.v1` / `lifecycle.corpus.v1` / `lifecycle.result.v1` / `lifecycle.report.v1`),每个 fixture 重新起 in-process memory store,直接调 service API(不走 CLI shim)。`pnpm run eval:lifecycle:quick` 当前 exit 0;`#55` AC 要求的 15-fixture 覆盖率矩阵在 v0.2.0 后续 corpus release 补齐。`pnpm test` 仍报 836 passing。设计在 `docs/adr/0012-lifecycle-eval-harness.md`,rollout plan 在 `docs/plans/v1.2-lifecycle-eval-design.md`。
+
+### 已知 caveat(本版本 ship-blocking 之外)
+
+- `test/blackbox/mcp-stdio-idle.test.ts` 在 Windows runner 上偶尔因 temp dir EPERM 失败(与本版本无关,pre-existing on Windows);Linux/macOS runner 上稳定。
+- Dimension C (recall + assembly) 的 quality scorers(Recall@K / nDCG / byte-determinism 计数)在 `ContextAssembler` 里已经留好 scaffold,但 v0.1.0 corpus 还没接入,v0.2.0 corpus release 会接入。
+- v0.1.0 lifecycle corpus 只有 2 个 fixture(1 happy + 1 policy_fail);完整的 15-fixture 覆盖率矩阵(#55 AC 要求)在后续 3 个 corpus release 里补齐。
+
+### 不在本版本范围(留待后续 Phase)
+
+- Lifecycle evaluation / release gate (#55 收口 Phase 2 + 整 v1.2 release 节奏)。
+- HTTP bridge 的 distillation / loadouts / skills / bootstrap 端点(Phase 3 一并提供)。
+- Admin app 的 candidate 浏览器 / loadout 编辑器 / SKILL.md 编辑器 / bootstrap plan 可视化(Phase 3 一并提供)。
+- Provider-backed extractor(LLM-backed 蒸馏,以替代 `DeterministicBaselineExtractor` 的占位)。
+
+## [1.2.0-alpha.0] — Derivation Job 子系统(issue #48,Phase 0)
+
+> v1.2 系列开篇:本条目只引入 derivation job 子系统,具体 kind 的执行器(session_distill / skill_extract / bootstrap_scan / external_ref_refresh)在后续 Phase 1 / 2 落地(#50、#53、#54)。本期所有现有 API 保持兼容,没有破坏性改动。
+
+### 新增
+
+- **Schema v14** — 三张 additive 表 `derivation_jobs` / `derivation_runs` / `derivation_outputs`,带复合主键与索引(`idx_derivation_jobs_state_next_retry`、`idx_derivation_jobs_lease WHERE state='running'`、`idx_derivation_jobs_creator_state`、`idx_derivation_jobs_kind`、`idx_derivation_runs_job_stage`、`idx_derivation_runs_job_status`、`idx_derivation_outputs_job_disposition`、`idx_derivation_outputs_run`)。所有 v13 表保持原样,迁移走 `migrate_v13_to_v14()`,失败可回滚,事务化(`BEGIN IMMEDIATE` + `COMMIT` / `ROLLBACK`)。
+- **`src/jobs/service.ts` — `DerivationJobStore`** — 提供 `enqueue` / `claim` / `listClaimable` / `reap` / `startStage` / `finishStage` / `complete` / `fail` / `requestCancel` / `markCancelled` / `inspect` / `list` 等公开 API;严格遵循 Epic #47 的"plan → review → apply"语义,claim 走单笔 `BEGIN IMMEDIATE` 事务保证多进程互斥,`listClaimable` 被动 reap 过期 lease。`enqueue` 通过 `UNIQUE (creator_actor_id, kind, idempotency_key)` 约束实现重放;若 `(input_digest, config_digest)` 与已存在行不一致则抛出 `idempotency_digest_mismatch`(issue #48 AC #3)。
+- **`src/jobs/runner.ts` — `runOnce` / `makeLeaseOwner`** — 事务外执行器,每个 `kind` 注册一个 `DerivationJobExecutor`;`runOnce` 单次扫描、claim 一次、处理一次,自动 catch 执行器抛错并把 job 标 `failed`(`internal_error`)。默认 lease TTL 30s,可在 `runOnce({lease_ttl_ms})` 覆盖。
+- **`src/jobs/redactor.ts` — `redactError` / `truncateRationale`** — secret-like pattern 替换为 `[redacted:<category>]`,限长 2000 字符,使用项目既有的 `secret-detector.ts` 词表。原始 prompt / response body 永远不进库,只持久化 `output_digest` + 200 字符 rationale(issue #48 AC #6)。
+- **`src/cli/commands/jobs.ts` — `agent-recall jobs ...`** — 4 个子命令:`list`(`--state` / `--kind` / `--limit` / `--json`)、`show <job_id>`(人类可读 + `--json` 两种格式)、`cancel <job_id>`(写 `cancel_requested_at`,runner 在下个 stage 边界处理)、`run`(`--kind` / `--max-jobs` / `--json`,单次扫描)。`--watch` 显式未实现,留待 Phase 2 #54 bootstrap planner 的 worker loop 一并落地。
+- **MCP resource `agentrecall://jobs/{job_id}`** — 只读,直接返回 `DerivationJobStore.inspect(jobId)` 的结果(job + runs + outputs 三块 JSON),对齐 CLI `jobs show` 的 JSON 输出。
+- **`packages/contracts/src/jobs.ts` — `DerivationJobSchema` / `DerivationRunSchema` / `DerivationOutputSchema` / `DerivationJobInspectionSchema`** — typed zod schema 公开 wire 形状,带 `schema_version: "1"` 字段供未来 v2 演进。Admin app 后续将消费这套 schema;`src/sqlite-store.ts` 仍持有 snake_case 行形状(数据源真相),中间通过 `DerivationJobStore` 的 row→wire 映射(留待 #55 收口时统一封装)。
+- **`docs/adr/0009-derivation-job-lifecycle.md`** — 完整记录 data model、9 步执行契约、lease 规则、被动 reap 策略、"为何不在中途续约"决策(简化实现,避免续约 race)、cancel 边界、`derivation_outputs` 的 reap-safe 重复写入语义。
+- **`docs/guides/jobs.md`** — 中文使用指南,含 CLI / MCP 三入口的等价示例、状态机、常见诊断步骤。
+
+### 改动
+
+- `src/sqlite-store.ts`:新增 `DerivationJobRow` / `DerivationRunRow` / `DerivationOutputRow` 类型 + 9 个 store 方法(`getDerivationJob` / `getDerivationJobByIdempotency` / `insertDerivationJob` / `claimDerivationJob` / `listClaimableDerivationJobs` / `requestDerivationJobCancel` / `finalizeDerivationJob` / `checkpointDerivationJob` / `renewDerivationJobLease` / `reapExpiredDerivationJobLeases` / `insertDerivationRun` / `completeDerivationRun` / `getDerivationRun` / `listDerivationRunsForJob` / `insertDerivationOutput` / `listDerivationOutputsForJob` / `listDerivationJobs`)+ 行解码器(`derivationJobFromRow` / `derivationRunFromRow` / `derivationOutputFromRow`)+ `isSqliteUniqueConstraintError`(同时识别 `code` / `errcode` / `errno` / message 多种形态,跨 node:sqlite / bun:sqlite 鲁棒)。`CURRENT_SCHEMA_VERSION` 由 13 升至 14,带 JSDoc 说明 Phase 0 的边界与对 v13 表的零侵入承诺。
+- `src/cli/arg-parser.ts`:新增 `flagNumber` 工具,`jobs` 子命令用其解析 `--limit` / `--max-jobs`。
+- `src/cli/index.ts`:dispatch 表新增 `jobs` 命令;`HELP_TEXT` 加一行说明。
+- `src/mcp/resources.ts`:新增 `derivation_job` resource 注册(MCP 同步回调直接调 `DerivationJobStore.inspect`);不动 v1.1.x 既有 resource 列表。
+- `test/mcp-v2-contract.test.ts`:"registers all 6 resources" → "registers all 7 resources",断言新增的 `derivation_job` 出现在列表里。
+
+### 测试
+
+- `test/unit/jobs-service.test.ts`(22 测试) — 覆盖:enqueue 四类路径(首次入队 / 同 idem 同 digest 重放 / 异 input_digest 拒绝 / 异 config_digest 拒绝);claim 三类路径(转 running + lease / 并发只一个赢 / 过期 lease 被 reap 后接管);`listClaimable` 按 kind 过滤;stage 写入 + finishStage 写出 `derivation_outputs`;`complete` / `fail`(redacted + 2000 截断)/ `requestCancel` + `markCancelled`;`outputs` 在 reap 重写下重复 `(job_id, output_kind, output_id)` 插入被静默吞掉。
+- `test/unit/jobs-runner.test.ts`(6 测试) — 覆盖:`runOnce` 空入队返回零计数;无 executor 的 kind 被自动标 `failed`(`internal_error` + "no executor" rationale);注册的 executor 收到 `startStage` 回调并写 `derivation_outputs`;执行器抛错被 catch 翻译为 `failed`;`max_jobs` 截断;cancel 路径走 `markCancelled` 终态。
+- `test/cli/jobs.test.ts`(9 测试) — 覆盖:`help` / `list` / `show` 正向 + 错误路径 / `cancel` / `run --json` / `run --watch` 拒绝 / 未知子命令;`enqueue` → `list --json` → `show --json` 端到端往返。
+- `test/unit/redactor` 嵌入在 `jobs-service.test.ts` 末尾(7 测试) — 覆盖:null / undefined / 空输入返空串、无 secret pattern 时原样透传、5 类 secret pattern 各自 mask、2000 截断。
+- `packages/contracts/tests/jobs.test.ts`(17 测试) — 覆盖 11 个 zod schema 的 happy path + rejection path,确认 `schema_version: "1"` 是 literal。
+- `test/release-gate/jobs-multi-process.test.ts`(1 测试,默认 config 已 exclude;release-candidate 跑) — 4 worker × 6 job = 24 job,共享一个 data home,验证多进程 lease 互斥 + reap takeover;依赖 `dist/`(`npm run build` 之后运行)。
+
+### 不在本版本范围(留待后续 Phase)
+
+- `session_distill` / `skill_extract` / `bootstrap_scan` / `external_ref_refresh` 这 4 个具体 kind 的执行器都属于 Phase 2(#50、#53、#54),本期 `runOnce` 在没有 executor 时会全部标 `failed`。
+- `--watch` 循环(让 CLI 持续轮询)、HTTP bridge 的 `jobs` 端点、Admin app 的候选 / Job 浏览器属于 Phase 1 / 2 的相邻工作。
+- 任何 `network` 端到端测试(provider 调用)按"零新依赖 + 零新网络"原则不在本期。本期所有新测试均纯本地 SQLite。
+
 ## [1.1.6] — 发布门强化:清理 CHANGELOG
 
 ### 新增

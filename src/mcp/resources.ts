@@ -34,9 +34,16 @@ import { listBackups } from "../backup.js";
 import { ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ProjectIdentityResolver } from "../scope-resolver.js";
 import { ImportBatchStore } from "../portability/import-batch-store.js";
+import { DerivationJobStore } from "../jobs/service.js";
+import { SessionService } from "../sessions/service.js";
+import { AssetService } from "../assets/service.js";
+import { DistillationService } from "../distillation/service.js";
+import { LoadoutService } from "../loadouts/service.js";
+import { ContextAssembler, type CallerAuthz } from "../context-assembly/assembler.js";
 import type { ToolProfile } from "../tools/profile.js";
 import type { CapabilityStore } from "../admin/capability.js";
 import type { AuthorizationDecision } from "../services/auth-context.js";
+import type { MemoryReadService } from "../services/memory-read-service.js";
 
 export interface MemoryServerContext {
   readonly store: SQLiteMemoryStore;
@@ -109,6 +116,28 @@ export interface MemoryServerContext {
    * the field is absent.
    */
   readonly authorization?: AuthorizationDecision;
+  /**
+   * v1.2.0-alpha.2 (issue #52): the read service
+   * the context-assembly surface uses to source
+   * `active` / search-candidate memory rows. The
+   * `agentrecall://context/loadout` resource is
+   * wired through this instance so every read is
+   * gated on the SQL-boundary sensitivity filter.
+   * Optional for backward compatibility with test
+   * fixtures that pre-date the loadout surface;
+   * the resource returns a structured
+   * `not_available` envelope when the field is
+   * absent.
+   */
+  readonly readService?: MemoryReadService;
+  /**
+   * v1.2.0-alpha.2 (issue #52): the caller's
+   * actor id (forwarded to the loadout resolver so
+   * the binding precedence chain can match the
+   * right loadout). Defaults to
+   * `defaultActor` when absent.
+   */
+  readonly callerActorId?: string;
 }
 
 type Variables = Record<string, string | string[] | undefined>;
@@ -507,6 +536,257 @@ export function registerMemoryResources(server: MemoryResourceServer, ctx: Memor
         });
       }
       return jsonResource(uri, batch);
+    }
+  );
+
+  // v1.2.0-alpha.0 (issue #48): the derivation job
+  // resource. The payload mirrors the `jobs show` CLI
+  // output and is the canonical read surface for an MCP
+  // client that wants to inspect a job's state, its
+  // per-stage runs, and the outputs the stages produced.
+  // The resource is read-only; mutations go through the
+  // `jobs_cancel` / `jobs_retry` tools.
+  server.registerResource(
+    "derivation_job",
+    new ResourceTemplate("agentrecall://jobs/{job_id}", { list: undefined }),
+    {
+      description:
+        "Durable derivation job inspection: state, lease, runs (one per stage), and the outputs the job has produced. Mirrors the agent-recall jobs show CLI output.",
+      mimeType: "application/json"
+    },
+    (uri: URL, variables: Variables) => {
+      const jobId = pickVariable(variables, "job_id");
+      if (jobId === undefined || jobId.length === 0) {
+        return jsonResource(uri, { ok: false, error: "not_found", message: "missing job_id" });
+      }
+      const store = new DerivationJobStore(ctx.store);
+      const inspection = store.inspect(jobId);
+      if (inspection === undefined) {
+        return jsonResource(uri, {
+          ok: false,
+          error: "not_found",
+          message: `unknown job_id ${jobId}`
+        });
+      }
+      return jsonResource(uri, {
+        ok: true,
+        job: inspection.job,
+        runs: inspection.runs,
+        outputs: inspection.outputs
+      });
+    }
+  );
+
+  // v1.2.0-alpha.1 (issue #49): the session evidence
+  // resource. The payload mirrors the `sessions show`
+  // CLI output: the session row + the per-event
+  // manifest (digest, redaction flags, metadata) + the
+  // ingestion plan. The event body is **not** in this
+  // payload — bodies live in `session_event_blobs`
+  // and are resolved on demand through a typed
+  // tool (added in Phase 2 with the candidate
+  // extractor).
+  server.registerResource(
+    "session_evidence",
+    new ResourceTemplate("agentrecall://sessions/{session_id}", { list: undefined }),
+    {
+      description:
+        "Durable session evidence: row + per-event manifest (sequence, type, content digest, redaction flags, metadata) + ingestion plan. Mirrors the agent-recall sessions show CLI output.",
+      mimeType: "application/json"
+    },
+    (uri: URL, variables: Variables) => {
+      const sessionId = pickVariable(variables, "session_id");
+      if (sessionId === undefined || sessionId.length === 0) {
+        return jsonResource(uri, { ok: false, error: "not_found", message: "missing session_id" });
+      }
+      const service = new SessionService(ctx.store, ctx.identityResolver);
+      const inspection = service.inspect(sessionId);
+      if (inspection === undefined) {
+        return jsonResource(uri, {
+          ok: false,
+          error: "not_found",
+          message: `unknown session_id ${sessionId}`
+        });
+      }
+      return jsonResource(uri, {
+        ok: true,
+        session: inspection.session,
+        events: inspection.events,
+        plan: inspection.plan
+      });
+    }
+  );
+
+  // v1.2.0-alpha.1 (issue #51): the asset registry
+  // resource. The payload mirrors the `assets show`
+  // CLI output: the envelope row + the current
+  // head (asset_versions row) + the type-specific
+  // payload (memory_ref binding for v1.2-alpha.1).
+  // Mutations go through the `assets_lifecycle` /
+  // `assets_create_memory_ref` tools.
+  server.registerResource(
+    "asset_envelope",
+    new ResourceTemplate("agentrecall://assets/{asset_id}", { list: undefined }),
+    {
+      description:
+        "Typed asset registry inspection: envelope + current head + type-specific payload (memory_ref binding in v1.2-alpha.1). Mirrors the agent-recall assets show CLI output.",
+      mimeType: "application/json"
+    },
+    (uri: URL, variables: Variables) => {
+      const assetId = pickVariable(variables, "asset_id");
+      if (assetId === undefined || assetId.length === 0) {
+        return jsonResource(uri, { ok: false, error: "not_found", message: "missing asset_id" });
+      }
+      const service = new AssetService(ctx.store);
+      const inspection = service.show(assetId);
+      if (inspection === undefined) {
+        return jsonResource(uri, {
+          ok: false,
+          error: "not_found",
+          message: `unknown asset_id ${assetId}`
+        });
+      }
+      return jsonResource(uri, {
+        ok: true,
+        asset: inspection.asset,
+        current_version: inspection.current_version,
+        payload: inspection.payload
+      });
+    }
+  );
+
+  // v1.2.0-alpha.2 (issue #50): the single
+  // distillation-candidate inspection resource.
+  // The payload is the full candidate row + the
+  // candidate's evidence rows + action rows,
+  // mirroring the `agent-recall candidates show`
+  // CLI verb. The `DistillationService` is
+  // constructed with the same `MemoryService` /
+  // `MemoryWriteService` the MCP server already
+  // owns; the apply path's trust / sensitivity
+  // gates are the same ones used by the `remember`
+  // tool.
+  server.registerResource(
+    "distillation_candidate",
+    new ResourceTemplate("agentrecall://candidates/{candidate_id}", { list: undefined }),
+    {
+      description:
+        "Distillation candidate inspection: candidate row + evidence rows + action rows. Mirrors the agent-recall candidates show CLI output. Read-only.",
+      mimeType: "application/json"
+    },
+    (uri: URL, variables: Variables) => {
+      const candidateId = pickVariable(variables, "candidate_id");
+      if (candidateId === undefined || candidateId.length === 0) {
+        return jsonResource(uri, { ok: false, error: "not_found", message: "missing candidate_id" });
+      }
+      const jobStore = new DerivationJobStore(ctx.store);
+      const sessionService = new SessionService(ctx.store, ctx.identityResolver);
+      const distillation = new DistillationService(ctx.store, sessionService, jobStore);
+      const inspection = distillation.show(candidateId);
+      if (inspection === undefined) {
+        return jsonResource(uri, {
+          ok: false,
+          error: "not_found",
+          message: `unknown candidate_id ${candidateId}`
+        });
+      }
+      return jsonResource(uri, {
+        ok: true,
+        candidate: inspection.candidate,
+        evidence: inspection.evidence,
+        actions: inspection.actions
+      });
+    }
+  );
+
+  // v1.2.0-alpha.2 (issue #50): the by-job
+  // candidate list. The payload is the full
+  // candidate + evidence + action triple for
+  // every row attached to a derivation job. An
+  // unknown `job_id` surfaces a `not_found`
+  // envelope.
+  server.registerResource(
+    "distillation_candidate_list",
+    new ResourceTemplate("agentrecall://candidates/by-job/{job_id}", { list: undefined }),
+    {
+      description:
+        "List of distillation candidates (with evidence + actions) for a single derivation job. Mirrors the agent-recall candidates list --job CLI output. Read-only.",
+      mimeType: "application/json"
+    },
+    (uri: URL, variables: Variables) => {
+      const jobId = pickVariable(variables, "job_id");
+      if (jobId === undefined || jobId.length === 0) {
+        return jsonResource(uri, { ok: false, error: "not_found", message: "missing job_id" });
+      }
+      const jobStore = new DerivationJobStore(ctx.store);
+      const sessionService = new SessionService(ctx.store, ctx.identityResolver);
+      const distillation = new DistillationService(ctx.store, sessionService, jobStore);
+      const rows = distillation.listForJob(jobId);
+      return jsonResource(uri, {
+        ok: true,
+        job_id: jobId,
+        candidates: rows
+      });
+    }
+  );
+
+  // v1.2.0-alpha.2 (issue #52): the agent loadout
+  // context-assembly resource. The payload is the
+  // assembled `Assembled` (bootstrap + query +
+  // tool_only channels) for the calling actor. The
+  // resource is the canonical MCP surface for the
+  // v1.2-alpha.2 loadout service: the OpenCode
+  // plugin (and any other MCP client) calls this
+  // resource to surface the assembled bootstrap
+  // channel into the system prompt without
+  // duplicating the assembler in JS. The
+  // `bootstrap_hash` field is the upstream
+  // prompt-cache key.
+  //
+  // The resource is read-only; mutations go
+  // through the `loadouts_create` /
+  // `loadouts_update_rules` / `loadouts_bind` /
+  // `loadouts_unbind` CLI verbs (the MCP tool
+  // surface for loadouts lands in Phase 2.3).
+  server.registerResource(
+    "agent_loadout_context",
+    "agentrecall://context/loadout",
+    {
+      description:
+        "Assembled context for the calling actor: bootstrap / query / tool_only channels + bootstrap_hash upstream-cache key. Mirrors the agent-recall loadouts resolve + context-assembly surface.",
+      mimeType: "application/json"
+    },
+    (uri: URL) => {
+      if (ctx.readService === undefined) {
+        return jsonResource(uri, {
+          ok: false,
+          error: "not_available",
+          message: "readService not configured; the loadout context resource requires a MemoryReadService on the server context"
+        });
+      }
+      const loadoutService = new LoadoutService(ctx.store);
+      const resolved = loadoutService.resolve({
+        actor_id: ctx.callerActorId ?? ctx.defaultActor
+      });
+      const authz: CallerAuthz = {
+        actor_id: ctx.callerActorId ?? ctx.defaultActor,
+        max_sensitivity: ctx.actorMaxSensitivity ?? "normal"
+      };
+      const assembler = new ContextAssembler({ read_service: ctx.readService });
+      const assembled = assembler.assembleAll({
+        loadout: resolved.loadout,
+        rules: resolved.rules,
+        authz
+      });
+      return jsonResource(uri, {
+        ok: true,
+        loadout_id: assembled.loadout_id,
+        loadout_version: assembled.loadout_version,
+        policy_version: assembled.policy_version,
+        channels: assembled.channels,
+        bootstrap_hash: assembled.bootstrap_hash,
+        explanation: assembled.explanation
+      });
     }
   );
 }
