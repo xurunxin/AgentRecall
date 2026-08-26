@@ -13,6 +13,7 @@ import { auditCommand } from "./commands/audit.js";
 import { backupCommand, restoreCommand } from "./commands/backup.js";
 import { bootstrapCommand } from "./commands/bootstrap.js";
 import { candidatesCommand } from "./commands/candidates.js";
+import { evalCommand } from "./commands/eval.js";
 import { doctorCommand } from "./commands/doctor.js";
 import { exportCommand } from "./commands/export.js";
 import { externalRefsCommand } from "./commands/external-refs.js";
@@ -146,6 +147,13 @@ const dispatch: Record<string, CommandHandler> = {
   restore: restoreCommand,
   migrate: migrateCommand,
   admin: adminCommand,
+  // v1.2.0-alpha.3 (issue #55d): the
+  // `agent-recall eval` lifecycle evaluation
+  // CLI. Subcommands are `run` / `list-corpora`
+  // / `show-report`; the implementation is a
+  // thin shell over `scripts/eval-lifecycle.mjs`
+  // so the same harness backs both surfaces.
+  eval: evalCommand,
   // v1.2.0-alpha.0 (issue #48): the derivation job
   // subcommand. Provides the durable inspect / cancel /
   // run surface for the v1.2 derivation job substrate.
