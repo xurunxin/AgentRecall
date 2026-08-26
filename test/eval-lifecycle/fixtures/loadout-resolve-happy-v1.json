@@ -1,0 +1,72 @@
+{
+  "schema_version": "lifecycle.eval.v1",
+  "fixture_id": "loadout_resolve_happy_v1",
+  "description": "Happy path: a loadout is created with scope=global, a binding is added for (actor=agent:claude, project=null, task_mode=chat), and resolve returns the bound loadout. Exercises dimension D (assets / loadouts) and the 4-step resolve precedence chain (the actor + project + task_mode match).",
+  "dimension": "D.assets_skills_bootstrap",
+  "workstream": "loadouts",
+  "fixture_class": "happy",
+  "determinism": "deterministic",
+  "requires_schema_version": 20,
+  "seed": {
+    "actor_id": "agent:eval-loadout-happy",
+    "project_id": null,
+    "memories": [
+      {
+        "id": "mem_eval_loadout_h_1",
+        "tier": "core",
+        "title": "stable rule",
+        "body": "test before you ship",
+        "pinned": true,
+        "tags": ["core"],
+        "trust_level": "user_confirmed",
+        "sensitivity": "normal"
+      }
+    ],
+    "loadouts": [
+      {
+        "name": "eval-loadout-happy",
+        "scope": "global",
+        "project_id": null,
+        "rules": [
+          {
+            "channel": "bootstrap",
+            "max_items": 16,
+            "max_chars": 4000,
+            "include_memory_ids": ["mem_eval_loadout_h_1"]
+          }
+        ],
+        "bindings": [
+          {
+            "actor_id": "agent:claude",
+            "client_name": null,
+            "project_id": null,
+            "task_mode": "chat",
+            "priority": 5
+          }
+        ]
+      }
+    ],
+    "session_bundles": []
+  },
+  "operations": [
+    {
+      "kind": "resolve_loadout",
+      "actor_id": "agent:claude",
+      "project_id": null,
+      "task_mode": "chat"
+    }
+  ],
+  "expected": {
+    "job_state": null,
+    "candidate_count": null,
+    "bootstrap_hash": null,
+    "safety": {
+      "cross_project_leak_count": 0,
+      "sensitivity_leak_count": 0,
+      "secret_leak_count": 0,
+      "injection_bypass_count": 0,
+      "unauthorized_trust_escalation_count": 0
+    },
+    "last_error_code": null
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "schema_version": "lifecycle.eval.v1",
+  "fixture_id": "skills_import_roundtrip_v1",
+  "description": "Happy path: import a canonical SKILL.md through SkillService.importSkillMd. The asset envelope (assets + asset_versions) and the type-specific `skills` row are written in the same logical transaction. A future v0.3.0 iteration will add the exportSkillMd round-trip assertion. Exercises dimension D (assets / skills) — the asset envelope's `current_version` CAS append and the `skills` type-specific table.",
+  "dimension": "D.assets_skills_bootstrap",
+  "workstream": "skills",
+  "fixture_class": "happy",
+  "determinism": "deterministic",
+  "requires_schema_version": 20,
+  "seed": {
+    "actor_id": "agent:eval-skills",
+    "project_id": null,
+    "memories": [],
+    "loadouts": [],
+    "session_bundles": []
+  },
+  "operations": [
+    {
+      "kind": "import_skill_md",
+      "name": "codebase-grep",
+      "source": "manual",
+      "skill_md": "---\nschema_version: \"1\"\nname: codebase-grep\ndescription: Fast code search via ripgrep\n---\n\n# codebase-grep\n\nUse `rg` (ripgrep) for fast text search across a codebase.\n\n## When to use\n\n- Locate symbols, identifiers, error messages\n- Find every call site of a function\n- Surface TODOs and FIXMEs across the tree\n\n## When NOT to use\n\n- Regex over binary files (use `rg --binary` for that)\n- Single-file edits (use your editor's search)\n"
+    }
+  ],
+  "expected": {
+    "job_state": null,
+    "candidate_count": null,
+    "bootstrap_hash": null,
+    "safety": {
+      "cross_project_leak_count": 0,
+      "sensitivity_leak_count": 0,
+      "secret_leak_count": 0,
+      "injection_bypass_count": 0,
+      "unauthorized_trust_escalation_count": 0
+    },
+    "last_error_code": null
+  }
+}

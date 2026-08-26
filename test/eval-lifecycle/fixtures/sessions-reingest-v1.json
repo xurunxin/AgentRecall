@@ -1,0 +1,43 @@
+{
+  "schema_version": "lifecycle.eval.v1",
+  "fixture_id": "sessions_reingest_v1",
+  "description": "Happy path: ingest a JSONL bundle with 3 events (1 user_message, 1 decision_confirmed, 1 tool_call), then re-ingest the same bundle. The seed step produces the session + 3 events; the re_ingest_session operation must be a no-op (replay-safe per ADR-0011) and return the original session_id. A `bundle_hash_drift` would surface as an error and fail the fixture. Exercises dimension A (ingestion) and dimension E (interruption / retry).",
+  "dimension": "A.ingestion",
+  "workstream": "ingestion",
+  "fixture_class": "happy",
+  "determinism": "deterministic",
+  "requires_schema_version": 20,
+  "seed": {
+    "actor_id": "agent:eval-sessions",
+    "project_id": null,
+    "memories": [],
+    "loadouts": [],
+    "session_bundles": [
+      {
+        "bundle_id": "eval_sessions_reingest_1",
+        "source_kind": "opencode",
+        "source_session_id": "oc-eval-sessions-1",
+        "jsonl": "{\"schema_version\":\"1\",\"bundle_id\":\"eval_sessions_reingest_1\",\"source_kind\":\"opencode\",\"source_version\":\"1.0.0\",\"source_instance_id\":\"eval-instance\",\"source_session_id\":\"oc-eval-sessions-1\",\"project_id\":null,\"actor_id\":\"agent:eval-sessions\",\"client_name\":\"opencode\",\"client_version\":\"1.0.0\",\"scope\":\"global\",\"sensitivity\":\"normal\",\"started_at\":\"2026-08-26T00:00:00.000Z\",\"ended_at\":\"2026-08-26T00:01:00.000Z\",\"adapter_id\":\"jsonl\",\"adapter_version\":\"1.0.0\",\"events\":[]}\n{\"schema_version\":\"1\",\"source_kind\":\"opencode\",\"source_version\":\"1.0.0\",\"source_instance_id\":\"eval-instance\",\"source_session_id\":\"oc-eval-sessions-1\",\"project_id\":null,\"actor_id\":\"agent:eval-sessions\",\"client_name\":\"opencode\",\"client_version\":\"1.0.0\",\"event_id\":\"evt_re_1\",\"sequence\":1,\"turn_id\":\"turn-1\",\"event_type\":\"user_message\",\"role\":\"user\",\"content\":\"How do I bootstrap a new project?\",\"content_digest\":\"sha256:PLACEHOLDER_WILL_BE_RECOMPUTED\",\"timestamp\":\"2026-08-26T00:00:10.000Z\",\"sensitivity\":\"normal\",\"redaction_flags\":[],\"metadata\":{}}\n{\"schema_version\":\"1\",\"source_kind\":\"opencode\",\"source_version\":\"1.0.0\",\"source_instance_id\":\"eval-instance\",\"source_session_id\":\"oc-eval-sessions-1\",\"project_id\":null,\"actor_id\":\"agent:eval-sessions\",\"client_name\":\"opencode\",\"client_version\":\"1.0.0\",\"event_id\":\"evt_re_2\",\"sequence\":2,\"turn_id\":\"turn-1\",\"event_type\":\"decision_confirmed\",\"role\":\"assistant\",\"content\":\"Use ripgrep for fast text search in code projects.\",\"content_digest\":\"sha256:PLACEHOLDER_WILL_BE_RECOMPUTED\",\"timestamp\":\"2026-08-26T00:00:20.000Z\",\"sensitivity\":\"normal\",\"redaction_flags\":[],\"metadata\":{}}\n{\"schema_version\":\"1\",\"source_kind\":\"opencode\",\"source_version\":\"1.0.0\",\"source_instance_id\":\"eval-instance\",\"source_session_id\":\"oc-eval-sessions-1\",\"project_id\":null,\"actor_id\":\"agent:eval-sessions\",\"client_name\":\"opencode\",\"client_version\":\"1.0.0\",\"event_id\":\"evt_re_3\",\"sequence\":3,\"turn_id\":\"turn-1\",\"event_type\":\"tool_call\",\"role\":\"assistant\",\"content\":\"rg --version\",\"content_digest\":\"sha256:PLACEHOLDER_WILL_BE_RECOMPUTED\",\"timestamp\":\"2026-08-26T00:00:25.000Z\",\"sensitivity\":\"normal\",\"redaction_flags\":[],\"metadata\":{}}\n"
+      }
+    ]
+  },
+  "operations": [
+    {
+      "kind": "re_ingest_session",
+      "jsonl": "{\"schema_version\":\"1\",\"bundle_id\":\"eval_sessions_reingest_1\",\"source_kind\":\"opencode\",\"source_version\":\"1.0.0\",\"source_instance_id\":\"eval-instance\",\"source_session_id\":\"oc-eval-sessions-1\",\"project_id\":null,\"actor_id\":\"agent:eval-sessions\",\"client_name\":\"opencode\",\"client_version\":\"1.0.0\",\"scope\":\"global\",\"sensitivity\":\"normal\",\"started_at\":\"2026-08-26T00:00:00.000Z\",\"ended_at\":\"2026-08-26T00:01:00.000Z\",\"adapter_id\":\"jsonl\",\"adapter_version\":\"1.0.0\",\"events\":[]}\n{\"schema_version\":\"1\",\"source_kind\":\"opencode\",\"source_version\":\"1.0.0\",\"source_instance_id\":\"eval-instance\",\"source_session_id\":\"oc-eval-sessions-1\",\"project_id\":null,\"actor_id\":\"agent:eval-sessions\",\"client_name\":\"opencode\",\"client_version\":\"1.0.0\",\"event_id\":\"evt_re_1\",\"sequence\":1,\"turn_id\":\"turn-1\",\"event_type\":\"user_message\",\"role\":\"user\",\"content\":\"How do I bootstrap a new project?\",\"content_digest\":\"sha256:PLACEHOLDER_WILL_BE_RECOMPUTED\",\"timestamp\":\"2026-08-26T00:00:10.000Z\",\"sensitivity\":\"normal\",\"redaction_flags\":[],\"metadata\":{}}\n{\"schema_version\":\"1\",\"source_kind\":\"opencode\",\"source_version\":\"1.0.0\",\"source_instance_id\":\"eval-instance\",\"source_session_id\":\"oc-eval-sessions-1\",\"project_id\":null,\"actor_id\":\"agent:eval-sessions\",\"client_name\":\"opencode\",\"client_version\":\"1.0.0\",\"event_id\":\"evt_re_2\",\"sequence\":2,\"turn_id\":\"turn-1\",\"event_type\":\"decision_confirmed\",\"role\":\"assistant\",\"content\":\"Use ripgrep for fast text search in code projects.\",\"content_digest\":\"sha256:PLACEHOLDER_WILL_BE_RECOMPUTED\",\"timestamp\":\"2026-08-26T00:00:20.000Z\",\"sensitivity\":\"normal\",\"redaction_flags\":[],\"metadata\":{}}\n{\"schema_version\":\"1\",\"source_kind\":\"opencode\",\"source_version\":\"1.0.0\",\"source_instance_id\":\"eval-instance\",\"source_session_id\":\"oc-eval-sessions-1\",\"project_id\":null,\"actor_id\":\"agent:eval-sessions\",\"client_name\":\"opencode\",\"client_version\":\"1.0.0\",\"event_id\":\"evt_re_3\",\"sequence\":3,\"turn_id\":\"turn-1\",\"event_type\":\"tool_call\",\"role\":\"assistant\",\"content\":\"rg --version\",\"content_digest\":\"sha256:PLACEHOLDER_WILL_BE_RECOMPUTED\",\"timestamp\":\"2026-08-26T00:00:25.000Z\",\"sensitivity\":\"normal\",\"redaction_flags\":[],\"metadata\":{}}\n"
+    }
+  ],
+  "expected": {
+    "job_state": null,
+    "candidate_count": null,
+    "bootstrap_hash": null,
+    "safety": {
+      "cross_project_leak_count": 0,
+      "sensitivity_leak_count": 0,
+      "secret_leak_count": 0,
+      "injection_bypass_count": 0,
+      "unauthorized_trust_escalation_count": 0
+    },
+    "last_error_code": null
+  }
+}

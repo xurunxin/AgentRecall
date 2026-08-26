@@ -1,7 +1,7 @@
 {
   "schema_version": "lifecycle.corpus.v1",
-  "corpus_version": "v0.1.0",
-  "description": "Phase 3 (#55) initial evaluation corpus. Two example fixtures ship with the skeleton; subsequent releases will grow the corpus to the documented coverage matrix (every v1.2 workstream × happy / policy_fail / interrupt_retry).",
+  "corpus_version": "v0.2.0",
+  "description": "Phase 3 (#55) v0.2.0 evaluation corpus. Five fixtures cover three of the five v1.2 workstreams (distillation, ingestion, loadouts, skills). The full 15-fixture coverage matrix per #55 AC lands over the next 3 corpus releases.",
   "baselines": {
     "distillation_supported_claim_rate": 0.9,
     "distillation_hallucination_rejection_rate": 0.95,
@@ -9,6 +9,9 @@
   },
   "fixtures": [
     "distill-happy.json",
-    "loadout-policy-fail.json"
+    "loadout-policy-fail.json",
+    "loadout-resolve-happy-v1.json",
+    "sessions-reingest-v1.json",
+    "skills-import-roundtrip-v1.json"
   ]
 }
