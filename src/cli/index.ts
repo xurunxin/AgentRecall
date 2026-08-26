@@ -11,6 +11,7 @@ import { adminCommand } from "./commands/admin.js";
 import { assetsCommand } from "./commands/assets.js";
 import { auditCommand } from "./commands/audit.js";
 import { backupCommand, restoreCommand } from "./commands/backup.js";
+import { candidatesCommand } from "./commands/candidates.js";
 import { doctorCommand } from "./commands/doctor.js";
 import { exportCommand } from "./commands/export.js";
 import { importCommand } from "./commands/import.js";
@@ -100,7 +101,8 @@ Commands:
   migrate    Run schema migrations
   admin      Manage the operator capability (grant / status / revoke)
   jobs       Inspect, cancel, or run derivation jobs
-  sessions   Inspect / ingest / list / show / forget captured session traces
+  candidates List, show, accept, reject, or apply distillation candidates (issue #50)
+  sessions   Inspect / ingest / list / show / forget / distill captured session traces
   assets     Manage the typed asset registry (memory_ref / skill / context_pack / external_reference)
   version    Print the server version (also: --version / -v)
   help       Show this help
@@ -145,6 +147,19 @@ const dispatch: Record<string, CommandHandler> = {
   // show / forget surface for the v1.2 session
   // evidence substrate.
   sessions: sessionsCommand,
+  // v1.2.0-alpha.1 (issue #51): the typed asset
+  // registry subcommand. Provides list / show /
+  // history / lifecycle / create-memory-ref for
+  // the additive asset envelope. Skill /
+  // context_pack / external_reference creation
+  // land with their owning Phase 2 issues
+  // (#53 / #54).
+  // v1.2.0-alpha.2 (issue #50): the candidate
+  // review / apply surface. Backed by the
+  // `DistillationService` (src/distillation/service.ts)
+  // and the `derivation_candidates` /
+  // `candidate_evidence` / `candidate_actions` tables.
+  candidates: candidatesCommand,
   // v1.2.0-alpha.1 (issue #51): the typed asset
   // registry subcommand. Provides list / show /
   // history / lifecycle / create-memory-ref for
@@ -279,4 +294,41 @@ export async function runCli(
 
 export function registerCommand(name: string, handler: CommandHandler): void {
   dispatch[name] = handler;
+}
+
+/**
+ * v1.2.0-alpha.2 (issue #50): build a minimal
+ * `WriteContext` for the CLI's `MemoryWriteService`.
+ * The CLI does not own a `MemoryService` instance
+ * directly (the MCP server does); the write
+ * services are only constructed when a CLI verb
+ * needs to mutate memory rows. The write context
+ * uses the CLI's `identityResolver` for project
+ * scope checks and the `ctx.defaultActor` for the
+ * `actor` field. A `configureProjectBudget` stub
+ * is supplied so the `remember` path can lazily
+ * bootstrap a project on a `project_path`-only
+ * input — the candidate apply path passes an
+ * explicit `project_id`, so the stub is only
+ * consulted for `project_path` flows.
+ */
+export function buildCliWriteContext(
+  cliCtx: CliContext
+): import("../services/memory-write-service.js").WriteContext {
+  return {
+    store: cliCtx.store,
+    defaultActor: cliCtx.ctx.actor_id,
+    identityResolver: cliCtx.identityResolver,
+    configureProjectBudget: (
+      _project_id: string,
+      _budget: import("../domain.js").MemoryBudget,
+      _canonical_path: string,
+      _display_name: string
+    ) => {
+      throw new Error(
+        "[internal_error] configureProjectBudget is not wired into the CLI; " +
+          "candidate apply must pass an explicit project_id"
+      );
+    }
+  };
 }
