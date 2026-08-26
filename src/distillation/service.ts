@@ -56,6 +56,14 @@ import type {
 import { MemoryWriteService } from "../services/memory-write-service.js";
 import type { RequestContext } from "../request-context.js";
 import type { NormalisedBundle, NormalisedEvent } from "../sessions/service.js";
+import {
+  detectSecrets,
+  type SecretFinding
+} from "../secret-detector.js";
+import {
+  noopSafetyCounters,
+  type SafetyCounters
+} from "../services/safety-counters.js";
 import { SessionService } from "../sessions/service.js";
 import { DerivationJobStore } from "../jobs/service.js";
 
@@ -100,6 +108,19 @@ export type DistillationServiceOptions = {
    * unreachable from distillation.
    */
   memoryWriteService?: MemoryWriteService;
+  /**
+   * v1.2.0-alpha.3 (issue #55b): the safety counter
+   * surface. The service increments
+   * `unauthorized_trust_escalation_count` for any
+   * accepted candidate whose proposed trust level
+   * would cross a privileged boundary (`inferred` /
+   * `agent_observed` → `user_confirmed`), and
+   * `secret_leak_count` for any candidate whose
+   * proposed body still contains a secret pattern
+   * after the baseline extractor has accepted it.
+   * Defaults to the no-op implementation.
+   */
+  safetyCounters?: SafetyCounters;
 };
 
 export type RunOnBundleInput = {
@@ -176,6 +197,7 @@ const APPLIED_MEMORY_DISPOSITION: DerivationOutputDisposition = "applied";
 export class DistillationService {
   private readonly provider: ExtractorProvider;
   private readonly memoryWriteService: MemoryWriteService | undefined;
+  private readonly safetyCounters: SafetyCounters;
 
   constructor(
     private readonly store: SQLiteMemoryStore,
@@ -185,6 +207,7 @@ export class DistillationService {
   ) {
     this.provider = options.provider ?? new DeterministicBaselineExtractor();
     this.memoryWriteService = options.memoryWriteService;
+    this.safetyCounters = options.safetyCounters ?? noopSafetyCounters;
   }
 
   /**
@@ -220,6 +243,18 @@ export class DistillationService {
       // a future provider-backed extractor can surface
       // the same telemetry. For the baseline it stays 0.
       void knownSecret;
+      // v1.2.0-alpha.3 (issue #55b): re-scan the
+      // proposed body for secret patterns. The
+      // baseline extractor refuses events whose
+      // source flag includes `contains_secret`, but
+      // a future provider-backed extractor may not
+      // honour that filter; the counter is the
+      // belt-and-braces check. A passing fixture
+      // observes `secret_leak_count = 0`.
+      const bodyFindings = detectSecrets(proposal.proposed_body ?? "");
+      if (bodyFindings.length > 0) {
+        this.safetyCounters.inc("secret_leak_count");
+      }
       const event = pickDecisionEvent(input.bundle, i);
       if (event === undefined) continue;
       const candidateId = deterministicCandidateId(input.bundle, event);
@@ -457,6 +492,23 @@ export class DistillationService {
     if (action.action === "create") {
       const idempotencyKey = `distill:${candidate.candidate_id}:create:${candidate.run_id}`;
       const rememberInput = buildRememberInputFromCandidate(candidate, actor, idempotencyKey);
+      // v1.2.0-alpha.3 (issue #55b): a distillation
+      // candidate proposing `user_confirmed` trust
+      // crosses a privileged boundary. The v1
+      // distillation contract disallows that
+      // (candidates are `inferred` / `agent_observed`
+      // at most), but the counter is the
+      // belt-and-braces check that catches a future
+      // provider-backed extractor that silently
+      // escalates. The candidate row's
+      // `proposed_trust_level` is typed as
+      // `DerivationCandidateTrustLevel`; the string
+      // comparison reaches a value the v1 schema
+      // never writes today, so a passing fixture
+      // observes `unauthorized_trust_escalation_count = 0`.
+      if ((candidate.proposed_trust_level as string) === "user_confirmed") {
+        this.safetyCounters.inc("unauthorized_trust_escalation_count");
+      }
       const result = write.remember(rememberInput, ctx);
       if (!result.ok) {
         return { kind: "failed", error: new Error(`remember failed: ${result.error}`) };
