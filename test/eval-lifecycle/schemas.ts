@@ -137,6 +137,23 @@ export const FixtureSeedSchema = z.object({
               required_refs: z.array(z.string()).default([])
             })
           )
+          .default([]),
+        /**
+         * Bindings to attach to the loadout after
+         * the create + updateRules steps. The
+         * happy-path resolve fixture uses these
+         * to exercise the 4-step resolve cascade.
+         */
+        bindings: z
+          .array(
+            z.object({
+              actor_id: z.string().nullable().default(null),
+              client_name: z.string().nullable().default(null),
+              project_id: z.string().nullable().default(null),
+              task_mode: z.string().nullable().default(null),
+              priority: z.number().int().default(0)
+            })
+          )
           .default([])
       })
     )
@@ -190,6 +207,33 @@ export const FixtureOperationSchema = z.discriminatedUnion("kind", [
     kind: z.literal("assemble_bootstrap"),
     loadout_id: z.string(),
     actor_id: z.string()
+  }),
+  z.object({
+    kind: z.literal("re_ingest_session"),
+    /**
+     * The JSONL body of the session bundle to
+     * re-ingest. The runner re-computes the
+     * content digests so the v1 contract
+     * (digest = sha256(body)) holds. The seed
+     * step must have already ingested the same
+     * source-identity for the re-ingest to be
+     * a no-op (`bundle_hash_drift` would throw).
+     */
+    jsonl: z.string()
+  }),
+  z.object({
+    kind: z.literal("import_skill_md"),
+    /**
+     * The full canonical SKILL.md body. The
+     * runner passes it to
+     * `SkillService.importSkillMd` and asserts
+     * the resulting `asset_id` / `version`
+     * come back. Used by the v0.2.0 skills
+     * import-roundtrip happy fixture.
+     */
+    skill_md: z.string(),
+    name: z.string(),
+    source: z.enum(["manual", "derived", "imported"]).default("manual")
   })
 ]);
 

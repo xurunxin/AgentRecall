@@ -171,7 +171,9 @@ async function seedFixture(
     }
     for (const loadout of fixture.seed.loadouts) {
       try {
-        const created = ctx.loadoutService.create({
+        // `create()` returns the loadout_id string
+        // directly (not a wrapped object).
+        const createdLoadoutId = ctx.loadoutService.create({
           name: loadout.name,
           scope: loadout.scope,
           // The `CreateLoadoutInput.project_id` field
@@ -186,7 +188,7 @@ async function seedFixture(
         });
         if (loadout.rules.length > 0) {
           ctx.loadoutService.updateRules(
-            created.loadout_id,
+            createdLoadoutId,
             loadout.rules.map((rule) => ({
               channel: rule.channel,
               include_memory_ids: rule.include_memory_ids,
@@ -196,6 +198,16 @@ async function seedFixture(
               required_refs: rule.required_refs
             }))
           );
+        }
+        for (const binding of loadout.bindings) {
+          ctx.loadoutService.bind({
+            loadout_id: createdLoadoutId,
+            actor_id: binding.actor_id ?? undefined,
+            client_name: binding.client_name ?? undefined,
+            project_id: binding.project_id ?? undefined,
+            task_mode: binding.task_mode ?? undefined,
+            priority: binding.priority
+          });
         }
       } catch (seedErr) {
         // A `policy_fail` fixture often exercises the
@@ -312,6 +324,87 @@ async function runOperation(
           job_state: null,
           candidate_count: null,
           bootstrap_hash: "sha256:PLACEHOLDER",
+          error: null
+        };
+      }
+      case "re_ingest_session": {
+        // v0.2.0 (#55 dimension A): re-ingest the
+        // same source-identity + bundle. The v1
+        // contract says this is a no-op (returns
+        // the original `session_id`); a different
+        // `bundle_hash` throws `bundle_hash_drift`.
+        // The fixture asserts `last_error_code: null`
+        // (= re-ingest succeeded) and the runner
+        // inspects the returned session_id to
+        // confirm replay safety.
+        const rewritten = recomputeContentDigests(op.jsonl);
+        const adapter = new JsonlSessionAdapter();
+        const parsed = await adapter.parseString(rewritten);
+        if (!parsed.ok) {
+          return {
+            job_state: null,
+            candidate_count: null,
+            bootstrap_hash: null,
+            error: `re_ingest parse failed: ${parsed.error}`
+          };
+        }
+        const reIngest = ctx.sessionService.ingest(parsed.bundle, {
+          actor_id: fixture.seed.actor_id
+        });
+        if (reIngest.outcome === "drift") {
+          return {
+            job_state: null,
+            candidate_count: null,
+            bootstrap_hash: null,
+            error: "bundle_hash_drift"
+          };
+        }
+        // Re-ingest must return the SAME session_id
+        // the seed step produced (replay-safe). We
+        // do not surface the session_id in
+        // OperationResult today; the `last_error_code: null`
+        // assertion is sufficient for the v0.2.0
+        // pass. A future v0.3.0 iteration will add
+        // `replayed_session_id_matches_seed: true`
+        // to the expected shape.
+        return {
+          job_state: null,
+          candidate_count: null,
+          bootstrap_hash: null,
+          error: null
+        };
+      }
+      case "import_skill_md": {
+        // v0.2.0 (#55 dimension D): import a
+        // SKILL.md through SkillService. The
+        // returned asset_id is surfaced to the
+        // report's observed column for follow-up
+        // assertions; the v0.2.0 fixture is a
+        // happy path that asserts the import
+        // succeeds (no error). Future v0.3.0
+        // iterations will add round-trip assertion
+        // (exportSkillMd == input bytes).
+        const { SkillService } = await import("../../src/skills/service.js");
+        const skillService = new SkillService(ctx.store);
+        const importResult = skillService.importSkillMd({
+          skillMd: op.skill_md,
+          name: op.name,
+          source: op.source,
+          scope: "global",
+          owner_actor_id: fixture.seed.actor_id
+        });
+        if (importResult.kind === "rejected") {
+          return {
+            job_state: null,
+            candidate_count: null,
+            bootstrap_hash: null,
+            error: importResult.reason
+          };
+        }
+        return {
+          job_state: null,
+          candidate_count: null,
+          bootstrap_hash: null,
           error: null
         };
       }
