@@ -1,0 +1,40 @@
+{
+  "schema_version": "lifecycle.eval.v1",
+  "fixture_id": "distill_happy_v1",
+  "description": "Happy path: ingest a session with one decision_confirmed event, distill it, assert the job terminates in `succeeded` state with exactly one candidate, accept the candidate, and apply it (verifying the candidate survives the apply CAS). Exercises dimension B (derivation) and dimension E (interruption / retry — a re-run of the same bundle must be a no-op, replay-safe).",
+  "dimension": "B.derivation",
+  "workstream": "distillation",
+  "fixture_class": "happy",
+  "determinism": "deterministic",
+  "requires_schema_version": 20,
+  "seed": {
+    "actor_id": "agent:eval-distill",
+    "project_id": null,
+    "memories": [],
+    "loadouts": [],
+    "session_bundles": [
+      {
+        "bundle_id": "eval_distill_happy_1",
+        "source_kind": "opencode",
+        "source_session_id": "oc-eval-distill-1",
+        "jsonl": "{\"schema_version\":\"1\",\"bundle_id\":\"eval_distill_happy_1\",\"source_kind\":\"opencode\",\"source_version\":\"1.0.0\",\"source_instance_id\":\"eval-instance\",\"source_session_id\":\"oc-eval-distill-1\",\"project_id\":null,\"actor_id\":\"agent:eval-distill\",\"client_name\":\"opencode\",\"client_version\":\"1.0.0\",\"scope\":\"global\",\"sensitivity\":\"normal\",\"started_at\":\"2026-08-26T00:00:00.000Z\",\"ended_at\":\"2026-08-26T00:01:00.000Z\",\"adapter_id\":\"jsonl\",\"adapter_version\":\"1.0.0\",\"events\":[]}\n{\"schema_version\":\"1\",\"source_kind\":\"opencode\",\"source_version\":\"1.0.0\",\"source_instance_id\":\"eval-instance\",\"source_session_id\":\"oc-eval-distill-1\",\"project_id\":null,\"actor_id\":\"agent:eval-distill\",\"client_name\":\"opencode\",\"client_version\":\"1.0.0\",\"event_id\":\"evt_eval_distill_1\",\"sequence\":1,\"turn_id\":\"turn-1\",\"event_type\":\"decision_confirmed\",\"role\":\"assistant\",\"content\":\"Use ripgrep for fast text search in code projects.\",\"content_digest\":\"sha256:PLACEHOLDER_WILL_BE_RECOMPUTED\",\"timestamp\":\"2026-08-26T00:00:30.000Z\",\"sensitivity\":\"normal\",\"redaction_flags\":[],\"metadata\":{}}\n"
+      }
+    ]
+  },
+  "operations": [
+    { "kind": "distill_session", "session_id": "SESS_PLACEHOLDER" }
+  ],
+  "expected": {
+    "job_state": "succeeded",
+    "candidate_count": 1,
+    "bootstrap_hash": null,
+    "safety": {
+      "cross_project_leak_count": 0,
+      "sensitivity_leak_count": 0,
+      "secret_leak_count": 0,
+      "injection_bypass_count": 0,
+      "unauthorized_trust_escalation_count": 0
+    },
+    "last_error_code": null
+  }
+}

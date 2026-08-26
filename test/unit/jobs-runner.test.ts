@@ -60,7 +60,9 @@ describe("runOnce (v1.2.0-alpha.0, issue #48)", () => {
       lease_owner: makeLeaseOwner(),
       max_jobs: 16
     });
-    expect(result).toEqual({ attempted: 0, succeeded: 0, failed: 0, cancelled: 0 });
+    expect(result).toMatchObject({ attempted: 0, succeeded: 0, failed: 0, cancelled: 0 });
+    expect(result.passes).toBe(1);
+    expect(result.loop_exit_reason).toBe("stop_after_empty_passes");
   });
 
   it("marks an unknown-kind job as failed (no executor)", async () => {
@@ -112,7 +114,8 @@ describe("runOnce (v1.2.0-alpha.0, issue #48)", () => {
         max_jobs: 16
       }
     );
-    expect(result).toEqual({ attempted: 1, succeeded: 1, failed: 0, cancelled: 0 });
+    expect(result).toMatchObject({ attempted: 1, succeeded: 1, failed: 0, cancelled: 0 });
+    expect(result.passes).toBe(1);
     const inspection = jobStore.list({ limit: 5 });
     expect(inspection[0]?.state).toBe("succeeded");
     expect(inspection[0]?.attempt_count).toBe(1);
@@ -143,7 +146,8 @@ describe("runOnce (v1.2.0-alpha.0, issue #48)", () => {
         max_jobs: 16
       }
     );
-    expect(result).toEqual({ attempted: 1, succeeded: 0, failed: 1, cancelled: 0 });
+    expect(result).toMatchObject({ attempted: 1, succeeded: 0, failed: 1, cancelled: 0 });
+    expect(result.passes).toBe(1);
     const inspection = jobStore.list({ limit: 5 });
     expect(inspection[0]?.state).toBe("failed");
     expect(inspection[0]?.redacted_error).toContain("boom");

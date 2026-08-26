@@ -179,12 +179,14 @@ export class ContextAssembler {
     // Honour explicit `include_*` pins even if
     // the candidate set is empty (the rule was
     // the entire selection). Required refs that
-    // were missing at candidate-collection time
-    // are reported in `required_refs_unavailable`.
+    // are not present in the candidate set (and
+    // therefore could not be surfaced) are reported
+    // in `required_refs_unavailable` — the caller
+    // is expected to fail closed (no silent
+    // substitution).
     for (const id of requiredIds) {
       if (included.some((e) => e.id === id)) continue;
       if (candidates.some((e) => e.id === id)) continue;
-      if (!explicitMemoryIds.has(id) && !explicitAssetIds.has(id)) continue;
       requiredRefsUnavailable.push(id);
     }
     const text = this.formatChannelText("bootstrap", included);
@@ -571,8 +573,16 @@ export class ContextAssembler {
     return ranked.some((e) => e.id === item.id);
   }
 
-  private isBootstrapAllowListed(_entry: MemoryEntry): boolean {
-    return false;
+  private isBootstrapAllowListed(entry: MemoryEntry): boolean {
+    // The `bootstrap` channel always surfaces
+    // `tier = 'core'` memories (per the assembler
+    // contract documented in the file header). The
+    // `pinned` / `include_*` filters are additive
+    // narrowings (a pinned working memory is also
+    // included; a loadout's `include_memory_ids`
+    // can force-include a working / archival
+    // memory).
+    return entry.tier === "core";
   }
 
   private formatChannelText(channel: LoadoutChannel, entries: MemoryEntry[]): string {

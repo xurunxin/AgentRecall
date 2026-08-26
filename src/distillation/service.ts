@@ -111,6 +111,18 @@ export type RunOnBundleInput = {
    * path uses the same value.
    */
   actor: string;
+  /**
+   * Optional override for the candidate's `job_id`
+   * and `run_id`. When the orchestrator (e.g.
+   * `enqueueAndRunSessionDistill`) wants the
+   * candidate attached to a specific derivation
+   * job, it passes the job_id + run_id here. When
+   * omitted, the service falls back to a synthetic
+   * `job_standalone` / `run_standalone` row so the
+   * synchronous unit-test path stays self-contained.
+   */
+  job_id?: string;
+  run_id?: string;
   signal?: AbortSignal;
 };
 
@@ -212,7 +224,9 @@ export class DistillationService {
       if (event === undefined) continue;
       const candidateId = deterministicCandidateId(input.bundle, event);
       const now = Date.now();
-      const { jobId, runId } = ensureStandaloneJobRow(this.store, now);
+      const { jobId, runId } = input.job_id !== undefined && input.run_id !== undefined
+        ? { jobId: input.job_id, runId: input.run_id }
+        : ensureStandaloneJobRow(this.store, now);
       const row = proposalToRow({
         proposal,
         candidateId,
@@ -784,16 +798,28 @@ export async function enqueueAndRunSessionDistill(args: {
         {
           kind: "session_distill",
           execute: async ({ job, startStage }) => {
+            // `startStage` returns `{ finish }`; the actual
+            // `run_id` is needed for the candidate's
+            // foreign key. Look it up via the job
+            // inspection (the runner has already
+            // inserted the row before invoking us).
+            let distillRunId = "run_distill_" + job.job_id;
             const stage = startStage(
               "extract",
               [{ kind: "session_event", id: args.sessionId }],
               { provider_id: DETERMINISTIC_BASELINE_ID, model_id: DETERMINISTIC_BASELINE_VERSION }
             );
+            const inspection = args.jobStore.inspect(job.job_id);
+            if (inspection !== undefined && inspection.runs.length > 0) {
+              distillRunId = inspection.runs[0]!.run_id;
+            }
             const service = new DistillationService(args.store, args.sessionService, args.jobStore);
-            const bundle = bundleFromSessionInspection(session);
+            const bundle = bundleFromSessionInspection(args.sessionService, session);
             const runResult = await service.runOnBundle({
               bundle,
-              actor: args.actor
+              actor: args.actor,
+              job_id: job.job_id,
+              run_id: distillRunId
             });
             const outputs: Array<{ output_kind: DerivationOutputKind; output_id: string; disposition: "proposed" | "applied" | "rejected" | "superseded" }> = [];
             for (const c of args.store.listCandidatesForJob(job.job_id)) {
@@ -822,23 +848,33 @@ export async function enqueueAndRunSessionDistill(args: {
   // The `runOnce` runner does not return the
   // individual `run_id` row; the executor's
   // `startStage` is internal to the runner. Re-read
-  // the job's most recent run row so the caller can
-  // surface it.
+  // the job (and its most recent run row) so the
+  // caller can surface the post-execution
+  // `state` (e.g. `succeeded`) instead of the
+  // pre-execution `queued` state.
   const inspect = args.jobStore.inspect(enqueue.job.job_id);
-  const run = inspect?.runs[0];
+  if (inspect === undefined) {
+    throw new Error(
+      `[internal_error] session_distill job ${enqueue.job.job_id} disappeared after runOnce`
+    );
+  }
+  const run = inspect.runs[0];
   if (run === undefined) {
     throw new Error(
       `[internal_error] session_distill job ${enqueue.job.job_id} produced no run row`
     );
   }
-  return { job: enqueue.job, run, outcome: result };
+  return { job: inspect.job, run, outcome: result };
 }
 
-function bundleFromSessionInspection(inspection: {
-  session: import("../sqlite-store.js").SessionRow;
-  events: import("../sqlite-store.js").SessionEventRow[];
-  plan: import("../sessions/service.js").PlanCounts;
-}): NormalisedBundle {
+function bundleFromSessionInspection(
+  sessionService: SessionService,
+  inspection: {
+    session: import("../sqlite-store.js").SessionRow;
+    events: import("../sqlite-store.js").SessionEventRow[];
+    plan: import("../sessions/service.js").PlanCounts;
+  }
+): NormalisedBundle {
   void inspection.plan;
   return {
     bundle_id: inspection.session.session_id,
@@ -856,22 +892,40 @@ function bundleFromSessionInspection(inspection: {
     ended_at: inspection.session.ended_at,
     adapter_id: inspection.session.adapter_id,
     adapter_version: inspection.session.adapter_version,
-    events: inspection.events.map((e) => ({
-      event_id: e.event_id,
-      sequence: e.sequence,
-      turn_id: e.turn_id,
-      event_type: e.event_type,
-      role: e.role,
-      content: null,
-      content_ref_digest: null,
-      content_digest: e.content_digest,
-      tool_name: e.tool_name,
-      tool_call_id: e.tool_call_id,
-      tool_status: e.tool_status,
-      timestamp: e.timestamp,
-      sensitivity: e.sensitivity,
-      metadata: parseRedactionFlags(e.redaction_flags_json)
-    }))
+    events: inspection.events.map((e) => {
+      // The body is content-addressed; the SQLite
+      // `session_events` row stores only a
+      // `content_digest` reference. The full body
+      // lives in a local file under the data home;
+      // for the v1 extractor we recover the body
+      // from the head + tail blob slices stored
+      // inline. For non-truncated events the head
+      // IS the body (tail is empty). The extractor
+      // only needs a non-empty body string to emit
+      // a candidate, so the head+tail reconstruction
+      // is sufficient for the deterministic
+      // baseline.
+      const body = sessionService.getEventBody(
+        inspection.session.session_id,
+        e.event_id
+      );
+      return {
+        event_id: e.event_id,
+        sequence: e.sequence,
+        turn_id: e.turn_id,
+        event_type: e.event_type,
+        role: e.role,
+        content: body,
+        content_ref_digest: null,
+        content_digest: e.content_digest,
+        tool_name: e.tool_name,
+        tool_call_id: e.tool_call_id,
+        tool_status: e.tool_status,
+        timestamp: e.timestamp,
+        sensitivity: e.sensitivity,
+        metadata: parseRedactionFlags(e.redaction_flags_json)
+      };
+    })
   };
 }
 

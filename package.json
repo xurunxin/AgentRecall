@@ -41,6 +41,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "pack:dry": "npm pack --dry-run",
     "smoke:blackbox": "tsx test/blackbox/mcp-client-e2e.test.ts",
+    "eval:lifecycle:quick": "node scripts/eval-lifecycle.mjs",
+    "eval:lifecycle:full": "node scripts/eval-lifecycle.mjs --bail",
     "verify:artifacts": "node scripts/verify-artifact-globs.mjs",
     "check-contracts": "node scripts/check-contract-sync.mjs"
   },

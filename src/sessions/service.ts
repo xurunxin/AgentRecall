@@ -237,6 +237,32 @@ export class SessionService {
   }
 
   /**
+   * Resolve the body of a single event for
+   * downstream consumers (the distillation
+   * extractor, the admin app inspector, etc.).
+   * The body is content-addressed; the SQLite
+   * `session_events` row stores only the digest,
+   * while the `session_event_blobs` row keeps the
+   * head + tail slices (for the small body case
+   * the head is the full body and the tail is
+   * empty). For the v1 extractor a non-empty
+   * reconstructed body is sufficient.
+   */
+  getEventBody(sessionId: string, eventId: string): string | null {
+    const event = this.store.listSessionEvents(sessionId).find(
+      (e) => e.event_id === eventId
+    );
+    if (event === undefined) return null;
+    if (event.content_blob_ref === null) return null;
+    const blob = this.store.getSessionEventBlob(event.content_blob_ref);
+    if (blob === undefined) return null;
+    const head = blob.head_bytes.toString("utf8");
+    const tail = blob.tail_bytes.toString("utf8");
+    if (tail.length === 0) return head;
+    return `${head}\n...[truncated]...\n${tail}`;
+  }
+
+  /**
    * List sessions for the CLI / MCP inspector.
    */
   list(opts: { scope?: SessionScope; project_id?: string; limit?: number } = {}): SessionRow[] {

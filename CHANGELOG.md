@@ -78,6 +78,77 @@
 - HTTP bridge 的 sessions / assets 端点(Phase 2 一并提供)。
 - Admin app 的 session 浏览器 / asset 浏览器(Phase 2 一并提供)。
 
+## [1.2.0-alpha.2] — Session 蒸馏(#50)+ Agent Loadout(#52)+ Skill 资产(#53)+ 冷启动 Bootstrap(#54,Phase 2 合并)
+
+> Phase 2 把 v1.2.0-alpha.0/1 的 substrate 接到一组面向 agent 的端到端链路上:从 captured session 蒸馏出 reviewable 候选、按 loadout 策略组装 context_pack、把 SKILL.md 注册为可版本化资产、从冷启动 scan 派生出可应用的 bootstrap plan。四个 issue 跨 4 个并行 worktree,通过 git rebase 顺序合成,schema version slot 预先分配 (v17=#50, v18=#52, v19=#53, v20=#54) 避免并发迁移冲突。所有现有 API 保持兼容,没有破坏性改动。`migrate_v16_to_v17` 是蒸馏 pipeline 的 additive 表,`migrate_v17_to_v18` 是 loadout substrate,`migrate_v18_to_v19` 是 skills 表,`migrate_v19_to_v20` 是 bootstrap 表面 — 4 个迁移依次 transactional + rollback-safe。
+
+### 新增
+
+- **Schema v17** (issue #50) — `derivation_candidates` / `candidate_evidence` / `candidate_actions` 三张 additive 表,backing 可 reviewable 的 memory / episode / skill_candidate 候选;`state` 字段是小型 state machine (`proposed` → `accepted` → `applied`,with `rejected` / `stale`);`expected_target_revision` 是 `apply` 步的 CAS guard。
+- **Schema v18** (issue #52) — `agent_loadouts` / `loadout_rules` / `loadout_bindings` 三张 additive 表,backing policy-bound loadout 表面;`loadout_rules` keyed on `(loadout_id, version, channel)`,让 `updateRules` 的 CAS-bump 保持 `bootstrap_hash` 稳定(上游 prompt-cache key)。
+- **Schema v19** (issue #53) — `skills` 类型特定表 for asset registry,`body_hash` 是 `sha256:hex64` over `skill_md_canonical` 与 `asset_versions.content_hash` 同步;`source` 严格 3-value enum,`name` 是 kebab-case 标识(由 Zod schema 强制,CHECK 兜底)。
+- **Schema v20** (issue #54) — `bootstrap_sources` / `bootstrap_plans` / `bootstrap_plan_items` / `external_references` 四张 additive 表,backing 冷启动 plan / 外部资源指针;`bootstrap_plans.state` 8-state machine (`draft` → `scanning` → `plan_ready` → `applying` → `applied` / `expired` / `failed` / `cancelled`),`applyPlan` 走原子 batch(任一失败整批回滚)。
+- **`DistillationService.runOnBundle`** (issue #50) — 6-stage pipeline (window select → extract → evidence validation → conflict / novelty analysis → review → apply);`apply` 批原子,`expected_target_revision` drift → `stale`。
+- **`DeterministicBaselineExtractor`** (issue #50) — 纯函数,emit 一个 `memory` candidate per `decision_confirmed` event with non-empty content;跳过 `risk_injection` / `contains_secret` flags;replay-safe (same input → same output)。
+- **`LoadoutService`** (issue #52) — `create` / `updateRules` (CAS on `version`) / `bind` / `unbind` / `resolve`;resolve 优先级 6 步:(1) 显式 `loadout_id` 短路,(2) actor + project + task_mode exact,(3) actor + project(task_mode NULL on binding),(4) project default,(5) global default,(6) built-in `legacy-inject-all-active` fallback;`updateRules` 支持 `--expected-previous-version` (CAS 显式 guard)。
+- **`ContextAssembler`** (issue #52) — `bootstrap` / `query` / `tool_only` 三 channel,filter by `include_*` / `exclude_*` / `required_refs`;`bootstrap_hash` 是上游 prompt-cache key(在 loadout + content 不变时稳定)。
+- **`SkillService`** (issue #53) — `importSkillMd` (CRLF → LF, frontmatter keys 字典序,unknown keys 走 `extension.*` namespace) / `appendSkillVersion` (CAS-bump) / `exportSkillMd` (byte-stable round-trip)。
+- **`BootstrapService`** (issue #54) — `configure` (rejects path traversal / device paths / unsafe symlinks;`.gitignore` + `bootstrap.deny` integration) / `scan` (idempotent: same content digest + same config → same plan, 0 new items) / `showPlan` / `applyPlan` (atomic batch) / `cancelPlan` / `expirePlan`。
+- **`ExternalReferenceService`** (issue #54) — `create` / `list` / `verify`;`last_verified_at` 记录新鲜度;`metadata` 始终是 pointer + retrieval contract,绝不存 provider 内容。
+- **`run --watch` extension** (issue #54) — `agent-recall jobs run --watch` 之前拒绝 `--watch`,现在默认 `poll_ms=2000` 轮询 `listClaimable`,signal-only exit。
+- **CLI** — `agent-recall sessions distill <id>` (issue #50) + `agent-recall candidates list | show | accept | reject | apply` (#50) + `agent-recall loadouts create | update | bind | unbind | resolve | list | show` (#52) + `agent-recall skills list | search | show | import | export` (#53) + `agent-recall bootstrap configure | scan | plan show | plan apply | plan cancel` (#54) + `agent-recall external-refs list | create | verify` (#54)。
+- **MCP resources** — `agentrecall://candidates/{candidate_id}` + `agentrecall://candidates/by-job/{job_id}` (issue #50);`agentrecall://context/loadout` (issue #52,loadout-assembled `Assembled` for the calling actor)。
+- **OpenCode plugin** — `opencode-plugin/context-client.mjs` 把 loadout resolve 结果通过 MCP 拉到 system prompt;`opencode-plugin/capture.mjs` 增强 opt-in 提示。
+- **Contracts** — `packages/contracts/src/distillation.ts` (5 zod schema, issue #50) + `packages/contracts/src/loadouts.ts` (5 zod schema + typed rule union, issue #52) + `packages/contracts/src/skills.ts` (tightened `SkillAssetV1Schema`: kebab-case name / source enum / resource type union, issue #53) + `packages/contracts/src/bootstrap.ts` (5 zod schema, issue #54);全部 `schema_version: "1"`。
+
+### 改动
+
+- `src/sqlite-store.ts`:`CURRENT_SCHEMA_VERSION` 升至 20,新增 `migrate_v16_to_v17` (蒸馏) + `migrate_v17_to_v18` (loadout) + `migrate_v18_to_v19` (skills) + `migrate_v19_to_v20` (bootstrap);4 个迁移都 `BEGIN IMMEDIATE` + `COMMIT` / `ROLLBACK`,失败可回滚;resolveLoadout 6 步级联 ((1) 显式 `loadout_id` 短路 → (2) actor + project + task_mode exact → (3) actor + project (task_mode NULL on binding) → (4) project default → (5) global default → (6) built-in `legacy-inject-all-active` fallback),`lifecycle_state IN ('draft', 'active')`;`updateLoadoutVersion` 暴露 expected_previous_version guard。
+- `src/cli/commands/loadouts.ts`:`--json` flag 在所有子命令 (create / update / bind / unbind / resolve / list / show) 上工作;`--expected-previous-version` flag 透传到 `LoadoutService.updateRules`。
+- `src/distillation/service.ts`:`enqueueAndRunSessionDistill` 在 runOnce 后重新读取 job (post-execution `state`),而不是返回 enqueue 时的 `queued` 状态;`DistillationService` 接收可选的 `ExtractorProvider` 注入。
+- `src/mcp/resources.ts`:`agent_loadout_context` (静态 URI) 移到 `distillation_candidate` 系列之后 (registration 顺序与测试 contract 一致);`agent_loadout_context` / `distillation_candidate` / `distillation_candidate_list` 是 v1.2-alpha.2 的 3 个新 resource,12 个 resource 总计。
+- `src/cli/commands/jobs.ts`:`--watch` flag 接入 runner 轮询循环 (issue #54);之前拒绝 `--watch` 的测试用例改写为订阅轮询 sentinel。
+- `test/mcp-v2-contract.test.ts`:"registers all 9 resources" → "registers all 12 resources",断言新增的 3 个 v1.2 resource 出现在列表里。
+- `test/blackbox/mcp-all-tools-e2e-{core,extended}.test.ts`:资源列表断言更新到 v1.2 的 4 静态 + 8 模板 (12 总) 形式。
+
+### 测试
+
+- `test/unit/distillation-service.test.ts` (26 测试) — extractor / validate / accept / reject / apply / 状态机 / CAS / 状态守护;6 阶段 pipeline 端到端。
+- `test/unit/loadouts-service.test.ts` (12 测试) — create / updateRules CAS / bind / resolve 5 步级联 / lifecycle 状态 / unbind。
+- `test/unit/context-assembly.test.ts` (7 测过 + 4 已知 gap) — `bootstrap` / `query` / `tool_only` channel 过滤 / `bootstrap_hash` 稳定性 / policy_version 戳。
+- `test/unit/skill-md.test.ts` (skill-md 解析 / CRLF → LF / frontmatter 排序 / extension.* 命名空间 / round-trip)。
+- `test/unit/skills-service.test.ts` (skills import / show / export / appendSkillVersion CAS / cas_mismatch)。
+- `test/unit/bootstrap-service.test.ts` (configure 路径安全 / scan idempotent / showPlan / applyPlan atomic / cancelPlan / expirePlan)。
+- `test/unit/external-refs-service.test.ts` (create / list / verify freshness / metadata 永远不存 provider 内容)。
+- `test/unit/jobs-runner-watch.test.ts` (--watch 轮询 / signal exit / poll_ms)。
+- `test/cli/loadouts.test.ts` (3 测试) — create + update + bind + resolve round-trip / cas_mismatch / list + show。
+- `test/cli/skills.test.ts` (skill CLI 端到端)。
+- `test/cli/bootstrap.test.ts` (configure / scan / plan show / plan apply 端到端)。
+- `test/cli/external-refs.test.ts` (external-refs CLI 端到端)。
+- `packages/contracts/tests/distillation.test.ts` (5 zod schema happy + rejection)。
+- `packages/contracts/tests/loadouts.test.ts` (5 zod schema + rule patch 校验)。
+- `packages/contracts/tests/skills.test.ts` (kebab-case / source enum / resource type union)。
+- `packages/contracts/tests/bootstrap.test.ts` (5 zod schema happy + rejection)。
+- `test/release-gate/loadout-resolution-multi-process.test.ts` — 8 worker 并发 resolve,no `binding_ambiguous` 误报,`bootstrap_hash` 在过程中稳定 (上游 prompt-cache key 不被意外 churn)。
+- `test/release-gate/skills-multi-process.test.ts` — 8 worker 并发 import 同一 SKILL.md,byte-stable 单次 import。
+- `test/release-gate/bootstrap-multi-process.test.ts` — 8 worker 并发 scan 同一 source,`source_set_digest` 在并发下稳定。
+- `test/mcp-v2-contract.test.ts`:1 测试更新 (9 → 12 resources,新增 3 个 v1.2)。
+- `test/blackbox/mcp-all-tools-e2e-core.test.ts` (30 测试) / `test/blackbox/mcp-all-tools-e2e-extended.test.ts` (39 测试) — 端到端 MCP 工具 + 资源 列表(已更新到 v1.2 资源集合)。
+- **`test/eval-lifecycle/` (issue #55 骨架)** — lifecycle evaluation harness 本期发 v0.1.0 corpus:2 个 fixture(1 happy + 1 policy_fail)。Runner 用 Zod-versioned schema 走 manifest(`lifecycle.eval.v1` / `lifecycle.corpus.v1` / `lifecycle.result.v1` / `lifecycle.report.v1`),每个 fixture 重新起 in-process memory store,直接调 service API(不走 CLI shim)。`pnpm run eval:lifecycle:quick` 当前 exit 0;`#55` AC 要求的 15-fixture 覆盖率矩阵在 v0.2.0 后续 corpus release 补齐。`pnpm test` 仍报 836 passing。设计在 `docs/adr/0012-lifecycle-eval-harness.md`,rollout plan 在 `docs/plans/v1.2-lifecycle-eval-design.md`。
+
+### 已知 caveat(本版本 ship-blocking 之外)
+
+- `test/blackbox/mcp-stdio-idle.test.ts` 在 Windows runner 上偶尔因 temp dir EPERM 失败(与本版本无关,pre-existing on Windows);Linux/macOS runner 上稳定。
+- Dimension C (recall + assembly) 的 quality scorers(Recall@K / nDCG / byte-determinism 计数)在 `ContextAssembler` 里已经留好 scaffold,但 v0.1.0 corpus 还没接入,v0.2.0 corpus release 会接入。
+- v0.1.0 lifecycle corpus 只有 2 个 fixture(1 happy + 1 policy_fail);完整的 15-fixture 覆盖率矩阵(#55 AC 要求)在后续 3 个 corpus release 里补齐。
+
+### 不在本版本范围(留待后续 Phase)
+
+- Lifecycle evaluation / release gate (#55 收口 Phase 2 + 整 v1.2 release 节奏)。
+- HTTP bridge 的 distillation / loadouts / skills / bootstrap 端点(Phase 3 一并提供)。
+- Admin app 的 candidate 浏览器 / loadout 编辑器 / SKILL.md 编辑器 / bootstrap plan 可视化(Phase 3 一并提供)。
+- Provider-backed extractor(LLM-backed 蒸馏,以替代 `DeterministicBaselineExtractor` 的占位)。
+
 ## [1.2.0-alpha.0] — Derivation Job 子系统(issue #48,Phase 0)
 
 > v1.2 系列开篇:本条目只引入 derivation job 子系统,具体 kind 的执行器(session_distill / skill_extract / bootstrap_scan / external_ref_refresh)在后续 Phase 1 / 2 落地(#50、#53、#54)。本期所有现有 API 保持兼容,没有破坏性改动。

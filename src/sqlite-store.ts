@@ -196,7 +196,7 @@ export type SearchFilters = EntryFilters & {
  * last successful version and the database is
  * untouched.
  */
-export const CURRENT_SCHEMA_VERSION = 19;
+export const CURRENT_SCHEMA_VERSION = 20;
 
 /**
  * Stage 12 PR9: thrown by `updateEntryWithRevision` when
@@ -844,6 +844,110 @@ export type SkillRow = {
   resources_json: string;
 };
 
+/**
+ * v1.2.0-alpha.2 (issue #54): the row shapes for the
+ * cold-start bootstrap surface. The four tables
+ * (`bootstrap_sources`, `bootstrap_plans`,
+ * `bootstrap_plan_items`, `external_references`) are
+ * the persistence layer for the v20 migration; the
+ * service layer is `src/bootstrap/service.ts` and
+ * `src/external-refs/service.ts`. The wire / MCP /
+ * admin shape is `packages/contracts/src/bootstrap.ts`.
+ */
+export type BootstrapSourceKind =
+  | "file"
+  | "directory"
+  | "git_metadata"
+  | "session_bundle"
+  | "memory_bundle"
+  | "external_provider";
+
+export type BootstrapSourceRow = {
+  source_id: string;
+  source_kind: BootstrapSourceKind;
+  scope: "global" | "project";
+  project_id: string | null;
+  canonical_ref: string;
+  source_version: string | null;
+  content_digest: string;
+  sensitivity: "normal" | "private" | "restricted";
+  configured_by_actor_id: string;
+  created_at: string;
+  last_scanned_at: string | null;
+  size_bytes: number | null;
+};
+
+export type BootstrapPlanState =
+  | "draft"
+  | "scanning"
+  | "plan_ready"
+  | "applying"
+  | "applied"
+  | "expired"
+  | "failed"
+  | "cancelled";
+
+export type BootstrapPlanRow = {
+  plan_id: string;
+  project_id: string;
+  creator_actor_id: string;
+  state: BootstrapPlanState;
+  config_digest: string;
+  source_set_digest: string;
+  created_at: string;
+  expires_at: string;
+  completed_at: string | null;
+  job_id: string | null;
+};
+
+export type BootstrapPlanItemAction =
+  | "propose_memory"
+  | "propose_context_pack"
+  | "propose_skill_ref"
+  | "register_external_ref"
+  | "bind_loadout"
+  | "skip";
+
+export type BootstrapPlanItemRow = {
+  plan_id: string;
+  source_id: string;
+  item_seq: number;
+  action: BootstrapPlanItemAction;
+  target_ref: string | null;
+  proposed_payload_json: string;
+  evidence_digest: string;
+  expected_revision_or_version: number | null;
+  risk: "low" | "medium" | "high";
+  rationale: string;
+};
+
+export type ExternalReferenceResourceKind =
+  | "wiki"
+  | "code_index"
+  | "repository_context"
+  | "document_set"
+  | "custom";
+
+export type ExternalReferenceRow = {
+  asset_id: string;
+  version: number;
+  provider_kind: string;
+  provider_instance_id: string;
+  resource_kind: ExternalReferenceResourceKind;
+  resource_ref: string;
+  uri: string;
+  source_version: string | null;
+  source_digest: string | null;
+  retrieval_contract_version: string;
+  capabilities_json: string;
+  allowed_scope: "global" | "project";
+  project_id: string | null;
+  sensitivity: "normal" | "private" | "restricted";
+  refresh_policy_json: string;
+  last_verified_at: string | null;
+  metadata_json: string;
+};
+
 type Row = Record<string, SQLOutputValue>;
 
 function encodeJson(value: unknown): string {
@@ -1190,6 +1294,82 @@ function skillFromRow(row: Row): SkillRow {
     skill_md_canonical: stringCell(row, "skill_md_canonical"),
     body_hash: stringCell(row, "body_hash"),
     resources_json: stringCell(row, "resources_json")
+  };
+}
+
+function bootstrapSourceFromRow(row: Row): BootstrapSourceRow {
+  return {
+    source_id: stringCell(row, "source_id"),
+    source_kind: stringCell(row, "source_kind") as BootstrapSourceKind,
+    scope: stringCell(row, "scope") as "global" | "project",
+    project_id: optionalStringCell(row, "project_id") ?? null,
+    canonical_ref: stringCell(row, "canonical_ref"),
+    source_version: optionalStringCell(row, "source_version") ?? null,
+    content_digest: stringCell(row, "content_digest"),
+    sensitivity: stringCell(row, "sensitivity") as
+      | "normal"
+      | "private"
+      | "restricted",
+    configured_by_actor_id: stringCell(row, "configured_by_actor_id"),
+    created_at: stringCell(row, "created_at"),
+    last_scanned_at: optionalStringCell(row, "last_scanned_at") ?? null,
+    size_bytes: optionalNumberCell(row, "size_bytes") ?? null
+  };
+}
+
+function bootstrapPlanFromRow(row: Row): BootstrapPlanRow {
+  return {
+    plan_id: stringCell(row, "plan_id"),
+    project_id: stringCell(row, "project_id"),
+    creator_actor_id: stringCell(row, "creator_actor_id"),
+    state: stringCell(row, "state") as BootstrapPlanState,
+    config_digest: stringCell(row, "config_digest"),
+    source_set_digest: stringCell(row, "source_set_digest"),
+    created_at: stringCell(row, "created_at"),
+    expires_at: stringCell(row, "expires_at"),
+    completed_at: optionalStringCell(row, "completed_at") ?? null,
+    job_id: optionalStringCell(row, "job_id") ?? null
+  };
+}
+
+function bootstrapPlanItemFromRow(row: Row): BootstrapPlanItemRow {
+  return {
+    plan_id: stringCell(row, "plan_id"),
+    source_id: stringCell(row, "source_id"),
+    item_seq: numberCell(row, "item_seq"),
+    action: stringCell(row, "action") as BootstrapPlanItemAction,
+    target_ref: optionalStringCell(row, "target_ref") ?? null,
+    proposed_payload_json: stringCell(row, "proposed_payload_json"),
+    evidence_digest: stringCell(row, "evidence_digest"),
+    expected_revision_or_version:
+      optionalNumberCell(row, "expected_revision_or_version") ?? null,
+    risk: stringCell(row, "risk") as "low" | "medium" | "high",
+    rationale: stringCell(row, "rationale")
+  };
+}
+
+function externalReferenceFromRow(row: Row): ExternalReferenceRow {
+  return {
+    asset_id: stringCell(row, "asset_id"),
+    version: numberCell(row, "version"),
+    provider_kind: stringCell(row, "provider_kind"),
+    provider_instance_id: stringCell(row, "provider_instance_id"),
+    resource_kind: stringCell(row, "resource_kind") as ExternalReferenceResourceKind,
+    resource_ref: stringCell(row, "resource_ref"),
+    uri: stringCell(row, "uri"),
+    source_version: optionalStringCell(row, "source_version") ?? null,
+    source_digest: optionalStringCell(row, "source_digest") ?? null,
+    retrieval_contract_version: stringCell(row, "retrieval_contract_version"),
+    capabilities_json: stringCell(row, "capabilities_json"),
+    allowed_scope: stringCell(row, "allowed_scope") as "global" | "project",
+    project_id: optionalStringCell(row, "project_id") ?? null,
+    sensitivity: stringCell(row, "sensitivity") as
+      | "normal"
+      | "private"
+      | "restricted",
+    refresh_policy_json: stringCell(row, "refresh_policy_json"),
+    last_verified_at: optionalStringCell(row, "last_verified_at") ?? null,
+    metadata_json: stringCell(row, "metadata_json")
   };
 }
 
@@ -2328,6 +2508,46 @@ export class SQLiteMemoryStore {
    * digest from two events reuses the same body
    * (issue #49 storage model: content-addressed).
    */
+  /**
+   * v1.2.0-alpha.2 (issue #50): read a single
+   * `session_event_blobs` row by digest. Returns
+   * `undefined` when the digest is unknown. Used
+   * by the distillation extractor (and the admin
+   * inspector) to reconstruct the event body
+   * from the head + tail slices.
+   */
+  getSessionEventBlob(digest: string): SessionEventBlobRow | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT * FROM session_event_blobs WHERE digest = ?"
+      )
+      .get(digest) as Row | undefined;
+    if (row === undefined) return undefined;
+    // The BLOB column may come back as a Buffer
+    // (preferred) or as a string (older node:sqlite
+    // builds or string-typed returns). Normalize
+    // both to a Buffer without re-encoding a
+    // string (which would corrupt binary payloads
+    // containing non-UTF-8 bytes).
+    const headRaw = row["head_bytes"];
+    const tailRaw = row["tail_bytes"];
+    const toBuffer = (v: unknown): Buffer => {
+      if (v instanceof Buffer) return v;
+      if (v instanceof Uint8Array) return Buffer.from(v);
+      if (typeof v === "string") return Buffer.from(v, "binary");
+      return Buffer.alloc(0);
+    };
+    return {
+      digest: stringCell(row, "digest"),
+      size_bytes: numberCell(row, "size_bytes"),
+      media_type: stringCell(row, "media_type"),
+      head_bytes: toBuffer(headRaw),
+      tail_bytes: toBuffer(tailRaw),
+      head_tail_window_json: stringCell(row, "head_tail_window_json"),
+      stored_at: stringCell(row, "stored_at")
+    };
+  }
+
   upsertSessionEventBlob(row: SessionEventBlobRow): void {
     this.db
       .prepare(
@@ -2759,6 +2979,405 @@ export class SQLiteMemoryStore {
     return rows.map((r) => skillFromRow(r));
   }
 
+  // ============================================================
+  // v1.2.0-alpha.2 (issue #54): bootstrap + external_references
+  // ============================================================
+
+  /**
+   * Upsert a bootstrap source row. The
+   * `(scope, project_id, canonical_ref)` triple is
+   * the natural key — re-configuring an existing
+   * source is idempotent. Returns the persisted row
+   * (either the inserted one or the pre-existing one).
+   * A unique-key collision that does not match the
+   * natural key is treated as `undefined` so the
+   * caller can surface a stable error.
+   */
+  upsertBootstrapSource(row: BootstrapSourceRow): BootstrapSourceRow | undefined {
+    const existing = this.db
+      .prepare(
+        `SELECT * FROM bootstrap_sources
+           WHERE scope = ? AND project_id IS ? AND canonical_ref = ?`
+      )
+      .get(row.scope, row.project_id, row.canonical_ref) as Row | undefined;
+    if (existing !== undefined) {
+      return bootstrapSourceFromRow(existing);
+    }
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO bootstrap_sources (
+            source_id, source_kind, scope, project_id, canonical_ref,
+            source_version, content_digest, sensitivity,
+            configured_by_actor_id, created_at, last_scanned_at, size_bytes
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          row.source_id,
+          row.source_kind,
+          row.scope,
+          row.project_id,
+          row.canonical_ref,
+          row.source_version,
+          row.content_digest,
+          row.sensitivity,
+          row.configured_by_actor_id,
+          row.created_at,
+          row.last_scanned_at,
+          row.size_bytes
+        );
+      return row;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) return undefined;
+      throw error;
+    }
+  }
+
+  /**
+   * Read all configured sources for a project (or
+   * the global scope when `project_id === null`).
+   * The order is `created_at ASC` so a re-scan
+   * produces a stable source_set_digest.
+   */
+  listBootstrapSources(filter: {
+    scope: "global" | "project";
+    project_id: string | null;
+  }): BootstrapSourceRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM bootstrap_sources
+           WHERE scope = ? AND project_id IS ?
+           ORDER BY created_at ASC, source_id ASC`
+      )
+      .all(filter.scope, filter.project_id) as Row[];
+    return rows.map(bootstrapSourceFromRow);
+  }
+
+  /**
+   * Read one source by id.
+   */
+  getBootstrapSource(sourceId: string): BootstrapSourceRow | undefined {
+    const row = this.db
+      .prepare(`SELECT * FROM bootstrap_sources WHERE source_id = ?`)
+      .get(sourceId) as Row | undefined;
+    if (row === undefined) return undefined;
+    return bootstrapSourceFromRow(row);
+  }
+
+  /**
+   * Update the `content_digest`, `last_scanned_at`
+   * and `size_bytes` of an existing source.
+   * Returns the updated row or `undefined` when the
+   * source has been removed concurrently.
+   */
+  updateBootstrapSourceScan(args: {
+    source_id: string;
+    content_digest: string;
+    last_scanned_at: string;
+    size_bytes: number | null;
+  }): BootstrapSourceRow | undefined {
+    const updated = this.db
+      .prepare(
+        `UPDATE bootstrap_sources
+            SET content_digest = ?,
+                last_scanned_at = ?,
+                size_bytes = ?
+          WHERE source_id = ?
+          RETURNING *`
+      )
+      .get(
+        args.content_digest,
+        args.last_scanned_at,
+        args.size_bytes,
+        args.source_id
+      ) as Row | undefined;
+    if (updated === undefined) return undefined;
+    return bootstrapSourceFromRow(updated);
+  }
+
+  /**
+   * Insert a fresh plan row. The plan_id is the
+   * primary key; a collision returns `false` so the
+   * caller can retry. The plan starts in `draft`
+   * state; the scan/apply verbs transition it.
+   */
+  insertBootstrapPlan(row: BootstrapPlanRow): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO bootstrap_plans (
+            plan_id, project_id, creator_actor_id, state,
+            config_digest, source_set_digest,
+            created_at, expires_at, completed_at, job_id
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          row.plan_id,
+          row.project_id,
+          row.creator_actor_id,
+          row.state,
+          row.config_digest,
+          row.source_set_digest,
+          row.created_at,
+          row.expires_at,
+          row.completed_at,
+          row.job_id
+        );
+      return true;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * CAS-update a plan's state. The `expected_state`
+   * guard makes concurrent transitions detectable.
+   * When the plan is not in `expected_state`, returns
+   * `undefined` and the caller surfaces a stable
+   * `cas_mismatch` error.
+   */
+  setBootstrapPlanState(args: {
+    plan_id: string;
+    expected_state: BootstrapPlanState;
+    new_state: BootstrapPlanState;
+    completed_at?: string | null;
+    job_id?: string | null;
+  }): BootstrapPlanRow | undefined {
+    const sets: string[] = ["state = ?"];
+    const params: Array<string | number | null> = [args.new_state];
+    if (args.completed_at !== undefined) {
+      sets.push("completed_at = ?");
+      params.push(args.completed_at);
+    }
+    if (args.job_id !== undefined) {
+      sets.push("job_id = ?");
+      params.push(args.job_id);
+    }
+    params.push(args.plan_id, args.expected_state);
+    const updated = this.db
+      .prepare(
+        `UPDATE bootstrap_plans
+            SET ${sets.join(", ")}
+          WHERE plan_id = ? AND state = ?
+          RETURNING *`
+      )
+      .get(...params) as Row | undefined;
+    if (updated === undefined) return undefined;
+    return bootstrapPlanFromRow(updated);
+  }
+
+  /**
+   * Read a plan by id.
+   */
+  getBootstrapPlan(planId: string): BootstrapPlanRow | undefined {
+    const row = this.db
+      .prepare(`SELECT * FROM bootstrap_plans WHERE plan_id = ?`)
+      .get(planId) as Row | undefined;
+    if (row === undefined) return undefined;
+    return bootstrapPlanFromRow(row);
+  }
+
+  /**
+   * List plans for a project (or global scope when
+   * `project_id === null`). Newest-first.
+   */
+  listBootstrapPlans(filter: {
+    project_id: string;
+    state?: BootstrapPlanState;
+    limit?: number;
+  }): BootstrapPlanRow[] {
+    const clauses: string[] = ["project_id = ?"];
+    const params: Array<string | number> = [filter.project_id];
+    if (filter.state !== undefined) {
+      clauses.push("state = ?");
+      params.push(filter.state);
+    }
+    const limit = filter.limit ?? 50;
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM bootstrap_plans
+           WHERE ${clauses.join(" AND ")}
+           ORDER BY created_at DESC LIMIT ?`
+      )
+      .all(...params, limit) as Row[];
+    return rows.map(bootstrapPlanFromRow);
+  }
+
+  /**
+   * Bulk-insert plan items. The order of the
+   * input array becomes the `item_seq` (1-based).
+   * The whole insert is wrapped in a single
+   * `BEGIN IMMEDIATE` so an item-rejected insert
+   * rolls back the entire batch.
+   */
+  insertBootstrapPlanItems(
+    items: ReadonlyArray<BootstrapPlanItemRow>
+  ): void {
+    if (items.length === 0) return;
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const stmt = this.db.prepare(
+        `INSERT INTO bootstrap_plan_items (
+          plan_id, source_id, item_seq, action, target_ref,
+          proposed_payload_json, evidence_digest,
+          expected_revision_or_version, risk, rationale
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+      for (const it of items) {
+        stmt.run(
+          it.plan_id,
+          it.source_id,
+          it.item_seq,
+          it.action,
+          it.target_ref,
+          it.proposed_payload_json,
+          it.evidence_digest,
+          it.expected_revision_or_version,
+          it.risk,
+          it.rationale
+        );
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * List the items of a plan, ordered by `item_seq ASC`.
+   */
+  listBootstrapPlanItems(planId: string): BootstrapPlanItemRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM bootstrap_plan_items
+           WHERE plan_id = ?
+           ORDER BY item_seq ASC`
+      )
+      .all(planId) as Row[];
+    return rows.map(bootstrapPlanItemFromRow);
+  }
+
+  /**
+   * Insert an `external_reference` row. The
+   * `(asset_id, version)` pair is the primary key
+   * (composite with `assets`).
+   */
+  insertExternalReference(row: ExternalReferenceRow): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO external_references (
+            asset_id, version, provider_kind, provider_instance_id,
+            resource_kind, resource_ref, uri,
+            source_version, source_digest, retrieval_contract_version,
+            capabilities_json, allowed_scope, project_id, sensitivity,
+            refresh_policy_json, last_verified_at, metadata_json
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          row.asset_id,
+          row.version,
+          row.provider_kind,
+          row.provider_instance_id,
+          row.resource_kind,
+          row.resource_ref,
+          row.uri,
+          row.source_version,
+          row.source_digest,
+          row.retrieval_contract_version,
+          row.capabilities_json,
+          row.allowed_scope,
+          row.project_id,
+          row.sensitivity,
+          row.refresh_policy_json,
+          row.last_verified_at,
+          row.metadata_json
+        );
+      return true;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * Read the latest `external_references` row for an
+   * asset (the row whose `version` is the head).
+   */
+  getLatestExternalReference(assetId: string): ExternalReferenceRow | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM external_references
+           WHERE asset_id = ?
+           ORDER BY version DESC LIMIT 1`
+      )
+      .get(assetId) as Row | undefined;
+    if (row === undefined) return undefined;
+    return externalReferenceFromRow(row);
+  }
+
+  /**
+   * List `external_references` rows, optionally
+   * filtered by `provider_kind` / `allowed_scope` /
+   * `project_id`. Newest-first by `version DESC`.
+   */
+  listExternalReferences(filter: {
+    provider_kind?: string;
+    allowed_scope?: "global" | "project";
+    project_id?: string;
+    limit?: number;
+  }): ExternalReferenceRow[] {
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (filter.provider_kind !== undefined) {
+      clauses.push("provider_kind = ?");
+      params.push(filter.provider_kind);
+    }
+    if (filter.allowed_scope !== undefined) {
+      clauses.push("allowed_scope = ?");
+      params.push(filter.allowed_scope);
+    }
+    if (filter.project_id !== undefined) {
+      clauses.push("project_id = ?");
+      params.push(filter.project_id);
+    }
+    const where = clauses.length === 0 ? "" : " WHERE " + clauses.join(" AND ");
+    const limit = filter.limit ?? 50;
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM external_references${where}
+           ORDER BY version DESC LIMIT ?`
+      )
+      .all(...params, limit) as Row[];
+    return rows.map(externalReferenceFromRow);
+  }
+
+  /**
+   * Refresh `last_verified_at` on the head
+   * `external_references` row for an asset. The
+   * `expected_version` guard makes concurrent
+   * version appends detectable; returns `undefined`
+   * on CAS failure.
+   */
+  refreshExternalReferenceLastVerified(args: {
+    asset_id: string;
+    expected_version: number;
+    now: string;
+  }): ExternalReferenceRow | undefined {
+    const updated = this.db
+      .prepare(
+        `UPDATE external_references
+            SET last_verified_at = ?
+          WHERE asset_id = ? AND version = ?
+          RETURNING *`
+      )
+      .get(args.now, args.asset_id, args.expected_version) as Row | undefined;
+    if (updated === undefined) return undefined;
+    return externalReferenceFromRow(updated);
+  }
+
   close(): void {
     this.db.close();
   }
@@ -3008,6 +3627,14 @@ export class SQLiteMemoryStore {
       // v19 (v1.2.0-alpha.2, issue #53) is the additive
       // `skills` type-specific table.
       this.migrate_v18_to_v19();
+      return;
+    }
+    if (version === 20) {
+      // v20 (v1.2.0-alpha.2, issue #54): the cold-start
+      // bootstrap surface. Four additive tables —
+      // `bootstrap_sources`, `bootstrap_plans`,
+      // `bootstrap_plan_items`, `external_references`.
+      this.migrate_v19_to_v20();
       return;
     }
     throw new Error(`No migration registered for schema version ${version}`);
@@ -4487,6 +5114,123 @@ export class SQLiteMemoryStore {
           ON skills(body_hash);
       `);
       this.db.exec("PRAGMA user_version = 19");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #54): v19 -> v20 schema
+   * migration. Four additive tables for the
+   * cold-start bootstrap surface —
+   * `bootstrap_sources`, `bootstrap_plans`,
+   * `bootstrap_plan_items`, `external_references`.
+   * The migration is fully transactional; on any
+   * throw the user_version stays at 19 and the
+   * database is untouched. All DDL is
+   * `IF NOT EXISTS` so the migration is idempotent
+   * against re-runs.
+   */
+  private migrate_v19_to_v20(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS bootstrap_sources (
+          source_id              TEXT PRIMARY KEY,
+          source_kind            TEXT NOT NULL
+                                  CHECK (source_kind IN
+                                    ('file','directory','git_metadata','session_bundle',
+                                     'memory_bundle','external_provider')),
+          scope                  TEXT NOT NULL
+                                  CHECK (scope IN ('global','project')),
+          project_id             TEXT,
+          canonical_ref          TEXT NOT NULL,
+          source_version         TEXT,
+          content_digest         TEXT NOT NULL,
+          sensitivity            TEXT NOT NULL
+                                  CHECK (sensitivity IN ('normal','private','restricted')),
+          configured_by_actor_id TEXT NOT NULL,
+          created_at             TEXT NOT NULL,
+          last_scanned_at        TEXT,
+          size_bytes             INTEGER
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_bootstrap_sources_project
+          ON bootstrap_sources(scope, project_id);
+
+        CREATE TABLE IF NOT EXISTS bootstrap_plans (
+          plan_id            TEXT PRIMARY KEY,
+          project_id         TEXT NOT NULL,
+          creator_actor_id   TEXT NOT NULL,
+          state              TEXT NOT NULL
+                                CHECK (state IN ('draft','scanning','plan_ready','applying',
+                                                 'applied','expired','failed','cancelled')),
+          config_digest      TEXT NOT NULL,
+          source_set_digest  TEXT NOT NULL,
+          created_at         TEXT NOT NULL,
+          expires_at         TEXT NOT NULL,
+          completed_at       TEXT,
+          job_id             TEXT
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_bootstrap_plans_project
+          ON bootstrap_plans(project_id, state);
+
+        CREATE TABLE IF NOT EXISTS bootstrap_plan_items (
+          plan_id                     TEXT NOT NULL
+                                        REFERENCES bootstrap_plans(plan_id) ON DELETE CASCADE,
+          source_id                   TEXT NOT NULL
+                                        REFERENCES bootstrap_sources(source_id) ON DELETE RESTRICT,
+          item_seq                    INTEGER NOT NULL,
+          action                      TEXT NOT NULL
+                                        CHECK (action IN ('propose_memory','propose_context_pack',
+                                                          'propose_skill_ref','register_external_ref',
+                                                          'bind_loadout','skip')),
+          target_ref                  TEXT,
+          proposed_payload_json       TEXT NOT NULL,
+          evidence_digest             TEXT NOT NULL,
+          expected_revision_or_version INTEGER,
+          risk                        TEXT NOT NULL
+                                        CHECK (risk IN ('low','medium','high')),
+          rationale                   TEXT NOT NULL,
+          PRIMARY KEY (plan_id, item_seq)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_bootstrap_plan_items_source
+          ON bootstrap_plan_items(source_id);
+
+        CREATE TABLE IF NOT EXISTS external_references (
+          asset_id                   TEXT NOT NULL
+                                       REFERENCES assets(asset_id) ON DELETE CASCADE,
+          version                    INTEGER NOT NULL,
+          provider_kind              TEXT NOT NULL,
+          provider_instance_id       TEXT NOT NULL,
+          resource_kind              TEXT NOT NULL
+                                       CHECK (resource_kind IN
+                                         ('wiki','code_index','repository_context','document_set','custom')),
+          resource_ref               TEXT NOT NULL,
+          uri                        TEXT NOT NULL,
+          source_version             TEXT,
+          source_digest              TEXT,
+          retrieval_contract_version TEXT NOT NULL,
+          capabilities_json          TEXT NOT NULL DEFAULT '[]',
+          allowed_scope              TEXT NOT NULL
+                                       CHECK (allowed_scope IN ('global','project')),
+          project_id                 TEXT,
+          sensitivity                TEXT NOT NULL
+                                       CHECK (sensitivity IN ('normal','private','restricted')),
+          refresh_policy_json        TEXT NOT NULL DEFAULT '{"kind":"manual"}',
+          last_verified_at           TEXT,
+          metadata_json              TEXT NOT NULL DEFAULT '{}',
+          PRIMARY KEY (asset_id, version)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_external_references_provider
+          ON external_references(provider_kind, resource_ref);
+      `);
+      this.db.exec("PRAGMA user_version = 20");
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
@@ -7265,11 +8009,16 @@ export class SQLiteMemoryStore {
       | "global_default";
   } | undefined {
     // Precedence chain. Each level tries every
-    // binding column, treating `NULL` as a
-    // wildcard. We walk the 4 levels in
-    // priority order; the first non-empty result
-    // wins. Within a single level, the row with
-    // the highest `priority` wins; ties are
+    // binding column, treating `NULL` on a
+    // binding column as "any value". We walk the
+    // 4 levels in priority order; the first
+    // non-empty result wins. Level 1
+    // (actor_project_task) is only queried when
+    // the resolve supplies a `task_mode` — when
+    // the resolve omits task_mode, the resolution
+    // falls through to level 2 (actor + project
+    // default). Within a single level, the row
+    // with the highest `priority` wins; ties are
     // surfaced as `binding_ambiguous` by the
     // service layer.
     const levelQueries: Array<{
@@ -7281,7 +8030,7 @@ export class SQLiteMemoryStore {
       sql: string;
       params: SQLInputValue[];
     }> = [
-      // 1. actor + project + task_mode
+      // 1. actor + project + task_mode (exact match)
       {
         matched_rule: "actor_project_task",
         sql: `SELECT b.* FROM loadout_bindings b
@@ -7289,15 +8038,15 @@ export class SQLiteMemoryStore {
               WHERE (b.actor_id = ? OR b.actor_id IS NULL)
                 AND (b.client_name = ? OR b.client_name IS NULL)
                 AND (b.project_id = ? OR b.project_id IS NULL)
-                AND (b.task_mode = ? OR b.task_mode IS NULL)
-                AND l.lifecycle_state = 'active'
+                AND b.task_mode = ?
+                AND l.lifecycle_state IN ('draft', 'active')
               ORDER BY b.priority DESC, b.created_at ASC
               LIMIT 10`,
         params: [
           input.actor_id ?? null,
           input.client_name ?? null,
           input.project_id ?? null,
-          input.task_mode ?? null
+          input.task_mode ?? ""
         ]
       },
       // 2. actor + project (task_mode NULL on binding)
@@ -7309,7 +8058,7 @@ export class SQLiteMemoryStore {
                 AND (b.client_name = ? OR b.client_name IS NULL)
                 AND (b.project_id = ? OR b.project_id IS NULL)
                 AND b.task_mode IS NULL
-                AND l.lifecycle_state = 'active'
+                AND l.lifecycle_state IN ('draft', 'active')
               ORDER BY b.priority DESC, b.created_at ASC
               LIMIT 10`,
         params: [
@@ -7327,7 +8076,7 @@ export class SQLiteMemoryStore {
                 AND b.client_name IS NULL
                 AND (b.project_id = ? OR b.project_id IS NULL)
                 AND b.task_mode IS NULL
-                AND l.lifecycle_state = 'active'
+                AND l.lifecycle_state IN ('draft', 'active')
               ORDER BY b.priority DESC, b.created_at ASC
               LIMIT 10`,
         params: [input.project_id ?? null]
@@ -7342,13 +8091,25 @@ export class SQLiteMemoryStore {
                 AND b.project_id IS NULL
                 AND b.task_mode IS NULL
                 AND l.scope = 'global'
-                AND l.lifecycle_state = 'active'
+                AND l.lifecycle_state IN ('draft', 'active')
               ORDER BY b.priority DESC, b.created_at ASC
               LIMIT 10`,
         params: []
       }
     ];
     for (const level of levelQueries) {
+      // Level 1 (actor_project_task) is an exact
+      // match — only query it when the resolve
+      // supplies a task_mode. When the resolve
+      // omits task_mode we fall through to level 2
+      // (actor + project default) which expects
+      // b.task_mode IS NULL.
+      if (
+        level.matched_rule === "actor_project_task" &&
+        input.task_mode === undefined
+      ) {
+        continue;
+      }
       const rows = this.db.prepare(level.sql).all(...level.params) as Row[];
       if (rows.length === 0) continue;
       const binding = loadoutBindingFromRow(rows[0] as Row);

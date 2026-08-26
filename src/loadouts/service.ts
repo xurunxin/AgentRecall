@@ -262,15 +262,35 @@ export class LoadoutService {
    * matches zero rows). The caller can retry the
    * read + update sequence.
    *
+   * When `expected_previous_version` is provided,
+   * the CAS guard compares the read `version`
+   * against that value (rather than the implicit
+   * "any current version"); a mismatch throws
+   * `cas_mismatch` immediately. The CLI uses this
+   * to let operators pin a known-good version.
+   *
    * The returned row carries the new `version`.
    */
-  updateRules(loadoutId: string, patches: LoadoutRulePatch[]): LoadoutRow {
+  updateRules(
+    loadoutId: string,
+    patches: LoadoutRulePatch[],
+    options?: { expected_previous_version?: number }
+  ): LoadoutRow {
     if (patches.length === 0) {
       throw loadoutError("invalid_scope", "updateRules requires at least one channel patch");
     }
     const current = this.store.getLoadout(loadoutId);
     if (current === undefined) {
       throw loadoutError("loadout_not_found", `loadout ${loadoutId} not found`);
+    }
+    if (
+      options?.expected_previous_version !== undefined &&
+      current.version !== options.expected_previous_version
+    ) {
+      throw loadoutError(
+        "cas_mismatch",
+        `loadout ${loadoutId} version changed under us (expected ${options.expected_previous_version}, found ${current.version}); retry`
+      );
     }
     const newVersion = current.version + 1;
     const now = nowIso();

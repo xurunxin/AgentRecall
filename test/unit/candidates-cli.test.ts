@@ -178,10 +178,10 @@ describe("candidates + sessions distill (v1.2.0-alpha.2, issue #50)", () => {
       args: parseArgs(["candidates", "list", "--job", distillJson.job_id, "--json"])
     });
     expect(list.exitCode).toBe(0);
-    const listJson = JSON.parse(list.stdout) as { candidates: Array<{ candidate: { candidate_id: string; state: string } }> };
+    const listJson = JSON.parse(list.stdout) as { candidates: Array<{ candidate_id: string; state: string }> };
     expect(listJson.candidates.length).toBe(1);
-    const candidateId = listJson.candidates[0]!.candidate.candidate_id;
-    expect(listJson.candidates[0]!.candidate.state).toBe("proposed");
+    const candidateId = listJson.candidates[0]!.candidate_id;
+    expect(listJson.candidates[0]!.state).toBe("proposed");
 
     // 4. Show a single candidate.
     const show = await candidatesCommand({
@@ -229,8 +229,8 @@ describe("candidates + sessions distill (v1.2.0-alpha.2, issue #50)", () => {
       ...env.ctx,
       args: parseArgs(["candidates", "list", "--job", distillJson.job_id, "--json"])
     });
-    const listJson = JSON.parse(list.stdout) as { candidates: Array<{ candidate: { candidate_id: string } }> };
-    const candidateId = listJson.candidates[0]!.candidate.candidate_id;
+    const listJson = JSON.parse(list.stdout) as { candidates: Array<{ candidate_id: string }> };
+    const candidateId = listJson.candidates[0]!.candidate_id;
     const accept = await candidatesCommand({
       ...env.ctx,
       args: parseArgs(["candidates", "accept", candidateId, "--json"])

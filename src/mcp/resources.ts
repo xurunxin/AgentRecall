@@ -655,66 +655,6 @@ export function registerMemoryResources(server: MemoryResourceServer, ctx: Memor
     }
   );
 
-  // v1.2.0-alpha.2 (issue #52): the agent loadout
-  // context-assembly resource. The payload is the
-  // assembled `Assembled` (bootstrap + query +
-  // tool_only channels) for the calling actor. The
-  // resource is the canonical MCP surface for the
-  // v1.2-alpha.2 loadout service: the OpenCode
-  // plugin (and any other MCP client) calls this
-  // resource to surface the assembled bootstrap
-  // channel into the system prompt without
-  // duplicating the assembler in JS. The
-  // `bootstrap_hash` field is the upstream
-  // prompt-cache key.
-  //
-  // The resource is read-only; mutations go
-  // through the `loadouts_create` /
-  // `loadouts_update_rules` / `loadouts_bind` /
-  // `loadouts_unbind` CLI verbs (the MCP tool
-  // surface for loadouts lands in Phase 2.3).
-  server.registerResource(
-    "agent_loadout_context",
-    "agentrecall://context/loadout",
-    {
-      description:
-        "Assembled context for the calling actor: bootstrap / query / tool_only channels + bootstrap_hash upstream-cache key. Mirrors the agent-recall loadouts resolve + context-assembly surface.",
-      mimeType: "application/json"
-    },
-    (uri: URL) => {
-      if (ctx.readService === undefined) {
-        return jsonResource(uri, {
-          ok: false,
-          error: "not_available",
-          message: "readService not configured; the loadout context resource requires a MemoryReadService on the server context"
-        });
-      }
-      const loadoutService = new LoadoutService(ctx.store);
-      const resolved = loadoutService.resolve({
-        actor_id: ctx.callerActorId ?? ctx.defaultActor
-      });
-      const authz: CallerAuthz = {
-        actor_id: ctx.callerActorId ?? ctx.defaultActor,
-        max_sensitivity: ctx.actorMaxSensitivity ?? "normal"
-      };
-      const assembler = new ContextAssembler({ read_service: ctx.readService });
-      const assembled = assembler.assembleAll({
-        loadout: resolved.loadout,
-        rules: resolved.rules,
-        authz
-      });
-      return jsonResource(uri, {
-        ok: true,
-        loadout_id: assembled.loadout_id,
-        loadout_version: assembled.loadout_version,
-        policy_version: assembled.policy_version,
-        channels: assembled.channels,
-        bootstrap_hash: assembled.bootstrap_hash,
-        explanation: assembled.explanation
-      });
-    }
-  );
-
   // v1.2.0-alpha.2 (issue #50): the single
   // distillation-candidate inspection resource.
   // The payload is the full candidate row + the
@@ -786,6 +726,66 @@ export function registerMemoryResources(server: MemoryResourceServer, ctx: Memor
         ok: true,
         job_id: jobId,
         candidates: rows
+      });
+    }
+  );
+
+  // v1.2.0-alpha.2 (issue #52): the agent loadout
+  // context-assembly resource. The payload is the
+  // assembled `Assembled` (bootstrap + query +
+  // tool_only channels) for the calling actor. The
+  // resource is the canonical MCP surface for the
+  // v1.2-alpha.2 loadout service: the OpenCode
+  // plugin (and any other MCP client) calls this
+  // resource to surface the assembled bootstrap
+  // channel into the system prompt without
+  // duplicating the assembler in JS. The
+  // `bootstrap_hash` field is the upstream
+  // prompt-cache key.
+  //
+  // The resource is read-only; mutations go
+  // through the `loadouts_create` /
+  // `loadouts_update_rules` / `loadouts_bind` /
+  // `loadouts_unbind` CLI verbs (the MCP tool
+  // surface for loadouts lands in Phase 2.3).
+  server.registerResource(
+    "agent_loadout_context",
+    "agentrecall://context/loadout",
+    {
+      description:
+        "Assembled context for the calling actor: bootstrap / query / tool_only channels + bootstrap_hash upstream-cache key. Mirrors the agent-recall loadouts resolve + context-assembly surface.",
+      mimeType: "application/json"
+    },
+    (uri: URL) => {
+      if (ctx.readService === undefined) {
+        return jsonResource(uri, {
+          ok: false,
+          error: "not_available",
+          message: "readService not configured; the loadout context resource requires a MemoryReadService on the server context"
+        });
+      }
+      const loadoutService = new LoadoutService(ctx.store);
+      const resolved = loadoutService.resolve({
+        actor_id: ctx.callerActorId ?? ctx.defaultActor
+      });
+      const authz: CallerAuthz = {
+        actor_id: ctx.callerActorId ?? ctx.defaultActor,
+        max_sensitivity: ctx.actorMaxSensitivity ?? "normal"
+      };
+      const assembler = new ContextAssembler({ read_service: ctx.readService });
+      const assembled = assembler.assembleAll({
+        loadout: resolved.loadout,
+        rules: resolved.rules,
+        authz
+      });
+      return jsonResource(uri, {
+        ok: true,
+        loadout_id: assembled.loadout_id,
+        loadout_version: assembled.loadout_version,
+        policy_version: assembled.policy_version,
+        channels: assembled.channels,
+        bootstrap_hash: assembled.bootstrap_hash,
+        explanation: assembled.explanation
       });
     }
   );

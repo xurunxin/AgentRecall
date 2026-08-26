@@ -11,9 +11,11 @@ import { adminCommand } from "./commands/admin.js";
 import { assetsCommand } from "./commands/assets.js";
 import { auditCommand } from "./commands/audit.js";
 import { backupCommand, restoreCommand } from "./commands/backup.js";
+import { bootstrapCommand } from "./commands/bootstrap.js";
 import { candidatesCommand } from "./commands/candidates.js";
 import { doctorCommand } from "./commands/doctor.js";
 import { exportCommand } from "./commands/export.js";
+import { externalRefsCommand } from "./commands/external-refs.js";
 import { importCommand } from "./commands/import.js";
 import { jobsCommand } from "./commands/jobs.js";
 import { loadoutsCommand } from "./commands/loadouts.js";
@@ -106,9 +108,10 @@ Commands:
   candidates List, show, accept, reject, or apply distillation candidates (issue #50)
   sessions   Inspect / ingest / list / show / forget / distill captured session traces
   assets     Manage the typed asset registry (memory_ref / skill / context_pack / external_reference)
-<<<<<<< HEAD
   loadouts   Manage the agent loadout substrate (issue #52; create / update / bind / resolve)
   skills     Manage Skill assets (canonical SKILL.md import / export / search)
+  bootstrap  Cold-start bootstrap pipeline (configure / scan / plan)
+  external-refs  Manage typed external_reference assets (list / create / verify)
   version    Print the server version (also: --version / -v)
   help       Show this help
 
@@ -159,20 +162,13 @@ const dispatch: Record<string, CommandHandler> = {
   // context_pack / external_reference creation
   // land with their owning Phase 2 issues
   // (#53 / #54).
+  assets: assetsCommand,
   // v1.2.0-alpha.2 (issue #50): the candidate
   // review / apply surface. Backed by the
   // `DistillationService` (src/distillation/service.ts)
   // and the `derivation_candidates` /
   // `candidate_evidence` / `candidate_actions` tables.
   candidates: candidatesCommand,
-  // v1.2.0-alpha.1 (issue #51): the typed asset
-  // registry subcommand. Provides list / show /
-  // history / lifecycle / create-memory-ref for
-  // the additive asset envelope. Skill /
-  // context_pack / external_reference creation
-  // land with their owning Phase 2 issues
-  // (#53 / #54).
-  assets: assetsCommand,
   // v1.2.0-alpha.2 (issue #52): the agent
   // loadout subcommand. Provides list / show /
   // create / update / bind / unbind / resolve
@@ -183,7 +179,17 @@ const dispatch: Record<string, CommandHandler> = {
   // import / export for the type-specific
   // `skills` table. Lifecycle is delegated to
   // the envelope's `assets lifecycle` verb.
-  skills: skillsCommand
+  skills: skillsCommand,
+  // v1.2.0-alpha.2 (issue #54): the cold-start
+  // bootstrap pipeline. Provides configure / scan /
+  // plan show / plan apply / plan cancel for the
+  // v20 surface.
+  bootstrap: bootstrapCommand,
+  // v1.2.0-alpha.2 (issue #54): the typed
+  // external_reference asset subcommand. Provides
+  // list / create / verify for the
+  // `external_references` table.
+  "external-refs": externalRefsCommand
 };
 
 export async function runCli(

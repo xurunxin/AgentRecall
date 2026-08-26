@@ -98,3 +98,22 @@ export function flagNumber(args: ParsedArgs, name: string): number | undefined {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : undefined;
 }
+
+/**
+ * Read a list of values for a flag. The arg-parser
+ * only retains a single value per flag, so callers
+ * pass repeated values comma-separated inside one
+ * `--flag a,b,c` invocation. An empty / missing
+ * flag returns an empty array. A boolean flag
+ * (presence-only) returns an empty array.
+ */
+export function flagStringList(args: ParsedArgs, name: string): string[] {
+  const value = args.flags[name];
+  if (value === undefined) return [];
+  if (typeof value !== "string") return [];
+  if (value.length === 0) return [];
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}

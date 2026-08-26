@@ -1,0 +1,14 @@
+{
+  "schema_version": "lifecycle.corpus.v1",
+  "corpus_version": "v0.1.0",
+  "description": "Phase 3 (#55) initial evaluation corpus. Two example fixtures ship with the skeleton; subsequent releases will grow the corpus to the documented coverage matrix (every v1.2 workstream × happy / policy_fail / interrupt_retry).",
+  "baselines": {
+    "distillation_supported_claim_rate": 0.9,
+    "distillation_hallucination_rejection_rate": 0.95,
+    "bootstrap_hash_byte_determinism": 1.0
+  },
+  "fixtures": [
+    "distill-happy.json",
+    "loadout-policy-fail.json"
+  ]
+}

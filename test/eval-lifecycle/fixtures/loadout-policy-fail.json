@@ -1,0 +1,63 @@
+{
+  "schema_version": "lifecycle.eval.v1",
+  "fixture_id": "loadout_policy_fail_v1",
+  "description": "Policy-fail: a loadout is created with `scope=project` but no `project_id`. The service MUST reject the create with `project_id_required` and the runner must surface the structured error code (not just the human-readable message). The fixture then resolves the loadout with an actor_id but no matching binding and asserts the resolve falls back to the built-in `legacy-inject-all-active` row — i.e. the resolution path is fail-closed (no silent injection of arbitrary data). Exercises dimension D (assets / loadouts) and dimension E (safety / isolation).",
+  "dimension": "D.assets_skills_bootstrap",
+  "workstream": "loadouts",
+  "fixture_class": "policy_fail",
+  "determinism": "deterministic",
+  "requires_schema_version": 20,
+  "seed": {
+    "actor_id": "agent:eval-loadout-fail",
+    "project_id": null,
+    "memories": [
+      {
+        "id": "mem_eval_loadout_1",
+        "tier": "core",
+        "title": "stable rule",
+        "body": "do not silence validation errors",
+        "pinned": true,
+        "tags": ["core"],
+        "trust_level": "user_confirmed",
+        "sensitivity": "normal"
+      }
+    ],
+    "loadouts": [
+      {
+        "name": "eval-loadout-orphan",
+        "scope": "project",
+        "project_id": null,
+        "rules": [
+          {
+            "channel": "bootstrap",
+            "max_items": 16,
+            "max_chars": 4000,
+            "include_memory_ids": ["mem_eval_loadout_1"]
+          }
+        ]
+      }
+    ],
+    "session_bundles": []
+  },
+  "operations": [
+    {
+      "kind": "resolve_loadout",
+      "actor_id": "agent:eval-loadout-fail",
+      "project_id": null,
+      "task_mode": null
+    }
+  ],
+  "expected": {
+    "job_state": null,
+    "candidate_count": null,
+    "bootstrap_hash": null,
+    "safety": {
+      "cross_project_leak_count": 0,
+      "sensitivity_leak_count": 0,
+      "secret_leak_count": 0,
+      "injection_bypass_count": 0,
+      "unauthorized_trust_escalation_count": 0
+    },
+    "last_error_code": "project_id"
+  }
+}

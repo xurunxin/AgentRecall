@@ -184,8 +184,8 @@ describe("ContextAssembler (v1.2.0-alpha.2, issue #52)", () => {
 
   describe("project scope guard", () => {
     it("a project-scope loadout cannot include memories from another project", () => {
-      const projA = makeEntry({ id: "mem_a", project_id: "proj_a", tier: "core", title: "a" });
-      const projB = makeEntry({ id: "mem_b", project_id: "proj_b", tier: "core", title: "b" });
+      const projA = makeEntry({ id: "mem_a", scope: "project", project_id: "proj_a", tier: "core", title: "a" });
+      const projB = makeEntry({ id: "mem_b", scope: "project", project_id: "proj_b", tier: "core", title: "b" });
       const read = makeMockReadService([projA, projB]);
       const assembler = new ContextAssembler({ read_service: read });
       const loadout = makeLoadout({ scope: "project", project_id: "proj_a" });

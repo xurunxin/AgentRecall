@@ -23,6 +23,10 @@ import { jsonOut } from "../format.js";
 import type { CliContext, CliResult } from "../index.js";
 import { DerivationJobStore } from "../../jobs/service.js";
 import { runOnce, makeLeaseOwner } from "../../jobs/runner.js";
+import { defaultBootstrapExecutors } from "../../jobs/executors/bootstrap.js";
+import type {
+  DerivationJobExecutor
+} from "../../jobs/runner.js";
 import type {
   DerivationJobRow,
   DerivationJobState,
@@ -36,20 +40,23 @@ Usage:
   agent-recall jobs list   [--state <s>] [--kind <k>] [--limit <n>] [--json]
   agent-recall jobs show   <job_id> [--json]
   agent-recall jobs cancel <job_id> [--json]
-  agent-recall jobs run    [--kind <k>] [--once] [--max-jobs <n>] [--json]
+  agent-recall jobs run    [--kind <k>] [--max-jobs <n>] [--watch] [--poll-ms <ms>] [--json]
 
 Subcommands:
   list    List derivation jobs (newest first).
   show    Inspect a single job, its run rows and outputs.
   cancel  Request cancellation of a running or queued job.
-  run     Claim + process claimable jobs. --once exits after a single pass.
+  run     Claim + process claimable jobs. Without --watch, exits after a
+          single pass. With --watch, polls every --poll-ms until SIGINT
+          (default 2000 ms).
 
 Flags:
   --state <state>     Filter (list) to a single state.
   --kind <kind>       Filter (list / run) to a single kind.
   --limit <n>         Cap (list) row count (default 50).
-  --max-jobs <n>      Cap (run --once) processed jobs (default 16).
-  --once              Default for run: one pass.
+  --max-jobs <n>      Cap (run) processed jobs per pass (default 16).
+  --watch             Poll forever; SIGINT / SIGTERM exits cleanly.
+  --poll-ms <ms>      Watch poll interval in ms (default 2000).
   --json              Emit JSON.
 `;
 
@@ -285,32 +292,62 @@ async function jobsRun(ctx: CliContext): Promise<CliResult> {
   const kind = flagString(ctx.args, "kind");
   const watch = flagBool(ctx.args, "watch");
   const maxJobs = flagNumber(ctx.args, "max-jobs") ?? 16;
-  if (watch) {
+  const pollMs = flagNumber(ctx.args, "poll-ms") ?? 2000;
+  const executors = defaultBootstrapExecutors() as ReadonlyArray<DerivationJobExecutor>;
+  if (!watch) {
+    // One synchronous pass: the v1.2.0-alpha.0
+    // contract. The default `stop_after_empty_passes=1`
+    // makes the runner return as soon as a single empty
+    // pass is observed.
+    const result = await runOnce(ctx.store, executors, {
+      ...(kind !== undefined ? { kind } : {}),
+      lease_owner: makeLeaseOwner(),
+      max_jobs: maxJobs
+    });
+    if (json) {
+      return { exitCode: 0, stdout: jsonOut(result), stderr: "" };
+    }
     return {
-      exitCode: 1,
-      stdout: "",
-      stderr: "[usage_error] jobs run --watch is not yet implemented; use --once for the synchronous pass"
+      exitCode: 0,
+      stdout:
+        `attempted=${result.attempted} succeeded=${result.succeeded} ` +
+        `failed=${result.failed} cancelled=${result.cancelled}\n`,
+      stderr: ""
     };
   }
-  // No executors are registered in v1.2.0-alpha.0: every
-  // claimable job fails with `no executor registered for
-  // kind '<kind>'`. This is the documented Phase 0
-  // surface — the enqueue / claim / cancel / inspect
-  // lifecycle is exercisable end-to-end; the real
-  // executors land in Phase 2 (#50, #53, #54).
-  const result = await runOnce(ctx.store, [], {
-    ...(kind !== undefined ? { kind } : {}),
-    lease_owner: makeLeaseOwner(),
-    max_jobs: maxJobs
-  });
-  if (json) {
-    return { exitCode: 0, stdout: jsonOut(result), stderr: "" };
-  }
-  return {
-    exitCode: 0,
-    stdout:
-      `attempted=${result.attempted} succeeded=${result.succeeded} ` +
-      `failed=${result.failed} cancelled=${result.cancelled}\n`,
-    stderr: ""
+  // v1.2.0-alpha.2 (issue #54): the `--watch`
+  // polling loop. The runner keeps claiming
+  // claimable jobs every `poll_ms` until the
+  // process receives SIGINT / SIGTERM (the
+  // Node.js `signal` driver is wired below).
+  const controller = new AbortController();
+  const onSigint = (): void => {
+    controller.abort();
   };
+  process.on("SIGINT", onSigint);
+  process.on("SIGTERM", onSigint);
+  try {
+    const result = await runOnce(ctx.store, executors, {
+      ...(kind !== undefined ? { kind } : {}),
+      lease_owner: makeLeaseOwner(),
+      max_jobs: maxJobs,
+      poll_ms: pollMs,
+      stop_after_empty_passes: Number.POSITIVE_INFINITY,
+      signal: controller.signal
+    });
+    if (json) {
+      return { exitCode: 0, stdout: jsonOut(result), stderr: "" };
+    }
+    return {
+      exitCode: 0,
+      stdout:
+        `attempted=${result.attempted} succeeded=${result.succeeded} ` +
+        `failed=${result.failed} cancelled=${result.cancelled} ` +
+        `passes=${result.passes} exit=${result.loop_exit_reason ?? "stop_after_empty_passes"}\n`,
+      stderr: ""
+    };
+  } finally {
+    process.removeListener("SIGINT", onSigint);
+    process.removeListener("SIGTERM", onSigint);
+  }
 }
