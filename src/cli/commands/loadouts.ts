@@ -365,7 +365,12 @@ function loadoutsUpdate(ctx: CliContext): CliResult {
     ...(tiers !== undefined ? { include_tiers: parseTiers(tiers) } : {}),
     ...(orderingPolicyValue !== undefined ? { ordering_policy: orderingPolicyValue } : {})
   };
-  const updated = service(ctx).updateRules(loadoutId, [patch]);
+  const expectedPreviousVersion = flagNumber(ctx.args, "expected-previous-version");
+  const updated = service(ctx).updateRules(loadoutId, [patch], {
+    ...(expectedPreviousVersion !== undefined
+      ? { expected_previous_version: expectedPreviousVersion }
+      : {})
+  });
   if (json) {
     return { exitCode: 0, stdout: jsonOut({ loadout: loadoutRowToJson(updated) }), stderr: "" };
   }

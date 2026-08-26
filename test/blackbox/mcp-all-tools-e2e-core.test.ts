@@ -394,6 +394,7 @@ describe("MCP all-tools black-box E2E - Core profile (v1.1.2 #22 Task 3 follow-u
     const resources = await client.listResources();
     const staticUris = resources.resources.map((r) => r.uri).sort();
     expect(staticUris).toEqual([
+      "agentrecall://context/loadout",
       "memory://global/summary",
       "memory://health",
       "memory://projects"
@@ -401,7 +402,16 @@ describe("MCP all-tools black-box E2E - Core profile (v1.1.2 #22 Task 3 follow-u
 
     const templates = await client.listResourceTemplates();
     const tplNames = templates.resourceTemplates.map((t) => t.name).sort();
-    expect(tplNames).toEqual(["memory_import_batch", "memory_project_memory", "memory_project_summary"]);
+    expect(tplNames).toEqual([
+      "asset_envelope",
+      "derivation_job",
+      "distillation_candidate",
+      "distillation_candidate_list",
+      "memory_import_batch",
+      "memory_project_memory",
+      "memory_project_summary",
+      "session_evidence"
+    ]);
   });
 
   it("surface: server PID is set and non-zero", () => {

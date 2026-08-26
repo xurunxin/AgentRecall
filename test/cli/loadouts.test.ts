@@ -97,7 +97,8 @@ describe("loadouts CLI (v1.2.0-alpha.2, issue #52)", () => {
       "--actor",
       "agent:claude",
       "--client",
-      "opencode"
+      "opencode",
+      "--json"
     ]);
     store = made.store;
     ctx = made.ctx;
@@ -117,11 +118,13 @@ describe("loadouts CLI (v1.2.0-alpha.2, issue #52)", () => {
       "--max-items",
       "16",
       "--max-chars",
-      "4000"
+      "4000",
+      "--json"
     ]).ctx;
     const updateResult = await loadoutsCommand(updateCtx);
     expect(updateResult.exitCode).toBe(0);
-    expect(updateResult.stdout).toMatch(/version 2/);
+    const updateJson = JSON.parse(updateResult.stdout) as { loadout: { version: number } };
+    expect(updateJson.loadout.version).toBe(2);
 
     // bind
     const bindCtx = makeContext(dataHome, [
@@ -133,7 +136,8 @@ describe("loadouts CLI (v1.2.0-alpha.2, issue #52)", () => {
       "--client",
       "opencode",
       "--priority",
-      "5"
+      "5",
+      "--json"
     ]).ctx;
     const bindResult = await loadoutsCommand(bindCtx);
     expect(bindResult.exitCode).toBe(0);
@@ -146,7 +150,8 @@ describe("loadouts CLI (v1.2.0-alpha.2, issue #52)", () => {
       "--actor",
       "agent:claude",
       "--client",
-      "opencode"
+      "opencode",
+      "--json"
     ]).ctx;
     const resolveResult = await loadoutsCommand(resolveCtx);
     expect(resolveResult.exitCode).toBe(0);
@@ -168,7 +173,8 @@ describe("loadouts CLI (v1.2.0-alpha.2, issue #52)", () => {
       "--name",
       "x",
       "--scope",
-      "global"
+      "global",
+      "--json"
     ]);
     store = made.store;
     ctx = made.ctx;
@@ -187,7 +193,9 @@ describe("loadouts CLI (v1.2.0-alpha.2, issue #52)", () => {
       "update",
       loadoutId,
       "--channel",
-      "bootstrap"
+      "bootstrap",
+      "--expected-previous-version",
+      "1"
     ]).ctx;
     const updateResult = await loadoutsCommand(updateCtx);
     expect(updateResult.exitCode).toBe(1);
@@ -201,7 +209,8 @@ describe("loadouts CLI (v1.2.0-alpha.2, issue #52)", () => {
       "--name",
       "x",
       "--scope",
-      "global"
+      "global",
+      "--json"
     ]);
     store = made.store;
     ctx = made.ctx;

@@ -68,7 +68,7 @@ describe("SkillService (v1.2.0-alpha.2, issue #53)", () => {
     store = openStore(dbPath);
     skills = new SkillService(store);
     expect(store.getUserVersion()).toBe(CURRENT_SCHEMA_VERSION);
-    expect(CURRENT_SCHEMA_VERSION).toBe(19);
+    expect(CURRENT_SCHEMA_VERSION).toBe(20);
   });
   afterEach(() => {
     if (store !== undefined) {

@@ -415,9 +415,13 @@ describe("MCP resources (spec § 6.3)", () => {
     // a templated URI keyed on `{batch_id}`.
     expect(calls[5]?.uriOrTemplate).toBeInstanceOf(ResourceTemplate);
     // v1.2.0-alpha.2 (issue #52): the loadout
-    // context-assembly resource is a static URI
-    // (`agentrecall://context/loadout`).
-    expect(calls[9]?.uriOrTemplate).toBe("agentrecall://context/loadout");
+    // context-assembly resource is the LAST
+    // registered static URI
+    // (`agentrecall://context/loadout`). It comes
+    // after the v1.2 distillation candidate
+    // resources (issues #50) so the precedence
+    // chain is candidates -> loadout context.
+    expect(calls[11]?.uriOrTemplate).toBe("agentrecall://context/loadout");
   });
 
   it("memory://health returns a JSON payload with server_version + schema_version", async () => {

@@ -156,12 +156,11 @@ describe("jobsCommand (v1.2.0-alpha.0, issue #48)", () => {
     expect(inspection?.job.cancel_requested_at).not.toBeNull();
   });
 
-  it("refuses --watch (not yet implemented)", async () => {
-    const args = parseArgs(["jobs", "run", "--watch"]);
-    const result = await jobsCommand({ ...env.ctx, args });
-    expect(result.exitCode).toBe(1);
-    expect(result.stderr).toContain("watch is not yet implemented");
-  });
+  // v1.2.0-alpha.2 (issue #54): --watch is now
+  // implemented as a polling loop. The test below
+  // covers the synchronous single-pass case; the
+  // polling / SIGINT-exit behavior is covered by
+  // `test/unit/jobs-runner-watch.test.ts`.
 
   it("runs a synchronous pass with no executors (no-op summary)", async () => {
     const args = parseArgs(["jobs", "run", "--json"]);

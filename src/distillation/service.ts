@@ -822,16 +822,23 @@ export async function enqueueAndRunSessionDistill(args: {
   // The `runOnce` runner does not return the
   // individual `run_id` row; the executor's
   // `startStage` is internal to the runner. Re-read
-  // the job's most recent run row so the caller can
-  // surface it.
+  // the job (and its most recent run row) so the
+  // caller can surface the post-execution
+  // `state` (e.g. `succeeded`) instead of the
+  // pre-execution `queued` state.
   const inspect = args.jobStore.inspect(enqueue.job.job_id);
-  const run = inspect?.runs[0];
+  if (inspect === undefined) {
+    throw new Error(
+      `[internal_error] session_distill job ${enqueue.job.job_id} disappeared after runOnce`
+    );
+  }
+  const run = inspect.runs[0];
   if (run === undefined) {
     throw new Error(
       `[internal_error] session_distill job ${enqueue.job.job_id} produced no run row`
     );
   }
-  return { job: enqueue.job, run, outcome: result };
+  return { job: inspect.job, run, outcome: result };
 }
 
 function bundleFromSessionInspection(inspection: {

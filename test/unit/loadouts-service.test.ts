@@ -31,7 +31,7 @@ describe("LoadoutService (v1.2.0-alpha.2, issue #52)", () => {
     store = openStore(dbPath);
     service = new LoadoutService(store);
     expect(store.getUserVersion()).toBe(CURRENT_SCHEMA_VERSION);
-    expect(CURRENT_SCHEMA_VERSION).toBe(18);
+    expect(CURRENT_SCHEMA_VERSION).toBe(20);
   });
   afterEach(() => {
     if (store !== undefined) {
@@ -65,13 +65,16 @@ describe("LoadoutService (v1.2.0-alpha.2, issue #52)", () => {
     });
 
     it("rejects scope=project without a project_id", () => {
-      expect(() =>
+      try {
         service.create({
           name: "x",
           scope: "project",
           created_by_actor_id: "user:test"
-        })
-      ).toThrow(/project_id_required/);
+        });
+        throw new Error("expected create to throw");
+      } catch (error) {
+        expect((error as { code?: string }).code).toBe("project_id_required");
+      }
     });
 
     it("lists loadouts by scope", () => {
