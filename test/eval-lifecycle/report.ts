@@ -77,6 +77,12 @@ export function formatReportMarkdown(report: CorpusReport): string {
   lines.push(
     `- Safety gate: ${report.safety_gate.passed ? "PASS" : "FAIL"} (${report.safety_gate.reasons.length} reason(s))`
   );
+  if (report.baselines !== undefined) {
+    const b = report.baselines;
+    lines.push(
+      `- Baselines: ${b.passed ? "PASS" : "FAIL"} (${b.reasons.length} reason(s))`
+    );
+  }
   lines.push("");
   lines.push("## By dimension");
   lines.push("");
@@ -90,6 +96,32 @@ export function formatReportMarkdown(report: CorpusReport): string {
     lines.push(`- **${ws}**: ${agg.passed}/${agg.total}`);
   }
   lines.push("");
+  if (report.baselines !== undefined) {
+    lines.push("## Quality baselines (v0.4.0 / issue #55c)");
+    lines.push("");
+    lines.push("| Metric | Measured | Declared |");
+    lines.push("| --- | --- | --- |");
+    const m = report.baselines.measured;
+    const d = report.baselines.declared;
+    lines.push(
+      `| distillation_supported_claim_rate | ${m.distillation_supported_claim_rate.toFixed(4)} | ${d.distillation_supported_claim_rate.toFixed(4)} |`
+    );
+    lines.push(
+      `| distillation_hallucination_rejection_rate | ${m.distillation_hallucination_rejection_rate.toFixed(4)} | ${d.distillation_hallucination_rejection_rate.toFixed(4)} |`
+    );
+    lines.push(
+      `| bootstrap_hash_byte_determinism | ${m.bootstrap_hash_byte_determinism.toFixed(4)} | ${d.bootstrap_hash_byte_determinism.toFixed(4)} |`
+    );
+    lines.push("");
+    if (report.baselines.reasons.length > 0) {
+      lines.push("### Baseline reasons");
+      lines.push("");
+      for (const reason of report.baselines.reasons) {
+        lines.push(`- ${reason}`);
+      }
+      lines.push("");
+    }
+  }
   lines.push("## Per-fixture results");
   lines.push("");
   for (const r of report.results) {

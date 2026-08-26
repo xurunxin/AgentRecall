@@ -1,7 +1,7 @@
 {
   "schema_version": "lifecycle.corpus.v1",
-  "corpus_version": "v0.3.1",
-  "description": "Phase 3 (#55) v0.3.1 evaluation corpus. Seventeen fixtures: 15 v0.3.0 fixtures covering the full 5-workstream x 3-class matrix (#55a) + 2 v0.3.1 fixtures exercising the safety counter instrumentation surface (#55b). The v0.3.1 additions are dimension=E (safety_resilience) positive counter assertions: safety-secret-leak-v1 verifies the SessionService.ingest hook records one secret_leak_count per secret-bearing event, safety-injection-blocked-v1 verifies the prompt-injection hook records one injection_bypass_count per pattern-matched event.",
+  "corpus_version": "v0.4.0",
+  "description": "Phase 3 (#55) v0.4.0 evaluation corpus. Seventeen fixtures: the 15-fixture (workstream x fixture_class) matrix from v0.3.0 (#55a) + the 2 safety counter fixtures from v0.3.1 (#55b). v0.4.0 adds baseline scoring (#55c): the runner aggregates `expected.metric_input` rows across the corpus, scores the totals against the manifest's declared thresholds, fails the run when a threshold is missed, and writes the measured numbers into `report.json` / `report.md`. The three v0.4.0 baselines are distillation_supported_claim_rate, distillation_hallucination_rejection_rate and bootstrap_hash_byte_determinism; the canonical happy fixtures (`distill_happy_v1`, `distill_no_hallucination_v1`, `bootstrap_scan_idempotent_v1`) declare the `metric_input` rows that drive the roll-up.",
   "baselines": {
     "distillation_supported_claim_rate": 0.9,
     "distillation_hallucination_rejection_rate": 0.95,

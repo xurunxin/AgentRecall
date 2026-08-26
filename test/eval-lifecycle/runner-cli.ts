@@ -26,7 +26,23 @@ async function main(): Promise<void> {
     }
   }
   const report = await runCorpusAndWriteReports({ corpusDir, outDir, bailOnFailure: bail });
+  // v1.2.0-alpha.3 (issue #55c): the runner now
+  // fails closed on quality baselines as well as
+  // on per-fixture failures. A baseline miss is
+  // a release-blocking event; the exit code is 1
+  // for either failure mode so CI surfaces the
+  // problem without having to inspect
+  // `report.json`. The two reasons arrays
+  // (`safety_gate.reasons` and `baselines.reasons`)
+  // are written to the report for human review.
   if (report.totals.failed > 0) {
+    process.exit(1);
+  }
+  if (report.baselines !== undefined && !report.baselines.passed) {
+    console.error(
+      "Quality baselines failed:\n" +
+        report.baselines.reasons.map((r) => `  - ${r}`).join("\n")
+    );
     process.exit(1);
   }
   process.exit(0);
