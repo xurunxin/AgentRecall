@@ -1,0 +1,44 @@
+{
+  "schema_version": "lifecycle.eval.v1",
+  "fixture_id": "distill_no_hallucination_v1",
+  "description": "Happy: a session bundle with only a `user_message` event. The baseline extractor filters out anything that is not `decision_confirmed` and produces zero candidates. The fixture asserts `candidate_count = 0` and no error — the baseline never hallucinated a decision from a non-decision event. Exercises dimension B (derivation).",
+  "dimension": "B.derivation",
+  "workstream": "distillation",
+  "fixture_class": "happy",
+  "determinism": "deterministic",
+  "requires_schema_version": 20,
+  "seed": {
+    "actor_id": "agent:eval-distill-nohalluc",
+    "project_id": null,
+    "memories": [],
+    "loadouts": [],
+    "session_bundles": [
+      {
+        "bundle_id": "eval_distill_nohalluc_1",
+        "source_kind": "opencode",
+        "source_session_id": "oc-eval-nohalluc-1",
+        "jsonl": "{\"schema_version\":\"1\",\"bundle_id\":\"eval_distill_nohalluc_1\",\"source_kind\":\"opencode\",\"source_version\":\"1.0.0\",\"source_instance_id\":\"eval-instance\",\"source_session_id\":\"oc-eval-nohalluc-1\",\"project_id\":null,\"actor_id\":\"agent:eval-distill-nohalluc\",\"client_name\":\"opencode\",\"client_version\":\"1.0.0\",\"scope\":\"global\",\"sensitivity\":\"normal\",\"started_at\":\"2026-08-26T00:00:00.000Z\",\"ended_at\":\"2026-08-26T00:01:00.000Z\",\"adapter_id\":\"jsonl\",\"adapter_version\":\"1.0.0\",\"events\":[]}\n{\"schema_version\":\"1\",\"source_kind\":\"opencode\",\"source_version\":\"1.0.0\",\"source_instance_id\":\"eval-instance\",\"source_session_id\":\"oc-eval-nohalluc-1\",\"project_id\":null,\"actor_id\":\"agent:eval-distill-nohalluc\",\"client_name\":\"opencode\",\"client_version\":\"1.0.0\",\"event_id\":\"evt_nohalluc_1\",\"sequence\":1,\"turn_id\":\"turn-1\",\"event_type\":\"user_message\",\"role\":\"user\",\"content\":\"How do I bootstrap a new project?\",\"content_digest\":\"sha256:PLACEHOLDER_WILL_BE_RECOMPUTED\",\"timestamp\":\"2026-08-26T00:00:10.000Z\",\"sensitivity\":\"normal\",\"redaction_flags\":[],\"metadata\":{}}"
+      }
+    ],
+    "bootstrap": null
+  },
+  "operations": [
+    {
+      "kind": "distill_session",
+      "session_id": "SESS_PLACEHOLDER"
+    }
+  ],
+  "expected": {
+    "job_state": "succeeded",
+    "candidate_count": 0,
+    "bootstrap_hash": null,
+    "safety": {
+      "cross_project_leak_count": 0,
+      "sensitivity_leak_count": 0,
+      "secret_leak_count": 0,
+      "injection_bypass_count": 0,
+      "unauthorized_trust_escalation_count": 0
+    },
+    "last_error_code": null
+  }
+}

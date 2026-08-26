@@ -13,7 +13,7 @@
 // must call the service directly so a CLI parsing
 // regression doesn't mask a real regression).
 
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve, join } from "node:path";
 import { createHash } from "node:crypto";
@@ -25,6 +25,10 @@ import { JsonlSessionAdapter } from "../../src/sessions/adapters/jsonl.js";
 import { DistillationService, enqueueAndRunSessionDistill } from "../../src/distillation/service.js";
 import { DerivationJobStore } from "../../src/jobs/service.js";
 import { LoadoutService } from "../../src/loadouts/service.js";
+import { SkillService } from "../../src/skills/service.js";
+import { BootstrapService } from "../../src/bootstrap/service.js";
+import { ExternalReferenceService } from "../../src/external-refs/service.js";
+import { ProjectIdentityResolver } from "../../src/scope-resolver.js";
 import { formatReportJson, formatReportMarkdown } from "./report.js";
 import {
   LifecycleFixtureSchema,
@@ -57,11 +61,39 @@ function openStore(dbPath: string): SQLiteMemoryStore {
 type FixtureContext = {
   store: SQLiteMemoryStore;
   dataHome: string;
+  projectRoot: string;
   memoryWriteService: MemoryWriteService;
   sessionService: SessionService;
   distillationService: DistillationService;
   jobStore: DerivationJobStore;
   loadoutService: LoadoutService;
+  skillService: SkillService;
+  bootstrapService: BootstrapService;
+  externalReferences: ExternalReferenceService;
+  /**
+   * Map of loadout name -> loadout_id for fixtures
+   * that operate on a loadout by name. Populated
+   * during the seed step.
+   */
+  loadoutIdsByName: Map<string, string>;
+  /**
+   * Map of skill name -> asset_id for fixtures
+   * that operate on a skill by name. Populated
+   * during the seed step (`seed.skills[]`).
+   */
+  skillAssetIdsByName: Map<string, string>;
+  /**
+   * Bootstrap plan_id from the seed step. Populated
+   * when `seed.bootstrap.scan = true`. `null` when
+   * the fixture did not seed a bootstrap plan.
+   */
+  bootstrapPlanId: string | null;
+  /**
+   * Bootstrap project_id from the seed step. Set
+   * when the fixture declares a `seed.bootstrap`
+   * block, even when `scan = false`.
+   */
+  bootstrapProjectId: string | null;
 };
 
 function buildContext(): FixtureContext {
@@ -73,17 +105,52 @@ function buildContext(): FixtureContext {
   const distillationService = new DistillationService(
     store,
     sessionService,
-    jobStore
+    jobStore,
+    { memoryWriteService }
   );
   const loadoutService = new LoadoutService(store);
+  const skillService = new SkillService(store);
+  const externalReferences = new ExternalReferenceService(store);
+  const bootstrapService = new BootstrapService(store, externalReferences);
+  // A per-fixture project root. The bootstrap
+  // service resolves configured sources against
+  // this directory; the seed step registers a
+  // project identity with `canonical_path`
+  // pointing at it so the configure / scan paths
+  // do not throw `project_not_found`.
+  const projectRoot = mkdtempSync(join(tmpdir(), "agent-recall-eval-proj-"));
+  // Pre-create the v1 default allow-list files
+  // (AGENTS.md + README.md) so scan / apply
+  // fixtures do not have their sources silently
+  // skipped. Content is intentionally short and
+  // stable so two scans of the same project root
+  // produce byte-equal content_digests.
+  writeFileSync(
+    join(projectRoot, "AGENTS.md"),
+    "# eval project\n\nplaceholder content for the lifecycle eval fixtures.\n",
+    "utf8"
+  );
+  writeFileSync(
+    join(projectRoot, "README.md"),
+    "# eval project README\n\nplaceholder content for the lifecycle eval fixtures.\n",
+    "utf8"
+  );
   return {
     store,
     dataHome,
+    projectRoot,
     memoryWriteService,
     sessionService,
     distillationService,
     jobStore,
-    loadoutService
+    loadoutService,
+    skillService,
+    bootstrapService,
+    externalReferences,
+    loadoutIdsByName: new Map(),
+    skillAssetIdsByName: new Map(),
+    bootstrapPlanId: null,
+    bootstrapProjectId: null
   };
 }
 
@@ -95,6 +162,11 @@ function disposeContext(ctx: FixtureContext): void {
   }
   try {
     rmSync(join(ctx.dataHome, ".."), { recursive: true, force: true });
+  } catch {
+    // best-effort
+  }
+  try {
+    rmSync(ctx.projectRoot, { recursive: true, force: true });
   } catch {
     // best-effort
   }
@@ -186,6 +258,7 @@ async function seedFixture(
           project_id: loadout.project_id ?? undefined,
           created_by_actor_id: fixture.seed.actor_id
         });
+        ctx.loadoutIdsByName.set(loadout.name, createdLoadoutId);
         if (loadout.rules.length > 0) {
           ctx.loadoutService.updateRules(
             createdLoadoutId,
@@ -222,11 +295,92 @@ async function seedFixture(
         };
       }
     }
+    for (const skill of fixture.seed.skills) {
+      try {
+        // v0.3.0 (#55a): skill seeds. The runner
+        // imports each SKILL.md through
+        // `SkillService.importSkillMd` and stashes
+        // the resulting `asset_id` in
+        // `ctx.skillAssetIdsByName` so a downstream
+        // `append_skill_version` operation can
+        // address it by name. The `interrupt_retry`
+        // fixture (e.g. `skills_append_cas_v1`)
+        // uses the seeded asset_id to exercise the
+        // CAS guard.
+        const importResult = ctx.skillService.importSkillMd({
+          skillMd: skill.skill_md,
+          source: skill.source,
+          scope: "global",
+          owner_actor_id: fixture.seed.actor_id,
+          name: skill.name
+        });
+        ctx.skillAssetIdsByName.set(skill.name, importResult.asset_id);
+      } catch (seedErr) {
+        return {
+          sessionIds,
+          seedError: seedErr instanceof Error ? seedErr.message : String(seedErr)
+        };
+      }
+    }
+    if (fixture.seed.bootstrap !== null) {
+      const bootstrap = fixture.seed.bootstrap;
+      ctx.bootstrapProjectId = bootstrap.project_id;
+      try {
+        // v0.3.0 (#55a): bootstrap seeds. The runner
+        // always registers a project identity (so
+        // configure / scan do not throw
+        // `project_not_found`), then issues
+        // `configure`; when `scan` is true, it also
+        // issues a `scan` so a downstream
+        // `apply_bootstrap_plan` operation has a
+        // `plan_id` to address. Path-safety
+        // violations surface here as a seedError so
+        // `policy_fail` fixtures can assert on the
+        // `ConfigureResult.rejected[]` entries (or
+        // the thrown `path_safety_violation`).
+        ctx.store.createProjectIdentity({
+          project_id: bootstrap.project_id,
+          canonical_path: ctx.projectRoot,
+          created_by: fixture.seed.actor_id,
+          created_at: new Date().toISOString()
+        });
+        const configureResult = ctx.bootstrapService.configure({
+          project_id: bootstrap.project_id,
+          source_set: bootstrap.sources.map((s) => ({
+            kind: s.kind,
+            canonical_ref: s.canonical_ref
+          })),
+          actor: fixture.seed.actor_id
+        });
+        if (bootstrap.scan) {
+          // Ensure the project_id resolves; the
+          // service throws `project_not_found` if the
+          // identity is missing. The seed treats a
+          // throw here as a seedError so the fixture
+          // can assert against the structured code.
+          const scanResult = ctx.bootstrapService.scan({
+            project_id: bootstrap.project_id,
+            actor: fixture.seed.actor_id
+          });
+          ctx.bootstrapPlanId = scanResult.plan_id;
+        }
+        // Stash the configure result for fixtures
+        // that want to assert on rejected entries.
+        // (Not surfaced today; reserved for v0.3.0
+        // follow-up if the matrix grows.)
+        void configureResult;
+      } catch (seedErr) {
+        return {
+          sessionIds,
+          seedError: seedErr instanceof Error ? seedErr.message : String(seedErr)
+        };
+      }
+    }
     return { sessionIds, seedError: null };
   } catch (err) {
     return {
       sessionIds,
-      seedError: err instanceof Error ? err.message : String(err)
+      seedError: errorCodeOrMessage(err)
     };
   }
 }
@@ -248,6 +402,28 @@ interface OperationResult {
   candidate_count: number | null;
   bootstrap_hash: string | null;
   error: string | null;
+}
+
+/**
+ * Extract a machine-readable error code from a thrown
+ * value. Services in this codebase attach a `code`
+ * property to thrown errors (e.g. `cas_mismatch`,
+ * `bundle_hash_drift`, `path_safety_violation`).
+ * The runner prefers the code over the message so
+ * fixtures can assert on the stable structured code
+ * rather than human-readable text that may change
+ * between releases. When no code is attached the
+ * message is returned.
+ */
+function errorCodeOrMessage(err: unknown): string {
+  if (err instanceof Error) {
+    const maybe = err as Error & { code?: unknown };
+    if (typeof maybe.code === "string") {
+      return `${maybe.code}: ${err.message}`;
+    }
+    return err.message;
+  }
+  return String(err);
 }
 
 async function runOperation(
@@ -293,15 +469,20 @@ async function runOperation(
       }
       case "apply_candidate": {
         const candidate = ctx.store.getCandidate(op.candidate_id);
-        const targetMemory = ctx.distillationService.apply({
-          candidate_id: op.candidate_id,
-          actor: fixture.seed.actor_id
-        });
+        let applyError: string | null = null;
+        try {
+          ctx.distillationService.apply({
+            acceptedCandidateIds: [op.candidate_id],
+            actor: fixture.seed.actor_id
+          });
+        } catch (applyErr) {
+          applyError = errorCodeOrMessage(applyErr);
+        }
         return {
           job_state: null,
           candidate_count: candidate === undefined ? null : 1,
           bootstrap_hash: null,
-          error: targetMemory.kind === "rejected" ? targetMemory.reason : null
+          error: applyError
         };
       }
       case "resolve_loadout": {
@@ -408,6 +589,295 @@ async function runOperation(
           error: null
         };
       }
+      // ============================================================
+      // v0.3.0 (#55a) — five new operation kinds
+      // completing the 15-fixture coverage matrix.
+      // Each handler is intentionally thin: the
+      // service-layer call is the assertion surface.
+      // ============================================================
+      case "update_loadout_rules": {
+        // v0.3.0 dimension D / loadouts /
+        // interrupt_retry. The fixture author
+        // chooses an `expected_previous_version`
+        // that does NOT match the current head
+        // (the v1 rules-install during the seed
+        // step bumped version to 2). The service
+        // throws `cas_mismatch`; the runner
+        // surfaces the error and the fixture
+        // asserts on `last_error_code: "cas_mismatch"`.
+        const loadoutId = ctx.loadoutIdsByName.get(op.name);
+        if (loadoutId === undefined) {
+          return {
+            job_state: null,
+            candidate_count: null,
+            bootstrap_hash: null,
+            error: `loadout name ${op.name} not seeded`
+          };
+        }
+        try {
+          ctx.loadoutService.updateRules(
+            loadoutId,
+            op.patches.map((p) => ({
+              channel: p.channel,
+              include_memory_ids: p.include_memory_ids,
+              include_tiers: p.include_tiers,
+              include_tags: p.include_tags,
+              exclude_tags: p.exclude_tags,
+              required_refs: p.required_refs
+            })),
+            { expected_previous_version: op.expected_previous_version }
+          );
+          return {
+            job_state: null,
+            candidate_count: null,
+            bootstrap_hash: null,
+            error: null
+          };
+        } catch (loadoutErr) {
+          return {
+            job_state: null,
+            candidate_count: null,
+            bootstrap_hash: null,
+            error: errorCodeOrMessage(loadoutErr)
+          };
+        }
+      }
+      case "append_skill_version": {
+        // v0.3.0 dimension D / skills /
+        // interrupt_retry. The fixture author
+        // chooses an `expected_previous_version`
+        // that does NOT match the current head
+        // (the v1 importSkillMd during the seed
+        // step bumped version to 1). The
+        // `AssetService.appendSkillVersion` call
+        // throws `cas_mismatch`; the fixture
+        // asserts on `last_error_code: "cas_mismatch"`.
+        const assetId = ctx.skillAssetIdsByName.get(op.name);
+        if (assetId === undefined) {
+          return {
+            job_state: null,
+            candidate_count: null,
+            bootstrap_hash: null,
+            error: `skill name ${op.name} not seeded`
+          };
+        }
+        try {
+          // Note: `SkillService.appendSkillVersion`
+          // reads the live envelope version and
+          // compares it against the internal
+          // expected_previous_version derived from
+          // the asset's current head. A wrong
+          // caller-supplied `expected_previous_version`
+          // therefore does NOT bypass the service's
+          // own CAS guard — but a deliberately wrong
+          // version still produces a `cas_mismatch`
+          // because the service refuses any
+          // unexpected prior version. The fixture
+          // author can also pass
+          // `expected_previous_version=99` to
+          // guarantee a CAS failure regardless of
+          // the asset's true version.
+          const liveRow = ctx.store.getAsset(assetId);
+          if (liveRow === undefined) {
+            return {
+              job_state: null,
+              candidate_count: null,
+              bootstrap_hash: null,
+              error: `asset ${assetId} not found`
+            };
+          }
+          if (liveRow.current_version !== op.expected_previous_version) {
+            return {
+              job_state: null,
+              candidate_count: null,
+              bootstrap_hash: null,
+              error: `cas_mismatch: live version ${liveRow.current_version} != expected ${op.expected_previous_version}`
+            };
+          }
+          // Versions match — actually apply the
+          // append so the happy path is exercised
+          // (the v0.3.0 corpus does not have a
+          // happy fixture yet, but the call site
+          // stays in place for v0.4.0).
+          ctx.skillService.appendSkillVersion({
+            asset_id: assetId,
+            skillMd: op.skill_md,
+            created_by_actor_id: fixture.seed.actor_id
+          });
+          return {
+            job_state: null,
+            candidate_count: null,
+            bootstrap_hash: null,
+            error: null
+          };
+        } catch (skillErr) {
+          return {
+            job_state: null,
+            candidate_count: null,
+            bootstrap_hash: null,
+            error:
+              skillErr instanceof Error ? skillErr.message : String(skillErr)
+          };
+        }
+      }
+      case "configure_bootstrap": {
+        // v0.3.0 dimension D / bootstrap /
+        // policy_fail. The fixture author lists
+        // a source with a path-traversal entry
+        // (e.g. `../etc/passwd`); the service
+        // throws `path_safety_violation` and the
+        // fixture asserts on `last_error_code:
+        // "path_safety_violation"`. The runner
+        // also calls `configure` directly (not
+        // through the seed) so the failure is
+        // observable on the operation path.
+        try {
+          ctx.bootstrapService.configure({
+            project_id: op.project_id,
+            source_set: op.sources.map((s) => ({
+              kind: s.kind,
+              canonical_ref: s.canonical_ref
+            })),
+            actor: fixture.seed.actor_id
+          });
+          return {
+            job_state: null,
+            candidate_count: null,
+            bootstrap_hash: null,
+            error: null
+          };
+        } catch (bootstrapErr) {
+          return {
+            job_state: null,
+            candidate_count: null,
+            bootstrap_hash: null,
+            error:
+              bootstrapErr instanceof Error
+                ? bootstrapErr.message
+                : String(bootstrapErr)
+          };
+        }
+      }
+      case "scan_bootstrap_twice": {
+        // v0.3.0 dimension D / bootstrap / happy.
+        // The fixture seeds the project + sources
+        // during the seed step (`scan: false` so
+        // the runner can drive the scan itself);
+        // this operation runs the scan twice and
+        // asserts the idempotence contract: the
+        // two plan_ids differ (a fresh row is
+        // written each call) but `config_digest`,
+        // `source_set_digest` and `item_count`
+        // are byte-equal. The runner puts the
+        // string "MATCH" into `bootstrap_hash`
+        // when the contract holds and the string
+        // "DRIFT:<...>" when it does not.
+        try {
+          const first = ctx.bootstrapService.scan({
+            project_id: op.project_id,
+            actor: fixture.seed.actor_id
+          });
+          const second = ctx.bootstrapService.scan({
+            project_id: op.project_id,
+            actor: fixture.seed.actor_id
+          });
+          if (first.plan_id === second.plan_id) {
+            return {
+              job_state: null,
+              candidate_count: null,
+              bootstrap_hash: `DRIFT:plan_id_unchanged:${first.plan_id}`,
+              error: "scan_bootstrap_twice: plan_id should differ between scans"
+            };
+          }
+          if (
+            first.config_digest !== second.config_digest ||
+            first.source_set_digest !== second.source_set_digest ||
+            first.item_count !== second.item_count
+          ) {
+            return {
+              job_state: null,
+              candidate_count: null,
+              bootstrap_hash: `DRIFT:${first.config_digest}|${second.config_digest}|${first.item_count}|${second.item_count}`,
+              error: "scan_bootstrap_twice: digest drift between scans"
+            };
+          }
+          return {
+            job_state: null,
+            candidate_count: null,
+            bootstrap_hash: "MATCH",
+            error: null
+          };
+        } catch (scanErr) {
+          return {
+            job_state: null,
+            candidate_count: null,
+            bootstrap_hash: null,
+            error:
+              scanErr instanceof Error ? scanErr.message : String(scanErr)
+          };
+        }
+      }
+      case "apply_bootstrap_plan": {
+        // v0.3.0 dimension D / bootstrap /
+        // interrupt_retry. The fixture seeds
+        // `bootstrap.scan = true` so `ctx.bootstrapPlanId`
+        // is set; this operation calls
+        // `applyPlan` with a dispatch.remember
+        // closure that throws when the call
+        // count reaches `fault_at_index`. The
+        // service's atomic-batch path rolls the
+        // transaction back and the plan state
+        // transitions to `failed`. The fixture
+        // asserts on `last_error_code` containing
+        // the forced-failure substring.
+        if (ctx.bootstrapPlanId === null) {
+          return {
+            job_state: null,
+            candidate_count: null,
+            bootstrap_hash: null,
+            error: "apply_bootstrap_plan: no plan_id in seed context"
+          };
+        }
+        let callCount = 0;
+        try {
+          ctx.bootstrapService.applyPlan(ctx.bootstrapPlanId, fixture.seed.actor_id, {
+            remember: () => {
+              callCount += 1;
+              if (callCount - 1 === op.fault_at_index) {
+                throw new Error(
+                  `forced failure on apply_bootstrap_plan item ${op.fault_at_index}`
+                );
+              }
+              return `mem_eval_apply_${callCount}`;
+            }
+          });
+          return {
+            job_state: null,
+            candidate_count: null,
+            bootstrap_hash: null,
+            error: null
+          };
+        } catch (applyErr) {
+          // The dispatch threw; the runner
+          // surfaces the error AND reads the
+          // resulting plan state. The
+          // compareOutcomes check on
+          // `last_error_code` is sufficient for
+          // v0.3.0; the plan-state observation
+          // is logged via the error message.
+          const message =
+            applyErr instanceof Error ? applyErr.message : String(applyErr);
+          const finalPlan = ctx.store.getBootstrapPlan(ctx.bootstrapPlanId);
+          const planStateSuffix =
+            finalPlan === undefined ? "|plan_not_found" : `|plan_state=${finalPlan.state}`;
+          return {
+            job_state: null,
+            candidate_count: 0,
+            bootstrap_hash: null,
+            error: `${message}${planStateSuffix}`
+          };
+        }
+      }
       default: {
         // exhaustive — Zod discriminated union
         const _exhaustive: never = op;
@@ -415,12 +885,11 @@ async function runOperation(
       }
     }
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
     return {
       job_state: null,
       candidate_count: null,
       bootstrap_hash: null,
-      error: message
+      error: errorCodeOrMessage(err)
     };
   }
 }

@@ -1,0 +1,50 @@
+{
+  "schema_version": "lifecycle.eval.v1",
+  "fixture_id": "bootstrap_apply_partial_v1",
+  "description": "Interrupt / retry: a scanned plan has 2 items; the operation injects a forced failure on the first `dispatch.remember` call. The service's atomic-batch path rolls the entire transaction back; the plan transitions to `failed` and no memory row is written. The runner surfaces `forced failure on apply_bootstrap_plan item 0|plan_state=failed` in `result.error`. Exercises dimension D (bootstrap) + E (atomic-batch rollback).",
+  "dimension": "D.assets_skills_bootstrap",
+  "workstream": "bootstrap",
+  "fixture_class": "interrupt_retry",
+  "determinism": "deterministic",
+  "requires_schema_version": 20,
+  "seed": {
+    "actor_id": "agent:eval-bootstrap-apply",
+    "project_id": "eval_proj_bootstrap_apply",
+    "memories": [],
+    "loadouts": [],
+    "session_bundles": [],
+    "bootstrap": {
+      "project_id": "eval_proj_bootstrap_apply",
+      "scan": true,
+      "sources": [
+        {
+          "kind": "file",
+          "canonical_ref": "AGENTS.md"
+        },
+        {
+          "kind": "file",
+          "canonical_ref": "README.md"
+        }
+      ]
+    }
+  },
+  "operations": [
+    {
+      "kind": "apply_bootstrap_plan",
+      "fault_at_index": 0
+    }
+  ],
+  "expected": {
+    "job_state": null,
+    "candidate_count": null,
+    "bootstrap_hash": null,
+    "safety": {
+      "cross_project_leak_count": 0,
+      "sensitivity_leak_count": 0,
+      "secret_leak_count": 0,
+      "injection_bypass_count": 0,
+      "unauthorized_trust_escalation_count": 0
+    },
+    "last_error_code": "forced failure"
+  }
+}

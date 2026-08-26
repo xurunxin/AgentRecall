@@ -174,6 +174,50 @@ export const FixtureSeedSchema = z.object({
         jsonl: z.string()
       })
     )
+    .default([]),
+  /**
+   * Optional bootstrap seed. When present, the
+   * runner calls `BootstrapService.configure` with
+   * the listed sources; when `scan` is true, a
+   * follow-up `scan` writes a fresh `plan_id`
+   * into the fixture context so a downstream
+   * operation (`apply_bootstrap_plan`) can address
+   * it. The project_id must match a project the
+   * store already knows about (the fixture's seed
+   * is the only consumer; the runner does not
+   * auto-create project identities).
+   */
+  bootstrap: z
+    .object({
+      project_id: z.string(),
+      scan: z.boolean().default(false),
+      sources: z
+        .array(
+          z.object({
+            kind: z.enum(["file", "external_ref"]),
+            canonical_ref: z.string()
+          })
+        )
+        .min(1)
+    })
+    .nullable()
+    .default(null),
+  /**
+   * Pre-populated skill imports. Each entry is
+   * forwarded to `SkillService.importSkillMd`; the
+   * resulting `asset_id` is stashed in the
+   * fixture context so a downstream operation
+   * (e.g. `append_skill_version`) can target it
+   * by name.
+   */
+  skills: z
+    .array(
+      z.object({
+        name: z.string(),
+        skill_md: z.string(),
+        source: z.enum(["manual", "derived", "imported"]).default("manual")
+      })
+    )
     .default([])
 });
 
@@ -234,6 +278,92 @@ export const FixtureOperationSchema = z.discriminatedUnion("kind", [
     skill_md: z.string(),
     name: z.string(),
     source: z.enum(["manual", "derived", "imported"]).default("manual")
+  }),
+  // ============================================================
+  // v0.3.0 (#55a) — additional operations for the
+  // 15-fixture coverage matrix. Each new operation
+  // pairs with a fixture class (happy /
+  // policy_fail / interrupt_retry) so the runner
+  // can exercise CAS guards, secret scans and
+  // path-safety rejection without taking CLI
+  // shortcuts.
+  // ============================================================
+  z.object({
+    kind: z.literal("update_loadout_rules"),
+    /**
+     * The loadout name to address. The runner
+     * resolves the name to a loadout_id through
+     * the seed context (loadouts are seeded by
+     * name in `seed.loadouts[]`).
+     */
+    name: z.string(),
+    patches: z
+      .array(
+        z.object({
+          channel: z.enum(["bootstrap", "query", "tool_only"]),
+          max_items: z.number().int().positive().default(32),
+          max_chars: z.number().int().positive().default(8000),
+          include_memory_ids: z.array(z.string()).default([]),
+          include_tiers: z.array(z.enum(["core", "working", "archival"])).default([]),
+          include_tags: z.array(z.string()).default([]),
+          exclude_tags: z.array(z.string()).default([]),
+          required_refs: z.array(z.string()).default([])
+        })
+      )
+      .min(1),
+    /**
+     * The CAS guard value. A wrong value
+     * (deliberately chosen by `interrupt_retry`
+     * fixtures) makes the service throw
+     * `cas_mismatch`; the runner surfaces the
+     * error in `result.error`.
+     */
+    expected_previous_version: z.number().int().nonnegative()
+  }),
+  z.object({
+    kind: z.literal("append_skill_version"),
+    /**
+     * The skill name to address. The runner
+     * resolves the name to an `asset_id` through
+     * the seed context (skills are imported by
+     * name in `seed.skills[]`).
+     */
+    name: z.string(),
+    skill_md: z.string(),
+    /**
+     * CAS on the asset envelope. A wrong value
+     * (deliberately chosen by `interrupt_retry`
+     * fixtures) makes `AssetService.appendSkillVersion`
+     * throw `cas_mismatch`.
+     */
+    expected_previous_version: z.number().int().nonnegative()
+  }),
+  z.object({
+    kind: z.literal("configure_bootstrap"),
+    project_id: z.string(),
+    sources: z
+      .array(
+        z.object({
+          kind: z.enum(["file", "external_ref"]),
+          canonical_ref: z.string()
+        })
+      )
+      .min(1)
+  }),
+  z.object({
+    kind: z.literal("scan_bootstrap_twice"),
+    project_id: z.string()
+  }),
+  z.object({
+    kind: z.literal("apply_bootstrap_plan"),
+    /**
+     * Inject a forced failure when the dispatch
+     * `remember` closure is called for the
+     * Nth time. `0` means fail on the first
+     * `remember` call. The runner reads the
+     * plan_id from the seed context.
+     */
+    fault_at_index: z.number().int().nonnegative()
   })
 ]);
 

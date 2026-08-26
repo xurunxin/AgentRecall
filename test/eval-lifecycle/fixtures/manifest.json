@@ -1,7 +1,7 @@
 {
   "schema_version": "lifecycle.corpus.v1",
-  "corpus_version": "v0.2.0",
-  "description": "Phase 3 (#55) v0.2.0 evaluation corpus. Five fixtures cover three of the five v1.2 workstreams (distillation, ingestion, loadouts, skills). The full 15-fixture coverage matrix per #55 AC lands over the next 3 corpus releases.",
+  "corpus_version": "v0.3.0",
+  "description": "Phase 3 (#55) v0.3.0 evaluation corpus. Fifteen fixtures covering the full 5-workstream x 3-class matrix (happy / policy_fail / interrupt_retry). v0.3.0 grows the corpus from v0.2.0's 5 fixtures to 15 by adding: session-ingest-secret-redact / drift-replay, distill-no-hallucination / partial-apply, loadout-cas-mismatch, skills-kebab-case / append-cas, bootstrap-scan-idempotent / unsafe-path / apply-partial. Closes the (workstream, class) coverage gap that v0.2.0 left in the ingestion workstream.",
   "baselines": {
     "distillation_supported_claim_rate": 0.9,
     "distillation_hallucination_rejection_rate": 0.95,
@@ -9,9 +9,19 @@
   },
   "fixtures": [
     "distill-happy.json",
+    "distill-no-hallucination-v1.json",
+    "distill-partial-apply-v1.json",
     "loadout-policy-fail.json",
     "loadout-resolve-happy-v1.json",
+    "loadout-cas-mismatch-v1.json",
     "sessions-reingest-v1.json",
-    "skills-import-roundtrip-v1.json"
+    "session-ingest-secret-redact-v1.json",
+    "session-ingest-drift-replay-v1.json",
+    "skills-import-roundtrip-v1.json",
+    "skills-kebab-case-v1.json",
+    "skills-append-cas-v1.json",
+    "bootstrap-scan-idempotent-v1.json",
+    "bootstrap-unsafe-path-v1.json",
+    "bootstrap-apply-partial-v1.json"
   ]
 }

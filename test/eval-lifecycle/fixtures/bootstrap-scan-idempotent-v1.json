@@ -1,0 +1,50 @@
+{
+  "schema_version": "lifecycle.eval.v1",
+  "fixture_id": "bootstrap_scan_idempotent_v1",
+  "description": "Happy: a project is configured with two allow-listed sources; the operation runs `scan` twice and asserts the idempotence contract — the two `plan_id`s differ (a fresh plan row is written each time) but `config_digest`, `source_set_digest` and `item_count` are byte-equal. The runner sets `bootstrap_hash` to the literal `\"MATCH\"` when the contract holds. Exercises dimension D (bootstrap) as a true positive for the deterministic-replay invariant.",
+  "dimension": "D.assets_skills_bootstrap",
+  "workstream": "bootstrap",
+  "fixture_class": "happy",
+  "determinism": "deterministic",
+  "requires_schema_version": 20,
+  "seed": {
+    "actor_id": "agent:eval-bootstrap-scan",
+    "project_id": "eval_proj_bootstrap_scan",
+    "memories": [],
+    "loadouts": [],
+    "session_bundles": [],
+    "bootstrap": {
+      "project_id": "eval_proj_bootstrap_scan",
+      "scan": false,
+      "sources": [
+        {
+          "kind": "file",
+          "canonical_ref": "AGENTS.md"
+        },
+        {
+          "kind": "file",
+          "canonical_ref": "README.md"
+        }
+      ]
+    }
+  },
+  "operations": [
+    {
+      "kind": "scan_bootstrap_twice",
+      "project_id": "eval_proj_bootstrap_scan"
+    }
+  ],
+  "expected": {
+    "job_state": null,
+    "candidate_count": null,
+    "bootstrap_hash": "MATCH",
+    "safety": {
+      "cross_project_leak_count": 0,
+      "sensitivity_leak_count": 0,
+      "secret_leak_count": 0,
+      "injection_bypass_count": 0,
+      "unauthorized_trust_escalation_count": 0
+    },
+    "last_error_code": null
+  }
+}
