@@ -197,10 +197,16 @@ function assetsShow(ctx: CliContext): CliResult {
     lines.push(`head:            v${inspection.current_version.version} content_hash=${inspection.current_version.content_hash}`);
   }
   if (inspection.payload !== null) {
-    lines.push(
-      `binding:         memory_id=${inspection.payload.memory_id} ` +
-        `revision=${inspection.payload.memory_revision}`
-    );
+    if (a.asset_type === "memory_ref") {
+      const binding = inspection.payload as { memory_id: string; memory_revision: number };
+      lines.push(
+        `binding:         memory_id=${binding.memory_id} ` +
+          `revision=${binding.memory_revision}`
+      );
+    } else if (a.asset_type === "skill") {
+      const row = inspection.payload as { name: string; body_hash: string };
+      lines.push(`skill:           name=${row.name} body_hash=${row.body_hash}`);
+    }
   }
   return { exitCode: 0, stdout: lines.join("\n") + "\n", stderr: "" };
 }

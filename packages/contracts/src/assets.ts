@@ -1,20 +1,24 @@
 // packages/contracts/src/assets.ts
 //
-// v1.2.0-alpha.1 (issue #51): typed contracts for the
-// additive asset registry. The asset table is a thin
+// v1.2.0-alpha.1 (issue #51) + v1.2.0-alpha.2
+// (issue #53): typed contracts for the additive
+// asset registry. The asset table is a thin
 // envelope over four type-specific payloads
-// (memory_ref / skill / context_pack / external_reference);
-// `memory_entries` remains the source of truth for
-// memory content — `memory_ref` is a *reference*,
-// never a copy.
+// (memory_ref / skill / context_pack /
+// external_reference); `memory_entries` remains
+// the source of truth for memory content —
+// `memory_ref` is a *reference*, never a copy.
 //
-// The on-disk schema is in `src/sqlite-store.ts` (v15);
-// the wire / MCP / admin shape is here. The two are
+// The on-disk schema is in `src/sqlite-store.ts`
+// (v16 envelope + v19 skill type table); the wire /
+// MCP / admin shape is here. The two are
 // intentionally not 1:1 — the SQLite shape is
 // permissive (snake_case columns, JSON blobs for
 // per-type metadata) while this contract is strict
 // (camelCase, discriminated unions, versioned).
-// The mapping happens in `src/assets/service.ts`.
+// The mapping happens in `src/assets/service.ts`
+// (envelope) and `src/skills/service.ts`
+// (skill type-specific).
 
 import { z } from "zod";
 
@@ -144,11 +148,29 @@ export const MemoryRefAssetV1Schema = z.object({
  * (SKILL.md frontmatter / body / resources) is
  * its own issue (#53) — this is the asset
  * envelope around the Skill manifest.
+ *
+ * v1.2.0-alpha.2 (issue #53) tightens the v1
+ * schema:
+ *  - `name` MUST be kebab-case
+ *    (`/^[a-z][a-z0-9-]*$/`). The same rule is
+ *    enforced in `parseSkillMd`; the contract
+ *    pin is the fail-closed gate.
+ *  - `source` is a strict 3-value enum (no
+ *    `unknown` survives).
+ *  - `resources[].type` is restricted to
+ *    `text` | `reference`; `binary` and other
+ *    values are rejected here so a malformed
+ *    payload can never reach the store.
  */
+const KEBAB_CASE_NAME = /^[a-z][a-z0-9-]*$/;
+
 export const SkillAssetV1Schema = z.object({
   asset_id: z.string().min(1),
   version: z.number().int().positive(),
-  name: z.string().min(1),
+  name: z.string().min(1).regex(
+    KEBAB_CASE_NAME,
+    "skill name must be kebab-case (/^[a-z][a-z0-9-]*$/)"
+  ),
   description: z.string(),
   schema_version: z.literal("1"),
   category: z.string().optional(),

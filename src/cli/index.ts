@@ -22,6 +22,7 @@ import { migrateCommand } from "./commands/migrate.js";
 import { searchCommand } from "./commands/search.js";
 import { sessionsCommand } from "./commands/sessions.js";
 import { showCommand } from "./commands/show.js";
+import { skillsCommand } from "./commands/skills.js";
 import { parseArgs, type ParsedArgs } from "./arg-parser.js";
 import { buildRequestContext, type RequestContext } from "../request-context.js";
 import { randomUUID } from "node:crypto";
@@ -105,7 +106,9 @@ Commands:
   candidates List, show, accept, reject, or apply distillation candidates (issue #50)
   sessions   Inspect / ingest / list / show / forget / distill captured session traces
   assets     Manage the typed asset registry (memory_ref / skill / context_pack / external_reference)
+<<<<<<< HEAD
   loadouts   Manage the agent loadout substrate (issue #52; create / update / bind / resolve)
+  skills     Manage Skill assets (canonical SKILL.md import / export / search)
   version    Print the server version (also: --version / -v)
   help       Show this help
 
@@ -174,7 +177,13 @@ const dispatch: Record<string, CommandHandler> = {
   // loadout subcommand. Provides list / show /
   // create / update / bind / unbind / resolve
   // for the policy-bound loadout substrate.
-  loadouts: loadoutsCommand
+  loadouts: loadoutsCommand,
+  // v1.2.0-alpha.2 (issue #53): the skill
+  // subcommand. Provides list / search / show /
+  // import / export for the type-specific
+  // `skills` table. Lifecycle is delegated to
+  // the envelope's `assets lifecycle` verb.
+  skills: skillsCommand
 };
 
 export async function runCli(

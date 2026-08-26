@@ -166,14 +166,12 @@ export type SearchFilters = EntryFilters & {
  * The migration is fully transactional; on any throw
  * the user_version stays at 15 and the database is
  * untouched.
- * v17 (v1.2.0-alpha.2, issue #50 placeholder): the
- * distillation pipeline lands a parallel additive set
- * of tables in its own worktree. This v18 migration
- * (issue #52) takes a no-op v17 hop so the v17 / v18
- * lanes can ship independently. If the v17 lane ships
- * first, its migration is the active one; if v18 ships
- * first, v17 is recorded as a no-op so the v18
- * migration chain stays linear.
+ * v17 (v1.2.0-alpha.2, issue #50): the distillation
+ * pipeline's additive set of tables —
+ * `derivation_candidates`, `candidate_evidence`,
+ * `candidate_actions` — back the reviewable
+ * memory / episode / skill-candidate proposals
+ * produced by the deterministic baseline extractor.
  * v18 (v1.2.0-alpha.2, issue #52): the agent loadout
  * substrate. Three additive tables — `agent_loadouts`,
  * `loadout_rules`, `loadout_bindings` — back the
@@ -183,11 +181,22 @@ export type SearchFilters = EntryFilters & {
  * is keyed on `(loadout_id, version, channel)` so a
  * `updateRules` call bumps the version and inserts a
  * new immutable rule row in the same transaction.
- * The migration is fully transactional; on any throw
- * the user_version stays at 16 and the database is
+ * v19 (v1.2.0-alpha.2, issue #53): the additive
+ * `skills` type-specific table for the asset
+ * registry. The `skill` envelope is a thin pointer
+ * to the `skills` row, which holds the canonical
+ * `SKILL.md` bytes plus the parsed frontmatter
+ * (name / description / triggers / etc.) and the
+ * content-addressed `resources` list. The
+ * `body_hash` column is `sha256:hex64` over
+ * `skill_md_canonical` and matches the
+ * `asset_versions.content_hash` for the same
+ * version. The migrations are fully transactional;
+ * on any throw the user_version stays at the
+ * last successful version and the database is
  * untouched.
  */
-export const CURRENT_SCHEMA_VERSION = 18;
+export const CURRENT_SCHEMA_VERSION = 19;
 
 /**
  * Stage 12 PR9: thrown by `updateEntryWithRevision` when
@@ -799,6 +808,42 @@ export type CandidateActionRow = {
   risk: DerivationCandidateRisk;
 };
 
+/**
+ * v1.2.0-alpha.2 (issue #53): the row shape for
+ * the type-specific `skills` table. The Skill
+ * envelope lives in `assets`; this row carries
+ * the canonical SKILL.md bytes plus the parsed
+ * frontmatter. `body_hash` is `sha256:hex64`
+ * over `skill_md_canonical`. The `resources_json`
+ * column is a JSON-encoded array of
+ * `{ path, type, media_type, sha256 }` (the
+ * shape is validated upstream by the Zod
+ * contract before insert).
+ */
+export type SkillResourceRow = {
+  path: string;
+  type: "text" | "reference";
+  media_type: string;
+  sha256: string;
+};
+
+export type SkillRow = {
+  asset_id: string;
+  version: number;
+  name: string;
+  description: string;
+  schema_version: string;
+  category: string | null;
+  triggers_json: string;
+  when_to_use: string | null;
+  when_not_to_use: string | null;
+  compatibility_json: string;
+  source: "manual" | "derived" | "imported";
+  skill_md_canonical: string;
+  body_hash: string;
+  resources_json: string;
+};
+
 type Row = Record<string, SQLOutputValue>;
 
 function encodeJson(value: unknown): string {
@@ -1126,6 +1171,25 @@ function candidateActionFromRow(row: Row): CandidateActionRow {
     rationale: stringCell(row, "rationale"),
     conflict_signals_json: stringCell(row, "conflict_signals_json"),
     risk: stringCell(row, "risk") as DerivationCandidateRisk
+  };
+}
+
+function skillFromRow(row: Row): SkillRow {
+  return {
+    asset_id: stringCell(row, "asset_id"),
+    version: numberCell(row, "version"),
+    name: stringCell(row, "name"),
+    description: stringCell(row, "description"),
+    schema_version: stringCell(row, "schema_version"),
+    category: optionalStringCell(row, "category") ?? null,
+    triggers_json: stringCell(row, "triggers_json"),
+    when_to_use: optionalStringCell(row, "when_to_use") ?? null,
+    when_not_to_use: optionalStringCell(row, "when_not_to_use") ?? null,
+    compatibility_json: stringCell(row, "compatibility_json"),
+    source: stringCell(row, "source") as "manual" | "derived" | "imported",
+    skill_md_canonical: stringCell(row, "skill_md_canonical"),
+    body_hash: stringCell(row, "body_hash"),
+    resources_json: stringCell(row, "resources_json")
   };
 }
 
@@ -2577,6 +2641,124 @@ export class SQLiteMemoryStore {
     return assetFromRow(updated);
   }
 
+  /**
+   * v1.2.0-alpha.2 (issue #53): insert one
+   * `skills` row. The composite primary key on
+   * `(asset_id, version)` guarantees no duplicate
+   * row per version; a v2 of the same asset reuses
+   * the same `asset_id` but bumps `version`, and
+   * the new row is a fresh body. Returns `false`
+   * on a UNIQUE collision (caller is racing an
+   * append or has a stale `version`). All other
+   * errors propagate.
+   */
+  insertSkillRow(row: SkillRow): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO skills (
+            asset_id, version, name, description, schema_version,
+            category, triggers_json, when_to_use, when_not_to_use,
+            compatibility_json, source, skill_md_canonical, body_hash,
+            resources_json
+          ) VALUES (
+            ?, ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?
+          )`
+        )
+        .run(
+          row.asset_id,
+          row.version,
+          row.name,
+          row.description,
+          row.schema_version,
+          row.category,
+          row.triggers_json,
+          row.when_to_use,
+          row.when_not_to_use,
+          row.compatibility_json,
+          row.source,
+          row.skill_md_canonical,
+          row.body_hash,
+          row.resources_json
+        );
+      return true;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #53): read one
+   * `skills` row by `(asset_id, version)`.
+   * Returns `undefined` for `skill` assets that
+   * have no row (the asset envelope exists but
+   * the type-specific body has not been
+   * materialised yet — should not happen in
+   * practice; the `SkillService` always writes
+   * the row inside the same transaction as the
+   * `asset_versions` append).
+   */
+  getSkillRow(assetId: string, version: number): SkillRow | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT * FROM skills WHERE asset_id = ? AND version = ?"
+      )
+      .get(assetId, version) as Row | undefined;
+    if (row === undefined) return undefined;
+    return skillFromRow(row);
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #53): list skill rows
+   * whose `name` matches the SQL LIKE `pattern`.
+   * The pattern is passed through verbatim (callers
+   * are responsible for any escaping they need; the
+   * underlying column is the kebab-case name). The
+   * list is ordered by `name ASC, asset_id ASC,
+   * version ASC` so the iteration is stable and the
+   * head (largest version) is the LAST row per
+   * `asset_id`. The result is NOT asset-id-
+   * deduplicated; callers that want a flat summary
+   * can pick the head in the service layer.
+   */
+  listSkillRows(pattern: string, limit: number): SkillRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM skills
+          WHERE name LIKE ?
+          ORDER BY name ASC, asset_id ASC, version ASC
+          LIMIT ?`
+      )
+      .all(pattern, limit) as Row[];
+    return rows.map((r) => skillFromRow(r));
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #53): list skill rows
+   * whose `body_hash` matches the supplied
+   * `sha256:hex64` value. Used to look up "do we
+   * already have this exact skill body?" before
+   * inserting. Ordered newest-first by `(asset_id,
+   * version)`. Limit defaults to 50 to keep the
+   * call bounded; callers should pass an explicit
+   * limit if they need a different cap.
+   */
+  listSkillRowsByHash(bodyHash: string, limit: number): SkillRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM skills
+          WHERE body_hash = ?
+          ORDER BY asset_id ASC, version ASC
+          LIMIT ?`
+      )
+      .all(bodyHash, limit) as Row[];
+    return rows.map((r) => skillFromRow(r));
+  }
+
   close(): void {
     this.db.close();
   }
@@ -2809,11 +2991,23 @@ export class SQLiteMemoryStore {
       return;
     }
     if (version === 17) {
+      // v17 (v1.2.0-alpha.2, issue #50): the session
+      // distillation candidate tables. Additive; does
+      // not touch any prior table.
       this.migrate_v16_to_v17();
       return;
     }
     if (version === 18) {
+      // v18 (v1.2.0-alpha.2, issue #52): the agent
+      // loadout tables. Additive; does not touch any
+      // prior table.
       this.migrate_v17_to_v18();
+      return;
+    }
+    if (version === 19) {
+      // v19 (v1.2.0-alpha.2, issue #53) is the additive
+      // `skills` type-specific table.
+      this.migrate_v18_to_v19();
       return;
     }
     throw new Error(`No migration registered for schema version ${version}`);
@@ -4038,35 +4232,26 @@ export class SQLiteMemoryStore {
   }
 
   /**
-   * v1.2.0-alpha.2 (issue #52) v17 lane placeholder.
-   *
-   * The v17 lane is owned by the parallel distillation
-   * pipeline worktree (issue #50). It ships its own
-   * additive tables; this migration is a no-op so the
-   * v18 chain stays linear. The migration is still
-   * wrapped in `BEGIN IMMEDIATE` + `COMMIT` so the
-   * no-op is atomic — if the v17 lane ever ships
-   * additional SQL through this method, the
-   * transactional shape is already in place.
-   *
-   * On any throw, the database is rolled back and
-   * `user_version` stays at 16.
+   * v1.2.0-alpha.2 (issue #50): the session-to-memory
+   * distillation pipeline. Three additive tables —
+   * `derivation_candidates`, `candidate_evidence`,
+   * `candidate_actions` — back the reviewable
+   * memory / episode / skill-candidate proposals
+   * produced by the deterministic baseline extractor
+   * (and any future provider-backed extractor).
+   * The candidate row's `state` is a small state
+   * machine (`proposed` -> `accepted` -> `applied` or
+   * `rejected` / `stale`); the row's
+   * `expected_target_revision` is the CAS guard for
+   * the `apply` step. The migration is fully
+   * transactional; on any throw the user_version
+   * stays at 16 and the database is untouched. All
+   * DDL is `IF NOT EXISTS` so the migration is
+   * idempotent against re-runs.
    */
   private migrate_v16_to_v17(): void {
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      // v1.2.0-alpha.2 (issue #50): the session-to-memory
-      // distillation pipeline. Three additive tables —
-      // `derivation_candidates`, `candidate_evidence`,
-      // `candidate_actions` — back the reviewable
-      // memory / episode / skill-candidate proposals
-      // produced by the deterministic baseline extractor
-      // (and any future provider-backed extractor).
-      // The candidate row's `state` is a small state
-      // machine (`proposed` -> `accepted` -> `applied` or
-      // `rejected` / `stale`); the row's
-      // `expected_target_revision` is the CAS guard for
-      // the `apply` step.
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS derivation_candidates (
           candidate_id              TEXT PRIMARY KEY,
@@ -4232,6 +4417,76 @@ export class SQLiteMemoryStore {
           ON loadout_bindings(actor_id, client_name, project_id, task_mode, priority);
       `);
       this.db.exec("PRAGMA user_version = 18");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #53): v18 -> v19 schema
+   * migration. Introduces the additive `skills`
+   * type-specific table. The `skill` envelope
+   * row lives in `assets` (asset_type='skill'); the
+   * type-specific body, frontmatter, and content-
+   * addressed resources live here, keyed by
+   * `(asset_id, version)`. The asset envelope's
+   * `current_version` stays the source of truth
+   * for "which version is the head".
+   *
+   * Schema invariants (mirrored in
+   * `docs/adr/0010-asset-registry.md` and the v19
+   * section of the contracts):
+   *  - `skills.body_hash` is `sha256:hex64` over
+   *    `skill_md_canonical` (the canonicalised
+   *    SKILL.md bytes). It MUST equal the
+   *    `asset_versions.content_hash` of the same
+   *    `(asset_id, version)`. The schema does not
+   *    enforce the equality (SQLite cannot compare
+   *    across tables inside a CHECK); the
+   *    `SkillService` write path enforces it.
+   *  - `skills.source` is the strict 3-value enum
+   *    that matches `SkillAssetV1Schema.source`.
+   *  - `skills.name` is a kebab-case identifier
+   *    (the canonical contract is enforced by the
+   *    Zod schema in `packages/contracts`; the
+   *    CHECK is a last-line safety net).
+   *  - `skills.resources_json` is JSON; the shape
+   *    is validated by the Zod contract before
+   *    the row is inserted.
+   */
+  private migrate_v18_to_v19(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS skills (
+          asset_id           TEXT NOT NULL
+                               REFERENCES assets(asset_id) ON DELETE CASCADE,
+          version            INTEGER NOT NULL,
+          name               TEXT NOT NULL,
+          description        TEXT NOT NULL,
+          schema_version     TEXT NOT NULL,
+          category           TEXT,
+          triggers_json      TEXT NOT NULL DEFAULT '[]',
+          when_to_use        TEXT,
+          when_not_to_use    TEXT,
+          compatibility_json TEXT NOT NULL DEFAULT '{}',
+          source             TEXT NOT NULL
+                               CHECK (source IN ('manual','derived','imported')),
+          skill_md_canonical TEXT NOT NULL,
+          body_hash          TEXT NOT NULL,
+          resources_json     TEXT NOT NULL DEFAULT '[]',
+          PRIMARY KEY (asset_id, version),
+          CHECK (version > 0)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_skills_name
+          ON skills(name);
+        CREATE INDEX IF NOT EXISTS idx_skills_body_hash
+          ON skills(body_hash);
+      `);
+      this.db.exec("PRAGMA user_version = 19");
       this.db.exec("COMMIT");
     } catch (error) {
       this.db.exec("ROLLBACK");
