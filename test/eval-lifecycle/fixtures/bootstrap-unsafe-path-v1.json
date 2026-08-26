@@ -1,0 +1,52 @@
+{
+  "schema_version": "lifecycle.eval.v1",
+  "fixture_id": "bootstrap_unsafe_path_v1",
+  "description": "Policy fail: a `configure_bootstrap` operation lists `../../../etc/passwd` as a source. The service's `checkPathSafety` rejects the source with `path_safety_violation`; no new `bootstrap_sources` row is inserted. Exercises dimension D (bootstrap) + E (path-traversal guard).",
+  "dimension": "D.assets_skills_bootstrap",
+  "workstream": "bootstrap",
+  "fixture_class": "policy_fail",
+  "determinism": "deterministic",
+  "requires_schema_version": 20,
+  "seed": {
+    "actor_id": "agent:eval-bootstrap-path",
+    "project_id": "eval_proj_bootstrap_path",
+    "memories": [],
+    "loadouts": [],
+    "session_bundles": [],
+    "bootstrap": {
+      "project_id": "eval_proj_bootstrap_path",
+      "scan": false,
+      "sources": [
+        {
+          "kind": "file",
+          "canonical_ref": "AGENTS.md"
+        }
+      ]
+    }
+  },
+  "operations": [
+    {
+      "kind": "configure_bootstrap",
+      "project_id": "eval_proj_bootstrap_path",
+      "sources": [
+        {
+          "kind": "file",
+          "canonical_ref": "../../../etc/passwd"
+        }
+      ]
+    }
+  ],
+  "expected": {
+    "job_state": null,
+    "candidate_count": null,
+    "bootstrap_hash": null,
+    "safety": {
+      "cross_project_leak_count": 0,
+      "sensitivity_leak_count": 0,
+      "secret_leak_count": 0,
+      "injection_bypass_count": 0,
+      "unauthorized_trust_escalation_count": 0
+    },
+    "last_error_code": "path_traversal"
+  }
+}

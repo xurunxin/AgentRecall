@@ -1,0 +1,44 @@
+{
+  "schema_version": "lifecycle.eval.v1",
+  "fixture_id": "session_ingest_drift_replay_v1",
+  "description": "Interrupt / retry: re-ingest the same source-identity with a different event body. The SessionService computes a fresh `bundle_hash`, the replay guard detects the drift, and the call throws `bundle_hash_drift`. No new session row is written. Exercises dimension A (ingestion) + E (interruption / retry).",
+  "dimension": "A.ingestion",
+  "workstream": "ingestion",
+  "fixture_class": "interrupt_retry",
+  "determinism": "deterministic",
+  "requires_schema_version": 20,
+  "seed": {
+    "actor_id": "agent:eval-sessions-drift",
+    "project_id": null,
+    "memories": [],
+    "loadouts": [],
+    "session_bundles": [
+      {
+        "bundle_id": "eval_sessions_drift_1",
+        "source_kind": "opencode",
+        "source_session_id": "oc-eval-drift-1",
+        "jsonl": "{\"schema_version\":\"1\",\"bundle_id\":\"eval_sessions_drift_1\",\"source_kind\":\"opencode\",\"source_version\":\"1.0.0\",\"source_instance_id\":\"eval-instance\",\"source_session_id\":\"oc-eval-drift-1\",\"project_id\":null,\"actor_id\":\"agent:eval-sessions-drift\",\"client_name\":\"opencode\",\"client_version\":\"1.0.0\",\"scope\":\"global\",\"sensitivity\":\"normal\",\"started_at\":\"2026-08-26T00:00:00.000Z\",\"ended_at\":\"2026-08-26T00:01:00.000Z\",\"adapter_id\":\"jsonl\",\"adapter_version\":\"1.0.0\",\"events\":[]}\n{\"schema_version\":\"1\",\"source_kind\":\"opencode\",\"source_version\":\"1.0.0\",\"source_instance_id\":\"eval-instance\",\"source_session_id\":\"oc-eval-drift-1\",\"project_id\":null,\"actor_id\":\"agent:eval-sessions-drift\",\"client_name\":\"opencode\",\"client_version\":\"1.0.0\",\"event_id\":\"evt_drift_a\",\"sequence\":1,\"turn_id\":\"turn-1\",\"event_type\":\"decision_confirmed\",\"role\":\"assistant\",\"content\":\"Original decision captured by the seed step.\",\"content_digest\":\"sha256:PLACEHOLDER_WILL_BE_RECOMPUTED\",\"timestamp\":\"2026-08-26T00:00:10.000Z\",\"sensitivity\":\"normal\",\"redaction_flags\":[],\"metadata\":{}}"
+      }
+    ],
+    "bootstrap": null
+  },
+  "operations": [
+    {
+      "kind": "re_ingest_session",
+      "jsonl": "{\"schema_version\":\"1\",\"bundle_id\":\"eval_sessions_drift_1\",\"source_kind\":\"opencode\",\"source_version\":\"1.0.0\",\"source_instance_id\":\"eval-instance\",\"source_session_id\":\"oc-eval-drift-1\",\"project_id\":null,\"actor_id\":\"agent:eval-sessions-drift\",\"client_name\":\"opencode\",\"client_version\":\"1.0.0\",\"scope\":\"global\",\"sensitivity\":\"normal\",\"started_at\":\"2026-08-26T00:00:00.000Z\",\"ended_at\":\"2026-08-26T00:01:00.000Z\",\"adapter_id\":\"jsonl\",\"adapter_version\":\"1.0.0\",\"events\":[]}\n{\"schema_version\":\"1\",\"source_kind\":\"opencode\",\"source_version\":\"1.0.0\",\"source_instance_id\":\"eval-instance\",\"source_session_id\":\"oc-eval-drift-1\",\"project_id\":null,\"actor_id\":\"agent:eval-sessions-drift\",\"client_name\":\"opencode\",\"client_version\":\"1.0.0\",\"event_id\":\"evt_drift_b\",\"sequence\":1,\"turn_id\":\"turn-1\",\"event_type\":\"decision_confirmed\",\"role\":\"assistant\",\"content\":\"MUTATED decision text — bundle_hash will differ.\",\"content_digest\":\"sha256:PLACEHOLDER_WILL_BE_RECOMPUTED\",\"timestamp\":\"2026-08-26T00:00:10.000Z\",\"sensitivity\":\"normal\",\"redaction_flags\":[],\"metadata\":{}}"
+    }
+  ],
+  "expected": {
+    "job_state": null,
+    "candidate_count": null,
+    "bootstrap_hash": null,
+    "safety": {
+      "cross_project_leak_count": 0,
+      "sensitivity_leak_count": 0,
+      "secret_leak_count": 0,
+      "injection_bypass_count": 0,
+      "unauthorized_trust_escalation_count": 0
+    },
+    "last_error_code": "bundle_hash_drift"
+  }
+}

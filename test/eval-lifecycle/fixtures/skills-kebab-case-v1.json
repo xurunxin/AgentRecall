@@ -1,0 +1,39 @@
+{
+  "schema_version": "lifecycle.eval.v1",
+  "fixture_id": "skills_kebab_case_v1",
+  "description": "Policy fail: a SKILL.md frontmatter carries `name: NotKebabCase` — uppercase letters violate the v1 /^[a-z][a-z0-9-]*$/ contract. The parser throws `skill_invalid` (or `skill_contract_mismatch` after the zod re-check). No skill row is written. Exercises dimension D (skills) + E (policy failure as a deliberate, observable error path).",
+  "dimension": "D.assets_skills_bootstrap",
+  "workstream": "skills",
+  "fixture_class": "policy_fail",
+  "determinism": "deterministic",
+  "requires_schema_version": 20,
+  "seed": {
+    "actor_id": "agent:eval-skills-kebab",
+    "project_id": null,
+    "memories": [],
+    "loadouts": [],
+    "session_bundles": [],
+    "bootstrap": null
+  },
+  "operations": [
+    {
+      "kind": "import_skill_md",
+      "skill_md": "---\nschema_version: \"1\"\nname: NotKebabCase\ndescription: invalid name; should match /^[a-z][a-z0-9-]*$/\nsource: manual\n---\n# NotKebabCase\nBody text. Not relevant to the parse failure.\n",
+      "name": "NotKebabCase",
+      "source": "manual"
+    }
+  ],
+  "expected": {
+    "job_state": null,
+    "candidate_count": null,
+    "bootstrap_hash": null,
+    "safety": {
+      "cross_project_leak_count": 0,
+      "sensitivity_leak_count": 0,
+      "secret_leak_count": 0,
+      "injection_bypass_count": 0,
+      "unauthorized_trust_escalation_count": 0
+    },
+    "last_error_code": "skill_"
+  }
+}

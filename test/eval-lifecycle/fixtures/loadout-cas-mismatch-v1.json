@@ -1,0 +1,86 @@
+{
+  "schema_version": "lifecycle.eval.v1",
+  "fixture_id": "loadout_cas_mismatch_v1",
+  "description": "Interrupt / retry: an `update_loadout_rules` operation supplies an `expected_previous_version` of 99 while the live loadout is at version 2 (one create + one updateRules). The CAS guard throws `cas_mismatch`; the loadout row and its rule rows are unchanged. Exercises dimension D (loadouts) + E (CAS guards).",
+  "dimension": "D.assets_skills_bootstrap",
+  "workstream": "loadouts",
+  "fixture_class": "interrupt_retry",
+  "determinism": "deterministic",
+  "requires_schema_version": 20,
+  "seed": {
+    "actor_id": "agent:eval-loadout-cas",
+    "project_id": null,
+    "memories": [
+      {
+        "id": "mem_eval_loadout_cas_1",
+        "tier": "core",
+        "title": "stable rule",
+        "body": "test before you ship",
+        "pinned": true,
+        "tags": [
+          "core"
+        ],
+        "trust_level": "user_confirmed",
+        "sensitivity": "normal"
+      }
+    ],
+    "loadouts": [
+      {
+        "name": "eval-loadout-cas",
+        "scope": "global",
+        "project_id": null,
+        "rules": [
+          {
+            "channel": "bootstrap",
+            "max_items": 16,
+            "max_chars": 4000,
+            "include_memory_ids": [
+              "mem_eval_loadout_cas_1"
+            ]
+          }
+        ],
+        "bindings": []
+      }
+    ],
+    "session_bundles": [],
+    "bootstrap": null
+  },
+  "operations": [
+    {
+      "kind": "update_loadout_rules",
+      "name": "eval-loadout-cas",
+      "patches": [
+        {
+          "channel": "bootstrap",
+          "max_items": 32,
+          "max_chars": 8000,
+          "include_memory_ids": [
+            "mem_eval_loadout_cas_1"
+          ],
+          "include_tiers": [
+            "core"
+          ],
+          "include_tags": [
+            "core"
+          ],
+          "exclude_tags": [],
+          "required_refs": []
+        }
+      ],
+      "expected_previous_version": 99
+    }
+  ],
+  "expected": {
+    "job_state": null,
+    "candidate_count": null,
+    "bootstrap_hash": null,
+    "safety": {
+      "cross_project_leak_count": 0,
+      "sensitivity_leak_count": 0,
+      "secret_leak_count": 0,
+      "injection_bypass_count": 0,
+      "unauthorized_trust_escalation_count": 0
+    },
+    "last_error_code": "cas_mismatch"
+  }
+}
