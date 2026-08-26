@@ -1,8 +1,8 @@
 // src/cli/commands/eval.ts
 //
-// v1.2.0-alpha.3 (issue #55d): the
-// `agent-recall eval` user-facing CLI subcommand.
-// The runner is implemented in
+// v1.2.0 (issue #55d, follow-up for v1.2.0 release):
+// the `agent-recall eval` user-facing CLI
+// subcommand. The harness is implemented in
 // `test/eval-lifecycle/runner.ts`; this module
 // is a thin CLI wrapper that re-exports the
 // runner with the project-wide CLI conventions
@@ -15,17 +15,28 @@
 //   agent-recall eval list-corpora [--corpus <dir>]
 //   agent-recall eval show-report <path> [--json]
 //
+// v1.2.0 release change: `eval run` now invokes
+// the harness in-process (via dynamic `import()`)
+// instead of shelling out to
+// `scripts/eval-lifecycle.mjs`. The shell-out
+// path failed in the Bun single-file binary
+// because the wrapper script is not bundled;
+// the in-process path uses a dynamic import to
+// load `runner.ts` from the corpus's neighbour
+// location, which works in both source mode
+// (`pnpm exec tsx …`) and binary mode.
+//
 // The CLI does NOT swallow the runner's exit
 // code: a per-fixture failure is exit 1, a
 // baseline miss is exit 1, a schema violation
-// is exit 2. The CLI runs the runner through
-// `tsx` (the same loader `scripts/eval-lifecycle.mjs`
-// uses) so the same TypeScript source backs both
-// surfaces.
+// is exit 2. The literal-typed
+// `CliResult.exitCode` (`0 | 1 | 2 | 3`) is
+// preserved by clamping any out-of-band exit
+// code to 1.
 
-import { resolve } from "node:path";
+import { resolve, isAbsolute } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { flagBool, flagString } from "../arg-parser.js";
 import type { CliContext, CliResult } from "../index.js";
@@ -50,30 +61,24 @@ Subcommands:
       (or --json for the raw payload).`;
 
 /**
- * Resolve the eval runner entry point at runtime.
- * The CLI cannot import `test/eval-lifecycle/runner.ts`
- * directly because that file lives outside the
- * published `src/` graph and uses absolute paths into
- * `test/`. We shell out to `node --import tsx` instead
- * so the harness's pure API is exercised end-to-end
- * without a build step. The wrapper script
- * `scripts/eval-lifecycle.mjs` already does this for
- * `pnpm run eval:lifecycle:quick`; the CLI reuses
- * the same script.
+ * v1.2.0 release: the CLI now invokes the
+ * harness in-process instead of shelling out
+ * to `scripts/eval-lifecycle.mjs`. The shell-out
+ * path worked in source mode (where
+ * `scripts/eval-lifecycle.mjs` lives next to
+ * `src/`) but failed in the Bun single-file
+ * binary: the wrapper script is not present
+ * in the staged binary, so the CLI surfaced
+ * `[not_found] eval script not found at
+ * B:\\scripts\\eval-lifecycle.mjs` on Windows. The
+ * in-process call resolves the runner module
+ * next to the corpus directory the user passed
+ * (or the repo-root default) and writes the
+ * report to the requested `--out` directory.
+ * The harness stays available via
+ * `pnpm run eval:lifecycle:quick` for source-tree
+ * development.
  */
-function evalScriptPath(): string {
-  // Resolve the repo root from this file's
-  // location: `src/cli/commands/eval.ts` lives
-  // 3 directories below the repo root
-  // (`src/cli/commands/<file>.ts` -> 4 levels:
-  // the file itself + 3 parents). Walking 4
-  // `..` segments lands on the root; the
-  // harness script is then resolved under
-  // `scripts/eval-lifecycle.mjs`.
-  const here = fileURLToPath(import.meta.url);
-  return resolve(here, "..", "..", "..", "..", "scripts", "eval-lifecycle.mjs");
-}
-
 interface SubprocessResult {
   exitCode: number;
   stdout: string;
@@ -81,17 +86,18 @@ interface SubprocessResult {
 }
 
 /**
- * Run `scripts/eval-lifecycle.mjs` as a child
- * process and capture its exit code + streams.
- * The harness already writes a structured
- * `report.json` and `report.md` to the
- * `artifacts/eval-lifecycle` directory; the CLI
- * forwards the exit code so the caller's `if
- * ((Get-Process ...).ExitCode)` style check works.
+ * @deprecated the CLI no longer shells out; the
+ * `runEvalInline` path below replaces it. Kept for
+ * the (currently dormant) `--external-script`
+ * flag that future releases may opt into when the
+ * runner needs to live in a separate process
+ * (e.g. for memory isolation in CI). The shell-out
+ * spawner is unchanged.
  */
 async function runEvalScript(args: string[]): Promise<SubprocessResult> {
+  const here = fileURLToPath(import.meta.url);
+  const scriptPath = resolve(here, "..", "..", "..", "..", "scripts", "eval-lifecycle.mjs");
   const { spawn } = await import("node:child_process");
-  const scriptPath = evalScriptPath();
   if (!existsSync(scriptPath)) {
     return {
       exitCode: 2,
@@ -129,6 +135,146 @@ async function runEvalScript(args: string[]): Promise<SubprocessResult> {
 }
 
 /**
+ * Resolve the corpus's runner module. The runner
+ * lives at `<corpusDir>/runner.ts` in source mode
+ * and at `<corpusDir>/runner.js` after the
+ * release-time `tsc` build (the runner compiles
+ * to `dist/test/eval-lifecycle/runner.js` for
+ * Node-mode deploys; the corpus-adjacent
+ * `<corpusDir>/runner.{ts,js}` probe lets both
+ * layouts resolve). The CLI also probes the
+ * source-tree `test/eval-lifecycle/runner.ts`
+ * fallback for development workflows that
+ * run the CLI from the repo root without a
+ * precompiled `dist/` next to the corpus.
+ */
+function resolveEvalRunnerCandidates(corpusDir: string): string[] {
+  // v1.2.0 release: the `chdirToInstallRoot`
+  // helper in `launcher.ts` makes `process.cwd()`
+  // the install root before the CLI dispatches,
+  // so we can resolve the runner relative to
+  // the cwd (the repo root when the operator
+  // runs from a checkout, or the deploy root
+  // when the operator runs the staged binary).
+  // The candidates are ordered by preference:
+  //   1. Compiled `dist/test/eval-lifecycle/runner.js`
+  //      (production deploys ship `dist/`)
+  //   2. The corpus-adjacent `runner.{js,ts}` if
+  //      a `runner.js` is next to the corpus
+  //      (custom corpus layouts)
+  //   3. The source-tree `test/eval-lifecycle/runner.ts`
+  //      (dev-mode fallbacks for an operator
+  //      running the CLI with the `tsx` loader)
+  const cwd = process.cwd();
+  const candidates: string[] = [];
+  candidates.push(resolve(cwd, "dist", "test", "eval-lifecycle", "runner.js"));
+  if (isAbsolute(corpusDir)) {
+    candidates.push(resolve(corpusDir, "runner.js"));
+    candidates.push(resolve(corpusDir, "runner.ts"));
+  } else {
+    candidates.push(resolve(cwd, corpusDir, "runner.js"));
+    candidates.push(resolve(cwd, corpusDir, "runner.ts"));
+    candidates.push(resolve(corpusDir, "runner.js"));
+    candidates.push(resolve(corpusDir, "runner.ts"));
+  }
+  candidates.push(resolve(cwd, "test", "eval-lifecycle", "runner.js"));
+  candidates.push(resolve(cwd, "test", "eval-lifecycle", "runner.ts"));
+  return candidates;
+}
+
+interface InProcessEvalResult {
+  exitCode: number;
+  stderr: string;
+}
+
+/**
+ * v1.2.0 release: invoke the harness in-process
+ * via dynamic `import()`. The runner is a
+ * `test/eval-lifecycle/runner.ts` module that
+ * the source-mode `pnpm` build loads through the
+ * `tsx` loader; the Bun binary's runtime can
+ * load it directly because the binary's working
+ * directory at install time is the repo root
+ * (or wherever the operator deployed the
+ * checkout). The in-process path returns a
+ * `{exitCode, stderr}` shape that mirrors the
+ * `runEvalScript` return type so the caller
+ * (`evalRunCommand`) does not need to care which
+ * mode was used.
+ */
+async function runEvalInline(args: {
+  corpusDir: string;
+  outDir: string;
+  bail: boolean;
+}): Promise<InProcessEvalResult> {
+  const candidates = resolveEvalRunnerCandidates(args.corpusDir);
+  let runnerPath: string | null = null;
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      runnerPath = candidate;
+      break;
+    }
+  }
+  if (process.env["DEBUG_AGENT_RECALL_EVAL"] === "1") {
+    process.stderr.write(
+      `agent-recall eval: candidate resolution\n  cwd=${process.cwd()}\n  corpusDir=${args.corpusDir}\n  candidates=${candidates.join("\n    ")}\n  resolved=${runnerPath ?? "<null>"}\n`
+    );
+  }
+  if (runnerPath === null) {
+    return {
+      exitCode: 2,
+      stderr: `[${STABLE_NOT_FOUND}] cannot locate the eval-lifecycle harness; checked ${candidates.join(", ")}. Run from the repo root or pass --corpus pointing at the directory that contains test/eval-lifecycle.`
+    };
+  }
+  try {
+    // Wrap the import through `pathToFileURL` so
+    // the Windows path separator doesn't trip the
+    // resolver on `file:///` round-trips.
+    const runner = (await import(
+      pathToFileURL(runnerPath).href
+    )) as { runCorpusAndWriteReports?: unknown };
+    const runFn = runner.runCorpusAndWriteReports;
+    if (typeof runFn !== "function") {
+      return {
+        exitCode: 3,
+        stderr: `[${STABLE_INTERNAL_ERROR}] eval runner does not export runCorpusAndWriteReports; refusing to fall back to a subprocess.`
+      };
+    }
+    const report = await (runFn as (opts: {
+      corpusDir: string;
+      outDir: string;
+      bailOnFailure: boolean;
+    }) => Promise<{
+      totals: { failed: number };
+      baselines?: { passed: boolean; reasons: string[] };
+    }>)({
+      corpusDir: args.corpusDir,
+      outDir: args.outDir,
+      bailOnFailure: args.bail
+    });
+    if (report.totals.failed > 0) {
+      return { exitCode: 1, stderr: "" };
+    }
+    if (report.baselines !== undefined && !report.baselines.passed) {
+      return {
+        exitCode: 1,
+        stderr:
+          "Quality baselines failed:\n" +
+          report.baselines.reasons.map((r) => `  - ${r}`).join("\n")
+      };
+    }
+    return { exitCode: 0, stderr: "" };
+  } catch (err) {
+    return {
+      exitCode: 2,
+      stderr: `[${STABLE_INTERNAL_ERROR}] eval runner crashed: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    };
+  }
+}
+
+/**
  * Top-level `eval` command. Branches on the
  * first positional argument (`run`,
  * `list-corpora`, `show-report`) and forwards to
@@ -162,12 +308,14 @@ export async function evalCommand(ctx: CliContext): Promise<CliResult> {
 /**
  * `agent-recall eval run --corpus <dir> --out <dir> [--bail]`
  *
- * The CLI hands the harness to
- * `scripts/eval-lifecycle.mjs`, which is the same
- * entry point `pnpm run eval:lifecycle:quick`
- * uses. The wrapper's exit code propagates as
- * the CLI's exit code so CI can gate on a
- * non-zero return without parsing stderr.
+ * v1.2.0 release: the CLI now invokes the harness
+ * in-process via `runEvalInline` (the previous
+ * `runEvalScript` shell-out path is preserved as
+ * `@deprecated` for the future `--external-script`
+ * flag). The in-process call returns a
+ * `{totals.failed, baselines.passed/reasons}` shape
+ * that the CLI maps onto the literal-typed
+ * `CliResult.exitCode`.
  */
 async function evalRunCommand(ctx: CliContext): Promise<CliResult> {
   const corpusDir = flagString(ctx.args, "corpus") ?? "test/eval-lifecycle";
@@ -181,25 +329,14 @@ async function evalRunCommand(ctx: CliContext): Promise<CliResult> {
     const banner = `agent-recall eval: corpus=${corpusDir} out=${outDir} bail=${bail}`;
     process.stderr.write(banner + "\n");
   }
-  const args = [
-    "--corpus",
-    corpusDir,
-    "--out",
-    outDir,
-    ...(bail ? ["--bail"] : [])
-  ];
-  const result = await runEvalScript(args);
-  // The harness's stdout is the Markdown report
-  // (via formatReportMarkdown's intent) when the
-  // child process pipes it; the script actually
-  // writes the file and exits. The CLI only
-  // forwards the exit code; the caller reads the
-  // file from `--out` directly. `CliResult.exitCode`
-  // is a 4-valued literal union; the harness's
-  // exit code (0 or 1 in the normal path, 2 on
-  // schema violation) maps cleanly. Any other
-  // value is clamped to 1 (failure) so the CLI
-  // does not surface a literal-typed mismatch.
+  const result = await runEvalInline({ corpusDir, outDir, bail });
+  // `CliResult.exitCode` is a 4-valued literal
+  // union (`0 | 1 | 2 | 3`); the in-process
+  // harness's exit code (0 or 1 in the normal
+  // path, 2 on a schema violation) maps cleanly.
+  // Any other value is clamped to 1 (failure) so
+  // the CLI does not surface a literal-typed
+  // mismatch.
   const clampedExit: 0 | 1 | 2 | 3 =
     result.exitCode === 0 ? 0
     : result.exitCode === 1 ? 1

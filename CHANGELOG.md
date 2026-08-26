@@ -78,6 +78,64 @@
 - HTTP bridge 的 sessions / assets 端点(Phase 2 一并提供)。
 - Admin app 的 session 浏览器 / asset 浏览器(Phase 2 一并提供)。
 
+## [1.2.0] — Lifecycle evaluation harness + quality gates (#55, Phase 3 收口)
+
+> v1.2 的 Phase 3:把 alpha.0/1/2 落地的 substrate 接到一个可重复执行的 end-to-end lifecycle evaluation harness 上。17 个 fixture 覆盖 5 workstream × 3 fixture_class + 2 个 dimension=E safety counter fixture;3 个 corpus-level quality baseline (distillation_supported_claim_rate, hallucination_rejection_rate, bootstrap_hash_byte_determinism) 在 runner 里实评,任一低于 declared threshold 即 hard fail;`agent-recall eval` CLI 子命令把 harness 从 `pnpm` 脚本升级到用户级入口。所有 workstream 不变量仍然成立:SQLite 是唯一 source of truth,deterministic baseline 仍然默认,无 LLM MITM proxy 需求,no daemon required。
+
+### 新增
+
+- **`test/eval-lifecycle/runner.ts`** (v0.3.0 / #55a) — fixture-by-fixture 串行 runner,每个 fixture 一个 fresh in-process SQLiteMemoryStore + per-fixture context (loadout / skill / bootstrap service 已注入);`seedFixture` 处理 session bundle ingest + loadout create + bootstrap configure + skill import;`runOperation` 7+ 种 operation kind (`distill_session` / `accept_candidate` / `apply_candidate` / `resolve_loadout` / `assemble_bootstrap` / `re_ingest_session` / `import_skill_md` / `update_loadout_rules` / `append_skill_version` / `configure_bootstrap` / `scan_bootstrap_twice` / `apply_bootstrap_plan`);`compareOutcomes` 跑 4 维断言 (job_state / candidate_count / bootstrap_hash / safety);`runCorpus` 聚合 fixtures → aggregate report (per-dimension / per-workstream rollup + safety gate + baselines gate)。
+- **`test/eval-lifecycle/schemas.ts`** — `LifecycleFixtureSchema` + `LifecycleCorpusManifestSchema` + `ExpectedOutcomesSchema` + `CorpusReportSchema` 四个 zod schema,wire `lifecycle.eval.v1` / `lifecycle.corpus.v1` / `lifecycle.report.v1` 三个 version literal;`expected.metric_input` 是 per-fixture baseline contribution row。
+- **`test/eval-lifecycle/report.ts`** — `formatReportJson` (canonical machine-readable, CI artifact) + `formatReportMarkdown` (human-readable, per-fixture status + per-dimension / per-workstream rollup + Quality baselines 表格 + Baseline reasons 列表)。
+- **`scripts/eval-lifecycle.mjs`** — 跨 tsx loader 跑 TypeScript harness;`pnpm run eval:lifecycle:quick` 跑全 corpus 写 report 到 `artifacts/eval-lifecycle/`,`--bail` 改成 fail-fast。
+- **`src/services/safety-counters.ts`** (v0.3.1 / #55b) — `SafetyCounters` interface (`inc` / `snapshot` / `reset`) + `noopSafetyCounters` (production, no allocation) + `CollectingSafetyCounters` (harness, 累加 5 维)。5 个 counter kinds 钉死在 `SAFETY_COUNTER_KINDS` literal tuple;`errorCodeOrMessage` helper 在 runner 提取 structured `err.code` 优先于 human message。
+- **5 个 safety counter 挂载点** — `SessionService.ingest.persistEvent` (secret + injection) + `DistillationService.runOnBundle` (secret) + `DistillationService.applyOneAction` (unauthorized_trust_escalation) + `ContextAssembler.assembleBootstrap` (cross_project + sensitivity)。Service constructor 接受可选 `safetyCounters`,default 是 `noopSafetyCounters` — 生产路径 zero allocation。
+- **3 个 corpus-level quality baselines** (v0.4.0 / #55c) — `distillation_supported_claim_rate` (declared 0.9),`distillation_hallucination_rejection_rate` (declared 0.95),`bootstrap_hash_byte_determinism` (declared 1.0);runner 在 `runCorpus` 末尾聚合 `expected.metric_input` contributions,对比 manifest 中 `baselines` 字段,任一 miss → runner exit 1 + `baselines.reasons` 记录。
+- **`src/cli/commands/eval.ts`** (v1.0.0 / #55d) — `agent-recall eval` 用户级 CLI:
+  - `eval run --corpus <dir> --out <dir> [--bail]` — 跑 corpus,exit code 直传 (0 / 1 / 2)
+  - `eval list-corpora [--corpus <dir>]` — 列 manifest fixture 列表
+  - `eval show-report <path> [--json]` — 读 report.json,人类可读 summary (per-baseline ok|miss) 或 raw payload
+  - 稳定错误码 (`[usage_error]` / `[not_found]` / `[internal_error]`) 走 stderr
+- **17 个 fixture** 覆盖 5 workstream × 3 class + 2 dimension=E safety counter:
+  - ingestion: `sessions_reingest_v1` (happy), `session_ingest_secret_redact_v1` (happy), `session_ingest_drift_replay_v1` (interrupt_retry)
+  - distillation: `distill_happy_v1` (happy), `distill_no_hallucination_v1` (happy), `distill_partial_apply_v1` (interrupt_retry)
+  - loadouts: `loadout_resolve_happy_v1` (happy), `loadout_policy_fail_v1` (policy_fail), `loadout_cas_mismatch_v1` (interrupt_retry)
+  - skills: `skills_import_roundtrip_v1` (happy), `skills_kebab_case_v1` (policy_fail), `skills_append_cas_v1` (interrupt_retry)
+  - bootstrap: `bootstrap_scan_idempotent_v1` (happy), `bootstrap_unsafe_path_v1` (policy_fail), `bootstrap_apply_partial_v1` (interrupt_retry)
+  - safety: `safety_secret_leak_v1` (E happy, counter=1), `safety_injection_blocked_v1` (E happy, counter=1)
+
+### 改动
+
+- **`test/eval-lifecycle/fixtures/_generate.mjs`** — dev aid,future schema change 时可重新生成 12 个 v0.3.0+v0.3.1 fixture;runtime runner 不读。
+- **`SessionService` / `DistillationService` / `ContextAssembler`** constructor 接受可选 `SafetyCounters` 参数,default 是 `noopSafetyCounters`;非破坏性,所有现有 caller 不变。
+- **`runner-cli.ts`** 退出时检查 `baselines.passed`,baseline fail 时 exit 1 + stderr reason 列表。
+- **`manifest.json`** 升 `corpus_version: v0.4.0`,`baselines` 字段列出 3 个 declared threshold。
+- **`docs/plans/v1.2-lifecycle-eval-design.md`** — coverage matrix (15/15 workstream × class + 2 dimension=E),counter 挂载点表,baseline 算法说明。
+
+### 验证
+
+- `pnpm typecheck` exit 0
+- `pnpm run eval:lifecycle:quick` exit 0,17/17 fixture pass,safety gate PASS,baselines gate PASS (3/3)
+- `pnpm test test/eval-lifecycle.test.ts` 4/4 pass
+- `pnpm test test/cli` 16 文件,86/86 pass
+- `pnpm test test/unit/sessions-service.test.ts test/unit/distillation-service.test.ts test/unit/context-assembly.test.ts` 54/54 pass
+- 端到端 `agent-recall eval run --corpus test/eval-lifecycle --out /tmp/eval` → exit 0,写 report.json (13 KB) + report.md (3 KB)
+- 端到端 `agent-recall eval show-report /tmp/eval/report.json` → 显示 3 baseline `measured=1.0000 declared=0.9000/0.9500/1.0000 ok`
+
+### 后续(非本 release 范围)
+
+- Provider-backed `eval:lifecycle:provider` evaluator — deferred
+- `dist/release-evidence.json` evidence 接线 — release pipeline 侧
+- Trend artifact comparison — artifact store 侧
+- Memory hierarchy + coding-agent benchmark (#9 follow-up)
+
+### 关联 issue / PR
+
+- 关闭 #47 (v1.2 Epic parent, 7/7 checklist)
+- 关闭 #55 (v1.2 lifecycle eval EPIC) + 4 sub-issue: #59 #55a v0.3.0 corpus (PR #64), #62 #55b safety counter (PR #65), #63 #55c baselines (PR #66), #61 #55d CLI (PR #67)
+- 关闭 #60 (#55b duplicate of #62)
+- 关闭 #51 (#51 Asset registry 代码已在 v1.2.0-alpha.2 merge)
+
 ## [1.2.0-alpha.2] — Session 蒸馏(#50)+ Agent Loadout(#52)+ Skill 资产(#53)+ 冷启动 Bootstrap(#54,Phase 2 合并)
 
 > Phase 2 把 v1.2.0-alpha.0/1 的 substrate 接到一组面向 agent 的端到端链路上:从 captured session 蒸馏出 reviewable 候选、按 loadout 策略组装 context_pack、把 SKILL.md 注册为可版本化资产、从冷启动 scan 派生出可应用的 bootstrap plan。四个 issue 跨 4 个并行 worktree,通过 git rebase 顺序合成,schema version slot 预先分配 (v17=#50, v18=#52, v19=#53, v20=#54) 避免并发迁移冲突。所有现有 API 保持兼容,没有破坏性改动。`migrate_v16_to_v17` 是蒸馏 pipeline 的 additive 表,`migrate_v17_to_v18` 是 loadout substrate,`migrate_v18_to_v19` 是 skills 表,`migrate_v19_to_v20` 是 bootstrap 表面 — 4 个迁移依次 transactional + rollback-safe。

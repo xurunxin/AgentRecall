@@ -7,6 +7,64 @@ All notable changes to agent-recall are documented here. The format follows
 adheres to [Semantic Versioning](https://semver.org/) (informally — this is
 a personal tool, but the file structure is here for future contributors).
 
+## [1.2.0] — Lifecycle evaluation harness + quality gates (#55, Phase 3 closeout)
+
+> v1.2's Phase 3: take the alpha.0/1/2 substrate and put a reproducible end-to-end lifecycle evaluation harness on top of it. 17 fixtures cover 5 workstreams x 3 fixture_classes + 2 dimension=E safety counter fixtures; 3 corpus-level quality baselines (`distillation_supported_claim_rate`, `distillation_hallucination_rejection_rate`, `bootstrap_hash_byte_determinism`) are evaluated for real by the runner, and a single miss hard-fails the run; the `agent-recall eval` CLI subcommand promotes the harness from a `pnpm` script to a user-facing entry point. All architectural invariants still hold: SQLite is the single source of truth, the deterministic baseline is still the default, no LLM MITM proxy is required, no daemon is required.
+
+### Added
+
+- **`test/eval-lifecycle/runner.ts`** (v0.3.0 / #55a) — fixture-by-fixture serial runner; each fixture gets a fresh in-process `SQLiteMemoryStore` + per-fixture context (loadout / skill / bootstrap service are already injected); `seedFixture` handles session-bundle ingest + loadout create + bootstrap configure + skill import; `runOperation` covers 12 operation kinds (`distill_session` / `accept_candidate` / `apply_candidate` / `resolve_loadout` / `assemble_bootstrap` / `re_ingest_session` / `import_skill_md` / `update_loadout_rules` / `append_skill_version` / `configure_bootstrap` / `scan_bootstrap_twice` / `apply_bootstrap_plan`); `compareOutcomes` runs 4-dimensional assertions (`job_state` / `candidate_count` / `bootstrap_hash` / `safety`); `runCorpus` aggregates fixtures into a single report (per-dimension / per-workstream rollup + safety gate + baselines gate).
+- **`test/eval-lifecycle/schemas.ts`** — `LifecycleFixtureSchema` + `LifecycleCorpusManifestSchema` + `ExpectedOutcomesSchema` + `CorpusReportSchema` (four Zod schemas, wired to `lifecycle.eval.v1` / `lifecycle.corpus.v1` / `lifecycle.report.v1` version literals); `expected.metric_input` is the per-fixture baseline contribution row.
+- **`test/eval-lifecycle/report.ts`** — `formatReportJson` (canonical machine-readable, CI artifact) + `formatReportMarkdown` (human-readable, per-fixture status + per-dimension / per-workstream rollup + Quality baselines table + Baseline reasons list).
+- **`scripts/eval-lifecycle.mjs`** — runs the TypeScript harness via the tsx loader; `pnpm run eval:lifecycle:quick` walks the full corpus and writes the report to `artifacts/eval-lifecycle/`; `--bail` switches to fail-fast.
+- **`src/services/safety-counters.ts`** (v0.3.1 / #55b) — `SafetyCounters` interface (`inc` / `snapshot` / `reset`) + `noopSafetyCounters` (production, no allocation) + `CollectingSafetyCounters` (harness, accumulates 5 dimensions). The five counter kinds are pinned in the `SAFETY_COUNTER_KINDS` literal tuple; the `errorCodeOrMessage` helper in the runner prefers the structured `err.code` over the human message.
+- **5 safety counter mount points** — `SessionService.ingest.persistEvent` (secret + injection) + `DistillationService.runOnBundle` (secret) + `DistillationService.applyOneAction` (unauthorized_trust_escalation) + `ContextAssembler.assembleBootstrap` (cross_project + sensitivity). Service constructors accept an optional `safetyCounters` argument that defaults to `noopSafetyCounters` — the production path stays allocation-free.
+- **3 corpus-level quality baselines** (v0.4.0 / #55c) — `distillation_supported_claim_rate` (declared 0.9), `distillation_hallucination_rejection_rate` (declared 0.95), `bootstrap_hash_byte_determinism` (declared 1.0); the runner aggregates `expected.metric_input` contributions at the end of `runCorpus`, compares them against the manifest's `baselines` field, and on any miss the runner exits 1 with the failing metric recorded in `baselines.reasons`.
+- **`src/cli/commands/eval.ts`** (v1.0.0 / #55d) — the `agent-recall eval` user-facing CLI:
+  - `eval run --corpus <dir> --out <dir> [--bail]` — walk the corpus, propagate the runner's exit code (0 / 1 / 2)
+  - `eval list-corpora [--corpus <dir>]` — list the manifest's fixture ids
+  - `eval show-report <path> [--json]` — read `report.json` and print a human-readable summary (per-baseline `ok` / `miss`) or the raw payload
+  - Stable error codes (`[usage_error]` / `[not_found]` / `[internal_error]`) on stderr
+- **17 fixtures** covering 5 workstreams x 3 fixture_classes + 2 dimension=E safety counters:
+  - ingestion: `sessions_reingest_v1` (happy), `session_ingest_secret_redact_v1` (happy), `session_ingest_drift_replay_v1` (interrupt_retry)
+  - distillation: `distill_happy_v1` (happy), `distill_no_hallucination_v1` (happy), `distill_partial_apply_v1` (interrupt_retry)
+  - loadouts: `loadout_resolve_happy_v1` (happy), `loadout_policy_fail_v1` (policy_fail), `loadout_cas_mismatch_v1` (interrupt_retry)
+  - skills: `skills_import_roundtrip_v1` (happy), `skills_kebab_case_v1` (policy_fail), `skills_append_cas_v1` (interrupt_retry)
+  - bootstrap: `bootstrap_scan_idempotent_v1` (happy), `bootstrap_unsafe_path_v1` (policy_fail), `bootstrap_apply_partial_v1` (interrupt_retry)
+  - safety: `safety_secret_leak_v1` (E happy, counter = 1), `safety_injection_blocked_v1` (E happy, counter = 1)
+
+### Changed
+
+- **`test/eval-lifecycle/fixtures/_generate.mjs`** — a developer aid that re-emits the 12 v0.3.0+v0.3.1 fixtures when the schema changes; the runtime runner does not read it.
+- **`SessionService` / `DistillationService` / `ContextAssembler`** constructors accept an optional `SafetyCounters` argument that defaults to `noopSafetyCounters`; non-breaking, all existing callers unchanged.
+- **`runner-cli.ts`** checks `baselines.passed` on exit; on a baseline miss it exits 1 and prints the reason list on stderr.
+- **`manifest.json`** bumped to `corpus_version: v0.4.0`; the `baselines` field lists the three declared thresholds.
+- **`docs/plans/v1.2-lifecycle-eval-design.md`** — coverage matrix (15/15 workstream x class + 2 dimension=E), counter mount-point table, baseline algorithm notes.
+
+### Verification
+
+- `pnpm typecheck` exit 0
+- `pnpm run eval:lifecycle:quick` exit 0, 17/17 fixtures pass, safety gate PASS, baselines gate PASS (3/3)
+- `pnpm test test/eval-lifecycle.test.ts` 4/4 pass
+- `pnpm test test/cli` 16 files, 86/86 pass
+- `pnpm test test/unit/sessions-service.test.ts test/unit/distillation-service.test.ts test/unit/context-assembly.test.ts` 54/54 pass
+- End-to-end `agent-recall eval run --corpus test/eval-lifecycle --out /tmp/eval` → exit 0, writes `report.json` (13 KB) + `report.md` (3 KB)
+- End-to-end `agent-recall eval show-report /tmp/eval/report.json` → 3 baselines print `measured=1.0000 declared=0.9000/0.9500/1.0000 ok`
+
+### Out of scope (separate work)
+
+- Provider-backed `eval:lifecycle:provider` evaluator — deferred
+- `dist/release-evidence.json` wiring — release pipeline side
+- Trend artifact comparison — artifact store side
+- Memory hierarchy + coding-agent benchmark (#9 follow-up)
+
+### Linked issues / PRs
+
+- Closes #47 (v1.2 Epic parent, 7/7 checklist)
+- Closes #55 (v1.2 lifecycle eval EPIC) + 4 sub-issues: #59 #55a v0.3.0 corpus (PR #64), #62 #55b safety counter (PR #65), #63 #55c baselines (PR #66), #61 #55d CLI (PR #67)
+- Closes #60 (#55b duplicate of #62)
+- Closes #51 (the asset-registry code landed in v1.2.0-alpha.2)
+
 ## [1.2.0-alpha.2] — Session distillation (#50) + Agent loadouts (#52) + Skill assets (#53) + Cold-start bootstrap (#54, Phase 2 combined)
 
 > Phase 2 wires the v1.2.0-alpha.0/1 substrate into a set of end-to-end agent-facing flows: distill reviewable candidates from captured sessions, assemble context packs under a loadout policy, register SKILL.md as versioned assets, and derive an applicable bootstrap plan from a cold-start scan. The four issues shipped across four parallel worktrees and were sequentially rebased; the schema version slots (v17=#50, v18=#52, v19=#53, v20=#54) were pre-allocated to prevent concurrent migration conflicts. All existing APIs are preserved — no breaking changes. `migrate_v16_to_v17` adds the distillation pipeline tables, `migrate_v17_to_v18` adds the loadout substrate, `migrate_v18_to_v19` adds the skills table, and `migrate_v19_to_v20` adds the bootstrap surface. All four migrations are transactional + rollback-safe.

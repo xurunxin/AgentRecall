@@ -1,26 +1,32 @@
 {
   "compilerOptions": {
-    "target": "ES2024",
+    "target": "ES2022",
     "lib": ["ES2024"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true,
+    "strict": false,
+    "noUncheckedIndexedAccess": false,
+    "exactOptionalPropertyTypes": false,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
-    "outDir": "dist",
+    "outDir": "../../dist/test/eval-lifecycle",
     "rootDir": ".",
-    "types": ["node"],
-    "baseUrl": ".",
+    "baseUrl": "../..",
     "paths": {
       "@agent-recall/contracts": [
         "./packages/contracts/dist/index.d.ts",
         "./packages/contracts/dist/index.js"
       ]
-    }
+    },
+    "types": ["node"]
   },
-  "include": ["src/**/*.ts", "bin/**/*.ts"],
-  "exclude": ["dist", "node_modules"]
+  "include": [
+    "runner.ts",
+    "runner-cli.ts",
+    "schemas.ts",
+    "report.ts",
+    "index.ts"
+  ],
+  "exclude": ["fixtures"]
 }

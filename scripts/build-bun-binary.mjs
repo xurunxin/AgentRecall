@@ -42,6 +42,29 @@ execFileSync("npx", ["tsc", "-p", "tsconfig.json"], {
   stdio: "inherit",
   shell: process.platform === "win32"
 });
+// v1.2.0 release: the workspace package
+// (`@agent-recall/contracts`) ships its own
+// compiled JS under `packages/contracts/dist/`.
+// The binary's launcher imports the package by
+// its `main` field; the prior v1.1.x layout
+// pointed `main` at `./src/index.ts`, which
+// Node (and Bun's embedded resolver) cannot
+// import as plain JS. The release-time build
+// now compiles the contracts package so the
+// `dist/index.js` entry point is present when
+// the binary runs. The `composite: true` flag
+// on the contracts tsconfig already wires
+// incremental build through the root
+// tsconfig's `references`, but the root
+// `tsc -p tsconfig.json` invocation is
+// effectively project-isolated; we still need
+// the explicit package-level build below to
+// make the `dist/` directory discoverable from
+// the binary's `node_modules/@agent-recall/contracts/`.
+execFileSync("npx", ["tsc", "-p", "packages/contracts/tsconfig.json"], {
+  stdio: "inherit",
+  shell: process.platform === "win32"
+});
 
 // --- Source SHA: package.json + all .ts files under src/ + bin/ ---
 function sha256File(p) {
@@ -103,7 +126,36 @@ for (const plat of PLATFORMS) {
     try {
       execFileSync(
         "bun",
-        ["build", "--compile", `--target=${bunTarget}`, "--define", `process.env.AGENT_RECALL_VERSION='${pkg.version}'`, "--outfile", outfile, src],
+        [
+          "build",
+          "--compile",
+          `--target=${bunTarget}`,
+          // v1.2.0 release: workspace package
+          // (`@agent-recall/contracts`) is a sibling
+          // directory, not embedded in the bundle.
+          // Without `--external` Bun tries to resolve
+          // the import from the binary's working
+          // directory's `node_modules/`, which only
+          // works when the operator runs the binary
+          // from the repo root. Marking every
+          // `@agent-recall/*` specifier + the node
+          // built-ins as external keeps the binary
+          // resolution identical to the source-mode
+          // `pnpm` resolution. Node built-ins are
+          // externalised defensively so the binary
+          // does not embed a stale copy.
+          "--external",
+          "@agent-recall/contracts",
+          "--external",
+          "@agent-recall/*",
+          "--external",
+          "node:*",
+          "--define",
+          `process.env.AGENT_RECALL_VERSION='${pkg.version}'`,
+          "--outfile",
+          outfile,
+          src
+        ],
         { stdio: "inherit" }
       );
       const size = statSync(outfile).size;

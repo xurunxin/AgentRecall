@@ -30,7 +30,7 @@ import { createInterface } from "node:readline";
 import {
   SessionTraceBundleV1Schema,
   SessionTraceEventV1Schema
-} from "@agent-recall/contracts";
+} from "../../../packages/contracts/dist/index.js";
 
 import type { NormalisedBundle, NormalisedEvent } from "../service.js";
 import type { SessionEventType, SessionScope, SessionSensitivity } from "../../sqlite-store.js";
