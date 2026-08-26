@@ -166,8 +166,24 @@ export type SearchFilters = EntryFilters & {
  * The migration is fully transactional; on any throw
  * the user_version stays at 15 and the database is
  * untouched.
+ * v17 (v1.2.0-alpha.2, issue #50): the session-to-memory
+ * distillation pipeline. Three additive tables —
+ * `derivation_candidates`, `candidate_evidence`,
+ * `candidate_actions` — back the reviewable
+ * `memory` / `episode` / `skill_candidate` proposals
+ * produced by the deterministic baseline extractor
+ * (and any future provider-backed extractor).
+ * The candidate row's `state` is a small state
+ * machine (`proposed` -> `accepted` -> `applied` or
+ * `rejected` / `stale`); the row's `expected_target_revision`
+ * is the CAS guard for the `apply` step. The candidate
+ * is never a `memory_id` until the `apply` step writes
+ * the `derivation_outputs` + the `memory_entries` row
+ * (issue #50 AC #1). The migration is fully
+ * transactional; on any throw the user_version stays
+ * at 16 and the database is untouched.
  */
-export const CURRENT_SCHEMA_VERSION = 16;
+export const CURRENT_SCHEMA_VERSION = 17;
 
 /**
  * Stage 12 PR9: thrown by `updateEntryWithRevision` when
@@ -608,6 +624,109 @@ export type MemoryRefBindingRow = {
   note: string | null;
 };
 
+/**
+ * v1.2.0-alpha.2 (issue #50): the row shape for
+ * `derivation_candidates`. A candidate is a
+ * reviewable memory / episode / skill-candidate
+ * proposal produced by an extractor provider and
+ * surfaced through the session-to-memory distillation
+ * pipeline. The row is **not** a `memory_id`; the
+ * `apply` step writes the `memory_entries` row +
+ * a `derivation_outputs` row with
+ * `output_kind='applied_memory'` and
+ * `disposition='applied'`.
+ *
+ * The `state` column is a small state machine:
+ *   - `proposed`  -> freshly emitted by the extractor
+ *   - `accepted`  -> reviewed + accepted by a human
+ *   - `rejected`  -> reviewed + rejected by a human
+ *   - `applied`   -> accepted + successfully applied
+ *   - `stale`     -> CAS drift on apply; skipped
+ *
+ * The `expected_target_revision` is the CAS guard
+ * for the `apply` step (when the candidate targets
+ * an existing `memory_id`). A drift transitions the
+ * candidate to `stale` and the apply batch skips it.
+ */
+export type DerivationCandidateKind = "memory" | "episode" | "skill_candidate";
+
+export type DerivationCandidateState =
+  | "proposed"
+  | "accepted"
+  | "rejected"
+  | "applied"
+  | "stale";
+
+export type DerivationCandidateTier = "working";
+
+export type DerivationCandidateTrustLevel = "inferred" | "agent_observed";
+
+export type DerivationCandidateSensitivity = "normal";
+
+export type DerivationCandidateRisk = "low" | "medium" | "high";
+
+export type DerivationCandidateAction =
+  | "create"
+  | "update"
+  | "supersede"
+  | "merge"
+  | "skip";
+
+export type DerivationCandidateScope = "global" | "project";
+
+export type DerivationCandidateEvidenceRole =
+  | "primary"
+  | "supporting"
+  | "context";
+
+export type DerivationCandidateRow = {
+  candidate_id: string;
+  job_id: string;
+  run_id: string;
+  candidate_kind: DerivationCandidateKind;
+  proposed_type: string | null;
+  proposed_topic: string | null;
+  proposed_title: string | null;
+  proposed_body: string | null;
+  proposed_tags_json: string;
+  proposed_scope: "global" | "project";
+  proposed_project_id: string | null;
+  proposed_tier: DerivationCandidateTier;
+  proposed_trust_level: DerivationCandidateTrustLevel;
+  proposed_sensitivity: DerivationCandidateSensitivity;
+  confidence: number;
+  state: DerivationCandidateState;
+  extractor_id: string;
+  extractor_version: string;
+  content_hash: string;
+  created_at: number;
+  reviewed_at: number | null;
+  reviewed_by_actor_id: string | null;
+  applied_at: number | null;
+  expected_target_revision: number | null;
+};
+
+export type CandidateEvidenceRow = {
+  candidate_id: string;
+  evidence_role: DerivationCandidateEvidenceRole;
+  session_id: string | null;
+  event_id: string | null;
+  message_id: string | null;
+  tool_call_id: string | null;
+  file_ref: string | null;
+  excerpt_digest: string;
+};
+
+export type CandidateActionRow = {
+  candidate_id: string;
+  action: DerivationCandidateAction;
+  target_memory_ids_json: string;
+  expected_revisions_json: string;
+  rationale: string;
+  conflict_signals_json: string;
+  risk: DerivationCandidateRisk;
+};
+
 type Row = Record<string, SQLOutputValue>;
 
 function encodeJson(value: unknown): string {
@@ -827,6 +946,60 @@ function memoryRefBindingFromRow(row: Row): MemoryRefBindingRow {
     memory_revision: numberCell(row, "memory_revision"),
     binding_rule: optionalStringCell(row, "binding_rule") ?? null,
     note: optionalStringCell(row, "note") ?? null
+  };
+}
+
+function derivationCandidateFromRow(row: Row): DerivationCandidateRow {
+  return {
+    candidate_id: stringCell(row, "candidate_id"),
+    job_id: stringCell(row, "job_id"),
+    run_id: stringCell(row, "run_id"),
+    candidate_kind: stringCell(row, "candidate_kind") as DerivationCandidateKind,
+    proposed_type: optionalStringCell(row, "proposed_type") ?? null,
+    proposed_topic: optionalStringCell(row, "proposed_topic") ?? null,
+    proposed_title: optionalStringCell(row, "proposed_title") ?? null,
+    proposed_body: optionalStringCell(row, "proposed_body") ?? null,
+    proposed_tags_json: stringCell(row, "proposed_tags_json"),
+    proposed_scope: stringCell(row, "proposed_scope") as "global" | "project",
+    proposed_project_id: optionalStringCell(row, "proposed_project_id") ?? null,
+    proposed_tier: stringCell(row, "proposed_tier") as DerivationCandidateTier,
+    proposed_trust_level: stringCell(row, "proposed_trust_level") as DerivationCandidateTrustLevel,
+    proposed_sensitivity: stringCell(row, "proposed_sensitivity") as DerivationCandidateSensitivity,
+    confidence: numberCell(row, "confidence"),
+    state: stringCell(row, "state") as DerivationCandidateState,
+    extractor_id: stringCell(row, "extractor_id"),
+    extractor_version: stringCell(row, "extractor_version"),
+    content_hash: stringCell(row, "content_hash"),
+    created_at: numberCell(row, "created_at"),
+    reviewed_at: optionalNumberCell(row, "reviewed_at") ?? null,
+    reviewed_by_actor_id: optionalStringCell(row, "reviewed_by_actor_id") ?? null,
+    applied_at: optionalNumberCell(row, "applied_at") ?? null,
+    expected_target_revision: optionalNumberCell(row, "expected_target_revision") ?? null
+  };
+}
+
+function candidateEvidenceFromRow(row: Row): CandidateEvidenceRow {
+  return {
+    candidate_id: stringCell(row, "candidate_id"),
+    evidence_role: stringCell(row, "evidence_role") as DerivationCandidateEvidenceRole,
+    session_id: optionalStringCell(row, "session_id") ?? null,
+    event_id: optionalStringCell(row, "event_id") ?? null,
+    message_id: optionalStringCell(row, "message_id") ?? null,
+    tool_call_id: optionalStringCell(row, "tool_call_id") ?? null,
+    file_ref: optionalStringCell(row, "file_ref") ?? null,
+    excerpt_digest: stringCell(row, "excerpt_digest")
+  };
+}
+
+function candidateActionFromRow(row: Row): CandidateActionRow {
+  return {
+    candidate_id: stringCell(row, "candidate_id"),
+    action: stringCell(row, "action") as DerivationCandidateAction,
+    target_memory_ids_json: stringCell(row, "target_memory_ids_json"),
+    expected_revisions_json: stringCell(row, "expected_revisions_json"),
+    rationale: stringCell(row, "rationale"),
+    conflict_signals_json: stringCell(row, "conflict_signals_json"),
+    risk: stringCell(row, "risk") as DerivationCandidateRisk
   };
 }
 
@@ -2509,6 +2682,10 @@ export class SQLiteMemoryStore {
       this.migrate_v15_to_v16();
       return;
     }
+    if (version === 17) {
+      this.migrate_v16_to_v17();
+      return;
+    }
     throw new Error(`No migration registered for schema version ${version}`);
   }
 
@@ -3728,6 +3905,358 @@ export class SQLiteMemoryStore {
       this.db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  /**
+   * v1.2.0-alpha.2 (issue #50): the v16 -> v17 schema
+   * migration. Three additive tables — `derivation_candidates`,
+   * `candidate_evidence`, `candidate_actions` — back the
+   * session-to-memory distillation pipeline. The candidate
+   * row's `state` is a small state machine (`proposed` ->
+   * `accepted` -> `applied` or `rejected` / `stale`); the
+   * `expected_target_revision` is the CAS guard for the
+   * `apply` step. The CHECK on `state = 'applied' OR
+   * applied_at IS NULL` keeps the two terminal "applied"
+   * fields in sync.
+   *
+   * The migration is fully transactional; on any throw
+   * the user_version stays at 16 and the database is
+   * untouched.
+   */
+  private migrate_v16_to_v17(): void {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS derivation_candidates (
+          candidate_id              TEXT PRIMARY KEY,
+          job_id                    TEXT NOT NULL REFERENCES derivation_jobs(job_id) ON DELETE CASCADE,
+          run_id                    TEXT NOT NULL REFERENCES derivation_runs(run_id) ON DELETE CASCADE,
+          candidate_kind            TEXT NOT NULL
+                                      CHECK (candidate_kind IN ('memory','episode','skill_candidate')),
+          proposed_type             TEXT,
+          proposed_topic            TEXT,
+          proposed_title            TEXT,
+          proposed_body             TEXT,
+          proposed_tags_json        TEXT NOT NULL DEFAULT '[]',
+          proposed_scope            TEXT NOT NULL
+                                      CHECK (proposed_scope IN ('global','project')),
+          proposed_project_id       TEXT,
+          proposed_tier             TEXT NOT NULL DEFAULT 'working'
+                                      CHECK (proposed_tier IN ('working')),
+          proposed_trust_level      TEXT NOT NULL DEFAULT 'inferred'
+                                      CHECK (proposed_trust_level IN ('inferred','agent_observed')),
+          proposed_sensitivity      TEXT NOT NULL
+                                      CHECK (proposed_sensitivity IN ('normal')),
+          confidence                REAL NOT NULL,
+          state                     TEXT NOT NULL
+                                      CHECK (state IN ('proposed','accepted','rejected','applied','stale')),
+          extractor_id              TEXT NOT NULL,
+          extractor_version         TEXT NOT NULL,
+          content_hash              TEXT NOT NULL,
+          created_at                INTEGER NOT NULL,
+          reviewed_at               INTEGER,
+          reviewed_by_actor_id      TEXT,
+          applied_at                INTEGER,
+          expected_target_revision  INTEGER,
+          CHECK (state = 'applied' OR applied_at IS NULL),
+          CHECK (proposed_scope = 'project' AND proposed_project_id IS NOT NULL
+                 OR proposed_scope = 'global' AND proposed_project_id IS NULL)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_candidates_job
+          ON derivation_candidates(job_id);
+        CREATE INDEX IF NOT EXISTS idx_candidates_state
+          ON derivation_candidates(state);
+
+        CREATE TABLE IF NOT EXISTS candidate_evidence (
+          candidate_id   TEXT NOT NULL REFERENCES derivation_candidates(candidate_id) ON DELETE CASCADE,
+          evidence_role  TEXT NOT NULL
+                           CHECK (evidence_role IN ('primary','supporting','context')),
+          session_id     TEXT,
+          event_id       TEXT,
+          message_id     TEXT,
+          tool_call_id   TEXT,
+          file_ref       TEXT,
+          excerpt_digest TEXT NOT NULL,
+          PRIMARY KEY (candidate_id, evidence_role, excerpt_digest)
+        ) STRICT;
+
+        CREATE INDEX IF NOT EXISTS idx_candidate_evidence_session
+          ON candidate_evidence(session_id);
+
+        CREATE TABLE IF NOT EXISTS candidate_actions (
+          candidate_id            TEXT NOT NULL REFERENCES derivation_candidates(candidate_id) ON DELETE CASCADE,
+          action                  TEXT NOT NULL
+                                    CHECK (action IN ('create','update','supersede','merge','skip')),
+          target_memory_ids_json  TEXT NOT NULL DEFAULT '[]',
+          expected_revisions_json TEXT NOT NULL DEFAULT '[]',
+          rationale               TEXT NOT NULL,
+          conflict_signals_json   TEXT NOT NULL DEFAULT '[]',
+          risk                    TEXT NOT NULL
+                                    CHECK (risk IN ('low','medium','high')),
+          PRIMARY KEY (candidate_id, action)
+        ) STRICT;
+      `);
+      this.db.exec("PRAGMA user_version = 17");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // v1.2.0-alpha.2 (issue #50): distillation candidate rows.
+  //
+  // The three tables — `derivation_candidates` /
+  // `candidate_evidence` / `candidate_actions` — back the
+  // reviewable memory / episode / skill-candidate proposals
+  // produced by the session-to-memory distillation pipeline.
+  // The public service lives in
+  // `src/distillation/service.ts`; the methods below are the
+  // lowest-level row readers and writers used by the
+  // `DistillationService`. The methods compose inside single
+  // `BEGIN IMMEDIATE` transactions so the apply step is
+  // atomic with the candidate state transition (issue #50
+  // AC #2).
+  // ─────────────────────────────────────────────────────────────────────
+
+  /**
+   * Insert a single candidate row. The caller pre-computes
+   * `candidate_id`, `content_hash`, the scope / project_id
+   * pair, and the proposed trust / tier / sensitivity
+   * values. The row is inserted with `state='proposed'`
+   * (the v17 CHECK constraint enforces the enum). Returns
+   * `false` on a primary-key collision so the service can
+   * translate it to a stable error code.
+   */
+  insertCandidate(row: DerivationCandidateRow): boolean {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO derivation_candidates (
+            candidate_id, job_id, run_id, candidate_kind,
+            proposed_type, proposed_topic, proposed_title, proposed_body,
+            proposed_tags_json, proposed_scope, proposed_project_id,
+            proposed_tier, proposed_trust_level, proposed_sensitivity,
+            confidence, state,
+            extractor_id, extractor_version, content_hash,
+            created_at, reviewed_at, reviewed_by_actor_id, applied_at,
+            expected_target_revision
+          ) VALUES (
+            ?, ?, ?, ?,
+            ?, ?, ?, ?,
+            ?, ?, ?,
+            ?, ?, ?,
+            ?, ?,
+            ?, ?, ?,
+            ?, ?, ?, ?,
+            ?
+          )`
+        )
+        .run(
+          row.candidate_id,
+          row.job_id,
+          row.run_id,
+          row.candidate_kind,
+          row.proposed_type,
+          row.proposed_topic,
+          row.proposed_title,
+          row.proposed_body,
+          row.proposed_tags_json,
+          row.proposed_scope,
+          row.proposed_project_id,
+          row.proposed_tier,
+          row.proposed_trust_level,
+          row.proposed_sensitivity,
+          row.confidence,
+          row.state,
+          row.extractor_id,
+          row.extractor_version,
+          row.content_hash,
+          row.created_at,
+          row.reviewed_at,
+          row.reviewed_by_actor_id,
+          row.applied_at,
+          row.expected_target_revision
+        );
+      return true;
+    } catch (error) {
+      if (isSqliteUniqueConstraintError(error)) return false;
+      throw error;
+    }
+  }
+
+  /**
+   * Read a single candidate row by its primary key.
+   * Returns `undefined` if the row does not exist.
+   */
+  getCandidate(candidateId: string): DerivationCandidateRow | undefined {
+    const row = this.db
+      .prepare("SELECT * FROM derivation_candidates WHERE candidate_id = ?")
+      .get(candidateId) as Row | undefined;
+    if (row === undefined) return undefined;
+    return derivationCandidateFromRow(row);
+  }
+
+  /**
+   * List all candidates for a given job, ordered by
+   * `created_at ASC` so the inspection output reads in
+   * the same order the extractor emitted them.
+   */
+  listCandidatesForJob(jobId: string): DerivationCandidateRow[] {
+    const rows = this.db
+      .prepare(
+        "SELECT * FROM derivation_candidates WHERE job_id = ? ORDER BY created_at ASC, candidate_id ASC"
+      )
+      .all(jobId) as Row[];
+    return rows.map((r) => derivationCandidateFromRow(r));
+  }
+
+  /**
+   * Transition a candidate's state. The `now_ms` is the
+   * timestamp written to the matching side-column
+   * (`reviewed_at` for accept/reject, `applied_at` for
+   * apply). A `stale` transition is a no-op for the
+   * reviewer / applied columns; the row still moves
+   * to `stale` so the inspector surfaces the drift.
+   * Returns `true` when the row updated.
+   */
+  updateCandidateState(args: {
+    candidate_id: string;
+    next_state: DerivationCandidateState;
+    reviewed_by_actor_id?: string | null;
+    now_ms: number;
+  }): boolean {
+    const reviewedBy =
+      args.reviewed_by_actor_id === undefined ? null : args.reviewed_by_actor_id;
+    if (args.next_state === "applied") {
+      const result = this.db
+        .prepare(
+          `UPDATE derivation_candidates
+              SET state = ?,
+                  applied_at = ?,
+                  reviewed_at = COALESCE(reviewed_at, ?),
+                  reviewed_by_actor_id = COALESCE(reviewed_by_actor_id, ?)
+            WHERE candidate_id = ?`
+        )
+        .run(args.next_state, args.now_ms, args.now_ms, reviewedBy, args.candidate_id);
+      return result.changes > 0;
+    }
+    if (args.next_state === "accepted" || args.next_state === "rejected") {
+      const result = this.db
+        .prepare(
+          `UPDATE derivation_candidates
+              SET state = ?,
+                  reviewed_at = ?,
+                  reviewed_by_actor_id = ?
+            WHERE candidate_id = ?`
+        )
+        .run(args.next_state, args.now_ms, reviewedBy, args.candidate_id);
+      return result.changes > 0;
+    }
+    // `proposed` (re-emit) or `stale` (CAS drift)
+    // transitions only flip the state column.
+    const result = this.db
+      .prepare(
+        `UPDATE derivation_candidates
+            SET state = ?
+          WHERE candidate_id = ?`
+      )
+      .run(args.next_state, args.candidate_id);
+    return result.changes > 0;
+  }
+
+  /**
+   * Insert one evidence row. The composite primary key
+   * `(candidate_id, evidence_role, excerpt_digest)`
+   * de-dupes identical rows so a re-run is a no-op.
+   * Throws on duplicate (caller can ignore).
+   */
+  insertCandidateEvidence(row: CandidateEvidenceRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO candidate_evidence (
+          candidate_id, evidence_role,
+          session_id, event_id, message_id, tool_call_id, file_ref,
+          excerpt_digest
+        ) VALUES (
+          ?, ?,
+          ?, ?, ?, ?, ?,
+          ?
+        )`
+      )
+      .run(
+        row.candidate_id,
+        row.evidence_role,
+        row.session_id,
+        row.event_id,
+        row.message_id,
+        row.tool_call_id,
+        row.file_ref,
+        row.excerpt_digest
+      );
+  }
+
+  /**
+   * Insert one action row. The composite primary key
+   * `(candidate_id, action)` keeps the action list
+   * deduped; a re-run of the same action is a
+   * SQLITE_CONSTRAINT that the service can ignore.
+   */
+  insertCandidateAction(row: CandidateActionRow): void {
+    this.db
+      .prepare(
+        `INSERT INTO candidate_actions (
+          candidate_id, action,
+          target_memory_ids_json, expected_revisions_json,
+          rationale, conflict_signals_json, risk
+        ) VALUES (
+          ?, ?,
+          ?, ?,
+          ?, ?, ?
+        )`
+      )
+      .run(
+        row.candidate_id,
+        row.action,
+        row.target_memory_ids_json,
+        row.expected_revisions_json,
+        row.rationale,
+        row.conflict_signals_json,
+        row.risk
+      );
+  }
+
+  /**
+   * Read all evidence rows for a candidate, ordered by
+   * `evidence_role ASC, excerpt_digest ASC` for stable
+   * inspection.
+   */
+  getCandidateEvidence(candidateId: string): CandidateEvidenceRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM candidate_evidence
+           WHERE candidate_id = ?
+           ORDER BY evidence_role ASC, excerpt_digest ASC`
+      )
+      .all(candidateId) as Row[];
+    return rows.map((r) => candidateEvidenceFromRow(r));
+  }
+
+  /**
+   * Read all action rows for a candidate, ordered by
+   * `action ASC` for stable inspection.
+   */
+  getCandidateAction(candidateId: string): CandidateActionRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM candidate_actions
+           WHERE candidate_id = ?
+           ORDER BY action ASC`
+      )
+      .all(candidateId) as Row[];
+    return rows.map((r) => candidateActionFromRow(r));
   }
 
   private addColumnIfMissing(table: string, column: string, definition: string): void {

@@ -6,3 +6,4 @@ export * from "./errors.js";
 export * from "./jobs.js";
 export * from "./sessions.js";
 export * from "./assets.js";
+export * from "./distillation.js";

@@ -37,6 +37,7 @@ import { ImportBatchStore } from "../portability/import-batch-store.js";
 import { DerivationJobStore } from "../jobs/service.js";
 import { SessionService } from "../sessions/service.js";
 import { AssetService } from "../assets/service.js";
+import { DistillationService } from "../distillation/service.js";
 import type { ToolProfile } from "../tools/profile.js";
 import type { CapabilityStore } from "../admin/capability.js";
 import type { AuthorizationDecision } from "../services/auth-context.js";
@@ -625,6 +626,81 @@ export function registerMemoryResources(server: MemoryResourceServer, ctx: Memor
         asset: inspection.asset,
         current_version: inspection.current_version,
         payload: inspection.payload
+      });
+    }
+  );
+
+  // v1.2.0-alpha.2 (issue #50): the distillation
+  // candidate resource. The payload mirrors the
+  // `candidates show <id>` CLI output: the candidate
+  // row + its evidence + its actions. Read-only;
+  // mutations go through the `candidates_accept` /
+  // `candidates_reject` / `candidates_apply` tools
+  // (added in a later Phase 2 issue). The
+  // `DistillationService` is constructed with the
+  // same `MemoryService` / `MemoryWriteService`
+  // the MCP server already owns; the apply path's
+  // trust / sensitivity gates are the same ones
+  // used by the `remember` tool.
+  server.registerResource(
+    "distillation_candidate",
+    new ResourceTemplate("agentrecall://candidates/{candidate_id}", { list: undefined }),
+    {
+      description:
+        "Distillation candidate inspection: candidate row + evidence rows + action rows. Mirrors the agent-recall candidates show CLI output. Read-only.",
+      mimeType: "application/json"
+    },
+    (uri: URL, variables: Variables) => {
+      const candidateId = pickVariable(variables, "candidate_id");
+      if (candidateId === undefined || candidateId.length === 0) {
+        return jsonResource(uri, { ok: false, error: "not_found", message: "missing candidate_id" });
+      }
+      const jobStore = new DerivationJobStore(ctx.store);
+      const sessionService = new SessionService(ctx.store, ctx.identityResolver);
+      const distillation = new DistillationService(ctx.store, sessionService, jobStore);
+      const inspection = distillation.show(candidateId);
+      if (inspection === undefined) {
+        return jsonResource(uri, {
+          ok: false,
+          error: "not_found",
+          message: `unknown candidate_id ${candidateId}`
+        });
+      }
+      return jsonResource(uri, {
+        ok: true,
+        candidate: inspection.candidate,
+        evidence: inspection.evidence,
+        actions: inspection.actions
+      });
+    }
+  );
+
+  // v1.2.0-alpha.2 (issue #50): the by-job
+  // candidate list. The payload is the full
+  // candidate + evidence + action triple for every
+  // row attached to a derivation job. An unknown
+  // `job_id` surfaces a `not_found` envelope.
+  server.registerResource(
+    "distillation_candidate_list",
+    new ResourceTemplate("agentrecall://candidates/by-job/{job_id}", { list: undefined }),
+    {
+      description:
+        "List of distillation candidates (with evidence + actions) for a single derivation job. Mirrors the agent-recall candidates list --job CLI output. Read-only.",
+      mimeType: "application/json"
+    },
+    (uri: URL, variables: Variables) => {
+      const jobId = pickVariable(variables, "job_id");
+      if (jobId === undefined || jobId.length === 0) {
+        return jsonResource(uri, { ok: false, error: "not_found", message: "missing job_id" });
+      }
+      const jobStore = new DerivationJobStore(ctx.store);
+      const sessionService = new SessionService(ctx.store, ctx.identityResolver);
+      const distillation = new DistillationService(ctx.store, sessionService, jobStore);
+      const rows = distillation.listForJob(jobId);
+      return jsonResource(uri, {
+        ok: true,
+        job_id: jobId,
+        candidates: rows
       });
     }
   );

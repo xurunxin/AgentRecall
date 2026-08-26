@@ -1,13 +1,18 @@
 // src/cli/commands/sessions.ts
 //
 // v1.2.0-alpha.1 (issue #49): the `agent-recall
-// sessions ...` subcommand. Four verbs:
+// sessions ...` subcommand. Five verbs:
 //
 //   inspect  -- parse + display a bundle plan (no DB write)
 //   ingest   -- parse + ingest a JSONL bundle (atomic)
 //   list     -- show the captured sessions newest first
 //   show     -- inspect one session + its events
 //   forget   -- delete a session + its events (blob rows kept)
+//   distill  -- enqueue + run a `session_distill` derivation job
+//               (issue #50). One pass; the deterministic
+//               baseline extractor emits reviewable
+//               memory candidates for every
+//               `decision_confirmed` event in the bundle.
 
 import { flagBool, flagString } from "../arg-parser.js";
 import { jsonOut } from "../format.js";
@@ -16,6 +21,9 @@ import { SessionService } from "../../sessions/service.js";
 import { JsonlSessionAdapter } from "../../sessions/adapters/jsonl.js";
 import type { ProjectIdentityResolver } from "../../scope-resolver.js";
 import type { SessionRow } from "../../sqlite-store.js";
+import { DerivationJobStore } from "../../jobs/service.js";
+import { enqueueAndRunSessionDistill } from "../../distillation/service.js";
+import { makeLeaseOwner } from "../../jobs/runner.js";
 
 const HELP = `agent-recall sessions — manage captured session traces
 
@@ -25,6 +33,7 @@ Usage:
   agent-recall sessions list     [--scope <global|project>] [--project-id <id>] [--limit <n>] [--json]
   agent-recall sessions show     <session_id> [--json]
   agent-recall sessions forget   <session_id> [--json]
+  agent-recall sessions distill  <session_id> [--actor <id>] [--json]
 
 Subcommands:
   inspect  Parse a JSONL bundle and print the planned ingestion result (no DB write).
@@ -33,11 +42,15 @@ Subcommands:
   show     Inspect one session + its events.
   forget   Delete a session + its event rows (blob rows are content-addressed
            and may be referenced by other sessions; GC runs in #55).
+  distill  Enqueue a session_distill derivation job + run the deterministic
+           baseline extractor (issue #50). The job's candidates are
+           available via 'agent-recall candidates list --job <job_id>'.
 
 Flags:
   --scope <s>           Filter (list) to a single scope.
   --project-id <id>     Filter (list) to a single project.
   --limit <n>           Cap (list) row count (default 50).
+  --actor <id>          Distill actor (defaults to "user:cli").
   --json                Emit JSON.
 `;
 
@@ -83,6 +96,8 @@ export async function sessionsCommand(ctx: CliContext): Promise<CliResult> {
       return sessionsShow(ctx);
     case "forget":
       return sessionsForget(ctx);
+    case "distill":
+      return sessionsDistill(ctx);
     case "help":
     case "--help":
     case "-h":
@@ -302,4 +317,56 @@ function sessionsForget(ctx: CliContext): CliResult {
     return { exitCode: 0, stdout: jsonOut({ session_id: sessionId, forgotten: true }), stderr: "" };
   }
   return { exitCode: 0, stdout: `forgot ${sessionId}\n`, stderr: "" };
+}
+
+async function sessionsDistill(ctx: CliContext): Promise<CliResult> {
+  const json = flagBool(ctx.args, "json");
+  const sessionId = ctx.args.positional[1];
+  if (sessionId === undefined || sessionId === "") {
+    return {
+      exitCode: 1,
+      stdout: "",
+      stderr: "[usage_error] sessions distill requires a <session_id> argument"
+    };
+  }
+  const actor = flagString(ctx.args, "actor") ?? "user:cli";
+  const jobStore = new DerivationJobStore(ctx.store);
+  const sessionService = service(ctx);
+  try {
+    const result = await enqueueAndRunSessionDistill({
+      store: ctx.store,
+      jobStore,
+      sessionService,
+      sessionId,
+      actor,
+      leaseOwner: makeLeaseOwner()
+    });
+    if (json) {
+      return {
+        exitCode: 0,
+        stdout: jsonOut({
+          job_id: result.job.job_id,
+          run_id: result.run.run_id,
+          state: result.job.state,
+          attempted: result.outcome.attempted,
+          succeeded: result.outcome.succeeded,
+          failed: result.outcome.failed
+        }),
+        stderr: ""
+      };
+    }
+    return {
+      exitCode: 0,
+      stdout:
+        `job_id: ${result.job.job_id}\n` +
+        `run_id: ${result.run.run_id}\n` +
+        `state:  ${result.job.state}\n` +
+        `attempted=${result.outcome.attempted} succeeded=${result.outcome.succeeded} ` +
+        `failed=${result.outcome.failed}\n`,
+      stderr: ""
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { exitCode: 1, stdout: "", stderr: `[distill_error] ${message}` };
+  }
 }
