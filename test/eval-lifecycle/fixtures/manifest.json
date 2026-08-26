@@ -1,7 +1,7 @@
 {
   "schema_version": "lifecycle.corpus.v1",
-  "corpus_version": "v0.3.0",
-  "description": "Phase 3 (#55) v0.3.0 evaluation corpus. Fifteen fixtures covering the full 5-workstream x 3-class matrix (happy / policy_fail / interrupt_retry). v0.3.0 grows the corpus from v0.2.0's 5 fixtures to 15 by adding: session-ingest-secret-redact / drift-replay, distill-no-hallucination / partial-apply, loadout-cas-mismatch, skills-kebab-case / append-cas, bootstrap-scan-idempotent / unsafe-path / apply-partial. Closes the (workstream, class) coverage gap that v0.2.0 left in the ingestion workstream.",
+  "corpus_version": "v0.3.1",
+  "description": "Phase 3 (#55) v0.3.1 evaluation corpus. Seventeen fixtures: 15 v0.3.0 fixtures covering the full 5-workstream x 3-class matrix (#55a) + 2 v0.3.1 fixtures exercising the safety counter instrumentation surface (#55b). The v0.3.1 additions are dimension=E (safety_resilience) positive counter assertions: safety-secret-leak-v1 verifies the SessionService.ingest hook records one secret_leak_count per secret-bearing event, safety-injection-blocked-v1 verifies the prompt-injection hook records one injection_bypass_count per pattern-matched event.",
   "baselines": {
     "distillation_supported_claim_rate": 0.9,
     "distillation_hallucination_rejection_rate": 0.95,
@@ -22,6 +22,8 @@
     "skills-append-cas-v1.json",
     "bootstrap-scan-idempotent-v1.json",
     "bootstrap-unsafe-path-v1.json",
-    "bootstrap-apply-partial-v1.json"
+    "bootstrap-apply-partial-v1.json",
+    "safety-secret-leak-v1.json",
+    "safety-injection-blocked-v1.json"
   ]
 }

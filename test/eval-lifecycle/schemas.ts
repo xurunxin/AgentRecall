@@ -454,7 +454,15 @@ export const LifecycleFixtureSchema = z.object({
    */
   requires_schema_version: z.number().int().nonnegative().default(20),
   seed: FixtureSeedSchema.default({}),
-  operations: z.array(FixtureOperationSchema).min(1),
+  operations: z
+    .array(FixtureOperationSchema)
+    // v1.2.0-alpha.3 (issue #55b): safety / counter
+    // fixtures assert on the post-seed state alone
+    // (the SessionService.ingest hook records the
+    // counter when the seed is admitted). An
+    // empty `operations` array is the canonical
+    // shape for these fixtures.
+    .default([]),
   expected: ExpectedOutcomesSchema.default({})
 });
 

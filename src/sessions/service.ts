@@ -39,6 +39,10 @@ import type {
 } from "../sqlite-store.js";
 import { nowIso } from "../domain.js";
 import { ProjectIdentityResolver } from "../scope-resolver.js";
+import {
+  noopSafetyCounters,
+  type SafetyCounters
+} from "../services/safety-counters.js";
 
 /**
  * Hard caps for the v1 ingest path. Per-event
@@ -123,7 +127,22 @@ export type SessionInspection = {
 export class SessionService {
   constructor(
     private readonly store: SQLiteMemoryStore,
-    private readonly identityResolver?: ProjectIdentityResolver
+    private readonly identityResolver?: ProjectIdentityResolver,
+    /**
+     * v1.2.0-alpha.3 (issue #55b): the safety counter
+     * surface. The service increments
+     * `secret_leak_count` for every event that the
+     * secret scanner tags with `contains_secret` and
+     * `injection_bypass_count` for every event that
+     * matches the prompt-injection pattern. The
+     * default (when omitted) is the no-op
+     * implementation; the eval harness passes a
+     * `CollectingSafetyCounters` so a passing fixture
+     * must observe `secret_leak_count = 0` (no
+     * secret-bearing content made it past the
+     * scanner).
+     */
+    private readonly safetyCounters: SafetyCounters = noopSafetyCounters
   ) {}
 
   /**
@@ -296,6 +315,15 @@ export class SessionService {
       const findings = detectSecrets(ev.content, "body");
       if (findings.length > 0) {
         flags.push("contains_secret");
+        // v1.2.0-alpha.3 (issue #55b): record the
+        // secret presence on the safety counter
+        // surface. The eval harness asserts
+        // `secret_leak_count = 0` for fixtures that
+        // do not contain secret-bearing content;
+        // a non-zero count points to a secret that
+        // the scanner tagged but the ingest path
+        // still admitted.
+        this.safetyCounters.inc("secret_leak_count");
         // The plan counter was already incremented
         // by `planBundle` (which knows the
         // pre-decision state). We do not increment
@@ -310,6 +338,14 @@ export class SessionService {
       // legitimate transcripts.
       if (/ignore (all )?previous instructions|disregard (the )?system prompt/i.test(ev.content)) {
         flags.push("risk_injection");
+        // v1.2.0-alpha.3 (issue #55b): the prompt
+        // injection pattern matched but the event
+        // was still accepted (the v1 surface flags
+        // it for downstream review but does not
+        // reject). Record the bypass so a passing
+        // fixture must observe
+        // `injection_bypass_count = 0`.
+        this.safetyCounters.inc("injection_bypass_count");
       }
     }
     // Decide the head/tail truncation BEFORE the

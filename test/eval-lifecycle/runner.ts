@@ -29,6 +29,7 @@ import { SkillService } from "../../src/skills/service.js";
 import { BootstrapService } from "../../src/bootstrap/service.js";
 import { ExternalReferenceService } from "../../src/external-refs/service.js";
 import { ProjectIdentityResolver } from "../../src/scope-resolver.js";
+import { CollectingSafetyCounters } from "../../src/services/safety-counters.js";
 import { formatReportJson, formatReportMarkdown } from "./report.js";
 import {
   LifecycleFixtureSchema,
@@ -71,6 +72,16 @@ type FixtureContext = {
   bootstrapService: BootstrapService;
   externalReferences: ExternalReferenceService;
   /**
+   * v1.2.0-alpha.3 (issue #55b): the collecting
+   * safety counter. Wired into SessionService
+   * (secret + injection) and DistillationService
+   * (secret + trust escalation). The runner reads
+   * `snapshot()` after the operation handler
+   * returns and writes the result into
+   * `OperationResult.safety_counters`.
+   */
+  safetyCounters: CollectingSafetyCounters;
+  /**
    * Map of loadout name -> loadout_id for fixtures
    * that operate on a loadout by name. Populated
    * during the seed step.
@@ -100,13 +111,27 @@ function buildContext(): FixtureContext {
   const dataHome = tmpDbPath();
   const store = openStore(dataHome);
   const memoryWriteService = new MemoryWriteService(store);
-  const sessionService = new SessionService(store, null);
+  // v1.2.0-alpha.3 (issue #55b): the collecting
+  // safety counter is wired into the two services
+  // that emit safety events (SessionService for
+  // secret / injection; DistillationService for
+  // secret / trust escalation). The ContextAssembler
+  // hook lives outside the runner's per-fixture
+  // services (the eval suite does not exercise
+  // context assembly yet) so it stays on the
+  // default no-op for now.
+  const safetyCounters = new CollectingSafetyCounters();
+  const sessionService = new SessionService(
+    store,
+    null,
+    safetyCounters
+  );
   const jobStore = new DerivationJobStore(store);
   const distillationService = new DistillationService(
     store,
     sessionService,
     jobStore,
-    { memoryWriteService }
+    { memoryWriteService, safetyCounters }
   );
   const loadoutService = new LoadoutService(store);
   const skillService = new SkillService(store);
@@ -147,6 +172,7 @@ function buildContext(): FixtureContext {
     skillService,
     bootstrapService,
     externalReferences,
+    safetyCounters,
     loadoutIdsByName: new Map(),
     skillAssetIdsByName: new Map(),
     bootstrapPlanId: null,
@@ -402,6 +428,21 @@ interface OperationResult {
   candidate_count: number | null;
   bootstrap_hash: string | null;
   error: string | null;
+  /**
+   * v1.2.0-alpha.3 (issue #55b): the safety
+   * counter snapshot at the end of the fixture's
+   * operations. Wired by the runner after the
+   * operation handler returns (a `seedFixture`-
+   * only path leaves the snapshot undefined and
+   * the comparison loop short-circuits).
+   */
+  safety_counters?: {
+    cross_project_leak_count: number;
+    sensitivity_leak_count: number;
+    secret_leak_count: number;
+    injection_bypass_count: number;
+    unauthorized_trust_escalation_count: number;
+  };
 }
 
 /**
@@ -967,20 +1008,54 @@ function compareOutcomes(
       `bootstrap_hash: expected=${fixture.expected.bootstrap_hash} observed=${result.bootstrap_hash ?? "<null>"}`
     );
   }
-  // Safety counters are always 0; we surface any
-  // deviation as a hard fail (the policy-fail /
-  // interrupt-retry fixture classes intentionally
-  // exercise these surfaces).
-  const e = fixture.expected.safety;
-  if (
-    e.cross_project_leak_count > 0 ||
-    e.sensitivity_leak_count > 0 ||
-    e.secret_leak_count > 0 ||
-    e.injection_bypass_count > 0 ||
-    e.unauthorized_trust_escalation_count > 0
-  ) {
-    passed = false;
-    notes.push(`safety counters expected=0; see expected.safety`);
+  // Safety counter check (v0.3.1 / issue #55b):
+  // every counter field in `expected.safety` is
+  // compared against the matching observed field
+  // on the `result.safety_counters` snapshot. The
+  // fixture author pins the expected values; the
+  // runner treats a mismatch as a hard fail. The
+  // canonical "safe" baseline is `0` for every
+  // counter — the v0.2.0 corpus already does this
+  // implicitly. The v0.3.1 additions (issue #55a +
+  // #55b) are first-class: a `safety_*_count = 1`
+  // expectation is a positive assertion that the
+  // counter instrumented a real safety event.
+  if (result.safety_counters !== undefined) {
+    const exp = fixture.expected.safety;
+    const obs = result.safety_counters;
+    if (exp.cross_project_leak_count !== obs.cross_project_leak_count) {
+      passed = false;
+      notes.push(
+        `safety.cross_project_leak_count: expected=${exp.cross_project_leak_count} observed=${obs.cross_project_leak_count}`
+      );
+    }
+    if (exp.sensitivity_leak_count !== obs.sensitivity_leak_count) {
+      passed = false;
+      notes.push(
+        `safety.sensitivity_leak_count: expected=${exp.sensitivity_leak_count} observed=${obs.sensitivity_leak_count}`
+      );
+    }
+    if (exp.secret_leak_count !== obs.secret_leak_count) {
+      passed = false;
+      notes.push(
+        `safety.secret_leak_count: expected=${exp.secret_leak_count} observed=${obs.secret_leak_count}`
+      );
+    }
+    if (exp.injection_bypass_count !== obs.injection_bypass_count) {
+      passed = false;
+      notes.push(
+        `safety.injection_bypass_count: expected=${exp.injection_bypass_count} observed=${obs.injection_bypass_count}`
+      );
+    }
+    if (
+      exp.unauthorized_trust_escalation_count !==
+      obs.unauthorized_trust_escalation_count
+    ) {
+      passed = false;
+      notes.push(
+        `safety.unauthorized_trust_escalation_count: expected=${exp.unauthorized_trust_escalation_count} observed=${obs.unauthorized_trust_escalation_count}`
+      );
+    }
   }
   if (
     fixture.expected.last_error_code !== null &&
@@ -1107,7 +1182,15 @@ export async function runCorpus(opts: RunCorpusOptions): Promise<CorpusReport> {
         candidate_count: opResult.candidate_count,
         bootstrap_hash: opResult.bootstrap_hash
       },
-      safety_counters: {},
+      // v1.2.0-alpha.3 (issue #55b): the safety
+      // counter snapshot is taken at the end of
+      // the fixture's lifetime. `runOperation` does
+      // not populate `safety_counters` directly
+      // (each case already returns its own
+      // `OperationResult` shape); the runner takes
+      // a single `snapshot()` here so the
+      // per-fixture scope is observed exactly once.
+      safety_counters: ctx.safetyCounters.snapshot(),
       error: opResult.error
     });
     if (!passed && opts.bailOnFailure === true) break;

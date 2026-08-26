@@ -43,6 +43,10 @@ import {
   type AssembledContextV1
 } from "../../packages/contracts/src/loadouts.js";
 import { LoadoutService } from "../loadouts/service.js";
+import {
+  noopSafetyCounters,
+  type SafetyCounters
+} from "../services/safety-counters.js";
 
 /**
  * Stable policy version stamped on every
@@ -100,6 +104,21 @@ export type AssemblerDeps = {
    * `MemoryReadService` search path.
    */
   listActiveEntries?: (authz: CallerAuthz) => MemoryEntry[];
+  /**
+   * v1.2.0-alpha.3 (issue #55b): the safety counter
+   * surface. The assembler increments
+   * `cross_project_leak_count` for every memory the
+   * caller is not authorised to see in the current
+   * project scope (the project's
+   * `CallerAuthz.project_id` is the gate; a memory
+   * with a different `project_id` is a leak) and
+   * `sensitivity_leak_count` for every memory whose
+   * sensitivity exceeds the caller's
+   * `CallerAuthz.max_sensitivity`. Defaults to the
+   * no-op implementation so the production path is
+   * allocation-free.
+   */
+  safetyCounters?: SafetyCounters;
 };
 
 /**
@@ -114,9 +133,11 @@ export type AssembleResult = Assembled;
 
 export class ContextAssembler {
   private readonly deps: AssemblerDeps;
+  private readonly safetyCounters: SafetyCounters;
 
   constructor(deps: AssemblerDeps) {
     this.deps = deps;
+    this.safetyCounters = deps.safetyCounters ?? noopSafetyCounters;
   }
 
   /**
@@ -416,8 +437,30 @@ export class ContextAssembler {
       // projects.
       if (loadout.scope === "project" && loadout.project_id !== null) {
         if (entry.scope === "project" && entry.project_id !== loadout.project_id) {
+          // v1.2.0-alpha.3 (issue #55b): the
+          // `listActiveEntries` source fed a
+          // cross-project entry into the
+          // bootstrap path. The guard's `continue`
+          // keeps it out of the output, but the
+          // counter records the attempt so a
+          // passing fixture observes
+          // `cross_project_leak_count = 0`.
+          this.safetyCounters.inc("cross_project_leak_count");
           continue;
         }
+      }
+      // Sensitivity guard: a restricted / private
+      // entry must never be exposed to a caller
+      // whose `max_sensitivity` is `normal`. The
+      // `listActiveEntries` source should already
+      // honour the caller's visibility, but the
+      // counter is the belt-and-braces check.
+      if (
+        authz.max_sensitivity === "normal" &&
+        (entry.sensitivity === "restricted" || entry.sensitivity === "private")
+      ) {
+        this.safetyCounters.inc("sensitivity_leak_count");
+        continue;
       }
       if (entry.tier === "core") {
         if (entry.pinned || explicit.has(entry.id) || this.isBootstrapAllowListed(entry)) {
