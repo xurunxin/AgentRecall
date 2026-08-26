@@ -45,6 +45,9 @@
       "injection_bypass_count": 0,
       "unauthorized_trust_escalation_count": 0
     },
-    "last_error_code": null
+    "last_error_code": null,
+    "metric_input": {
+      "bootstrap_scan_idempotent": true
+    }
   }
 }

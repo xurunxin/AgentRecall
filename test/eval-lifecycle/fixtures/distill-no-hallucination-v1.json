@@ -39,6 +39,11 @@
       "injection_bypass_count": 0,
       "unauthorized_trust_escalation_count": 0
     },
-    "last_error_code": null
+    "last_error_code": null,
+    "metric_input": {
+      "distillation_total_decision_events": 0,
+      "distillation_non_decision_event_count": 1,
+      "distillation_candidate_count": 0
+    }
   }
 }

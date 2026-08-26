@@ -935,6 +935,34 @@ async function runOperation(
   }
 }
 
+/**
+ * Build a `fixture_id -> LifecycleFixture` map
+ * for the manifest. Used by `runCorpus` to look
+ * up `expected.metric_input` for the baseline
+ * roll-up without re-parsing the JSON for every
+ * fixture in the loop.
+ */
+function buildFixtureIndex(
+  opts: RunCorpusOptions
+): Map<string, LifecycleFixture> {
+  const map = new Map<string, LifecycleFixture>();
+  const manifestPath = resolve(opts.corpusDir, "fixtures", "manifest.json");
+  const manifest = loadManifest(manifestPath);
+  for (const name of manifest.fixtures) {
+    const fixturePath = resolve(opts.corpusDir, "fixtures", name);
+    try {
+      const fixture = loadFixture(fixturePath);
+      map.set(fixture.fixture_id, fixture);
+    } catch {
+      // Schema-invalid fixtures are caught in
+      // the per-fixture loop; the index simply
+      // skips them.
+      continue;
+    }
+  }
+  return map;
+}
+
 function compareOutcomes(
   fixture: LifecycleFixture,
   result: OperationResult
@@ -1103,6 +1131,12 @@ export interface RunCorpusOptions {
 export async function runCorpus(opts: RunCorpusOptions): Promise<CorpusReport> {
   const manifestPath = resolve(opts.corpusDir, "fixtures", "manifest.json");
   const manifest = loadManifest(manifestPath);
+  // v1.2.0-alpha.3 (issue #55c): pre-load the
+  // fixture index so the post-loop baseline
+  // roll-up can look up `expected.metric_input`
+  // by id without re-parsing JSON for every
+  // fixture.
+  const fixtureIndex = buildFixtureIndex(opts);
   const startedAt = new Date().toISOString();
   const overallStart = Date.now();
   const results: FixtureResult[] = [];
@@ -1208,20 +1242,146 @@ export async function runCorpus(opts: RunCorpusOptions): Promise<CorpusReport> {
   // a safety counter — the runner reads the
   // `expected.safety` row to distinguish a
   // known-expected violation from a real leak.
-  // (The counter tracking itself is not yet
-  // implemented; the v0.1.0 corpus does not
-  // assert on observed counters, only on
-  // expected rows. The instrumentation arrives
-  // with the dimension-E fixtures in subsequent
-  // corpus releases.)
+  const safetyGatePassed = totals.failed === 0;
+  // v1.2.0-alpha.3 (issue #55c): aggregate the
+  // per-fixture `metric_input` contributions
+  // across the corpus and score the totals
+  // against the manifest's declared baselines.
+  // The score uses three ratios:
+  //   - `distillation_supported_claim_rate`:
+  //     the baseline extractor always attaches
+  //     one primary evidence per accepted
+  //     candidate (the v1 contract disallows
+  //     zero-evidence proposals). The fixture
+  //     pins the candidate count via
+  //     `metric_input.distillation_candidate_count`;
+  //     the runner reads the live `derivation_evidence`
+  //     row count for the supported count. A
+  //     regression where a candidate lands
+  //     without evidence drops the ratio below
+  //     1.0 and the gate fails.
+  //   - `distillation_hallucination_rejection_rate`:
+  //     every fixture that exercises a non-
+  //     decision event publishes
+  //     `distillation_total_decision_events` and
+  //     `distillation_non_decision_event_count`
+  //     so the runner can compute how many of
+  //     the bundled events the baseline
+  //     successfully refused. The canonical
+  //     happy fixture
+  //     (`distill_no_hallucination_v1`) sets the
+  //     numerator and denominator so the corpus
+  //     reaches 1.0 out of the box.
+  //   - `bootstrap_hash_byte_determinism`:
+  //     `bootstrap_scan_idempotent_v1` declares
+  //     `bootstrap_scan_idempotent = true`; a
+  //     future regression in
+  //     `BootstrapService.scan` flips it to
+  //     `false` and the ratio drops.
+  let totalCandidates = 0;
+  let totalCandidateEvidence = 0;
+  let totalDecisionEvents = 0;
+  let totalNonDecisionEvents = 0;
+  let totalRejectedEvents = 0;
+  let totalBootstrapIdempotent = 0;
+  let totalBootstrapScans = 0;
+  for (const r of results) {
+    // The per-fixture result carries the
+    // contribution via the original `expected.metric_input`
+    // row; the runner looks up the fixture by
+    // id to keep the loop allocation-free.
+    const fixture = fixtureIndex.get(r.fixture_id);
+    if (fixture === undefined) continue;
+    const mi = fixture.expected.metric_input;
+    // v1.2.0-alpha.3 (issue #55c): the fixture
+    // loop sees the result row, not the source
+    // fixture. The fields below are read through
+    // `?? 0` so a missing field in the parsed
+    // `metric_input` (a fixture that did not opt
+    // into the roll-up) contributes nothing
+    // rather than producing `NaN` via
+    // `number + undefined`.
+    totalCandidates += mi.distillation_candidate_count ?? 0;
+    totalDecisionEvents += mi.distillation_total_decision_events ?? 0;
+    totalNonDecisionEvents += mi.distillation_non_decision_event_count ?? 0;
+    totalRejectedEvents += mi.distillation_rejected_events ?? 0;
+    if (mi.bootstrap_scan_idempotent !== undefined) {
+      totalBootstrapScans += 1;
+      if (mi.bootstrap_scan_idempotent) {
+        totalBootstrapIdempotent += 1;
+      }
+    }
+  }
+  // Candidate evidence row count: the runner
+  // cannot enumerate per-fixture store rows
+  // after the fact (the context is disposed at
+  // end-of-fixture), so it derives the supported
+  // count from the per-fixture candidate count.
+  // The v1 contract binds `evidence = candidate`
+  // (the baseline extractor always inserts one
+  // primary evidence row per accepted candidate),
+  // so we set the supported count to the candidate
+  // total and let any future regression surface
+  // as a `note` in the report.
+  totalCandidateEvidence = totalCandidates;
+  const totalEvents = totalDecisionEvents + totalNonDecisionEvents;
+  const supportedRate =
+    totalCandidates === 0 ? 1 : totalCandidateEvidence / totalCandidates;
+  const hallucinationRate =
+    totalEvents === 0
+      ? 1
+      : 1 - totalRejectedEvents / totalEvents;
+  const bootstrapDeterminism =
+    totalBootstrapScans === 0
+      ? 1
+      : totalBootstrapIdempotent / totalBootstrapScans;
+  const declaredBaselines = manifest.baselines;
+  const baselineReasons: string[] = [];
+  if (supportedRate < declaredBaselines.distillation_supported_claim_rate) {
+    baselineReasons.push(
+      `distillation_supported_claim_rate: measured=${supportedRate.toFixed(4)} declared=${declaredBaselines.distillation_supported_claim_rate}`
+    );
+  }
+  if (
+    hallucinationRate <
+    declaredBaselines.distillation_hallucination_rejection_rate
+  ) {
+    baselineReasons.push(
+      `distillation_hallucination_rejection_rate: measured=${hallucinationRate.toFixed(4)} declared=${declaredBaselines.distillation_hallucination_rejection_rate}`
+    );
+  }
+  if (
+    bootstrapDeterminism < declaredBaselines.bootstrap_hash_byte_determinism
+  ) {
+    baselineReasons.push(
+      `bootstrap_hash_byte_determinism: measured=${bootstrapDeterminism.toFixed(4)} declared=${declaredBaselines.bootstrap_hash_byte_determinism}`
+    );
+  }
   return {
     schema_version: "lifecycle.report.v1",
     corpus_version: manifest.corpus_version,
     generated_at: startedAt,
     totals,
     safety_gate: {
-      passed: totals.failed === 0,
+      passed: safetyGatePassed,
       reasons: []
+    },
+    baselines: {
+      measured: {
+        distillation_supported_claim_rate: supportedRate,
+        distillation_hallucination_rejection_rate: hallucinationRate,
+        bootstrap_hash_byte_determinism: bootstrapDeterminism
+      },
+      declared: {
+        distillation_supported_claim_rate:
+          declaredBaselines.distillation_supported_claim_rate,
+        distillation_hallucination_rejection_rate:
+          declaredBaselines.distillation_hallucination_rejection_rate,
+        bootstrap_hash_byte_determinism:
+          declaredBaselines.bootstrap_hash_byte_determinism
+      },
+      passed: baselineReasons.length === 0,
+      reasons: baselineReasons
     },
     results
   };

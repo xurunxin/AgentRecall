@@ -419,7 +419,42 @@ export const ExpectedOutcomesSchema = z.object({
    * Used by `policy_fail` and `interrupt_retry`
    * fixtures.
    */
-  last_error_code: z.string().nullable().default(null)
+  last_error_code: z.string().nullable().default(null),
+  /**
+   * v1.2.0-alpha.3 (issue #55c): the fixture's
+   * contribution to the corpus-level quality
+   * baselines. The runner aggregates these
+   * contributions across the corpus and scores
+   * the totals against the manifest's declared
+   * thresholds; a `0` on any of the denominator
+   * fields means the fixture does not exercise
+   * that metric and the runner ignores it for the
+   * corresponding baseline. The fields are
+   * aligned with the three v0.4.0 baselines:
+   *   - `distillation_total_decision_events` +
+   *     `distillation_rejected_events`  →
+   *     distillation_hallucination_rejection_rate
+   *     (how many non-decision events the
+   *     baseline refuses)
+   *   - `distillation_candidate_count`  →
+   *     denominator of
+   *     distillation_supported_claim_rate
+   *     (paired with the runner-side
+   *     `derivation_evidence` row count)
+   *   - `bootstrap_scan_idempotent`  →
+   *     bootstrap_hash_byte_determinism
+   *     (1 / 0 contribution to the per-fixture
+   *     idempotence set)
+   */
+  metric_input: z
+    .object({
+      distillation_total_decision_events: z.number().int().nonnegative().default(0),
+      distillation_non_decision_event_count: z.number().int().nonnegative().default(0),
+      distillation_rejected_events: z.number().int().nonnegative().default(0),
+      distillation_candidate_count: z.number().int().nonnegative().default(0),
+      bootstrap_scan_idempotent: z.boolean().optional()
+    })
+    .default({})
 });
 
 /**
@@ -569,6 +604,46 @@ export const CorpusReportSchema = z.object({
     passed: z.boolean(),
     reasons: z.array(z.string())
   }),
+  /**
+   * v1.2.0-alpha.3 (issue #55c): the corpus-level
+   * quality baseline roll-up. `baselines_measured`
+   * carries the actual numbers the runner
+   * computed from `expected.metric_input` rows
+   * across the corpus. `baselines_passed` is
+   * `true` when every measured value is at or
+   * above the threshold declared in
+   * `manifest.baselines`; a single miss flips it
+   * to `false` and the runner exits with code 1.
+   * The reasons array names the failed metrics.
+   */
+  baselines: z
+    .object({
+      measured: z.object({
+        distillation_supported_claim_rate: z
+          .number()
+          .min(0)
+          .max(1),
+        distillation_hallucination_rejection_rate: z
+          .number()
+          .min(0)
+          .max(1),
+        bootstrap_hash_byte_determinism: z.number().min(0).max(1)
+      }),
+      declared: z.object({
+        distillation_supported_claim_rate: z
+          .number()
+          .min(0)
+          .max(1),
+        distillation_hallucination_rejection_rate: z
+          .number()
+          .min(0)
+          .max(1),
+        bootstrap_hash_byte_determinism: z.number().min(0).max(1)
+      }),
+      passed: z.boolean(),
+      reasons: z.array(z.string())
+    })
+    .optional(),
   results: z.array(FixtureResultSchema)
 });
 
