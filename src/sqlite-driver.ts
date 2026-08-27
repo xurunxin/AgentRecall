@@ -186,7 +186,15 @@ class BunStatementAdapter implements SqliteStatement {
     return this.raw.run(...params);
   }
   get<T>(...params: SqliteBindValue[]): T | undefined {
-    return this.raw.get<T>(...params);
+    // v1.2.0 follow-up: `bun:sqlite` returns `null`
+    // when the statement matches no row; `node:sqlite`
+    // returns `undefined`. The rest of the store
+    // checks `row === undefined` and crashes on `null`
+    // (`null is not an object (evaluating 'row[column]')`).
+    // Normalize to `undefined` here so the two
+    // drivers look identical to the call sites.
+    const row = this.raw.get<T | null>(...params);
+    return (row === null ? undefined : row) as T | undefined;
   }
   all<T>(...params: SqliteBindValue[]): T[] {
     return this.raw.all<T>(...params);
