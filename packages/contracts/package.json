@@ -12,7 +12,7 @@
     }
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node -e \"const fs=require('node:fs');fs.rmSync('./dist',{recursive:true,force:true});fs.cpSync('../../dist/packages/contracts/dist','./dist',{recursive:true});\"",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },
