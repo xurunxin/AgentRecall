@@ -16,8 +16,8 @@
     "baseUrl": ".",
     "paths": {
       "@agent-recall/contracts": [
-        "./packages/contracts/dist/index.d.ts",
-        "./packages/contracts/dist/index.js"
+        "./dist/packages/contracts/dist/index.d.ts",
+        "./dist/packages/contracts/dist/index.js"
       ]
     }
   },

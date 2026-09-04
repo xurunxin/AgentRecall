@@ -65,6 +65,23 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # The root `tsc` typecheck (and the subsequent
+      # `build`) resolve `packages/contracts` via the
+      # workspace path alias in tsconfig.json's
+      # `paths."@agent-recall/contracts"`, which points
+      # at `./packages/contracts/dist/index.d.ts` and
+      # `./packages/contracts/dist/index.js`. Without
+      # an explicit contracts build, the first time
+      # `tsc` walks the dependency graph it errors
+      # with `Cannot find module '.../packages/contracts/dist/index.js'`
+      # on every source file that imports the
+      # contracts surface. The contracts package is
+      # not in the root tsconfig's `include` set (it
+      # has its own tsconfig), so `tsc` from the root
+      # never builds it as a side effect.
+      - name: Build @agent-recall/contracts (workspace dep of src imports)
+        run: npm run build --workspace=@agent-recall/contracts
+
       - name: Typecheck
         run: npm run typecheck
 
