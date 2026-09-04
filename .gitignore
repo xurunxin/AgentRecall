@@ -85,3 +85,49 @@ node.out
 /mcp-config-before.json
 /http-bridge/find-mcp-config.py
 
+# Tauri (apps/admin/src-tauri) build artefacts.
+# The Tauri CLI regenerates `gen/` on every build (it
+# holds `tauri-build` macro output and the capability
+# schema snapshots), and `cargo` writes the standard
+# Rust build dir under `target/`. Neither is source.
+# Scoped to the admin Tauri app so a future `target/`
+# under another crate (e.g. a future shared `packages/`
+# Rust lib) is not silently swallowed.
+apps/admin/src-tauri/gen/
+apps/admin/src-tauri/target/
+
+# Tauri-built application binary. The CI release
+# pipeline produces this in dist/ and uploads it from
+# there; the local debug build drops it at the repo
+# root and must not be tracked.
+agent-recall.exe
+
+# Stale `src/**/*.js` siblings of `*.ts` source files.
+# The project's `tsconfig.json` includes only `*.ts`
+# and emits to `dist/`, so any .js sitting next to a
+# .ts in `src/` is by definition a stray transpile
+# artefact (or a one-off diagnostic output) — never
+# project source. Real JS lives under `dist/` after
+# `npm run build`.
+src/**/*.js
+
+# TypeScript incremental build cache. `tsc --incremental`
+# drops a `<tsconfig>.tsbuildinfo` next to each
+# tsconfig.json; they are pure rebuild-skip metadata
+# and must not be tracked.
+*.tsbuildinfo
+
+# Backup files (mostly `*.bak` rotated by the local
+# Tauri debug-build pipeline, which renames the
+# previous `agent-recall*.exe` to `*.vN.bak` before
+# overwriting). Hundreds of MB each; never source.
+*.bak
+
+# Demo / scratch data homes produced by the eval
+# harness and ad-hoc reproductions. Sibling of the
+# already-ignored `.local-memory-mcp/` and
+# `.agent-recall/`. Holds the bulky `agent-recall-*.bak`
+# binaries plus the per-eval `report.json` / `report.md`
+# and the eval runner copies. Regenerable from scripts.
+.demo-data-home/
+
