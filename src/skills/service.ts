@@ -30,7 +30,7 @@ import type {
   SQLiteMemoryStore
 } from "../sqlite-store.js";
 import { AssetService } from "../assets/service.js";
-import { SkillAssetV1Schema } from "../../packages/contracts/dist/index.js";
+import { SkillAssetV1Schema } from "../../dist/packages/contracts/dist/index.js";
 import {
   formatSkillMd,
   parseSkillMd,

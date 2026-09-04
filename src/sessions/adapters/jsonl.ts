@@ -30,7 +30,7 @@ import { createInterface } from "node:readline";
 import {
   SessionTraceBundleV1Schema,
   SessionTraceEventV1Schema
-} from "../../../packages/contracts/dist/index.js";
+} from "../../../dist/packages/contracts/dist/index.js";
 
 import type { NormalisedBundle, NormalisedEvent } from "../service.js";
 import type { SessionEventType, SessionScope, SessionSensitivity } from "../../sqlite-store.js";
@@ -184,7 +184,12 @@ function normaliseBundle(value: unknown):
   | { ok: false; error: string } {
   const parsed = SessionTraceBundleV1Schema.safeParse(value);
   if (!parsed.success) {
-    return { ok: false, error: parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ") };
+    return {
+      ok: false,
+      error: parsed.error.issues
+        .map((i: { path: PropertyKey[]; message: string }) => `${i.path.map(String).join(".")}: ${i.message}`)
+        .join("; ")
+    };
   }
   return { ok: true, bundle: toNormalisedBundle(parsed.data) };
 }
@@ -200,7 +205,7 @@ function normaliseEvent(value: unknown, header: NormalisedBundle):
     return {
       ok: false,
       error: parsed.error.issues
-        .map((i) => `${i.path.map(String).join(".")}: ${i.message}`)
+        .map((i: { path: PropertyKey[]; message: string }) => `${i.path.map(String).join(".")}: ${i.message}`)
         .join("; ")
     };
   }
